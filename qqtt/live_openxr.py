@@ -21,6 +21,35 @@ MIDDLE_TIP_JOINT_INDEX = 15
 CONTROLLER_FORWARD = np.asarray([0.0, 0.0, -1.0], dtype=np.float32)
 
 
+def _prepend_env_path(env: dict[str, str], key: str, value: str) -> None:
+    current = env.get(key, "")
+    env[key] = f"{value}:{current}" if current else value
+
+
+def _ensure_jsoncpp_compat_dir(repo_root: Path) -> Optional[str]:
+    compat_dir = repo_root / "linux_pose_probe" / ".compat_libs"
+    compat_link = compat_dir / "libjsoncpp.so.1"
+    if compat_link.exists():
+        return str(compat_dir)
+
+    candidates = (
+        Path("/usr/lib/x86_64-linux-gnu/libjsoncpp.so.1.9.5"),
+        Path("/lib/x86_64-linux-gnu/libjsoncpp.so.1.9.5"),
+        Path("/usr/lib/x86_64-linux-gnu/libjsoncpp.so.25"),
+        Path("/lib/x86_64-linux-gnu/libjsoncpp.so.25"),
+    )
+    target = next((candidate for candidate in candidates if candidate.exists()), None)
+    if target is None:
+        return None
+
+    compat_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        compat_link.symlink_to(target)
+    except FileExistsError:
+        pass
+    return str(compat_dir)
+
+
 @dataclass
 class HandJointSample:
     active: bool
@@ -117,10 +146,10 @@ class OpenXRHandJointStream:
 
         steamvr_lib_dir = self._default_steamvr_lib_dir()
         if steamvr_lib_dir is not None:
-            current_ld = env.get("LD_LIBRARY_PATH", "")
-            env["LD_LIBRARY_PATH"] = (
-                f"{steamvr_lib_dir}:{current_ld}" if current_ld else steamvr_lib_dir
-            )
+            _prepend_env_path(env, "LD_LIBRARY_PATH", steamvr_lib_dir)
+        jsoncpp_compat_dir = _ensure_jsoncpp_compat_dir(self.repo_root)
+        if jsoncpp_compat_dir is not None:
+            _prepend_env_path(env, "LD_LIBRARY_PATH", jsoncpp_compat_dir)
 
         self.process = subprocess.Popen(
             [str(self.binary_path), "0"],
@@ -284,10 +313,10 @@ class OpenXRControllerStream:
 
         steamvr_lib_dir = self._default_steamvr_lib_dir()
         if steamvr_lib_dir is not None:
-            current_ld = env.get("LD_LIBRARY_PATH", "")
-            env["LD_LIBRARY_PATH"] = (
-                f"{steamvr_lib_dir}:{current_ld}" if current_ld else steamvr_lib_dir
-            )
+            _prepend_env_path(env, "LD_LIBRARY_PATH", steamvr_lib_dir)
+        jsoncpp_compat_dir = _ensure_jsoncpp_compat_dir(self.repo_root)
+        if jsoncpp_compat_dir is not None:
+            _prepend_env_path(env, "LD_LIBRARY_PATH", jsoncpp_compat_dir)
 
         self.process = subprocess.Popen(
             [str(self.binary_path), "0"],

@@ -58,12 +58,35 @@ def create_gl_window(width: int, height: int, visible: bool = True):
 def configure_local_python_paths():
     repo_root = os.path.dirname(os.path.abspath(__file__))
     submodule_roots = (
-        os.path.join(repo_root, "gaussian_splatting", "submodules", "simple-knn"),
-        os.path.join(repo_root, "gaussian_splatting", "submodules", "diff-gaussian-rasterization"),
-        os.path.join(repo_root, "gaussian_splatting", "submodules", "fused-ssim"),
+        (
+            os.path.join(repo_root, "gaussian_splatting", "submodules", "simple-knn"),
+            ("simple_knn/_C*.so",),
+        ),
+        (
+            os.path.join(repo_root, "gaussian_splatting", "submodules", "diff-gaussian-rasterization"),
+            ("diff_gaussian_rasterization/_C*.so",),
+        ),
+        (
+            os.path.join(repo_root, "gaussian_splatting", "submodules", "fused-ssim"),
+            ("fused_ssim_cuda*.so",),
+        ),
     )
-    for path in reversed(submodule_roots):
-        if os.path.isdir(path) and path not in sys.path:
+    for path, required_globs in reversed(submodule_roots):
+        if not os.path.isdir(path):
+            continue
+
+        has_native_build = any(
+            glob.glob(os.path.join(path, pattern))
+            for pattern in required_globs
+        )
+        if not has_native_build:
+            print(
+                f"[python_path] skipping local submodule without built extension: {path}",
+                flush=True,
+            )
+            continue
+
+        if path not in sys.path:
             sys.path.insert(0, path)
 
 

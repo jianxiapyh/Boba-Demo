@@ -266,6 +266,30 @@ bool AppendAnchorCycleBindings(
     return true;
 }
 
+bool AppendSnapAssistBindings(
+    XrInstance instance,
+    XrAction snap_assist_click_action,
+    const char* profile_string,
+    std::vector<XrActionSuggestedBinding>* bindings) {
+    if (std::strcmp(profile_string, "/interaction_profiles/oculus/touch_controller") != 0) {
+        return true;
+    }
+
+    const char* paths[] = {
+        "/user/hand/left/input/y/click",
+        "/user/hand/right/input/b/click",
+    };
+    bindings->reserve(bindings->size() + 2);
+    for (const char* path_string : paths) {
+        XrPath path = XR_NULL_PATH;
+        if (!StringToPath(instance, path_string, &path)) {
+            return false;
+        }
+        bindings->push_back({snap_assist_click_action, path});
+    }
+    return true;
+}
+
 bool QueryControllerPose(
     XrInstance instance,
     XrSession session,
@@ -380,7 +404,8 @@ bool QuerySelectValueState(
 
 void PrintControllerJson(const char* prefix, const ControllerPoseSample& pose,
                          const SelectStateSample& select,
-                         const SelectStateSample& anchor_cycle) {
+                         const SelectStateSample& anchor_cycle,
+                         const SelectStateSample& snap_assist) {
     std::cout << "\"" << prefix << "\":{";
     std::cout << "\"source\":\"" << pose.source << "\",";
     std::cout << "\"active\":" << (pose.action_active ? 1 : 0) << ",";
@@ -401,9 +426,9 @@ void PrintControllerJson(const char* prefix, const ControllerPoseSample& pose,
     std::cout << "\"anchor_cycle_available\":" << (anchor_cycle.available ? 1 : 0) << ",";
     std::cout << "\"anchor_cycle_pressed\":" << (anchor_cycle.pressed ? 1 : 0) << ",";
     std::cout << "\"anchor_cycle_source\":\"" << anchor_cycle.source << "\",";
-    std::cout << "\"snap_assist_available\":0,";
-    std::cout << "\"snap_assist_pressed\":0,";
-    std::cout << "\"snap_assist_source\":\"none\"";
+    std::cout << "\"snap_assist_available\":" << (snap_assist.available ? 1 : 0) << ",";
+    std::cout << "\"snap_assist_pressed\":" << (snap_assist.pressed ? 1 : 0) << ",";
+    std::cout << "\"snap_assist_source\":\"" << snap_assist.source << "\"";
     std::cout << "}";
 }
 
@@ -1169,6 +1194,7 @@ int main(int argc, char** argv) {
     XrAction select_click_action = XR_NULL_HANDLE;
     XrAction select_value_action = XR_NULL_HANDLE;
     XrAction anchor_cycle_click_action = XR_NULL_HANDLE;
+    XrAction snap_assist_click_action = XR_NULL_HANDLE;
     if (!create_action("grip_pose", "Grip Pose", XR_ACTION_TYPE_POSE_INPUT,
                        &grip_pose_action) ||
         !create_action("aim_pose", "Aim Pose", XR_ACTION_TYPE_POSE_INPUT, &aim_pose_action) ||
@@ -1177,7 +1203,9 @@ int main(int argc, char** argv) {
         !create_action("select_value", "Select Value", XR_ACTION_TYPE_FLOAT_INPUT,
                        &select_value_action) ||
         !create_action("anchor_cycle_click", "Anchor Cycle Click",
-                       XR_ACTION_TYPE_BOOLEAN_INPUT, &anchor_cycle_click_action)) {
+                       XR_ACTION_TYPE_BOOLEAN_INPUT, &anchor_cycle_click_action) ||
+        !create_action("snap_assist_click", "Snap Assist Click",
+                       XR_ACTION_TYPE_BOOLEAN_INPUT, &snap_assist_click_action)) {
         xrDestroyActionSet(action_set);
         xrDestroySession(session);
         xrDestroyInstance(instance);
@@ -1200,6 +1228,7 @@ int main(int argc, char** argv) {
             !AppendSelectBindings(instance, select_click_action, select_value_action, profile,
                                   &bindings) ||
             !AppendAnchorCycleBindings(instance, anchor_cycle_click_action, profile, &bindings) ||
+            !AppendSnapAssistBindings(instance, snap_assist_click_action, profile, &bindings) ||
             !SuggestBindingsForProfile(instance, profile, bindings)) {
             xrDestroyActionSet(action_set);
             xrDestroySession(session);
@@ -1333,27 +1362,6 @@ int main(int argc, char** argv) {
         CloseSharedFrameFile(&shared_frame);
         return 18;
     }
-    XrReferenceSpaceCreateInfo view_space_info =
-        MakeXrStruct<XrReferenceSpaceCreateInfo>(XR_TYPE_REFERENCE_SPACE_CREATE_INFO);
-    view_space_info.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_VIEW;
-    view_space_info.poseInReferenceSpace.orientation.w = 1.0f;
-    XrSpace view_space = XR_NULL_HANDLE;
-    if (!CheckXr(instance, xrCreateReferenceSpace(session, &view_space_info, &view_space),
-                 "xrCreateReferenceSpace(VIEW)")) {
-        xrDestroySpace(local_space);
-        glDeleteFramebuffers(1, &framebuffer);
-        glDeleteVertexArrays(1, &vao);
-        glDeleteProgram(program);
-        glDeleteTextures(1, &source_texture);
-        DestroyViewSwapchains(&swapchain_views);
-        xrDestroySession(session);
-        xrDestroyInstance(instance);
-        glfwDestroyWindow(window);
-        glfwTerminate();
-        CloseSharedFrameFile(&shared_frame);
-        return 19;
-    }
-
     std::vector<XrView> views(config_view_count);
     for (auto& view : views) {
         view = MakeXrStruct<XrView>(XR_TYPE_VIEW);
@@ -1375,12 +1383,8 @@ int main(int argc, char** argv) {
         kPanelWidthMeters *
         (static_cast<float>(shared_frame.header->height) /
          static_cast<float>(shared_frame.header->width));
-    const Mat4 panel_model = Multiply(
-        TranslationMatrix(0.0f, kPanelYOffsetMeters, -kPanelDistanceMeters),
-        ScaleMatrix(kPanelWidthMeters, panel_height_meters, 1.0f));
-    std::cerr << "Presentation path: VIEW-space head-locked textured panel at z="
-              << -kPanelDistanceMeters << " width=" << kPanelWidthMeters
-              << " height=" << panel_height_meters << "\n";
+    Mat4 panel_model = IdentityMatrix();
+    bool panel_anchor_initialized = false;
     XrActiveActionSet active_action_set{action_set, XR_NULL_PATH};
     XrActionsSyncInfo sync_info = MakeXrStruct<XrActionsSyncInfo>(XR_TYPE_ACTIONS_SYNC_INFO);
     sync_info.countActiveActionSets = 1;
@@ -1444,6 +1448,8 @@ int main(int argc, char** argv) {
         SelectStateSample select_right;
         SelectStateSample anchor_cycle_left;
         SelectStateSample anchor_cycle_right;
+        SelectStateSample snap_assist_left;
+        SelectStateSample snap_assist_right;
         if (!QueryBooleanActionState(instance, session, select_click_action, left_hand_path,
                                      &select_left) ||
             !QueryBooleanActionState(instance, session, select_click_action, right_hand_path,
@@ -1455,15 +1461,23 @@ int main(int argc, char** argv) {
             !QueryBooleanActionState(instance, session, anchor_cycle_click_action,
                                      left_hand_path, &anchor_cycle_left) ||
             !QueryBooleanActionState(instance, session, anchor_cycle_click_action,
-                                     right_hand_path, &anchor_cycle_right)) {
+                                     right_hand_path, &anchor_cycle_right) ||
+            !QueryBooleanActionState(instance, session, snap_assist_click_action,
+                                     left_hand_path, &snap_assist_left) ||
+            !QueryBooleanActionState(instance, session, snap_assist_click_action,
+                                     right_hand_path, &snap_assist_right)) {
             break;
         }
 
         std::cout << "{";
         std::cout << "\"sample\":" << controller_sample_count << ",";
-        PrintControllerJson("left", selected_left, select_left, anchor_cycle_left);
+        PrintControllerJson(
+            "left", selected_left, select_left, anchor_cycle_left, snap_assist_left
+        );
         std::cout << ",";
-        PrintControllerJson("right", selected_right, select_right, anchor_cycle_right);
+        PrintControllerJson(
+            "right", selected_right, select_right, anchor_cycle_right, snap_assist_right
+        );
         std::cout << "}\n";
         ++controller_sample_count;
 
@@ -1490,7 +1504,7 @@ int main(int argc, char** argv) {
                 MakeXrStruct<XrViewLocateInfo>(XR_TYPE_VIEW_LOCATE_INFO);
             locate_info.viewConfigurationType = view_configuration_type;
             locate_info.displayTime = frame_state.predictedDisplayTime;
-            locate_info.space = view_space;
+            locate_info.space = local_space;
             XrViewState view_state = MakeXrStruct<XrViewState>(XR_TYPE_VIEW_STATE);
             uint32_t view_count_output = 0;
             if (!CheckXr(instance,
@@ -1501,7 +1515,21 @@ int main(int argc, char** argv) {
                 break;
             }
 
-            projection_layer.space = view_space;
+            if (!panel_anchor_initialized && view_count_output > 0) {
+                const Mat4 initial_head_pose = PoseMatrix(views[0].pose);
+                panel_model = Multiply(
+                    initial_head_pose,
+                    Multiply(
+                        TranslationMatrix(0.0f, kPanelYOffsetMeters, -kPanelDistanceMeters),
+                        ScaleMatrix(kPanelWidthMeters, panel_height_meters, 1.0f)));
+                panel_anchor_initialized = true;
+                std::cerr << "Presentation path: LOCAL-space world-locked textured panel anchored "
+                          << "at initial head pose, z-offset=" << -kPanelDistanceMeters
+                          << " width=" << kPanelWidthMeters
+                          << " height=" << panel_height_meters << "\n";
+            }
+
+            projection_layer.space = local_space;
             projection_layer.viewCount = view_count_output;
             projection_layer.views = projection_views.data();
 
@@ -1606,7 +1634,6 @@ int main(int argc, char** argv) {
     if (session_running) {
         xrEndSession(session);
     }
-    xrDestroySpace(view_space);
     xrDestroySpace(local_space);
     xrDestroySpace(aim_right_space);
     xrDestroySpace(aim_left_space);

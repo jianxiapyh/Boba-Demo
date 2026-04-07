@@ -568,24 +568,36 @@ class InvPhyTrainerWarp:
         cycle_state_cache,
     ):
         pressed = bool(
-            controller_world is not None
-            and controller_world["anchor_cycle_available"]
-            and controller_world["anchor_cycle_pressed"]
+            self._controller_input_available(controller_world, "anchor_cycle_available")
+            and self._controller_input_pressed(controller_world, "anchor_cycle_pressed")
         )
         previous = bool(cycle_state_cache.get(source, False))
         cycle_state_cache[source] = pressed
         return pressed and not previous
 
+    def _controller_input_available(self, controller_state, field_name):
+        if controller_state is None:
+            return False
+        if isinstance(controller_state, dict):
+            return bool(controller_state.get(field_name, False))
+        return bool(getattr(controller_state, field_name, False))
+
+    def _controller_input_pressed(self, controller_state, field_name):
+        if controller_state is None:
+            return False
+        if isinstance(controller_state, dict):
+            return bool(controller_state.get(field_name, False))
+        return bool(getattr(controller_state, field_name, False))
+
     def _controller_snap_edge(
         self,
         source,
-        controller_world,
+        controller_state,
         snap_state_cache,
     ):
         pressed = bool(
-            controller_world is not None
-            and controller_world["snap_assist_available"]
-            and controller_world["snap_assist_pressed"]
+            self._controller_input_available(controller_state, "snap_assist_available")
+            and self._controller_input_pressed(controller_state, "snap_assist_pressed")
         )
         previous = bool(snap_state_cache.get(source, False))
         snap_state_cache[source] = pressed
@@ -1934,6 +1946,37 @@ class InvPhyTrainerWarp:
                 source_mask = controller_source_masks[self._controller_source_index(source)]
                 prev_target[source_mask] = current_target[source_mask]
             interaction_state["just_started"] = False
+
+    def _reset_live_controller_runtime(
+        self,
+        controller_runtime_base_target,
+        controller_interaction_state,
+        controller_anchor_preview_state,
+        controller_attachment_metadata,
+    ):
+        for source in ("left", "right"):
+            interaction_state = controller_interaction_state.get(source)
+            if (
+                interaction_state is not None
+                and interaction_state.get("spring_remap_applied", False)
+            ):
+                self._restore_controller_attachment_remap(
+                    source, controller_attachment_metadata
+                )
+            controller_interaction_state[source] = None
+            controller_anchor_preview_state[source]["visible"] = False
+            controller_anchor_preview_state[source]["selected_anchor_name"] = None
+
+        self.simulator.set_init_state(
+            self.simulator.wp_init_vertices,
+            self.simulator.wp_init_velocities,
+        )
+        if self.simulator.object_collision_flag:
+            self.simulator.create_resting_case()
+
+        reset_target = controller_runtime_base_target.clone()
+        self.simulator.set_controller_interactive(reset_target, reset_target)
+        return reset_target
 
     def _project_points_to_pixels(self, world_points, intrinsic, w2c):
         ones = torch.ones(
@@ -4587,7 +4630,7 @@ class InvPhyTrainerWarp:
         controller_interaction_state = {"left": None, "right": None}
         controller_interaction_state_cache = {"left": None, "right": None}
         quest_frame_panel = None
-        repo_root = Path(__file__).resolve().parents[3]
+        repo_root = Path(__file__).resolve().parents[2]
 
         if quest_display_mode in {"panel", "primary"}:
             quest_frame_panel = OpenXRFramePanelMirror(repo_root, width=width, height=height)
@@ -4641,7 +4684,7 @@ class InvPhyTrainerWarp:
                 )
                 print(
                     "[live_openxr_controller] A/X preview anchors; select starts the "
-                    f"{controller_mode} 2-point controller spring path; B/Y unused",
+                    f"{controller_mode} 2-point controller spring path; B/Y reset the sloth",
                     flush=True,
                 )
                 print(
@@ -4779,6 +4822,7 @@ class InvPhyTrainerWarp:
 
                 total_timer.start()
                 controller_overlay_by_source = {}
+                controller_reset_triggered = False
 
                 if input_source == "live_openxr":
                     latest_live_sample = live_hand_stream.get_latest_sample()
@@ -4808,6 +4852,7 @@ class InvPhyTrainerWarp:
                         current_live_right_anchor = None
                 elif input_source == "live_openxr_controller":
                     latest_controller_sample = live_controller_stream.get_latest_sample()
+                    controller_reset_sources = []
                     if latest_controller_sample is not None:
                         live_controller_alignment, live_controller_alignment_mode = (
                             self._update_live_controller_alignment(
@@ -4858,9 +4903,40 @@ class InvPhyTrainerWarp:
                             latest_controller_sample.right,
                             controller_snap_state_cache,
                         )
+                        for source, controller_sample in (
+                            ("left", latest_controller_sample.left),
+                            ("right", latest_controller_sample.right),
+                        ):
+                            if self._controller_snap_edge(
+                                source,
+                                controller_sample,
+                                controller_snap_edge_cache,
+                            ):
+                                controller_reset_sources.append(source)
                     else:
                         current_live_left_controller = None
                         current_live_right_controller = None
+
+                    if controller_reset_sources:
+                        pressed_buttons = [
+                            "Y" if source == "left" else "B"
+                            for source in controller_reset_sources
+                        ]
+                        print(
+                            "[live_openxr_controller] reset requested via "
+                            + "/".join(pressed_buttons)
+                            + "; restoring the original object pose",
+                            flush=True,
+                        )
+                        reset_target = self._reset_live_controller_runtime(
+                            controller_runtime_base_target,
+                            controller_interaction_state,
+                            controller_anchor_preview_state,
+                            controller_attachment_metadata,
+                        )
+                        prev_target = reset_target.clone()
+                        current_target = reset_target
+                        controller_reset_triggered = True
 
                 # 1. Simulator step
 
@@ -5337,44 +5413,56 @@ class InvPhyTrainerWarp:
                     else:
                         current_target = recorded_base_target.clone()
                     if input_source == "live_openxr_controller":
-                        (
-                            current_left_interaction_anchor,
-                            current_right_interaction_anchor,
-                        ) = self._resolve_live_controller_interaction_anchors(
-                            current_live_left_controller,
-                            current_live_right_controller,
-                            controller_overlay_by_source,
-                            controller_interaction_state,
-                            controller_source_anchor_centers,
-                            controller_attachment_metadata,
-                            controller_predefined_anchor_states,
-                            controller_anchor_preview_state,
-                            x[: self.num_all_points],
-                        )
-                        self._log_controller_interaction_transition(
-                            "left",
-                            controller_interaction_state["left"],
-                            controller_interaction_state_cache,
-                        )
-                        self._log_controller_interaction_transition(
-                            "right",
-                            controller_interaction_state["right"],
-                            controller_interaction_state_cache,
-                        )
-                        current_target = self._make_live_controller_target_from_anchors(
-                            current_target,
-                            current_left_interaction_anchor,
-                        current_right_interaction_anchor,
-                            controller_source_masks,
-                            controller_source_anchor_centers,
-                            controller_interaction_state,
-                        )
-                        self._apply_controller_start_prev_target_overrides(
-                            prev_target,
-                            current_target,
-                            controller_source_masks,
-                            controller_interaction_state,
-                        )
+                        if not controller_reset_triggered:
+                            (
+                                current_left_interaction_anchor,
+                                current_right_interaction_anchor,
+                            ) = self._resolve_live_controller_interaction_anchors(
+                                current_live_left_controller,
+                                current_live_right_controller,
+                                controller_overlay_by_source,
+                                controller_interaction_state,
+                                controller_source_anchor_centers,
+                                controller_attachment_metadata,
+                                controller_predefined_anchor_states,
+                                controller_anchor_preview_state,
+                                x[: self.num_all_points],
+                            )
+                            self._log_controller_interaction_transition(
+                                "left",
+                                controller_interaction_state["left"],
+                                controller_interaction_state_cache,
+                            )
+                            self._log_controller_interaction_transition(
+                                "right",
+                                controller_interaction_state["right"],
+                                controller_interaction_state_cache,
+                            )
+                            current_target = self._make_live_controller_target_from_anchors(
+                                current_target,
+                                current_left_interaction_anchor,
+                                current_right_interaction_anchor,
+                                controller_source_masks,
+                                controller_source_anchor_centers,
+                                controller_interaction_state,
+                            )
+                            self._apply_controller_start_prev_target_overrides(
+                                prev_target,
+                                current_target,
+                                controller_source_masks,
+                                controller_interaction_state,
+                            )
+                        else:
+                            self._log_controller_interaction_transition(
+                                "left",
+                                controller_interaction_state["left"],
+                                controller_interaction_state_cache,
+                            )
+                            self._log_controller_interaction_transition(
+                                "right",
+                                controller_interaction_state["right"],
+                                controller_interaction_state_cache,
+                            )
                 else:
                     if frame_count < self.frame_len:
                         current_target = self.batch_controller_points[frame_count]

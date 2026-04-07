@@ -18,4 +18,10 @@ python interactive_playground_batched_view_orin.py \
 
 # Desktop-only replay baseline.
 python interactive_playground_batched_view_orin.py \
-  --case_name double_stretch_sloth -exp -eval --n_dup 0
+  --case_name double_stretch_sloth -exp -eval --nzzzz_dup 0
+
+python interactive_playground_batched_view_orin.py \
+  --case_name double_stretch_sloth -exp --n_dup 0 \
+  --input_source live_openxr_controller \
+  --quest_display_mode primary \
+  --interactive_window_mode hidden

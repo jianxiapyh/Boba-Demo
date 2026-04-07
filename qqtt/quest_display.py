@@ -15,7 +15,12 @@ from typing import Optional
 import numpy as np
 import torch
 
-from qqtt.live_openxr import ControllerPoseSample, LiveControllerSample
+from qqtt.live_openxr import (
+    ControllerPoseSample,
+    LiveControllerSample,
+    _ensure_jsoncpp_compat_dir,
+    _prepend_env_path,
+)
 
 
 class OpenXRFramePanelMirror:
@@ -75,10 +80,10 @@ class OpenXRFramePanelMirror:
 
         steamvr_lib_dir = self._default_steamvr_lib_dir()
         if steamvr_lib_dir is not None:
-            current_ld = env.get("LD_LIBRARY_PATH", "")
-            env["LD_LIBRARY_PATH"] = (
-                f"{steamvr_lib_dir}:{current_ld}" if current_ld else steamvr_lib_dir
-            )
+            _prepend_env_path(env, "LD_LIBRARY_PATH", steamvr_lib_dir)
+        jsoncpp_compat_dir = _ensure_jsoncpp_compat_dir(self.repo_root)
+        if jsoncpp_compat_dir is not None:
+            _prepend_env_path(env, "LD_LIBRARY_PATH", jsoncpp_compat_dir)
 
         assert self.shared_frame_path is not None
         self.process = subprocess.Popen(
@@ -218,10 +223,13 @@ class OpenXRFramePanelMirror:
         stage_index = self._next_stage_index
         stage_buffer = self._cpu_stage_buffers[stage_index]
         stage_array = self._cpu_stage_arrays[stage_index]
+        producer_ready_event = torch.cuda.Event()
         copy_start_event = torch.cuda.Event(enable_timing=True)
         copy_end_event = torch.cuda.Event(enable_timing=True)
         enqueue_start = time.perf_counter()
+        producer_ready_event.record(torch.cuda.current_stream())
         with torch.cuda.stream(self._staging_copy_stream):
+            self._staging_copy_stream.wait_event(producer_ready_event)
             copy_start_event.record(self._staging_copy_stream)
             stage_buffer.copy_(frame_rgba, non_blocking=True)
             copy_end_event.record(self._staging_copy_stream)

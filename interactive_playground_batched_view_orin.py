@@ -126,9 +126,21 @@ def main():
     )
     parser.add_argument(
         "--quest_display_mode",
-        choices=("off", "panel", "primary"),
+        choices=("off", "panel", "primary", "immersive"),
         default="off",
         help="Quest display mode for the final composited frame; 'primary' treats Quest as the intended display target",
+    )
+    parser.add_argument(
+        "--scene_preset",
+        choices=("none", "simple_lab"),
+        default="none",
+        help="immersive scene preset; use simple_lab for the room-and-table Quest demo",
+    )
+    parser.add_argument(
+        "--scene_assets_root",
+        type=str,
+        default="./data/open_scene_assets",
+        help="root directory for downloaded immersive scene assets",
     )
     parser.add_argument(
         "--interactive_window_mode",
@@ -159,8 +171,8 @@ def main():
                 "Quest display mode currently supports only "
                 "--input_source live_openxr_controller"
             )
-    if args.quest_display_mode == "primary":
-        print("[quest_display] quest_primary_display enabled", flush=True)
+    if args.quest_display_mode in {"primary", "immersive"}:
+        print(f"[quest_display] mode={args.quest_display_mode}", flush=True)
         print(
             f"[quest_display] input_source={args.input_source}",
             flush=True,
@@ -169,6 +181,12 @@ def main():
             f"[quest_display] interactive_window_mode={args.interactive_window_mode}",
             flush=True,
         )
+    if args.quest_display_mode == "immersive" and args.scene_preset != "simple_lab":
+        print(
+            "[quest_display] overriding --scene_preset none -> simple_lab for immersive mode",
+            flush=True,
+        )
+        args.scene_preset = "simple_lab"
 
     # -------------------------
     # (0) GL context FIRST
@@ -265,6 +283,8 @@ def main():
             controller_mode=args.controller_mode,
             quest_display_mode=args.quest_display_mode,
             interactive_window_mode=args.interactive_window_mode,
+            scene_preset=args.scene_preset,
+            scene_assets_root=args.scene_assets_root,
         )
     finally:
         import glfw

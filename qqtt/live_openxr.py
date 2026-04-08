@@ -84,6 +84,20 @@ class ControllerPoseSample:
     snap_assist_available: bool
     snap_assist_pressed: bool
     snap_assist_source: str
+    grip_active: bool = False
+    grip_position_valid: bool = False
+    grip_orientation_valid: bool = False
+    grip_position_tracked: bool = False
+    grip_orientation_tracked: bool = False
+    grip_position: Optional[np.ndarray] = None
+    grip_orientation: Optional[np.ndarray] = None
+    aim_active: bool = False
+    aim_position_valid: bool = False
+    aim_orientation_valid: bool = False
+    aim_position_tracked: bool = False
+    aim_orientation_tracked: bool = False
+    aim_position: Optional[np.ndarray] = None
+    aim_orientation: Optional[np.ndarray] = None
 
 
 @dataclass
@@ -91,6 +105,34 @@ class LiveControllerSample:
     sample: int
     left: ControllerPoseSample
     right: ControllerPoseSample
+
+
+@dataclass
+class EyeFovSample:
+    angle_left: float
+    angle_right: float
+    angle_up: float
+    angle_down: float
+
+
+@dataclass
+class EyePoseSample:
+    pose_valid: bool
+    pose_tracked: bool
+    position: np.ndarray
+    orientation: np.ndarray
+    fov: EyeFovSample
+    recommended_width: int
+    recommended_height: int
+
+
+@dataclass
+class LiveImmersiveSample:
+    sample: int
+    left: ControllerPoseSample
+    right: ControllerPoseSample
+    left_eye: EyePoseSample
+    right_eye: EyePoseSample
 
 
 def hand_anchor(hand: HandJointSample) -> Optional[np.ndarray]:
@@ -120,6 +162,129 @@ def controller_forward(sample: ControllerPoseSample) -> Optional[np.ndarray]:
     if norm < 1e-6:
         return None
     return direction / norm
+
+
+def _parse_pose_vector(
+    payload: dict,
+    key: str,
+    *,
+    fallback: Optional[np.ndarray] = None,
+) -> Optional[np.ndarray]:
+    if key in payload:
+        value = np.asarray(payload[key], dtype=np.float32)
+    elif fallback is not None:
+        value = np.asarray(fallback, dtype=np.float32)
+    else:
+        return None
+    if value.shape != (3,) and value.shape != (4,):
+        raise ValueError(f"{key} shape {value.shape} is not supported")
+    return value
+
+
+def controller_pose_position(
+    sample: Optional[ControllerPoseSample],
+    pose_role: str = "selected",
+) -> Optional[np.ndarray]:
+    if sample is None or not sample.active:
+        return None
+    if pose_role == "grip":
+        if sample.grip_position is not None:
+            return sample.grip_position if sample.grip_position_valid else None
+    elif pose_role == "aim":
+        if sample.aim_position is not None:
+            return sample.aim_position if sample.aim_position_valid else None
+    return sample.position if sample.position_valid else None
+
+
+def controller_pose_forward(
+    sample: Optional[ControllerPoseSample],
+    pose_role: str = "selected",
+) -> Optional[np.ndarray]:
+    if sample is None or not sample.active:
+        return None
+    if pose_role == "grip":
+        if sample.grip_orientation is not None:
+            if not sample.grip_orientation_valid:
+                return None
+            direction = quaternion_rotate_vector(sample.grip_orientation, CONTROLLER_FORWARD)
+        else:
+            direction = None
+    elif pose_role == "aim":
+        if sample.aim_orientation is not None:
+            if not sample.aim_orientation_valid:
+                return None
+            direction = quaternion_rotate_vector(sample.aim_orientation, CONTROLLER_FORWARD)
+        else:
+            direction = None
+    else:
+        direction = None
+    if direction is None:
+        if not sample.orientation_valid:
+            return None
+        direction = quaternion_rotate_vector(sample.orientation, CONTROLLER_FORWARD)
+    norm = float(np.linalg.norm(direction))
+    if norm < 1e-6:
+        return None
+    return direction / norm
+
+
+def parse_controller_payload(payload: dict) -> ControllerPoseSample:
+    position = np.asarray(payload["position"], dtype=np.float32)
+    orientation = np.asarray(payload["orientation"], dtype=np.float32)
+    if position.shape != (3,):
+        raise ValueError(f"controller position shape {position.shape} != (3,)")
+    if orientation.shape != (4,):
+        raise ValueError(f"controller orientation shape {orientation.shape} != (4,)")
+    grip_position = _parse_pose_vector(payload, "grip_position")
+    grip_orientation = _parse_pose_vector(payload, "grip_orientation")
+    aim_position = _parse_pose_vector(payload, "aim_position")
+    aim_orientation = _parse_pose_vector(payload, "aim_orientation")
+    return ControllerPoseSample(
+        source=str(payload["source"]),
+        active=bool(payload["active"]),
+        position_valid=bool(payload["position_valid"]),
+        orientation_valid=bool(payload["orientation_valid"]),
+        position_tracked=bool(payload["position_tracked"]),
+        orientation_tracked=bool(payload["orientation_tracked"]),
+        position=position,
+        orientation=orientation,
+        select_available=bool(payload["select_available"]),
+        select_pressed=bool(payload["select_pressed"]),
+        select_value=float(payload["select_value"]),
+        select_source=str(payload["select_source"]),
+        anchor_cycle_available=bool(payload["anchor_cycle_available"]),
+        anchor_cycle_pressed=bool(payload["anchor_cycle_pressed"]),
+        anchor_cycle_source=str(payload["anchor_cycle_source"]),
+        snap_assist_available=bool(payload["snap_assist_available"]),
+        snap_assist_pressed=bool(payload["snap_assist_pressed"]),
+        snap_assist_source=str(payload["snap_assist_source"]),
+        grip_active=bool(payload.get("grip_active", payload["active"])),
+        grip_position_valid=bool(payload.get("grip_position_valid", payload["position_valid"])),
+        grip_orientation_valid=bool(
+            payload.get("grip_orientation_valid", payload["orientation_valid"])
+        ),
+        grip_position_tracked=bool(
+            payload.get("grip_position_tracked", payload["position_tracked"])
+        ),
+        grip_orientation_tracked=bool(
+            payload.get("grip_orientation_tracked", payload["orientation_tracked"])
+        ),
+        grip_position=grip_position,
+        grip_orientation=grip_orientation,
+        aim_active=bool(payload.get("aim_active", payload["active"])),
+        aim_position_valid=bool(payload.get("aim_position_valid", payload["position_valid"])),
+        aim_orientation_valid=bool(
+            payload.get("aim_orientation_valid", payload["orientation_valid"])
+        ),
+        aim_position_tracked=bool(
+            payload.get("aim_position_tracked", payload["position_tracked"])
+        ),
+        aim_orientation_tracked=bool(
+            payload.get("aim_orientation_tracked", payload["orientation_tracked"])
+        ),
+        aim_position=aim_position,
+        aim_orientation=aim_orientation,
+    )
 
 
 class OpenXRHandJointStream:
@@ -418,32 +583,7 @@ class OpenXRControllerStream:
 
     @staticmethod
     def _parse_controller(payload: dict) -> ControllerPoseSample:
-        position = np.asarray(payload["position"], dtype=np.float32)
-        orientation = np.asarray(payload["orientation"], dtype=np.float32)
-        if position.shape != (3,):
-            raise ValueError(f"controller position shape {position.shape} != (3,)")
-        if orientation.shape != (4,):
-            raise ValueError(f"controller orientation shape {orientation.shape} != (4,)")
-        return ControllerPoseSample(
-            source=str(payload["source"]),
-            active=bool(payload["active"]),
-            position_valid=bool(payload["position_valid"]),
-            orientation_valid=bool(payload["orientation_valid"]),
-            position_tracked=bool(payload["position_tracked"]),
-            orientation_tracked=bool(payload["orientation_tracked"]),
-            position=position,
-            orientation=orientation,
-            select_available=bool(payload["select_available"]),
-            select_pressed=bool(payload["select_pressed"]),
-            select_value=float(payload["select_value"]),
-            select_source=str(payload["select_source"]),
-            anchor_cycle_available=bool(payload["anchor_cycle_available"]),
-            anchor_cycle_pressed=bool(payload["anchor_cycle_pressed"]),
-            anchor_cycle_source=str(payload["anchor_cycle_source"]),
-            snap_assist_available=bool(payload["snap_assist_available"]),
-            snap_assist_pressed=bool(payload["snap_assist_pressed"]),
-            snap_assist_source=str(payload["snap_assist_source"]),
-        )
+        return parse_controller_payload(payload)
 
     def _default_runtime_json_path(self) -> Optional[str]:
         candidate = (

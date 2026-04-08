@@ -381,6 +381,10 @@ def integrate_ground_collision(
     collide_fric: wp.array(dtype=float),
     dt: float,
     reverse_factor: float,
+    use_ground_plane: int,
+    static_box_mins: wp.array(dtype=wp.vec3),
+    static_box_maxs: wp.array(dtype=wp.vec3),
+    static_box_count: int,
     x_new: wp.array(dtype=wp.vec3),
     v_new: wp.array(dtype=wp.vec3),
 ):
@@ -389,40 +393,72 @@ def integrate_ground_collision(
     x0 = x[tid]
     v0 = v[tid]
 
+    clamp_collide_elas = wp.clamp(collide_elas[0], low=0.0, high=1.0)
+    clamp_collide_fric = wp.clamp(collide_fric[0], low=0.0, high=2.0)
     normal = wp.vec3(0.0, 0.0, 1.0) * reverse_factor
 
-    x_z = x0[2]
-    v_z = v0[2]
-    next_x_z = (x_z + v_z * dt) * reverse_factor
+    x_result = x0 + v0 * dt
+    v_result = v0
 
-    if next_x_z < 0.0 and v_z * reverse_factor < -1e-4:
-        # Ground Collision
-        v_normal = wp.dot(v0, normal) * normal
-        v_tao = v0 - v_normal
-        v_normal_length = wp.length(v_normal)
-        v_tao_length = wp.max(wp.length(v_tao), 1e-6)
-        clamp_collide_elas = wp.clamp(collide_elas[0], low=0.0, high=1.0)
-        clamp_collide_fric = wp.clamp(collide_fric[0], low=0.0, high=2.0)
+    if use_ground_plane != 0:
+        x_z = x0[2]
+        v_z = v0[2]
+        next_x_z = (x_z + v_z * dt) * reverse_factor
+        if next_x_z < 0.0 and v_z * reverse_factor < -1e-4:
+            v_normal = wp.dot(v0, normal) * normal
+            v_tao = v0 - v_normal
+            v_normal_length = wp.length(v_normal)
+            v_tao_length = wp.max(wp.length(v_tao), 1e-6)
+            v_normal_new = -clamp_collide_elas * v_normal
+            a = wp.max(
+                0.0,
+                1.0
+                - clamp_collide_fric
+                * (1.0 + clamp_collide_elas)
+                * v_normal_length
+                / v_tao_length,
+            )
+            v_tao_new = a * v_tao
+            v_after = v_normal_new + v_tao_new
+            toi = -x_z / v_z
+            x_result = x0 + v0 * toi + v_after * (dt - toi)
+            v_result = v_after
 
-        v_normal_new = -clamp_collide_elas * v_normal
-        a = wp.max(
-            0.0,
-            1.0
-            - clamp_collide_fric
-            * (1.0 + clamp_collide_elas)
-            * v_normal_length
-            / v_tao_length,
+    for box_index in range(static_box_count):
+        box_min = static_box_mins[box_index]
+        box_max = static_box_maxs[box_index]
+        next_pos = x0 + v0 * dt
+        inside_xy = (
+            next_pos[0] >= box_min[0]
+            and next_pos[0] <= box_max[0]
+            and next_pos[1] >= box_min[1]
+            and next_pos[1] <= box_max[1]
         )
-        v_tao_new = a * v_tao
+        local_z = x0[2] - box_min[2]
+        v_z = v0[2]
+        next_local_z = (local_z + v_z * dt) * reverse_factor
+        if inside_xy and next_local_z < 0.0 and v_z * reverse_factor < -1e-4:
+            v_normal = wp.dot(v0, normal) * normal
+            v_tao = v0 - v_normal
+            v_normal_length = wp.length(v_normal)
+            v_tao_length = wp.max(wp.length(v_tao), 1e-6)
+            v_normal_new = -clamp_collide_elas * v_normal
+            a = wp.max(
+                0.0,
+                1.0
+                - clamp_collide_fric
+                * (1.0 + clamp_collide_elas)
+                * v_normal_length
+                / v_tao_length,
+            )
+            v_tao_new = a * v_tao
+            v_after = v_normal_new + v_tao_new
+            toi = -local_z / v_z
+            x_result = x0 + v0 * toi + v_after * (dt - toi)
+            v_result = v_after
 
-        v1 = v_normal_new + v_tao_new
-        toi = -x_z / v_z
-    else:
-        v1 = v0
-        toi = 0.0
-
-    x_new[tid] = x0 + v0 * toi + v1 * (dt - toi)
-    v_new[tid] = v1
+    x_new[tid] = x_result
+    v_new[tid] = v_result
 
 class SpringMassSystemWarp:
     def __init__(
@@ -459,6 +495,7 @@ class SpringMassSystemWarp:
         controller_springs_single, 
         controller_rest_location, #replaces controller_points 
         number_of_instance,
+        use_ground_plane=True,
     ):
         logger.info(f"[SIMULATION]: Initialize the Spring-Mass System")
         self.device = cfg.device
@@ -521,6 +558,7 @@ class SpringMassSystemWarp:
         self.reverse_factor = 1.0 if not reverse_z else -1.0
         self.spring_Y_min = spring_Y_min
         self.spring_Y_max = spring_Y_max
+        self.use_ground_plane = int(bool(use_ground_plane))
         # variable for collision detection
         self.object_collision_flag = 0
         self.resting_collision_pairs = None
@@ -528,6 +566,14 @@ class SpringMassSystemWarp:
         self.collision_grid = None
         self.wp_collision_indices = None
         self.wp_collision_number = None
+        self.static_box_count = 0
+        zero_boxes = torch.zeros((1, 3), dtype=torch.float32, device=self.device)
+        self.wp_static_box_mins = wp.from_torch(
+            zero_boxes.clone(), dtype=wp.vec3, requires_grad=False
+        )
+        self.wp_static_box_maxs = wp.from_torch(
+            zero_boxes.clone(), dtype=wp.vec3, requires_grad=False
+        )
         
         if self_collision:
             self.object_collision_flag = 1
@@ -625,6 +671,24 @@ class SpringMassSystemWarp:
         
         #add early return counters
         self.wp_early_return_count = wp.zeros((1,), dtype=wp.int32, device = cfg.device, requires_grad=False)
+
+    def set_static_collision_boxes(self, boxes):
+        if boxes is None:
+            self.static_box_count = 0
+            return
+
+        boxes = boxes.to(device=self.device, dtype=torch.float32)
+        if boxes.numel() == 0:
+            self.static_box_count = 0
+            return
+        if boxes.ndim != 3 or boxes.shape[1:] != (2, 3):
+            raise ValueError(f"static boxes shape {tuple(boxes.shape)} != (N,2,3)")
+
+        mins = boxes[:, 0].contiguous()
+        maxs = boxes[:, 1].contiguous()
+        self.wp_static_box_mins = wp.from_torch(mins, dtype=wp.vec3, requires_grad=False)
+        self.wp_static_box_maxs = wp.from_torch(maxs, dtype=wp.vec3, requires_grad=False)
+        self.static_box_count = int(boxes.shape[0])
 
     def update_local_spring_subset(self, spring_indices, springs, rest_lengths):
         spring_indices = spring_indices.to(
@@ -837,6 +901,10 @@ class SpringMassSystemWarp:
                     self.wp_collide_fric,
                     self.dt,
                     self.reverse_factor,
+                    self.use_ground_plane,
+                    self.wp_static_box_mins,
+                    self.wp_static_box_maxs,
+                    self.static_box_count,
                 ],
                 outputs=[self.wp_states[i + 1].wp_x, self.wp_states[i + 1].wp_v],
             )         

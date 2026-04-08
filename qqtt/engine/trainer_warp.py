@@ -47,12 +47,19 @@ from qqtt.live_openxr import (
     PALM_JOINT_INDEX,
     THUMB_TIP_JOINT_INDEX,
     WRIST_JOINT_INDEX,
+    EyePoseSample,
     OpenXRControllerStream,
     OpenXRHandJointStream,
-    controller_forward,
+    controller_pose_forward,
+    controller_pose_position,
     hand_anchor,
 )
-from qqtt.quest_display import OpenXRFramePanelMirror
+from qqtt.quest_display import OpenXRFramePanelMirror, OpenXRImmersiveBridge
+from qqtt.immersive_scene import (
+    SimpleLabSceneRenderer,
+    ensure_simple_lab_assets,
+    make_simple_lab_layout,
+)
 
 TINY_BITMAP_FONT = {
     "0": ("111", "101", "101", "101", "111"),
@@ -138,16 +145,44 @@ class InvPhyTrainerWarp:
     LIVE_CONTROLLER_PREDEFINED_ANCHOR_MIN_RADIUS = 0.05
     LIVE_CONTROLLER_PREVIEW_RADIUS = 3
     LIVE_CONTROLLER_PREVIEW_SELECTED_RADIUS = 5
+    LIVE_CONTROLLER_CANDIDATE_SQUARE_RADIUS = 6
     LIVE_CONTROLLER_TEMPLATE_RADIUS_SCALE = 0.55
     LIVE_CONTROLLER_TEMPLATE_MIN_RADIUS = 0.012
     LIVE_CONTROLLER_BLOCK_POINT_COUNT = 15
     LIVE_CONTROLLER_BLOCK_SPRINGS_PER_POINT = 6
     LIVE_CONTROLLER_BLOCK_OFFSET_SCALE = 0.25
     LIVE_CONTROLLER_BLOCK_MIN_OFFSET = 0.05
+    LIVE_CONTROLLER_SELECT_START_THRESHOLD = 0.20
+    LIVE_CONTROLLER_SELECT_HOLD_THRESHOLD = 0.05
+    LIVE_CONTROLLER_SELECT_RELEASE_FRAMES = 2
+    LIVE_CONTROLLER_ACTIVE_DEBUG_LOG_INTERVAL = 20
+    LIVE_CONTROLLER_ACTIVE_MOTION_EPS = 1e-3
+    LIVE_CONTROLLER_ACTIVE_TARGET_EPS = 1e-4
     LIVE_CONTROLLER_MULTI_POINTS_BACK_DEPTH_THRESHOLD = 0.015
     LIVE_CONTROLLER_MULTI_POINTS_BACK_PENALTY = 4.0
     LIVE_CONTROLLER_MULTI_POINTS_FETCH_SCALE = 4
     QUEST_PRIMARY_COMPOSITE_WIDTH = 2064
+    IMMERSIVE_EYE_WIDTH = 1024
+    IMMERSIVE_EYE_HEIGHT = 1024
+    IMMERSIVE_SCENE_REST_SETTLE_STEPS = 90
+    IMMERSIVE_SCENE_REST_VELOCITY_EPS = 0.035
+    IMMERSIVE_SCENE_REST_POSITION_EPS = 0.015
+    IMMERSIVE_STARTUP_PLANE_EPS = 0.03
+    IMMERSIVE_STARTUP_CENTER_EPS = 0.08
+    IMMERSIVE_STARTUP_ALPHA_EPS = 0.02
+    IMMERSIVE_STARTUP_DEPTH_EPS = 1e-4
+    IMMERSIVE_STARTUP_PIXEL_MARGIN = 8.0
+    IMMERSIVE_STARTUP_YAW_RADIANS = 0.5 * np.pi
+    IMMERSIVE_GRAB_START_VALIDATION_DELAY_FRAMES = 1
+    IMMERSIVE_GRAB_START_VALIDATION_FRAMES = 2
+    IMMERSIVE_GRAB_START_MAX_TARGET_DELTA = 0.12
+    IMMERSIVE_GRAB_START_TARGET_DELTA_RADIUS_SCALE = 2.5
+    IMMERSIVE_GRAB_START_RELAXED_MAX_TARGET_DELTA = 0.20
+    IMMERSIVE_GRAB_START_RELAXED_TARGET_DELTA_RADIUS_SCALE = 4.0
+    IMMERSIVE_GRAB_START_MAX_CENTER_DELTA = 0.25
+    IMMERSIVE_HEAD_TRANSLATION_EMA_ALPHA = 0.35
+    IMMERSIVE_HEAD_RESET_JUMP_THRESHOLD = 0.20
+    IMMERSIVE_HEAD_DEBUG_LOG_INTERVAL = 120
     TIMING_OVERLAY_TEXT_COLOR = [255.0, 255.0, 255.0]
     TIMING_OVERLAY_BG_COLOR = [0.0, 0.0, 0.0]
     TIMING_OVERLAY_SCALE = 4
@@ -1091,6 +1126,7 @@ class InvPhyTrainerWarp:
         anchor_state,
         object_points,
         controller_attachment_metadata,
+        hit_world=None,
     ):
         if anchor_state is None:
             return None
@@ -1112,10 +1148,22 @@ class InvPhyTrainerWarp:
             dim=1,
         )
         attach_center_world = anchor_state["center_world"].clone()
+        attach_anchor_world = attach_center_world.clone()
+        if hit_world is not None:
+            region_points = object_points[object_indices]
+            nearest_idx = torch.argmin(
+                torch.linalg.norm(region_points - hit_world.unsqueeze(0), dim=1)
+            )
+            attach_anchor_world = region_points[nearest_idx].clone()
         rest_lengths = torch.linalg.norm(
-            object_points[object_indices] - attach_center_world.unsqueeze(0),
+            object_points[object_indices] - attach_anchor_world.unsqueeze(0),
             dim=1,
         ).clamp_min(1e-4).clamp_max(self.LIVE_CONTROLLER_ATTACH_MAX_REST_LENGTH)
+        hit_to_anchor_distance = None
+        if hit_world is not None:
+            hit_to_anchor_distance = float(
+                torch.linalg.norm(attach_anchor_world - hit_world).item()
+            )
         return {
             "anchor_name": anchor_state["name"],
             "springs": springs,
@@ -1124,7 +1172,7 @@ class InvPhyTrainerWarp:
             "attach_center_world": attach_center_world,
             "attach_node_count": int(object_indices.numel()),
             "attach_radius": float(anchor_state["radius"]),
-            "attach_anchor_world": attach_center_world.clone(),
+            "attach_anchor_world": attach_anchor_world,
             "source_template_offsets": torch.zeros(
                 (1, 3), dtype=torch.float32, device=cfg.device
             ),
@@ -1132,6 +1180,7 @@ class InvPhyTrainerWarp:
             "target_point_indices": torch.tensor(
                 [source_index], dtype=torch.long, device=cfg.device
             ),
+            "hit_to_anchor_distance": hit_to_anchor_distance,
         }
 
     def _build_predefined_controller_anchor_templates(
@@ -1305,13 +1354,43 @@ class InvPhyTrainerWarp:
             "anchor_name": anchor_state["name"],
             "springs": template_springs,
             "rest_lengths": rest_lengths,
+            "spring_y": source_meta["spring_y_template"].clone(),
             "attach_center_world": attach_center_world,
             "attach_node_count": int(unique_object_indices.numel()),
             "attach_radius": float(attach_radius.item()),
             "attach_anchor_world": attach_center_world.clone(),
             "source_template_offsets": source_template_offsets.clone(),
             "selected_object_indices": unique_object_indices.clone(),
+            "target_point_indices": torch.as_tensor(
+                source_meta["point_indices"],
+                dtype=torch.long,
+                device=cfg.device,
+            ),
         }
+
+    def _refine_attachment_candidate_anchor_world(
+        self,
+        remap_candidate,
+        object_points,
+        hit_world=None,
+    ):
+        if remap_candidate is None or hit_world is None:
+            return remap_candidate
+
+        selected_object_indices = remap_candidate.get("selected_object_indices")
+        if selected_object_indices is None or int(selected_object_indices.numel()) <= 0:
+            return remap_candidate
+
+        selected_points = object_points[selected_object_indices]
+        nearest_offset = torch.argmin(
+            torch.linalg.norm(selected_points - hit_world.unsqueeze(0), dim=1)
+        )
+        refined_candidate = dict(remap_candidate)
+        refined_candidate["attach_anchor_world"] = selected_points[nearest_offset].clone()
+        refined_candidate["hit_to_anchor_distance"] = float(
+            torch.linalg.norm(refined_candidate["attach_anchor_world"] - hit_world).item()
+        )
+        return refined_candidate
 
     def _select_predefined_interaction_anchor_for_ray(
         self,
@@ -1508,6 +1587,7 @@ class InvPhyTrainerWarp:
                 anchor_state,
                 object_points,
                 controller_attachment_metadata,
+                hit_world=hit_world,
             )
             if fallback is not None:
                 fallback["multi_points_debug"] = {
@@ -1531,6 +1611,7 @@ class InvPhyTrainerWarp:
                 anchor_state,
                 object_points,
                 controller_attachment_metadata,
+                hit_world=hit_world,
             )
             if fallback is not None:
                 fallback["multi_points_debug"] = {
@@ -1553,6 +1634,7 @@ class InvPhyTrainerWarp:
                 anchor_state,
                 object_points,
                 controller_attachment_metadata,
+                hit_world=hit_world,
             )
             if fallback is not None:
                 fallback["multi_points_debug"] = {
@@ -1575,8 +1657,14 @@ class InvPhyTrainerWarp:
         )
         selected_points = object_points[unique_indices]
         attach_center_world = selected_points.mean(dim=0)
+        attach_anchor_world = object_points[int(seed_idx)].clone()
+        if hit_world is not None:
+            nearest_patch_offset = torch.argmin(
+                torch.linalg.norm(selected_points - hit_world.unsqueeze(0), dim=1)
+            )
+            attach_anchor_world = selected_points[nearest_patch_offset].clone()
         rest_lengths = torch.linalg.norm(
-            object_points[expanded_indices] - attach_center_world.unsqueeze(0),
+            object_points[expanded_indices] - attach_anchor_world.unsqueeze(0),
             dim=1,
         ).clamp_min(1e-4).clamp_max(self.LIVE_CONTROLLER_ATTACH_MAX_REST_LENGTH)
         attach_radius = torch.linalg.norm(
@@ -1602,7 +1690,7 @@ class InvPhyTrainerWarp:
             "attach_center_world": attach_center_world,
             "attach_node_count": int(unique_indices.numel()),
             "attach_radius": float(attach_radius.item()),
-            "attach_anchor_world": attach_center_world.clone(),
+            "attach_anchor_world": attach_anchor_world,
             "source_template_offsets": torch.zeros(
                 (1, 3), dtype=torch.float32, device=cfg.device
             ),
@@ -1611,6 +1699,9 @@ class InvPhyTrainerWarp:
                 [source_index], dtype=torch.long, device=cfg.device
             ),
             "multi_points_debug": debug,
+            "hit_to_anchor_distance": None
+            if hit_world is None
+            else float(torch.linalg.norm(attach_anchor_world - hit_world).item()),
         }
 
     def _compute_live_hand_alignment(
@@ -1947,12 +2038,298 @@ class InvPhyTrainerWarp:
                 prev_target[source_mask] = current_target[source_mask]
             interaction_state["just_started"] = False
 
+    def _update_controller_select_hold_state(
+        self,
+        source,
+        controller_sample,
+        select_hold_state,
+    ):
+        previous_state = dict(select_hold_state.get(source, {}))
+        available = bool(
+            controller_sample is not None and controller_sample.select_available
+        )
+        pressed = bool(
+            controller_sample is not None
+            and controller_sample.select_available
+            and controller_sample.select_pressed
+        )
+        value = float(
+            0.0 if controller_sample is None else controller_sample.select_value
+        )
+        previous_pressed = bool(previous_state.get("pressed", False))
+        previous_value = float(previous_state.get("value", 0.0))
+        previous_release_frames = int(previous_state.get("release_frames", 0))
+        start_active = available and (
+            pressed or value >= self.LIVE_CONTROLLER_SELECT_START_THRESHOLD
+        )
+        hold_active = available and (
+            pressed or value >= self.LIVE_CONTROLLER_SELECT_HOLD_THRESHOLD
+        )
+        select_start_edge = available and (
+            (pressed and not previous_pressed)
+            or (
+                previous_value < self.LIVE_CONTROLLER_SELECT_START_THRESHOLD
+                and value >= self.LIVE_CONTROLLER_SELECT_START_THRESHOLD
+            )
+        )
+        release_ready = available and (not pressed) and (
+            value < self.LIVE_CONTROLLER_SELECT_HOLD_THRESHOLD
+        )
+        release_frames = previous_release_frames + 1 if release_ready else 0
+        state = {
+            "available": available,
+            "pressed": pressed,
+            "value": value,
+            "start_active": start_active,
+            "hold_active": hold_active,
+            "start_edge": select_start_edge,
+            "release_ready": release_ready,
+            "release_frames": release_frames,
+        }
+        select_hold_state[source] = state
+        return state
+
+    def _update_live_controller_runtime_from_sample(
+        self,
+        latest_controller_sample,
+        live_controller_alignment,
+        live_controller_alignment_mode,
+        controller_source_anchor_centers,
+        w2c,
+        controller_select_state_cache,
+        controller_select_hold_state,
+        controller_select_hold_state_cache,
+        controller_anchor_cycle_state_cache,
+        controller_snap_state_cache,
+        controller_snap_edge_cache,
+        basis_override=None,
+        collect_reset_edges=True,
+        alignment_pose_role="selected",
+        controller_position_pose_role="selected",
+        controller_ray_pose_role=None,
+    ):
+        controller_reset_sources = []
+        if latest_controller_sample is None:
+            return {
+                "alignment": live_controller_alignment,
+                "alignment_mode": live_controller_alignment_mode,
+                "left_controller": None,
+                "right_controller": None,
+                "reset_sources": controller_reset_sources,
+                "alignment_acquired": False,
+            }
+
+        previous_alignment_available = live_controller_alignment is not None
+        live_controller_alignment, live_controller_alignment_mode = (
+            self._update_live_controller_alignment(
+                live_controller_alignment,
+                live_controller_alignment_mode,
+                latest_controller_sample,
+                controller_source_anchor_centers,
+                w2c,
+                basis_override=basis_override,
+                pose_role=alignment_pose_role,
+            )
+        )
+        current_live_left_controller = self._convert_live_controller_to_world(
+            "left",
+            latest_controller_sample.left,
+            live_controller_alignment,
+            position_pose_role=controller_position_pose_role,
+            ray_pose_role=controller_ray_pose_role,
+        )
+        current_live_right_controller = self._convert_live_controller_to_world(
+            "right",
+            latest_controller_sample.right,
+            live_controller_alignment,
+            position_pose_role=controller_position_pose_role,
+            ray_pose_role=controller_ray_pose_role,
+        )
+        controller_world_by_source = {
+            "left": current_live_left_controller,
+            "right": current_live_right_controller,
+        }
+        for source, controller_sample in (
+            ("left", latest_controller_sample.left),
+            ("right", latest_controller_sample.right),
+        ):
+            self._log_controller_select_transition(
+                source,
+                controller_sample,
+                controller_select_state_cache,
+                sample_id=latest_controller_sample.sample,
+            )
+            select_hold_runtime = self._update_controller_select_hold_state(
+                source,
+                controller_sample,
+                controller_select_hold_state,
+            )
+            self._log_controller_select_hold_transition(
+                source,
+                select_hold_runtime,
+                controller_select_hold_state_cache,
+                sample_id=latest_controller_sample.sample,
+            )
+            controller_world = controller_world_by_source[source]
+            if controller_world is not None:
+                controller_world.update(
+                    {
+                        "sample_id": int(latest_controller_sample.sample),
+                        "select_start_edge": select_hold_runtime["start_edge"],
+                        "select_hold_active": select_hold_runtime["hold_active"],
+                        "select_release_ready": select_hold_runtime["release_ready"],
+                        "select_release_frames": select_hold_runtime["release_frames"],
+                        "select_start_active": select_hold_runtime["start_active"],
+                    }
+                )
+            self._log_controller_anchor_cycle_transition(
+                source,
+                controller_sample,
+                controller_anchor_cycle_state_cache,
+            )
+            self._log_controller_snap_transition(
+                source,
+                controller_sample,
+                controller_snap_state_cache,
+            )
+            if (
+                collect_reset_edges
+                and self._controller_snap_edge(
+                    source,
+                    controller_sample,
+                    controller_snap_edge_cache,
+                )
+            ):
+                controller_reset_sources.append(source)
+
+        return {
+            "alignment": live_controller_alignment,
+            "alignment_mode": live_controller_alignment_mode,
+            "left_controller": current_live_left_controller,
+            "right_controller": current_live_right_controller,
+            "reset_sources": controller_reset_sources,
+            "alignment_acquired": (
+                not previous_alignment_available
+                and live_controller_alignment is not None
+            ),
+        }
+
+    def _compute_next_live_controller_target(
+        self,
+        controller_runtime_base_target,
+        prev_target,
+        controller_interaction_state,
+        controller_interaction_state_cache,
+        controller_source_masks,
+        controller_source_anchor_centers,
+        controller_attachment_metadata,
+        controller_anchor_templates,
+        controller_predefined_anchor_states,
+        controller_anchor_preview_state,
+        controller_overlay_by_source,
+        current_live_left_controller,
+        current_live_right_controller,
+        object_points,
+        controller_reset_triggered=False,
+        allow_implicit_fallback_start=True,
+        preview_selected_translation_only=False,
+        controller_motion_state_cache=None,
+        frame_index=0,
+        runtime_label="shared",
+    ):
+        next_target = controller_runtime_base_target.clone()
+        if not controller_reset_triggered:
+            (
+                current_left_interaction_anchor,
+                current_right_interaction_anchor,
+            ) = self._resolve_live_controller_interaction_anchors(
+                current_live_left_controller,
+                current_live_right_controller,
+                controller_overlay_by_source,
+                controller_interaction_state,
+                controller_source_anchor_centers,
+                controller_attachment_metadata,
+                controller_anchor_templates,
+                controller_predefined_anchor_states,
+                controller_anchor_preview_state,
+                object_points,
+                allow_implicit_fallback_start=allow_implicit_fallback_start,
+                preview_selected_translation_only=preview_selected_translation_only,
+            )
+            self._log_controller_interaction_transition(
+                "left",
+                controller_interaction_state["left"],
+                controller_interaction_state_cache,
+            )
+            self._log_controller_interaction_transition(
+                "right",
+                controller_interaction_state["right"],
+                controller_interaction_state_cache,
+            )
+            next_target = self._make_live_controller_target_from_anchors(
+                next_target,
+                current_left_interaction_anchor,
+                current_right_interaction_anchor,
+                controller_source_masks,
+                controller_source_anchor_centers,
+                controller_interaction_state,
+            )
+            if controller_motion_state_cache is not None:
+                self._log_controller_motion_parity(
+                    runtime_label,
+                    frame_index,
+                    "left",
+                    current_live_left_controller,
+                    current_left_interaction_anchor,
+                    next_target,
+                    controller_runtime_base_target,
+                    controller_source_masks,
+                    controller_attachment_metadata,
+                    controller_interaction_state.get("left"),
+                    controller_motion_state_cache,
+                )
+                self._log_controller_motion_parity(
+                    runtime_label,
+                    frame_index,
+                    "right",
+                    current_live_right_controller,
+                    current_right_interaction_anchor,
+                    next_target,
+                    controller_runtime_base_target,
+                    controller_source_masks,
+                    controller_attachment_metadata,
+                    controller_interaction_state.get("right"),
+                    controller_motion_state_cache,
+                )
+            self._apply_controller_start_prev_target_overrides(
+                prev_target,
+                next_target,
+                controller_source_masks,
+                controller_interaction_state,
+            )
+        else:
+            if controller_motion_state_cache is not None:
+                controller_motion_state_cache["left"] = None
+                controller_motion_state_cache["right"] = None
+            self._log_controller_interaction_transition(
+                "left",
+                controller_interaction_state["left"],
+                controller_interaction_state_cache,
+            )
+            self._log_controller_interaction_transition(
+                "right",
+                controller_interaction_state["right"],
+                controller_interaction_state_cache,
+            )
+        return next_target
+
     def _reset_live_controller_runtime(
         self,
         controller_runtime_base_target,
         controller_interaction_state,
         controller_anchor_preview_state,
         controller_attachment_metadata,
+        reset_state=None,
     ):
         for source in ("left", "right"):
             interaction_state = controller_interaction_state.get(source)
@@ -1967,10 +2344,13 @@ class InvPhyTrainerWarp:
             controller_anchor_preview_state[source]["visible"] = False
             controller_anchor_preview_state[source]["selected_anchor_name"] = None
 
-        self.simulator.set_init_state(
-            self.simulator.wp_init_vertices,
-            self.simulator.wp_init_velocities,
-        )
+        if reset_state is None:
+            self.simulator.set_init_state(
+                self.simulator.wp_init_vertices,
+                self.simulator.wp_init_velocities,
+            )
+        else:
+            self._restore_sim_state(reset_state)
         if self.simulator.object_collision_flag:
             self.simulator.create_resting_case()
 
@@ -1979,22 +2359,65 @@ class InvPhyTrainerWarp:
         return reset_target
 
     def _project_points_to_pixels(self, world_points, intrinsic, w2c):
-        ones = torch.ones(
-            (world_points.shape[0], 1), dtype=world_points.dtype, device=world_points.device
+        if torch.is_tensor(world_points):
+            target_device = world_points.device
+            target_dtype = world_points.dtype
+            world_points_t = world_points
+        else:
+            target_device = torch.device(cfg.device)
+            target_dtype = torch.float32
+            world_points_t = torch.as_tensor(
+                world_points,
+                dtype=target_dtype,
+                device=target_device,
+            )
+        if world_points_t.ndim == 1:
+            world_points_t = world_points_t.unsqueeze(0)
+        intrinsic_t = torch.as_tensor(
+            intrinsic,
+            dtype=target_dtype,
+            device=target_device,
         )
-        world_points_h = torch.cat([world_points, ones], dim=1)
-        camera_points_h = world_points_h @ w2c.T
+        w2c_t = torch.as_tensor(
+            w2c,
+            dtype=target_dtype,
+            device=target_device,
+        )
+        ones = torch.ones(
+            (world_points_t.shape[0], 1),
+            dtype=target_dtype,
+            device=target_device,
+        )
+        world_points_h = torch.cat([world_points_t, ones], dim=1)
+        camera_points_h = world_points_h @ w2c_t.T
         camera_points = camera_points_h[:, :3]
         depth_valid = camera_points[:, 2] > 1e-6
-        pixel_h = camera_points @ intrinsic.T
+        pixel_h = camera_points @ intrinsic_t.T
         pixels = pixel_h[:, :2] / pixel_h[:, 2:3].clamp_min(1e-6)
         return pixels, depth_valid
 
     def _project_world_point_to_pixel(self, world_point, intrinsic, w2c, height, width):
         if world_point is None:
             return None
+        if torch.is_tensor(intrinsic):
+            target_device = intrinsic.device
+            target_dtype = intrinsic.dtype
+        elif torch.is_tensor(w2c):
+            target_device = w2c.device
+            target_dtype = w2c.dtype
+        elif torch.is_tensor(world_point):
+            target_device = world_point.device
+            target_dtype = world_point.dtype
+        else:
+            target_device = torch.device(cfg.device)
+            target_dtype = torch.float32
+        world_point_t = torch.as_tensor(
+            world_point,
+            dtype=target_dtype,
+            device=target_device,
+        )
         pixels, depth_valid = self._project_points_to_pixels(
-            world_point.unsqueeze(0), intrinsic, w2c
+            world_point_t.unsqueeze(0), intrinsic, w2c
         )
         if not bool(depth_valid[0].item()):
             return None
@@ -2084,8 +2507,9 @@ class InvPhyTrainerWarp:
         x1 = min(width, x + radius + 1)
         y0 = max(0, y - radius)
         y1 = min(height, y + radius + 1)
-        color_tensor = frame.new_tensor(color)
-        frame[y0:y1, x0:x1].mul_(1.0 - blend).add_(color_tensor * blend)
+        rgb_frame = frame[..., :3]
+        color_tensor = rgb_frame.new_tensor(color[:3])
+        rgb_frame[y0:y1, x0:x1].mul_(1.0 - blend).add_(color_tensor * blend)
 
     def _blend_rect(self, frame, x0, y0, x1, y1, color, blend=0.45):
         height, width = frame.shape[:2]
@@ -2095,8 +2519,25 @@ class InvPhyTrainerWarp:
         y1 = max(0, min(height, int(y1)))
         if x0 >= x1 or y0 >= y1:
             return
-        color_tensor = frame.new_tensor(color)
-        frame[y0:y1, x0:x1].mul_(1.0 - blend).add_(color_tensor * blend)
+        rgb_frame = frame[..., :3]
+        color_tensor = rgb_frame.new_tensor(color[:3])
+        rgb_frame[y0:y1, x0:x1].mul_(1.0 - blend).add_(color_tensor * blend)
+
+    def _blend_square_marker(self, frame, pixel, color, radius, blend=0.78):
+        height, width = frame.shape[:2]
+        x = int(round(float(pixel[0].item())))
+        y = int(round(float(pixel[1].item())))
+        if x < 0 or x >= width or y < 0 or y >= height:
+            return
+
+        x0 = x - radius
+        x1 = x + radius + 1
+        y0 = y - radius
+        y1 = y + radius + 1
+        self._blend_rect(frame, x0, y0, x1, y0 + 1, color, blend=blend)
+        self._blend_rect(frame, x0, y1 - 1, x1, y1, color, blend=blend)
+        self._blend_rect(frame, x0, y0, x0 + 1, y1, color, blend=blend)
+        self._blend_rect(frame, x1 - 1, y0, x1, y1, color, blend=blend)
 
     def _bitmap_text_size(self, text, scale=1):
         glyph_width = 3 * scale
@@ -2108,7 +2549,8 @@ class InvPhyTrainerWarp:
     def _draw_bitmap_text(self, frame, text, x, y, color, scale=1, blend=0.88):
         cursor_x = int(x)
         cursor_y = int(y)
-        color_tensor = frame.new_tensor(color)
+        rgb_frame = frame[..., :3]
+        color_tensor = rgb_frame.new_tensor(color[:3])
         advance = 3 * scale + scale
         height, width = frame.shape[:2]
         for char in text:
@@ -2127,7 +2569,7 @@ class InvPhyTrainerWarp:
                     y0 = max(0, y0)
                     x1 = min(width, x1)
                     y1 = min(height, y1)
-                    patch = frame[y0:y1, x0:x1]
+                    patch = rgb_frame[y0:y1, x0:x1]
                     patch.mul_(1.0 - blend).add_(color_tensor * blend)
             cursor_x += advance
 
@@ -2220,8 +2662,9 @@ class InvPhyTrainerWarp:
         if not bool(ellipse_mask.any().item()):
             return
 
-        color_tensor = frame.new_tensor(color)
-        patch = frame[y0:y1, x0:x1]
+        rgb_frame = frame[..., :3]
+        color_tensor = rgb_frame.new_tensor(color[:3])
+        patch = rgb_frame[y0:y1, x0:x1]
         patch[ellipse_mask] = patch[ellipse_mask] * (1.0 - blend) + color_tensor * blend
 
     def _draw_marker_line(self, frame, start_pixel, end_pixel, color, radius=1, blend=0.45):
@@ -2260,8 +2703,9 @@ class InvPhyTrainerWarp:
         if not bool(line_mask.any().item()):
             return
 
-        color_tensor = frame.new_tensor(color)
-        patch = frame[min_y:max_y, min_x:max_x]
+        rgb_frame = frame[..., :3]
+        color_tensor = rgb_frame.new_tensor(color[:3])
+        patch = rgb_frame[min_y:max_y, min_x:max_x]
         patch[line_mask] = patch[line_mask] * (1.0 - blend) + color_tensor * blend
 
     def _mirror_symbol_about_palm(self, projected):
@@ -2382,13 +2826,26 @@ class InvPhyTrainerWarp:
                 )
                 self._blend_marker(frame, pinch_point, [255.0, 255.0, 255.0], radius=1, blend=0.95)
 
-    def _controller_sample_is_renderable(self, controller_sample):
+    def _controller_sample_has_position(self, controller_sample, pose_role="selected"):
+        return controller_pose_position(controller_sample, pose_role) is not None
+
+    def _controller_sample_is_renderable(self, controller_sample, pose_role="selected"):
         return (
-            controller_sample is not None
-            and controller_sample.active
-            and controller_sample.position_valid
-            and controller_sample.orientation_valid
+            self._controller_sample_has_position(controller_sample, pose_role)
+            and controller_pose_forward(controller_sample, pose_role) is not None
         )
+
+    def _controller_world_ray_pose(self, controller_world):
+        if controller_world is None:
+            return None, None
+        origin_world = controller_world.get("ray_origin", controller_world.get("position"))
+        direction_world = controller_world.get("ray_direction", controller_world.get("direction"))
+        if origin_world is None or direction_world is None:
+            return origin_world, direction_world
+        norm = torch.linalg.norm(direction_world)
+        if float(norm.item()) < 1e-6:
+            return origin_world, None
+        return origin_world, direction_world / norm
 
     def _controller_camera_basis(self, w2c):
         if torch.is_tensor(w2c):
@@ -2406,6 +2863,126 @@ class InvPhyTrainerWarp:
         ).astype(np.float32)
         return torch.as_tensor(basis, dtype=torch.float32, device=cfg.device)
 
+    def _scene_world_up_vector_np(self):
+        return np.array(
+            [0.0, 0.0, -1.0 if cfg.reverse_z else 1.0],
+            dtype=np.float32,
+        )
+
+    def _scene_world_up_vector_torch(self, device=None, dtype=torch.float32):
+        if device is None:
+            device = cfg.device
+        return torch.as_tensor(
+            self._scene_world_up_vector_np(),
+            dtype=dtype,
+            device=device,
+        )
+
+    def _scene_world_forward_vector_np(self):
+        return np.array([0.0, 1.0, 0.0], dtype=np.float32)
+
+    def _normalize_numpy_vector(self, vector, fallback):
+        vector = np.asarray(vector, dtype=np.float32)
+        norm = float(np.linalg.norm(vector))
+        if norm < 1e-6:
+            return np.asarray(fallback, dtype=np.float32).copy()
+        return vector / norm
+
+    def _normalize_torch_vector(self, vector, fallback):
+        vector = torch.as_tensor(vector, dtype=torch.float32, device=cfg.device)
+        fallback = torch.as_tensor(fallback, dtype=vector.dtype, device=vector.device)
+        norm = torch.linalg.norm(vector)
+        if float(norm.item()) < 1e-6:
+            return fallback.clone()
+        return vector / norm
+
+    def _axis_angle_rotation_matrix_torch(self, axis, angle, device=None, dtype=torch.float32):
+        if device is None:
+            device = cfg.device
+        axis = torch.as_tensor(axis, dtype=dtype, device=device)
+        axis = axis / torch.linalg.norm(axis).clamp_min(1e-6)
+        angle = torch.as_tensor(angle, dtype=dtype, device=device)
+        x, y, z = axis.unbind()
+        c = torch.cos(angle)
+        s = torch.sin(angle)
+        one_c = 1.0 - c
+        return torch.stack(
+            [
+                torch.stack([c + x * x * one_c, x * y * one_c - z * s, x * z * one_c + y * s]),
+                torch.stack([y * x * one_c + z * s, c + y * y * one_c, y * z * one_c - x * s]),
+                torch.stack([z * x * one_c - y * s, z * y * one_c + x * s, c + z * z * one_c]),
+            ],
+            dim=0,
+        )
+
+    def _rotate_points_with_matrix(self, points, rotation_matrix, pivot=None):
+        points = torch.as_tensor(points, dtype=rotation_matrix.dtype, device=rotation_matrix.device)
+        if pivot is None:
+            pivot = torch.zeros(3, dtype=rotation_matrix.dtype, device=rotation_matrix.device)
+        else:
+            pivot = torch.as_tensor(pivot, dtype=rotation_matrix.dtype, device=rotation_matrix.device)
+        return (points - pivot.unsqueeze(0)) @ rotation_matrix.T + pivot.unsqueeze(0)
+
+    def _gaussian_quaternion_multiply_wxyz(self, lhs, rhs):
+        lhs = torch.as_tensor(lhs, dtype=torch.float32, device=cfg.device)
+        rhs = torch.as_tensor(rhs, dtype=torch.float32, device=cfg.device)
+        lhs_shape = lhs.shape
+        rhs_shape = rhs.shape
+        lhs = lhs.reshape(-1, 4)
+        rhs = rhs.reshape(-1, 4)
+        if lhs.shape[0] == 1 and rhs.shape[0] > 1:
+            lhs = lhs.expand(rhs.shape[0], 4)
+        if rhs.shape[0] == 1 and lhs.shape[0] > 1:
+            rhs = rhs.expand(lhs.shape[0], 4)
+        w1, x1, y1, z1 = lhs.unbind(dim=1)
+        w2, x2, y2, z2 = rhs.unbind(dim=1)
+        product = torch.stack(
+            [
+                w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+                w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+                w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+                w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+            ],
+            dim=1,
+        )
+        if len(lhs_shape) == 1 and len(rhs_shape) == 1:
+            return product[0]
+        return product
+
+    def _axis_angle_to_gaussian_quaternion_wxyz(self, axis, angle, device=None, dtype=torch.float32):
+        if device is None:
+            device = cfg.device
+        axis = torch.as_tensor(axis, dtype=dtype, device=device)
+        axis = axis / torch.linalg.norm(axis).clamp_min(1e-6)
+        half_angle = 0.5 * torch.as_tensor(angle, dtype=dtype, device=device)
+        sin_half = torch.sin(half_angle)
+        return torch.stack(
+            [
+                torch.cos(half_angle),
+                axis[0] * sin_half,
+                axis[1] * sin_half,
+                axis[2] * sin_half,
+            ],
+            dim=0,
+        )
+
+    def _rotate_gaussian_quaternions_about_axis(self, quaternions, axis, angle):
+        quaternions = torch.as_tensor(quaternions, dtype=torch.float32, device=cfg.device)
+        rotation_quaternion = self._axis_angle_to_gaussian_quaternion_wxyz(
+            axis,
+            angle,
+            device=quaternions.device,
+            dtype=quaternions.dtype,
+        )
+        rotated = self._gaussian_quaternion_multiply_wxyz(
+            rotation_quaternion.unsqueeze(0),
+            quaternions,
+        )
+        return F.normalize(rotated, dim=-1)
+
+    def _is_finite_tensor(self, tensor):
+        return bool(torch.isfinite(torch.as_tensor(tensor)).all().item())
+
     def _compute_live_controller_alignment(
         self,
         live_left_anchor,
@@ -2413,6 +2990,7 @@ class InvPhyTrainerWarp:
         recorded_left_anchor,
         recorded_right_anchor,
         w2c,
+        basis_override=None,
     ):
         live_left_anchor = torch.as_tensor(
             np.asarray(live_left_anchor, dtype=np.float32),
@@ -2434,7 +3012,11 @@ class InvPhyTrainerWarp:
             dtype=torch.float32,
             device=cfg.device,
         )
-        basis = self._controller_camera_basis(w2c)
+        basis = (
+            basis_override
+            if basis_override is not None
+            else self._controller_camera_basis(w2c)
+        )
         return {
             "basis": basis,
             "translation_scale": torch.tensor(
@@ -2448,7 +3030,13 @@ class InvPhyTrainerWarp:
             "reference_scene_right": recorded_right_anchor,
         }
 
-    def _compute_single_controller_alignment(self, live_anchor, recorded_anchor, w2c):
+    def _compute_single_controller_alignment(
+        self,
+        live_anchor,
+        recorded_anchor,
+        w2c,
+        basis_override=None,
+    ):
         live_anchor = torch.as_tensor(
             np.asarray(live_anchor, dtype=np.float32),
             dtype=torch.float32,
@@ -2459,7 +3047,11 @@ class InvPhyTrainerWarp:
             dtype=torch.float32,
             device=cfg.device,
         )
-        basis = self._controller_camera_basis(w2c)
+        basis = (
+            basis_override
+            if basis_override is not None
+            else self._controller_camera_basis(w2c)
+        )
         return {
             "basis": basis,
             "translation_scale": torch.tensor(
@@ -2480,11 +3072,11 @@ class InvPhyTrainerWarp:
         live_sample,
         recorded_anchor_centers,
         w2c,
+        basis_override=None,
+        pose_role="selected",
     ):
-        left_anchor = live_sample.left.position if self._controller_sample_is_renderable(live_sample.left) else None
-        right_anchor = (
-            live_sample.right.position if self._controller_sample_is_renderable(live_sample.right) else None
-        )
+        left_anchor = controller_pose_position(live_sample.left, pose_role)
+        right_anchor = controller_pose_position(live_sample.right, pose_role)
 
         if left_anchor is not None and right_anchor is not None:
             if alignment_mode != "dual":
@@ -2494,6 +3086,7 @@ class InvPhyTrainerWarp:
                     recorded_anchor_centers[0],
                     recorded_anchor_centers[1],
                     w2c,
+                    basis_override=basis_override,
                 )
                 alignment_mode = "dual"
             return alignment, alignment_mode
@@ -2504,6 +3097,7 @@ class InvPhyTrainerWarp:
                     left_anchor,
                     recorded_anchor_centers[0],
                     w2c,
+                    basis_override=basis_override,
                 )
                 alignment_mode = "single_left"
             return alignment, alignment_mode
@@ -2514,6 +3108,7 @@ class InvPhyTrainerWarp:
                     right_anchor,
                     recorded_anchor_centers[1],
                     w2c,
+                    basis_override=basis_override,
                 )
                 alignment_mode = "single_right"
             return alignment, alignment_mode
@@ -2531,15 +3126,38 @@ class InvPhyTrainerWarp:
             return None
         return transformed / norm
 
-    def _convert_live_controller_to_world(self, source, controller_sample, alignment):
-        if alignment is None or not self._controller_sample_is_renderable(controller_sample):
+    def _convert_live_controller_to_world(
+        self,
+        source,
+        controller_sample,
+        alignment,
+        position_pose_role="selected",
+        ray_pose_role=None,
+    ):
+        if alignment is None or controller_sample is None or not controller_sample.active:
             return None
 
-        direction_np = controller_forward(controller_sample)
+        if ray_pose_role is None:
+            ray_pose_role = position_pose_role
+
+        position_np = controller_pose_position(controller_sample, position_pose_role)
+        if position_np is None:
+            return None
+
+        ray_origin_np = controller_pose_position(controller_sample, ray_pose_role)
+        if ray_origin_np is None:
+            ray_origin_np = position_np
+
+        direction_np = controller_pose_forward(controller_sample, ray_pose_role)
+        if direction_np is None:
+            direction_np = controller_pose_forward(controller_sample, position_pose_role)
         if direction_np is None:
             return None
 
-        position = torch.from_numpy(controller_sample.position).to(
+        position = torch.from_numpy(np.asarray(position_np, dtype=np.float32)).to(
+            device=cfg.device, dtype=torch.float32
+        )
+        ray_origin = torch.from_numpy(np.asarray(ray_origin_np, dtype=np.float32)).to(
             device=cfg.device, dtype=torch.float32
         )
         direction = torch.from_numpy(np.asarray(direction_np, dtype=np.float32)).to(
@@ -2555,14 +3173,20 @@ class InvPhyTrainerWarp:
             position - reference_live,
             alignment,
         )
-        world_direction = self._transform_live_controller_direction(direction, alignment)
-        if world_direction is None:
+        world_ray_origin = reference_scene + self._transform_live_controller_delta(
+            ray_origin - reference_live,
+            alignment,
+        )
+        world_ray_direction = self._transform_live_controller_direction(direction, alignment)
+        if world_ray_direction is None:
             return None
 
         return {
             "source": controller_sample.source,
             "position": world_position,
-            "direction": world_direction,
+            "direction": world_ray_direction,
+            "ray_origin": world_ray_origin,
+            "ray_direction": world_ray_direction,
             "select_available": controller_sample.select_available,
             "select_pressed": controller_sample.select_pressed,
             "select_value": controller_sample.select_value,
@@ -2573,7 +3197,1177 @@ class InvPhyTrainerWarp:
             "snap_assist_available": controller_sample.snap_assist_available,
             "snap_assist_pressed": controller_sample.snap_assist_pressed,
             "snap_assist_source": controller_sample.snap_assist_source,
+            "position_pose_role": position_pose_role,
+            "ray_pose_role": ray_pose_role,
+            "grip_pose_valid": bool(
+                controller_sample.grip_active
+                and controller_sample.grip_position_valid
+                and controller_sample.grip_orientation_valid
+            )
+            ,
+            "aim_pose_valid": bool(
+                controller_sample.aim_active
+                and controller_sample.aim_position_valid
+                and controller_sample.aim_orientation_valid
+            )
+            ,
         }
+
+    def _quaternion_xyzw_to_rotation_matrix(self, quaternion):
+        x, y, z, w = [float(v) for v in quaternion]
+        xx = x * x
+        yy = y * y
+        zz = z * z
+        xy = x * y
+        xz = x * z
+        yz = y * z
+        wx = w * x
+        wy = w * y
+        wz = w * z
+        return np.array(
+            [
+                [1.0 - 2.0 * (yy + zz), 2.0 * (xy - wz), 2.0 * (xz + wy)],
+                [2.0 * (xy + wz), 1.0 - 2.0 * (xx + zz), 2.0 * (yz - wx)],
+                [2.0 * (xz - wy), 2.0 * (yz + wx), 1.0 - 2.0 * (xx + yy)],
+            ],
+            dtype=np.float32,
+        )
+
+    def _controller_alignment_reference_centers(self, alignment):
+        if alignment is None:
+            return None, None
+        live_center = 0.5 * (
+            alignment["reference_live_left"] + alignment["reference_live_right"]
+        )
+        scene_center = 0.5 * (
+            alignment["reference_scene_left"] + alignment["reference_scene_right"]
+        )
+        return live_center, scene_center
+
+    def _immersive_live_forward_from_sample(self, sample):
+        if sample is None:
+            return None
+
+        eye_forwards = []
+        for eye_sample in (sample.left_eye, sample.right_eye):
+            if eye_sample is None or not eye_sample.pose_valid:
+                continue
+            rotation_local = self._quaternion_xyzw_to_rotation_matrix(
+                eye_sample.orientation
+            )
+            eye_forwards.append(rotation_local @ np.array([0.0, 0.0, -1.0], dtype=np.float32))
+        if not eye_forwards:
+            return None
+        return self._normalize_numpy_vector(
+            np.mean(np.stack(eye_forwards, axis=0), axis=0),
+            fallback=np.array([0.0, 0.0, -1.0], dtype=np.float32),
+        )
+
+    def _immersive_sample_has_valid_eye_pose(self, sample):
+        return bool(
+            sample is not None
+            and (
+                (sample.left_eye is not None and sample.left_eye.pose_valid)
+                or (sample.right_eye is not None and sample.right_eye.pose_valid)
+            )
+        )
+
+    def _immersive_live_head_center_from_sample(self, sample):
+        if sample is None:
+            return None
+
+        eye_positions = []
+        for eye_sample in (sample.left_eye, sample.right_eye):
+            if eye_sample is None or not eye_sample.pose_valid:
+                continue
+            eye_positions.append(
+                torch.from_numpy(np.asarray(eye_sample.position, dtype=np.float32)).to(
+                    device=cfg.device,
+                    dtype=torch.float32,
+                )
+            )
+        if not eye_positions:
+            return None
+        return torch.stack(eye_positions, dim=0).mean(dim=0)
+
+    def _compute_immersive_head_alignment(self, sample):
+        live_head_origin = self._immersive_live_head_center_from_sample(sample)
+        if live_head_origin is None:
+            return None
+
+        local_up = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+        live_forward = self._immersive_live_forward_from_sample(sample)
+        if live_forward is None:
+            return None
+        live_forward_horizontal = live_forward - float(np.dot(live_forward, local_up)) * local_up
+        live_forward_horizontal = self._normalize_numpy_vector(
+            live_forward_horizontal,
+            fallback=np.array([0.0, 0.0, -1.0], dtype=np.float32),
+        )
+        live_back = -live_forward_horizontal
+        live_right = self._normalize_numpy_vector(
+            np.cross(local_up, live_back),
+            fallback=np.array([1.0, 0.0, 0.0], dtype=np.float32),
+        )
+        live_back = self._normalize_numpy_vector(
+            np.cross(live_right, local_up),
+            fallback=live_back,
+        )
+        live_basis = np.stack([live_right, local_up, live_back], axis=1)
+
+        scene_up = self._scene_world_up_vector_np()
+        scene_forward = self._scene_world_forward_vector_np()
+        scene_back = -scene_forward
+        scene_right = self._normalize_numpy_vector(
+            np.cross(scene_up, scene_back),
+            fallback=np.array([1.0, 0.0, 0.0], dtype=np.float32),
+        )
+        scene_back = self._normalize_numpy_vector(
+            np.cross(scene_right, scene_up),
+            fallback=scene_back,
+        )
+        scene_basis = np.stack([scene_right, scene_up, scene_back], axis=1)
+        basis_np = (scene_basis @ live_basis.T).astype(np.float32)
+        basis_np_t_basis = basis_np.T @ basis_np
+
+        return {
+            "basis": torch.as_tensor(basis_np, dtype=torch.float32, device=cfg.device),
+            "translation_scale": torch.tensor(
+                self.LIVE_CONTROLLER_TRANSLATION_SCALE,
+                dtype=torch.float32,
+                device=cfg.device,
+            ),
+            "reference_live_head": live_head_origin,
+            "reference_scene_head": torch.zeros(
+                3, dtype=torch.float32, device=cfg.device
+            ),
+            "scene_up": scene_up,
+            "scene_forward": scene_forward,
+            "scene_right": scene_right,
+            "basis_det": float(np.linalg.det(basis_np)),
+            "basis_orthogonality_error": float(
+                np.max(np.abs(basis_np_t_basis - np.eye(3, dtype=np.float32)))
+            ),
+            "startup_live_forward": live_forward_horizontal,
+        }
+
+    def _map_live_delta_into_scene(self, delta, head_alignment):
+        delta = torch.as_tensor(delta, dtype=torch.float32, device=cfg.device)
+        return (
+            head_alignment["basis"] @ delta
+        ) * head_alignment["translation_scale"]
+
+    def _map_live_head_center_into_scene(self, live_head_center, head_alignment):
+        live_head_center = torch.as_tensor(
+            live_head_center, dtype=torch.float32, device=cfg.device
+        )
+        return head_alignment["reference_scene_head"] + self._map_live_delta_into_scene(
+            live_head_center - head_alignment["reference_live_head"],
+            head_alignment,
+        )
+
+    def _update_immersive_head_pose_state(
+        self,
+        sample,
+        head_alignment,
+        head_pose_state,
+        frame_index=0,
+    ):
+        if sample is None or head_alignment is None:
+            return None, None, head_pose_state
+
+        if head_pose_state is None:
+            head_pose_state = {
+                "smoothed_scene_head_center": None,
+                "last_raw_scene_head_center": None,
+                "had_valid_pose": False,
+                "cached_scene_eye_offsets": {},
+                "last_eye_rotations_world": {},
+            }
+
+        valid_eye_positions_live = {}
+        current_scene_eye_offsets = {}
+        current_eye_rotations_world = {}
+        basis_np = head_alignment["basis"].detach().cpu().numpy()
+
+        for source, eye_sample in (
+            ("left", sample.left_eye),
+            ("right", sample.right_eye),
+        ):
+            if eye_sample is None or not eye_sample.pose_valid:
+                continue
+            eye_position_live = torch.from_numpy(
+                np.asarray(eye_sample.position, dtype=np.float32)
+            ).to(device=cfg.device, dtype=torch.float32)
+            valid_eye_positions_live[source] = eye_position_live
+            rotation_local = self._quaternion_xyzw_to_rotation_matrix(
+                eye_sample.orientation
+            )
+            current_eye_rotations_world[source] = (basis_np @ rotation_local).astype(
+                np.float32
+            )
+
+        if not valid_eye_positions_live:
+            head_pose_state["had_valid_pose"] = False
+            return None, None, head_pose_state
+
+        live_head_center = torch.stack(
+            list(valid_eye_positions_live.values()), dim=0
+        ).mean(dim=0)
+        raw_scene_head_center = self._map_live_head_center_into_scene(
+            live_head_center,
+            head_alignment,
+        )
+
+        for source, eye_position_live in valid_eye_positions_live.items():
+            current_scene_eye_offsets[source] = self._map_live_delta_into_scene(
+                eye_position_live - live_head_center,
+                head_alignment,
+            )
+
+        cached_scene_eye_offsets = dict(
+            head_pose_state.get("cached_scene_eye_offsets", {})
+        )
+        cached_scene_eye_offsets.update(current_scene_eye_offsets)
+
+        previous_raw_scene_head_center = head_pose_state.get(
+            "last_raw_scene_head_center"
+        )
+        raw_scene_head_jump = None
+        if previous_raw_scene_head_center is not None:
+            raw_scene_head_jump = float(
+                torch.linalg.norm(
+                    raw_scene_head_center - previous_raw_scene_head_center
+                ).item()
+            )
+
+        reset_reason = None
+        if head_pose_state.get("smoothed_scene_head_center") is None:
+            reset_reason = "startup"
+        elif not head_pose_state.get("had_valid_pose", False):
+            reset_reason = "tracking_reacquired"
+        elif (
+            raw_scene_head_jump is not None
+            and raw_scene_head_jump > self.IMMERSIVE_HEAD_RESET_JUMP_THRESHOLD
+        ):
+            reset_reason = f"jump_{raw_scene_head_jump:.3f}"
+
+        if reset_reason is not None:
+            smoothed_scene_head_center = raw_scene_head_center.clone()
+        else:
+            alpha = float(self.IMMERSIVE_HEAD_TRANSLATION_EMA_ALPHA)
+            smoothed_scene_head_center = (
+                alpha * raw_scene_head_center
+                + (1.0 - alpha) * head_pose_state["smoothed_scene_head_center"]
+            )
+
+        last_eye_rotations_world = dict(
+            head_pose_state.get("last_eye_rotations_world", {})
+        )
+        last_eye_rotations_world.update(current_eye_rotations_world)
+
+        head_pose_state.update(
+            {
+                "smoothed_scene_head_center": smoothed_scene_head_center,
+                "last_raw_scene_head_center": raw_scene_head_center.clone(),
+                "had_valid_pose": True,
+                "cached_scene_eye_offsets": cached_scene_eye_offsets,
+                "last_eye_rotations_world": last_eye_rotations_world,
+            }
+        )
+
+        eye_pose_world = {}
+        debug_offsets = {}
+        for source, eye_sample in (
+            ("left", sample.left_eye),
+            ("right", sample.right_eye),
+        ):
+            eye_offset_world = current_scene_eye_offsets.get(
+                source,
+                cached_scene_eye_offsets.get(source),
+            )
+            rotation_world = current_eye_rotations_world.get(
+                source,
+                last_eye_rotations_world.get(source),
+            )
+            debug_offsets[source] = (
+                None
+                if eye_offset_world is None
+                else eye_offset_world.detach().cpu().numpy().tolist()
+            )
+            if eye_offset_world is None or rotation_world is None:
+                eye_pose_world[source] = None
+                continue
+            pose = np.eye(4, dtype=np.float32)
+            pose[:3, :3] = rotation_world
+            pose[:3, 3] = (
+                smoothed_scene_head_center + eye_offset_world
+            ).detach().cpu().numpy()
+            eye_pose_world[source] = pose
+
+        if (
+            reset_reason is not None
+            or frame_index == 0
+            or (
+                self.IMMERSIVE_HEAD_DEBUG_LOG_INTERVAL > 0
+                and frame_index % self.IMMERSIVE_HEAD_DEBUG_LOG_INTERVAL == 0
+            )
+        ):
+            print(
+                "[quest_display] immersive head pose: "
+                f"frame={frame_index} "
+                f"raw_head_center={raw_scene_head_center.detach().cpu().numpy().tolist()} "
+                f"smoothed_head_center={smoothed_scene_head_center.detach().cpu().numpy().tolist()} "
+                f"left_offset={debug_offsets['left']} "
+                f"right_offset={debug_offsets['right']} "
+                f"reset={reset_reason}",
+                flush=True,
+            )
+
+        return eye_pose_world["left"], eye_pose_world["right"], head_pose_state
+
+    def _format_controller_pose_startup_state(self, controller_sample):
+        if controller_sample is None:
+            return "missing"
+        return (
+            f"active={int(bool(controller_sample.active))} "
+            f"position_valid={int(bool(controller_sample.position_valid))} "
+            f"orientation_valid={int(bool(controller_sample.orientation_valid))} "
+            f"position_tracked={int(bool(controller_sample.position_tracked))} "
+            f"orientation_tracked={int(bool(controller_sample.orientation_tracked))}"
+        )
+
+    def _format_eye_pose_startup_state(self, eye_sample):
+        if eye_sample is None:
+            return "missing"
+        return (
+            f"pose_valid={int(bool(eye_sample.pose_valid))} "
+            f"pose_tracked={int(bool(eye_sample.pose_tracked))}"
+        )
+
+    def _format_immersive_sample_startup_state(self, sample):
+        if sample is None:
+            return "no immersive sample received yet"
+        return (
+            f"left_eye({self._format_eye_pose_startup_state(sample.left_eye)}) "
+            f"right_eye({self._format_eye_pose_startup_state(sample.right_eye)}) "
+            f"left_controller({self._format_controller_pose_startup_state(sample.left)}) "
+            f"right_controller({self._format_controller_pose_startup_state(sample.right)})"
+        )
+
+    def _wait_for_valid_immersive_startup_sample(self, immersive_bridge, timeout=10.0):
+        deadline = time.time() + timeout
+        last_sample = None
+        while time.time() < deadline:
+            sample = immersive_bridge.get_latest_sample()
+            if sample is not None:
+                last_sample = sample
+                if self._immersive_sample_has_valid_eye_pose(sample):
+                    return sample
+            if (
+                immersive_bridge.process is not None
+                and immersive_bridge.process.poll() is not None
+            ):
+                diagnostics = self._format_immersive_sample_startup_state(last_sample)
+                raise RuntimeError(
+                    "Quest immersive bridge exited before producing a valid eye pose.\n"
+                    f"last_sample: {diagnostics}\n"
+                    + immersive_bridge.debug_summary()
+                )
+            time.sleep(0.05)
+
+        diagnostics = self._format_immersive_sample_startup_state(last_sample)
+        raise RuntimeError(
+            "Timed out waiting for a valid immersive eye pose.\n"
+            f"last_sample: {diagnostics}\n"
+            + immersive_bridge.debug_summary()
+        )
+
+    def _convert_live_eye_to_world_pose(self, eye_sample: EyePoseSample, head_alignment):
+        if head_alignment is None or not eye_sample.pose_valid:
+            return None
+
+        eye_position = torch.from_numpy(np.asarray(eye_sample.position, dtype=np.float32)).to(
+            device=cfg.device, dtype=torch.float32
+        )
+        world_position = head_alignment["reference_scene_head"] + (
+            head_alignment["basis"]
+            @ (eye_position - head_alignment["reference_live_head"])
+        ) * head_alignment["translation_scale"]
+
+        rotation_local = self._quaternion_xyzw_to_rotation_matrix(eye_sample.orientation)
+        basis = head_alignment["basis"].detach().cpu().numpy()
+        rotation_world = basis @ rotation_local
+
+        pose = np.eye(4, dtype=np.float32)
+        pose[:3, :3] = rotation_world
+        pose[:3, 3] = world_position.detach().cpu().numpy()
+        return pose
+
+    def _camera_pose_world_to_cv_w2c(self, camera_pose_world):
+        camera_pose_world = np.asarray(camera_pose_world, dtype=np.float32)
+        cv_from_gl = np.diag([1.0, -1.0, -1.0]).astype(np.float32)
+        pose_world_cv = np.eye(4, dtype=np.float32)
+        pose_world_cv[:3, :3] = camera_pose_world[:3, :3] @ cv_from_gl
+        pose_world_cv[:3, 3] = camera_pose_world[:3, 3]
+        return np.linalg.inv(pose_world_cv).astype(np.float32)
+
+    def _project_world_point_into_eye(self, world_point, intrinsic, w2c, width, height):
+        if world_point is None:
+            return {
+                "depth": None,
+                "pixel": None,
+                "in_bounds": False,
+            }
+        world_point = np.asarray(world_point, dtype=np.float32)
+        intrinsic = np.asarray(intrinsic, dtype=np.float32)
+        w2c = np.asarray(w2c, dtype=np.float32)
+        world_point_h = np.concatenate([world_point, np.array([1.0], dtype=np.float32)])
+        camera_point = w2c @ world_point_h
+        depth = float(camera_point[2])
+        pixel = None
+        in_bounds = False
+        if abs(depth) > 1e-6:
+            pixel_h = intrinsic @ camera_point[:3]
+            pixel = pixel_h[:2] / max(pixel_h[2], 1e-6)
+            margin = float(self.IMMERSIVE_STARTUP_PIXEL_MARGIN)
+            in_bounds = (
+                depth > self.IMMERSIVE_STARTUP_DEPTH_EPS
+                and pixel[0] >= -margin
+                and pixel[0] <= float(width) + margin
+                and pixel[1] >= -margin
+                and pixel[1] <= float(height) + margin
+            )
+        return {
+            "depth": depth,
+            "pixel": pixel,
+            "in_bounds": in_bounds,
+        }
+
+    def _eye_sample_intrinsic(self, eye_sample: EyePoseSample, width: int, height: int):
+        tan_left = float(np.tan(eye_sample.fov.angle_left))
+        tan_right = float(np.tan(eye_sample.fov.angle_right))
+        tan_up = float(np.tan(eye_sample.fov.angle_up))
+        tan_down = float(np.tan(eye_sample.fov.angle_down))
+        fx = float(width) / max(tan_right - tan_left, 1e-6)
+        fy = float(height) / max(tan_up - tan_down, 1e-6)
+        cx = -tan_left * fx
+        cy = tan_up * fy
+        return np.array(
+            [[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]],
+            dtype=np.float32,
+        )
+
+    def _eye_forward_world(self, camera_pose_world):
+        return camera_pose_world[:3, :3] @ np.array([0.0, 0.0, -1.0], dtype=np.float32)
+
+    def _normalize_gaussian_depth(self, gaussian_depth):
+        if gaussian_depth is None:
+            return None
+        if not torch.is_tensor(gaussian_depth):
+            gaussian_depth = torch.as_tensor(
+                gaussian_depth,
+                device=cfg.device,
+                dtype=torch.float32,
+            )
+        else:
+            gaussian_depth = gaussian_depth.to(device=cfg.device, dtype=torch.float32)
+        gaussian_depth = gaussian_depth.squeeze()
+        finite_mask = torch.isfinite(gaussian_depth)
+        if not bool(finite_mask.any().item()):
+            return torch.zeros_like(gaussian_depth)
+        valid_mask = finite_mask & (gaussian_depth.abs() > self.IMMERSIVE_STARTUP_DEPTH_EPS)
+        positive_count = int((valid_mask & (gaussian_depth > 0.0)).sum().item())
+        negative_count = int((valid_mask & (gaussian_depth < 0.0)).sum().item())
+        normalized_depth = gaussian_depth.clone()
+        if negative_count > positive_count:
+            normalized_depth = -normalized_depth
+        normalized_depth = torch.where(
+            finite_mask & (normalized_depth > self.IMMERSIVE_STARTUP_DEPTH_EPS),
+            normalized_depth,
+            torch.zeros_like(normalized_depth),
+        )
+        return normalized_depth
+
+    def _object_support_patch_center(self, object_points):
+        scene_down = torch.tensor(
+            [0.0, 0.0, 1.0 if cfg.reverse_z else -1.0],
+            dtype=object_points.dtype,
+            device=object_points.device,
+        )
+        support_depth = torch.sum(object_points * scene_down.unsqueeze(0), dim=1)
+        support_depth_max = support_depth.max()
+        support_mask = support_depth >= (support_depth_max - 0.012)
+        support_points = object_points[support_mask]
+        if support_points.numel() == 0:
+            support_points = object_points
+        support_center = support_points.mean(dim=0)
+        support_center = support_center.clone()
+        support_center[2] = float(
+            object_points[:, 2].max().item() if cfg.reverse_z else object_points[:, 2].min().item()
+        )
+        return support_center
+
+    def _apply_immersive_startup_yaw(
+        self,
+        object_vertices,
+        controller_vertices,
+        gaussians,
+        recorded_base_target,
+        recorded_anchor_centers,
+        controller_source_anchor_centers,
+        yaw_axis=None,
+        yaw_angle=None,
+    ):
+        if yaw_axis is None:
+            yaw_axis = self._scene_world_up_vector_torch(
+                device=object_vertices.device,
+                dtype=object_vertices.dtype,
+            )
+        else:
+            yaw_axis = torch.as_tensor(
+                yaw_axis,
+                dtype=object_vertices.dtype,
+                device=object_vertices.device,
+            )
+        if yaw_angle is None:
+            yaw_angle = self.IMMERSIVE_STARTUP_YAW_RADIANS
+        rotation_matrix = self._axis_angle_rotation_matrix_torch(
+            yaw_axis,
+            yaw_angle,
+            device=object_vertices.device,
+            dtype=object_vertices.dtype,
+        )
+        yaw_pivot = self._object_support_patch_center(object_vertices)
+        rotated_object_vertices = self._rotate_points_with_matrix(
+            object_vertices,
+            rotation_matrix,
+            pivot=yaw_pivot,
+        )
+        rotated_controller_vertices = None
+        if controller_vertices is not None:
+            rotated_controller_vertices = self._rotate_points_with_matrix(
+                controller_vertices,
+                rotation_matrix,
+                pivot=yaw_pivot,
+            )
+        rotated_recorded_base_target = self._rotate_points_with_matrix(
+            recorded_base_target,
+            rotation_matrix,
+            pivot=yaw_pivot,
+        )
+        rotated_recorded_anchor_centers = [
+            self._rotate_points_with_matrix(
+                center.unsqueeze(0),
+                rotation_matrix,
+                pivot=yaw_pivot,
+            )[0]
+            for center in recorded_anchor_centers
+        ]
+        rotated_controller_source_anchor_centers = [
+            self._rotate_points_with_matrix(
+                center.unsqueeze(0),
+                rotation_matrix,
+                pivot=yaw_pivot,
+            )[0]
+            for center in controller_source_anchor_centers
+        ]
+        gaussians._xyz = self._rotate_points_with_matrix(
+            gaussians._xyz,
+            rotation_matrix.to(device=gaussians._xyz.device, dtype=gaussians._xyz.dtype),
+            pivot=yaw_pivot.to(device=gaussians._xyz.device, dtype=gaussians._xyz.dtype),
+        )
+        gaussians._rotation = self._rotate_gaussian_quaternions_about_axis(
+            gaussians.get_rotation,
+            yaw_axis.to(device=gaussians.get_rotation.device, dtype=gaussians.get_rotation.dtype),
+            yaw_angle,
+        )
+        rotated_support_center = self._object_support_patch_center(rotated_object_vertices)
+        return {
+            "object_vertices": rotated_object_vertices,
+            "controller_vertices": rotated_controller_vertices,
+            "recorded_base_target": rotated_recorded_base_target,
+            "recorded_anchor_centers": rotated_recorded_anchor_centers,
+            "controller_source_anchor_centers": rotated_controller_source_anchor_centers,
+            "yaw_axis": yaw_axis,
+            "yaw_angle": float(torch.as_tensor(yaw_angle).item()),
+            "yaw_pivot": yaw_pivot,
+            "rotated_support_center": rotated_support_center,
+        }
+
+    def _capture_gaussian_runtime_state(self, gaussians):
+        return {
+            "xyz": gaussians._xyz.detach().clone(),
+            "rotation": gaussians._rotation.detach().clone(),
+        }
+
+    def _restore_gaussian_runtime_state(self, gaussians, state):
+        gaussians._xyz = state["xyz"].clone()
+        gaussians._rotation = state["rotation"].clone()
+
+    def _validate_scene_spawn_alignment(
+        self,
+        object_points,
+        layout,
+        context,
+        table_surface_center_world=None,
+    ):
+        support_center = self._object_support_patch_center(object_points)
+        target_center = (
+            layout.table_top_center
+            if table_surface_center_world is None
+            else table_surface_center_world
+        )
+        table_center = torch.as_tensor(
+            target_center,
+            dtype=torch.float32,
+            device=object_points.device,
+        )
+        xy_error = float(torch.linalg.norm(support_center[:2] - table_center[:2]).item())
+        z_error = float(torch.abs(support_center[2] - table_center[2]).item())
+        if xy_error > self.IMMERSIVE_STARTUP_CENTER_EPS or z_error > self.IMMERSIVE_STARTUP_PLANE_EPS:
+            raise RuntimeError(
+                f"Immersive scene spawn validation failed during {context}: "
+                f"support_center={support_center.detach().cpu().numpy().tolist()} "
+                f"table_top_center={table_center.detach().cpu().numpy().tolist()} "
+                f"xy_error={xy_error:.4f} z_error={z_error:.4f}"
+            )
+        return support_center
+
+    def _save_immersive_startup_debug_images(self, output_dir, frames):
+        if not output_dir:
+            return
+        os.makedirs(output_dir, exist_ok=True)
+        for name, frame in frames.items():
+            if frame is None:
+                continue
+            if torch.is_tensor(frame):
+                array = frame.detach().cpu().numpy()
+            else:
+                array = np.asarray(frame)
+            array = np.ascontiguousarray(array)
+            if array.ndim != 3:
+                continue
+            if array.dtype != np.uint8:
+                array = np.clip(array, 0, 255).astype(np.uint8)
+            output_path = os.path.join(output_dir, f"{name}.png")
+            if array.shape[2] == 4:
+                cv2.imwrite(output_path, cv2.cvtColor(array, cv2.COLOR_RGBA2BGRA))
+            elif array.shape[2] == 3:
+                cv2.imwrite(output_path, cv2.cvtColor(array, cv2.COLOR_RGB2BGR))
+
+    def _validate_immersive_startup_render(
+        self,
+        head_alignment,
+        layout,
+        scene_renderer,
+        left_eye_sample,
+        right_eye_sample,
+        left_eye_pose_world,
+        right_eye_pose_world,
+        eye_width,
+        eye_height,
+        gaussians,
+        render_pipe,
+        background_black,
+        background_white,
+        view_render_path,
+    ):
+        table_top_center = np.asarray(layout.table_top_center, dtype=np.float32)
+        object_points = gaussians.get_xyz.detach()
+        object_center = object_points.mean(dim=0).detach().cpu().numpy().astype(np.float32)
+        object_support_center = (
+            self._object_support_patch_center(object_points).detach().cpu().numpy().astype(np.float32)
+        )
+        object_bounds_min = (
+            object_points.min(dim=0).values.detach().cpu().numpy().astype(np.float32)
+        )
+        object_bounds_max = (
+            object_points.max(dim=0).values.detach().cpu().numpy().astype(np.float32)
+        )
+        debug_renders = {}
+        startup_debug = {
+            "table_top_center": table_top_center.tolist(),
+            "object_center": object_center.tolist(),
+            "object_support_center": object_support_center.tolist(),
+            "object_bounds_min": object_bounds_min.tolist(),
+            "object_bounds_max": object_bounds_max.tolist(),
+            "head_alignment_basis_det": head_alignment["basis_det"],
+            "head_alignment_orthogonality_error": head_alignment["basis_orthogonality_error"],
+            "scene_up": np.asarray(head_alignment["scene_up"], dtype=np.float32).tolist(),
+            "scene_forward": np.asarray(head_alignment["scene_forward"], dtype=np.float32).tolist(),
+            "scene_right": np.asarray(head_alignment["scene_right"], dtype=np.float32).tolist(),
+        }
+        gaussian_visible_any = False
+        projection_failures = []
+
+        for eye_name, eye_sample, eye_pose_world in (
+            ("left", left_eye_sample, left_eye_pose_world),
+            ("right", right_eye_sample, right_eye_pose_world),
+        ):
+            if eye_sample is None or not eye_sample.pose_valid or eye_pose_world is None:
+                continue
+            startup_debug[f"{eye_name}_eye_pose_world"] = eye_pose_world.tolist()
+            intrinsic = self._eye_sample_intrinsic(eye_sample, eye_width, eye_height)
+            w2c_cv = self._camera_pose_world_to_cv_w2c(eye_pose_world)
+            table_projection = self._project_world_point_into_eye(
+                table_top_center,
+                intrinsic,
+                w2c_cv,
+                eye_width,
+                eye_height,
+            )
+            object_projection = self._project_world_point_into_eye(
+                object_center,
+                intrinsic,
+                w2c_cv,
+                eye_width,
+                eye_height,
+            )
+            startup_debug[f"{eye_name}_table_projection"] = {
+                "depth": table_projection["depth"],
+                "pixel": None
+                if table_projection["pixel"] is None
+                else table_projection["pixel"].astype(np.float32).tolist(),
+                "in_bounds": bool(table_projection["in_bounds"]),
+            }
+            startup_debug[f"{eye_name}_object_projection"] = {
+                "depth": object_projection["depth"],
+                "pixel": None
+                if object_projection["pixel"] is None
+                else object_projection["pixel"].astype(np.float32).tolist(),
+                "in_bounds": bool(object_projection["in_bounds"]),
+            }
+            if not table_projection["in_bounds"] or not object_projection["in_bounds"]:
+                projection_failures.append(eye_name)
+
+            scene_color, scene_depth = scene_renderer.render_eye(eye_pose_world, intrinsic)
+            view, _ = self._create_gs_view(
+                w2c_cv,
+                intrinsic,
+                eye_height,
+                eye_width,
+            )
+            gaussian_rgba, gaussian_depth = self._render_gaussian_rgba(
+                view,
+                gaussians,
+                render_pipe,
+                background_black,
+                background_white,
+                use_gsplat=True,
+            )
+            gaussian_depth = self._normalize_gaussian_depth(gaussian_depth)
+            composed = self._compose_immersive_eye_frame(
+                scene_color,
+                scene_depth,
+                gaussian_rgba,
+                gaussian_depth,
+            )
+            debug_renders[f"{eye_name}_scene"] = scene_color
+            debug_renders[f"{eye_name}_composed"] = composed
+            gaussian_alpha = gaussian_rgba[3]
+            gaussian_alpha_max = float(gaussian_alpha.max().item())
+            gaussian_depth_nonzero = int((gaussian_depth > 0.0).sum().item()) if gaussian_depth is not None else 0
+            startup_debug[f"{eye_name}_gaussian_alpha_max"] = gaussian_alpha_max
+            startup_debug[f"{eye_name}_gaussian_depth_nonzero"] = gaussian_depth_nonzero
+            if gaussian_alpha_max > self.IMMERSIVE_STARTUP_ALPHA_EPS or gaussian_depth_nonzero > 0:
+                gaussian_visible_any = True
+
+        if projection_failures or not gaussian_visible_any:
+            failure_dir = (
+                os.path.join(view_render_path, "startup_failure")
+                if view_render_path is not None
+                else None
+            )
+            self._save_immersive_startup_debug_images(failure_dir, debug_renders)
+            startup_debug["projection_failures"] = projection_failures
+            raise RuntimeError(
+                "Immersive startup render validation failed.\n"
+                + str(startup_debug)
+            )
+        return startup_debug
+
+    def _sources_pending_grab_start_validation(self, controller_interaction_state):
+        sources = []
+        for source in ("left", "right"):
+            interaction_state = controller_interaction_state.get(source)
+            if interaction_state is None:
+                continue
+            if int(interaction_state.get("startup_validation_frames_remaining", 0)) > 0:
+                sources.append(source)
+        return sources
+
+    def _validate_new_controller_interaction_candidate(
+        self,
+        source,
+        controller_world,
+        interaction_state,
+        remap_candidate,
+        hit_world,
+        ray_direction,
+        explicit_preview_selected=False,
+    ):
+        if interaction_state is None or remap_candidate is None:
+            return "missing_interaction_candidate", {}
+
+        candidate_tensors = (
+            remap_candidate.get("springs"),
+            remap_candidate.get("rest_lengths"),
+            remap_candidate.get("attach_center_world"),
+            remap_candidate.get("attach_anchor_world"),
+        )
+        if any(tensor is None or not self._is_finite_tensor(tensor) for tensor in candidate_tensors):
+            return "non_finite_candidate", {}
+
+        selected_object_indices = remap_candidate.get("selected_object_indices")
+        if selected_object_indices is None or int(selected_object_indices.numel()) <= 0:
+            return "empty_patch", {}
+
+        attach_anchor_world = remap_candidate["attach_anchor_world"]
+        attach_radius = float(remap_candidate.get("attach_radius", 0.0))
+        hit_distance = None
+        if hit_world is not None and not explicit_preview_selected:
+            hit_distance = float(torch.linalg.norm(attach_anchor_world - hit_world).item())
+            if hit_distance > self.LIVE_CONTROLLER_HIT_WORLD_RADIUS:
+                return (
+                    f"hit_anchor_mismatch({hit_distance:.4f}>"
+                    f"{self.LIVE_CONTROLLER_HIT_WORLD_RADIUS:.4f})",
+                    {
+                        "hit_distance": hit_distance,
+                    },
+                )
+
+        projected_anchor_distance = float(
+            interaction_state.get("projected_anchor_distance", 0.0)
+        )
+        strict_projected_anchor_distance_limit = max(
+            self.IMMERSIVE_GRAB_START_MAX_TARGET_DELTA,
+            self.IMMERSIVE_GRAB_START_TARGET_DELTA_RADIUS_SCALE * attach_radius,
+        )
+        relaxed_projected_anchor_distance_limit = max(
+            self.IMMERSIVE_GRAB_START_RELAXED_MAX_TARGET_DELTA,
+            self.IMMERSIVE_GRAB_START_RELAXED_TARGET_DELTA_RADIUS_SCALE * attach_radius,
+        )
+        projected_anchor_distance_bypassed = bool(
+            explicit_preview_selected
+            and projected_anchor_distance > strict_projected_anchor_distance_limit
+        )
+        if (
+            not explicit_preview_selected
+            and projected_anchor_distance > relaxed_projected_anchor_distance_limit
+        ):
+            return (
+                "projected_anchor_distance_exceeded("
+                f"{projected_anchor_distance:.4f}>"
+                f"{relaxed_projected_anchor_distance_limit:.4f})",
+                {
+                    "projected_anchor_distance": projected_anchor_distance,
+                    "projected_anchor_distance_limit": relaxed_projected_anchor_distance_limit,
+                    "projected_anchor_distance_bypassed": False,
+                },
+            )
+
+        if hit_world is not None and ray_direction is not None and not explicit_preview_selected:
+            direction = ray_direction / ray_direction.norm().clamp_min(1e-6)
+            anchor_depth = float(torch.dot(attach_anchor_world - hit_world, direction).item())
+            if anchor_depth > self.LIVE_CONTROLLER_MULTI_POINTS_BACK_DEPTH_THRESHOLD:
+                return (
+                    f"back_facing_patch({anchor_depth:.4f}>"
+                    f"{self.LIVE_CONTROLLER_MULTI_POINTS_BACK_DEPTH_THRESHOLD:.4f})",
+                    {
+                        "anchor_depth": anchor_depth,
+                    },
+                )
+
+        return None, {
+            "projected_anchor_distance": projected_anchor_distance,
+            "projected_anchor_distance_limit": relaxed_projected_anchor_distance_limit,
+            "projected_anchor_distance_bypassed": projected_anchor_distance_bypassed,
+            "strict_projected_anchor_distance_limit": strict_projected_anchor_distance_limit,
+            "explicit_preview_selected": bool(explicit_preview_selected),
+            "hit_distance": hit_distance,
+        }
+
+    def _log_controller_interaction_start_attempt(
+        self,
+        source,
+        interaction_state,
+        remap_candidate=None,
+        reason=None,
+    ):
+        preview_anchor_visible = (
+            None
+            if interaction_state is None
+            else int(bool(interaction_state.get("preview_anchor_visible", False)))
+        )
+        preview_anchor_name = (
+            None
+            if interaction_state is None
+            else interaction_state.get("preview_anchor_name")
+        )
+        preview_anchor_resolved = (
+            None
+            if interaction_state is None
+            else int(bool(interaction_state.get("preview_anchor_resolved", False)))
+        )
+        grab_start_mode = (
+            None
+            if interaction_state is None
+            else interaction_state.get("grab_start_mode")
+        )
+        anchor_name = (
+            remap_candidate.get("anchor_name")
+            if remap_candidate is not None
+            else preview_anchor_name
+        )
+        hit_distance = (
+            None
+            if remap_candidate is None
+            else remap_candidate.get("hit_to_anchor_distance")
+        )
+        projected_anchor_distance = (
+            None
+            if interaction_state is None
+            else interaction_state.get("projected_anchor_distance")
+        )
+        target_delta = (
+            None
+            if interaction_state is None
+            else interaction_state.get("target_delta")
+        )
+        hit_present = (
+            None
+            if interaction_state is None
+            else int(bool(interaction_state.get("hit_present", False)))
+        )
+        start_reference = (
+            None
+            if interaction_state is None
+            else interaction_state.get("start_reference")
+        )
+        print(
+            "[live_openxr_controller] "
+            f"{source} interaction_start=1 "
+            f"mode={grab_start_mode} "
+            f"preview_visible={preview_anchor_visible} "
+            f"preview_anchor={preview_anchor_name} "
+            f"preview_resolved={preview_anchor_resolved} "
+            f"hit_present={hit_present} "
+            f"start_reference={start_reference} "
+            f"anchor={anchor_name} "
+            f"hit_to_anchor={None if hit_distance is None else round(float(hit_distance), 4)} "
+            f"projected_anchor={None if projected_anchor_distance is None else round(float(projected_anchor_distance), 4)} "
+            f"target_delta={None if target_delta is None else round(float(target_delta), 4)} "
+            f"reason={reason}",
+            flush=True,
+        )
+
+    def _log_controller_interaction_rejected(
+        self,
+        source,
+        remap_candidate,
+        interaction_state,
+        reason,
+        action="rejected",
+    ):
+        multi_points_debug = None if remap_candidate is None else remap_candidate.get("multi_points_debug")
+        seed_index = None
+        patch_size = None
+        if multi_points_debug is not None and not multi_points_debug.get("fallback_used", False):
+            seed_index = multi_points_debug.get("seed_index")
+            patch_size = multi_points_debug.get("patch_size")
+        hit_distance = None
+        if remap_candidate is not None:
+            hit_distance = remap_candidate.get("hit_to_anchor_distance")
+        target_delta = None if interaction_state is None else interaction_state.get("target_delta")
+        projected_anchor_distance = (
+            None
+            if interaction_state is None
+            else interaction_state.get("projected_anchor_distance")
+        )
+        anchor_name = None if remap_candidate is None else remap_candidate.get("anchor_name")
+        if anchor_name is None and interaction_state is not None:
+            anchor_name = interaction_state.get("preview_anchor_name")
+        grab_start_mode = None if interaction_state is None else interaction_state.get("grab_start_mode")
+        start_reference = None if interaction_state is None else interaction_state.get("start_reference")
+        print(
+            "[live_openxr_controller] "
+            f"{source} interaction_{action}=1 "
+            f"mode={grab_start_mode} "
+            f"start_reference={start_reference} "
+            f"anchor={anchor_name} "
+            f"seed={seed_index} patch={patch_size} "
+            f"hit_to_anchor={None if hit_distance is None else round(float(hit_distance), 4)} "
+            f"projected_anchor={None if projected_anchor_distance is None else round(float(projected_anchor_distance), 4)} "
+            f"target_delta={None if target_delta is None else round(float(target_delta), 4)} "
+            f"reason={reason}",
+            flush=True,
+        )
+
+    def _validate_immersive_grab_start_frame(
+        self,
+        x,
+        current_pos,
+        current_rot,
+        last_valid_object_center,
+        last_immersive_sample,
+        last_left_eye_pose_world,
+        last_right_eye_pose_world,
+        eye_width,
+        eye_height,
+        left_gaussian_rgba,
+        left_gaussian_depth,
+        right_gaussian_rgba,
+        right_gaussian_depth,
+    ):
+        if not self._is_finite_tensor(x):
+            return "non_finite_sim_state", {}
+        if not self._is_finite_tensor(current_pos):
+            return "non_finite_gaussian_positions", {}
+        if not self._is_finite_tensor(current_rot):
+            return "non_finite_gaussian_rotations", {}
+        return None, {}
+
+    def _rollback_immersive_grab_start(
+        self,
+        sources,
+        controller_interaction_state,
+        controller_attachment_metadata,
+        last_valid_sim_state,
+        last_valid_target,
+        gaussians,
+        last_valid_gaussian_state,
+    ):
+        for source in sources:
+            self._clear_live_controller_interaction(
+                source,
+                controller_interaction_state,
+                controller_attachment_metadata,
+                reason="rollback",
+            )
+        self._restore_sim_state(last_valid_sim_state)
+        self._restore_gaussian_runtime_state(gaussians, last_valid_gaussian_state)
+        restored_target = last_valid_target.clone()
+        self.simulator.set_controller_interactive(restored_target, restored_target)
+        return restored_target
+
+    def _compute_scene_spawn_shift(self, object_points, table_top_center_world):
+        support_center = self._object_support_patch_center(object_points)
+        target = torch.as_tensor(
+            table_top_center_world,
+            dtype=torch.float32,
+            device=object_points.device,
+        )
+        return target - support_center
+
+    def _copy_object_init_vertices_to_simulator(self, object_vertices):
+        self.simulator.wp_init_vertices = wp.from_torch(
+            object_vertices.contiguous(), dtype=wp.vec3, requires_grad=False
+        )
+
+    def _apply_scene_spawn_offset_runtime(
+        self,
+        spawn_shift,
+        gaussians,
+        controller_runtime_base_target=None,
+        recorded_base_target=None,
+        recorded_anchor_centers=None,
+        controller_source_anchor_centers=None,
+    ):
+        spawn_shift = spawn_shift.to(device=cfg.device, dtype=torch.float32)
+        self.batch_init_vertices = self.batch_init_vertices + spawn_shift
+        self.batch_controller_points = self.batch_controller_points + spawn_shift
+        if controller_runtime_base_target is not None:
+            controller_runtime_base_target += spawn_shift
+        if recorded_base_target is not None:
+            recorded_base_target += spawn_shift
+        if recorded_anchor_centers is not None:
+            for idx in range(len(recorded_anchor_centers)):
+                recorded_anchor_centers[idx] = recorded_anchor_centers[idx] + spawn_shift
+        if controller_source_anchor_centers is not None:
+            for idx in range(len(controller_source_anchor_centers)):
+                controller_source_anchor_centers[idx] = (
+                    controller_source_anchor_centers[idx] + spawn_shift
+                )
+        gaussians._xyz = gaussians._xyz + spawn_shift
+        object_vertices = self.batch_init_vertices[: self.simulator.object_massnode_total]
+        self._copy_object_init_vertices_to_simulator(object_vertices)
+        control_points = (
+            controller_runtime_base_target
+            if controller_runtime_base_target is not None
+            else self.batch_controller_points[0]
+        )
+        control_points = control_points.contiguous()
+        self.simulator.wp_original_control_point = wp.from_torch(
+            control_points.clone(),
+            dtype=wp.vec3,
+            requires_grad=False,
+        )
+        self.simulator.wp_target_control_point = wp.from_torch(
+            control_points.clone(),
+            dtype=wp.vec3,
+            requires_grad=False,
+        )
+        self.simulator.set_init_state(self.simulator.wp_init_vertices, self.simulator.wp_init_velocities)
+
+    def _capture_sim_state(self):
+        return {
+            "x": wp.to_torch(self.simulator.wp_states[0].wp_x, requires_grad=False).clone(),
+            "v": wp.to_torch(self.simulator.wp_states[0].wp_v, requires_grad=False).clone(),
+        }
+
+    def _restore_sim_state(self, state):
+        wp_x = wp.from_torch(state["x"].contiguous(), dtype=wp.vec3, requires_grad=False)
+        wp_v = wp.from_torch(state["v"].contiguous(), dtype=wp.vec3, requires_grad=False)
+        self.simulator.set_init_state(wp_x, wp_v)
+
+    def _set_scene_collider_boxes(self, layout):
+        boxes = torch.tensor(
+            [
+                [layout.table_box.mins, layout.table_box.maxs],
+                [layout.floor_box.mins, layout.floor_box.maxs],
+            ],
+            dtype=torch.float32,
+            device=cfg.device,
+        )
+        self.simulator.set_static_collision_boxes(boxes)
+
+    def _settle_scene_rest_state(self, rest_target):
+        self.simulator.set_controller_interactive(rest_target, rest_target)
+        last_state = None
+        for _ in range(self.IMMERSIVE_SCENE_REST_SETTLE_STEPS):
+            if self.simulator.object_collision_flag:
+                self.simulator.update_collision_graph()
+            wp.capture_launch(self.simulator.forward_graph)
+            wp.synchronize()
+            x = wp.to_torch(self.simulator.wp_states[-1].wp_x, requires_grad=False).clone()
+            v = wp.to_torch(self.simulator.wp_states[-1].wp_v, requires_grad=False).clone()
+            last_state = {"x": x, "v": v}
+            self._restore_sim_state(last_state)
+            max_speed = float(torch.linalg.norm(v, dim=1).max().item())
+            if max_speed <= self.IMMERSIVE_SCENE_REST_VELOCITY_EPS:
+                break
+        if last_state is None:
+            last_state = self._capture_sim_state()
+        return last_state
+
+    def _snap_to_scene_rest_if_idle(self, scene_rest_state, controller_interaction_state):
+        if scene_rest_state is None:
+            return False
+        if controller_interaction_state["left"] is not None or controller_interaction_state["right"] is not None:
+            return False
+        current_x = wp.to_torch(self.simulator.wp_states[0].wp_x, requires_grad=False)
+        current_v = wp.to_torch(self.simulator.wp_states[0].wp_v, requires_grad=False)
+        max_speed = float(torch.linalg.norm(current_v, dim=1).max().item())
+        if max_speed > self.IMMERSIVE_SCENE_REST_VELOCITY_EPS:
+            return False
+        mean_position_delta = float(
+            torch.linalg.norm(current_x - scene_rest_state["x"], dim=1).mean().item()
+        )
+        if mean_position_delta > self.IMMERSIVE_SCENE_REST_POSITION_EPS:
+            return False
+        self._restore_sim_state(scene_rest_state)
+        return True
 
     def _ray_aabb_intersection(self, origin, direction, bounds_min, bounds_max):
         eps = 1e-6
@@ -2639,8 +4433,9 @@ class InvPhyTrainerWarp:
         if controller_world is None:
             return None
 
-        origin_world = controller_world["position"]
-        direction_world = controller_world["direction"]
+        origin_world, direction_world = self._controller_world_ray_pose(controller_world)
+        if origin_world is None or direction_world is None:
+            return None
         hit_world = self._ray_object_intersection(
             origin_world,
             direction_world,
@@ -2685,7 +4480,10 @@ class InvPhyTrainerWarp:
                 else self.LIVE_CONTROLLER_RIGHT_COLOR
             ),
             "select_available": controller_world["select_available"],
-            "select_pressed": controller_world["select_pressed"],
+            "select_pressed": controller_world.get(
+                "select_hold_active",
+                controller_world["select_pressed"],
+            ),
             "select_value": controller_world["select_value"],
             "select_source": controller_world["select_source"],
             "anchor_cycle_available": controller_world["anchor_cycle_available"],
@@ -2898,29 +4696,71 @@ class InvPhyTrainerWarp:
         controller_world,
         target_anchor_world,
         controller_source_anchor_centers,
+        translation_only=False,
     ):
         source_index = self._controller_source_index(source)
-        origin_world = controller_world["position"]
-        direction_world = controller_world["direction"]
-        ray_distance = torch.dot(
-            target_anchor_world - origin_world, direction_world
-        ).clamp_min(0.0)
-        projected_anchor_world = origin_world + direction_world * ray_distance
+        controller_position_world = controller_world["position"]
+        ray_origin_world, ray_direction_world = self._controller_world_ray_pose(
+            controller_world
+        )
+        if ray_origin_world is not None and ray_direction_world is not None:
+            ray_distance = torch.dot(
+                target_anchor_world - ray_origin_world,
+                ray_direction_world,
+            ).clamp_min(0.0)
+            projected_anchor_world = ray_origin_world + ray_direction_world * ray_distance
+            anchor_offset = target_anchor_world - projected_anchor_world
+            ray_distance_value = float(ray_distance.item())
+            projected_anchor_distance = float(
+                torch.linalg.norm(target_anchor_world - projected_anchor_world).item()
+            )
+        else:
+            ray_distance_value = 0.0
+            projected_anchor_world = controller_position_world
+            anchor_offset = target_anchor_world - controller_position_world
+            projected_anchor_distance = 0.0
         target_delta = torch.linalg.norm(
             target_anchor_world - controller_source_anchor_centers[source_index]
         )
-        return {
+        interaction_state = {
             "source": source,
-            "ray_distance": float(ray_distance.item()),
-            "anchor_offset": target_anchor_world - projected_anchor_world,
+            "ray_distance": ray_distance_value,
+            "anchor_offset": anchor_offset,
             "target_delta": float(target_delta.item()),
+            "projected_anchor_distance": projected_anchor_distance,
             "just_started": True,
+            "start_controller_position_world": controller_position_world.clone(),
+            "start_anchor_world": target_anchor_world.clone(),
         }
+        if translation_only:
+            interaction_state.update(
+                {
+                    "translation_only": True,
+                    "grab_controller_position_world": controller_position_world.clone(),
+                    "grab_attach_anchor_world": target_anchor_world.clone(),
+                }
+            )
+        return interaction_state
 
     def _controller_interaction_anchor(self, controller_world, interaction_state):
+        if interaction_state.get("translation_only", False):
+            grab_controller_position_world = interaction_state.get(
+                "grab_controller_position_world"
+            )
+            grab_attach_anchor_world = interaction_state.get("grab_attach_anchor_world")
+            if grab_controller_position_world is None or grab_attach_anchor_world is None:
+                return None
+            return grab_attach_anchor_world + (
+                controller_world["position"] - grab_controller_position_world
+            )
+        ray_origin_world, ray_direction_world = self._controller_world_ray_pose(
+            controller_world
+        )
+        if ray_origin_world is None or ray_direction_world is None:
+            return None
         return (
-            controller_world["position"]
-            + controller_world["direction"] * float(interaction_state["ray_distance"])
+            ray_origin_world
+            + ray_direction_world * float(interaction_state["ray_distance"])
             + interaction_state["anchor_offset"]
         )
 
@@ -2937,6 +4777,26 @@ class InvPhyTrainerWarp:
             return attach_center_world
         return attach_center_world + (current_anchor - attach_anchor_world)
 
+    def _clear_live_controller_interaction(
+        self,
+        source,
+        controller_interaction_state,
+        controller_attachment_metadata,
+        reason=None,
+    ):
+        interaction_state = controller_interaction_state.get(source)
+        if interaction_state is None:
+            return None
+        if interaction_state.get("spring_remap_applied", False):
+            self._restore_controller_attachment_remap(
+                source,
+                controller_attachment_metadata,
+            )
+        if reason is not None:
+            self._log_controller_interaction_end(source, interaction_state, reason)
+        controller_interaction_state[source] = None
+        return interaction_state
+
     def _resolve_live_controller_interaction_anchors(
         self,
         left_controller_world,
@@ -2945,9 +4805,12 @@ class InvPhyTrainerWarp:
         controller_interaction_state,
         controller_source_anchor_centers,
         controller_attachment_metadata,
+        controller_anchor_templates,
         controller_predefined_anchor_states,
         controller_anchor_preview_state,
         object_points,
+        allow_implicit_fallback_start=True,
+        preview_selected_translation_only=False,
     ):
         anchors = {"left": None, "right": None}
         controller_world_by_source = {
@@ -2955,84 +4818,207 @@ class InvPhyTrainerWarp:
             "right": right_controller_world,
         }
         for source, controller_world in controller_world_by_source.items():
-            select_pressed = bool(
-                controller_world is not None
-                and controller_world["select_available"]
-                and controller_world["select_pressed"]
-            )
-            if controller_world is None or not select_pressed:
-                if (
-                    controller_interaction_state[source] is not None
-                    and controller_interaction_state[source].get("spring_remap_applied", False)
-                ):
-                    self._restore_controller_attachment_remap(
-                        source, controller_attachment_metadata
+            interaction_state = controller_interaction_state[source]
+            if controller_world is None:
+                if interaction_state is not None:
+                    self._clear_live_controller_interaction(
+                        source,
+                        controller_interaction_state,
+                        controller_attachment_metadata,
+                        reason="controller_invalid",
                     )
-                controller_interaction_state[source] = None
                 continue
 
-            interaction_state = controller_interaction_state[source]
-            if interaction_state is None and select_pressed:
+            select_start_edge = bool(controller_world.get("select_start_edge", False))
+            select_hold_active = bool(controller_world.get("select_hold_active", False))
+            select_release_frames = int(
+                controller_world.get("select_release_frames", 0)
+            )
+            if (
+                interaction_state is not None
+                and (not select_hold_active)
+                and select_release_frames >= self.LIVE_CONTROLLER_SELECT_RELEASE_FRAMES
+            ):
+                self._clear_live_controller_interaction(
+                    source,
+                    controller_interaction_state,
+                    controller_attachment_metadata,
+                    reason="released",
+                )
+                interaction_state = None
+            if interaction_state is None and select_start_edge:
                 overlay = controller_overlay_by_source.get(source)
+                preview_anchor_visible = bool(
+                    controller_anchor_preview_state[source]["visible"]
+                )
+                preview_anchor_name = controller_anchor_preview_state[source].get(
+                    "selected_anchor_name"
+                )
                 selected_preview_anchor = None
-                if (
-                    controller_predefined_anchor_states
-                    and controller_anchor_preview_state[source]["visible"]
-                ):
+                if controller_predefined_anchor_states and preview_anchor_visible:
                     selected_preview_anchor = self._anchor_state_by_name(
                         controller_predefined_anchor_states,
-                        controller_anchor_preview_state[source].get(
-                            "selected_anchor_name"
-                        ),
+                        preview_anchor_name,
                     )
+                preview_anchor_resolved = selected_preview_anchor is not None
                 nearest_anchor = None
                 hit_world = None if overlay is None else overlay.get("hit_world")
-                if hit_world is not None and controller_predefined_anchor_states:
-                    nearest_anchor = self._select_predefined_interaction_anchor(
+                ray_origin_world, ray_direction_world = self._controller_world_ray_pose(
+                    controller_world
+                )
+                grab_start_mode = None
+                if preview_anchor_visible:
+                    grab_start_mode = "preview_selected_template"
+                    if not preview_anchor_resolved:
+                        preview_interaction_state = {
+                            "grab_start_mode": grab_start_mode,
+                            "preview_anchor_visible": preview_anchor_visible,
+                            "preview_anchor_name": preview_anchor_name,
+                            "preview_anchor_resolved": False,
+                            "hit_present": False,
+                            "start_reference": None,
+                        }
+                        self._log_controller_interaction_start_attempt(
+                            source,
+                            preview_interaction_state,
+                            reason=f"selected_preview_anchor_unresolved(name={preview_anchor_name})",
+                        )
+                        self._log_controller_interaction_rejected(
+                            source,
+                            None,
+                            preview_interaction_state,
+                            f"selected_preview_anchor_unresolved(name={preview_anchor_name})",
+                        )
+                        continue
+                    snapped_anchor = selected_preview_anchor
+                    remap_candidate = self._instantiate_predefined_controller_anchor_template(
+                        source,
+                        snapped_anchor,
+                        object_points,
+                        controller_anchor_templates,
+                        controller_attachment_metadata,
+                    )
+                    if remap_candidate is None:
+                        preview_interaction_state = {
+                            "grab_start_mode": grab_start_mode,
+                            "preview_anchor_visible": preview_anchor_visible,
+                            "preview_anchor_name": preview_anchor_name,
+                            "preview_anchor_resolved": True,
+                            "hit_present": bool(hit_world is not None),
+                            "start_reference": (
+                                "ray_hit" if hit_world is not None else "anchor_center"
+                            ),
+                        }
+                        reason = (
+                            f"selected_preview_anchor_template_missing(name={preview_anchor_name})"
+                        )
+                        self._log_controller_interaction_start_attempt(
+                            source,
+                            preview_interaction_state,
+                            reason=reason,
+                        )
+                        self._log_controller_interaction_rejected(
+                            source,
+                            None,
+                            preview_interaction_state,
+                            reason,
+                        )
+                        continue
+                else:
+                    if not allow_implicit_fallback_start:
+                        continue
+                    if hit_world is not None and controller_predefined_anchor_states:
+                        nearest_anchor = self._select_predefined_interaction_anchor(
+                            hit_world,
+                            controller_predefined_anchor_states,
+                            require_selection_radius=False,
+                        )
+                    if (
+                        nearest_anchor is None
+                        and ray_origin_world is not None
+                        and ray_direction_world is not None
+                        and controller_predefined_anchor_states
+                    ):
+                        nearest_anchor = self._select_predefined_interaction_anchor_for_ray(
+                            ray_origin_world,
+                            ray_direction_world,
+                            controller_predefined_anchor_states,
+                        )
+                    snapped_anchor = nearest_anchor
+                    grab_start_mode = "implicit_fallback"
+                    if snapped_anchor is None:
+                        continue
+                    remap_candidate = self._build_multi_points_controller_attachment_candidate(
+                        source,
+                        snapped_anchor,
+                        object_points,
+                        controller_attachment_metadata,
                         hit_world,
-                        controller_predefined_anchor_states,
-                        require_selection_radius=False,
+                        ray_direction_world,
                     )
-                if (
-                    nearest_anchor is None
-                    and controller_world is not None
-                    and controller_predefined_anchor_states
-                ):
-                    nearest_anchor = self._select_predefined_interaction_anchor_for_ray(
-                        controller_world["position"],
-                        controller_world["direction"],
-                        controller_predefined_anchor_states,
-                    )
-                snapped_anchor = (
-                    selected_preview_anchor
-                    if selected_preview_anchor is not None
-                    else nearest_anchor
-                )
-                if snapped_anchor is None:
-                    continue
-                remap_candidate = self._build_multi_points_controller_attachment_candidate(
-                    source,
-                    snapped_anchor,
-                    object_points,
-                    controller_attachment_metadata,
-                    hit_world,
-                    None if controller_world is None else controller_world["direction"],
-                )
                 if remap_candidate is None:
                     continue
-                self._apply_controller_attachment_remap(
-                    source, remap_candidate, controller_attachment_metadata
-                )
-                target_anchor_world = remap_candidate["attach_center_world"].clone()
-                controller_anchor_preview_state[source]["visible"] = True
-                controller_anchor_preview_state[source]["selected_anchor_name"] = (
-                    remap_candidate["anchor_name"]
-                )
                 interaction_state = self._start_live_controller_interaction(
                     source,
                     controller_world,
-                    target_anchor_world,
+                    remap_candidate["attach_anchor_world"].clone(),
                     controller_source_anchor_centers,
+                    translation_only=(
+                        bool(selected_preview_anchor is not None)
+                        and preview_selected_translation_only
+                    ),
+                )
+                interaction_state.update(
+                    {
+                        "grab_start_mode": grab_start_mode,
+                        "preview_anchor_visible": preview_anchor_visible,
+                        "preview_anchor_name": preview_anchor_name,
+                        "preview_anchor_resolved": preview_anchor_resolved,
+                        "hit_present": bool(hit_world is not None),
+                        "start_reference": (
+                            "ray_hit" if hit_world is not None else "anchor_center"
+                        ),
+                    }
+                )
+                self._log_controller_interaction_start_attempt(
+                    source,
+                    interaction_state,
+                    remap_candidate=remap_candidate,
+                    reason="candidate_built",
+                )
+                rejection_reason, validation_debug = self._validate_new_controller_interaction_candidate(
+                    source,
+                    controller_world,
+                    interaction_state,
+                    remap_candidate,
+                    hit_world,
+                    ray_direction_world,
+                    explicit_preview_selected=selected_preview_anchor is not None,
+                )
+                if rejection_reason is not None:
+                    self._log_controller_interaction_rejected(
+                        source,
+                        remap_candidate,
+                        interaction_state,
+                        rejection_reason,
+                    )
+                    continue
+                if validation_debug.get("projected_anchor_distance_bypassed", False):
+                    print(
+                        "[live_openxr_controller] "
+                        f"{source} interaction_projected_anchor_bypass=1 "
+                        f"anchor={remap_candidate['anchor_name']} "
+                        f"projected_anchor={validation_debug['projected_anchor_distance']:.4f} "
+                        f"strict_limit={validation_debug['strict_projected_anchor_distance_limit']:.4f} "
+                        f"hit_to_anchor={validation_debug.get('hit_distance')}",
+                        flush=True,
+                    )
+                self._apply_controller_attachment_remap(
+                    source, remap_candidate, controller_attachment_metadata
+                )
+                controller_anchor_preview_state[source]["visible"] = True
+                controller_anchor_preview_state[source]["selected_anchor_name"] = (
+                    remap_candidate["anchor_name"]
                 )
                 interaction_state.update(
                     {
@@ -3047,13 +5033,31 @@ class InvPhyTrainerWarp:
                         "selected_object_indices": remap_candidate["selected_object_indices"],
                         "target_point_indices": remap_candidate.get("target_point_indices"),
                         "multi_points_debug": remap_candidate.get("multi_points_debug"),
+                        "hit_to_anchor_distance": remap_candidate.get("hit_to_anchor_distance"),
+                        "explicit_preview_selected": bool(selected_preview_anchor is not None),
+                        "grab_start_mode": grab_start_mode,
+                        "preview_anchor_visible": preview_anchor_visible,
+                        "preview_anchor_name": preview_anchor_name,
+                        "preview_anchor_resolved": preview_anchor_resolved,
+                        "startup_validation_delay_frames": self.IMMERSIVE_GRAB_START_VALIDATION_DELAY_FRAMES,
+                        "startup_validation_frames_remaining": self.IMMERSIVE_GRAB_START_VALIDATION_FRAMES,
                     }
+                )
+                self._log_controller_interaction_rejected(
+                    source,
+                    remap_candidate,
+                    interaction_state,
+                    "grab_start_ok",
+                    action="accepted",
                 )
                 controller_interaction_state[source] = interaction_state
 
-            anchors[source] = self._controller_interaction_anchor(
-                controller_world, controller_interaction_state[source]
-            )
+            interaction_state = controller_interaction_state[source]
+            if interaction_state is not None:
+                anchors[source] = self._controller_interaction_anchor(
+                    controller_world,
+                    interaction_state,
+                )
 
         return anchors["left"], anchors["right"]
 
@@ -3123,6 +5127,22 @@ class InvPhyTrainerWarp:
                 radius=self.LIVE_CONTROLLER_ORIGIN_RADIUS,
                 blend=0.85,
             )
+
+            if attach_candidate and candidate_pixel is not None:
+                self._blend_square_marker(
+                    frame,
+                    candidate_pixel,
+                    self.LIVE_CONTROLLER_ATTACH_CANDIDATE_COLOR,
+                    radius=self.LIVE_CONTROLLER_CANDIDATE_SQUARE_RADIUS,
+                    blend=0.86,
+                )
+                self._blend_marker(
+                    frame,
+                    candidate_pixel,
+                    self.LIVE_CONTROLLER_SELECT_COLOR,
+                    radius=1,
+                    blend=0.98,
+                )
 
             for preview_entry in anchor_preview_entries:
                 preview_pixel = preview_entry["pixel"]
@@ -3196,7 +5216,13 @@ class InvPhyTrainerWarp:
                         blend=0.98,
                     )
 
-    def _log_controller_select_transition(self, source, controller_sample, state_cache):
+    def _log_controller_select_transition(
+        self,
+        source,
+        controller_sample,
+        state_cache,
+        sample_id=None,
+    ):
         if controller_sample is None:
             return
 
@@ -3211,9 +5237,42 @@ class InvPhyTrainerWarp:
 
         print(
             "[live_openxr_controller] "
+            + ("" if sample_id is None else f"sample={int(sample_id)} ")
+            +
             f"{source} select available={int(state[0])} "
             f"pressed={int(state[1])} value={state[2]:.3f} source={state[3]}"
             ,
+            flush=True,
+        )
+        state_cache[source] = state
+
+    def _log_controller_select_hold_transition(
+        self,
+        source,
+        select_hold_runtime,
+        state_cache,
+        sample_id=None,
+    ):
+        if select_hold_runtime is None:
+            return
+
+        state = (
+            bool(select_hold_runtime["start_edge"]),
+            bool(select_hold_runtime["hold_active"]),
+            bool(select_hold_runtime["release_ready"]),
+            int(select_hold_runtime["release_frames"]),
+            round(float(select_hold_runtime["value"]), 3),
+        )
+        if state_cache.get(source) == state:
+            return
+
+        print(
+            "[live_openxr_controller] "
+            + ("" if sample_id is None else f"sample={int(sample_id)} ")
+            +
+            f"{source} select_hold start_edge={int(state[0])} "
+            f"hold_active={int(state[1])} release_ready={int(state[2])} "
+            f"release_frames={state[3]} value={state[4]:.3f}",
             flush=True,
         )
         state_cache[source] = state
@@ -3373,6 +5432,202 @@ class InvPhyTrainerWarp:
             )
         state_cache[source] = state
 
+    def _log_controller_interaction_end(self, source, interaction_state, reason):
+        if interaction_state is None:
+            return
+        print(
+            "[live_openxr_controller] "
+            f"{source} interaction_end=1 "
+            f"anchor={interaction_state.get('anchor_name')} "
+            f"reason={reason}",
+            flush=True,
+        )
+
+    def _controller_target_point_indices_for_state(
+        self,
+        source,
+        controller_source_masks,
+        interaction_state=None,
+    ):
+        if interaction_state is not None:
+            target_point_indices = interaction_state.get("target_point_indices")
+            if target_point_indices is not None:
+                return target_point_indices.to(device=cfg.device, dtype=torch.long)
+        source_index = self._controller_source_index(source)
+        return torch.nonzero(
+            controller_source_masks[source_index],
+            as_tuple=False,
+        ).squeeze(1)
+
+    def _controller_spring_subset_stats(self, source, controller_attachment_metadata):
+        source_meta = controller_attachment_metadata.get(source)
+        if source_meta is None:
+            return {
+                "spring_active": False,
+                "spring_mean": 0.0,
+                "spring_max": 0.0,
+            }
+        spring_indices = source_meta.get("spring_indices")
+        if (
+            spring_indices is None
+            or not hasattr(self.simulator, "torch_spring_Y_clamped")
+            or int(spring_indices.numel()) <= 0
+        ):
+            return {
+                "spring_active": False,
+                "spring_mean": 0.0,
+                "spring_max": 0.0,
+            }
+        spring_values = self.simulator.torch_spring_Y_clamped[
+            spring_indices.to(
+                device=self.simulator.torch_spring_Y_clamped.device,
+                dtype=torch.long,
+            )
+        ]
+        if int(spring_values.numel()) <= 0:
+            return {
+                "spring_active": False,
+                "spring_mean": 0.0,
+                "spring_max": 0.0,
+            }
+        spring_mean = float(spring_values.mean().item())
+        spring_max = float(spring_values.max().item())
+        return {
+            "spring_active": bool((spring_values > 1e-6).any().item()),
+            "spring_mean": spring_mean,
+            "spring_max": spring_max,
+        }
+
+    def _log_controller_motion_parity(
+        self,
+        runtime_label,
+        frame_index,
+        source,
+        controller_world,
+        current_anchor,
+        next_target,
+        controller_runtime_base_target,
+        controller_source_masks,
+        controller_attachment_metadata,
+        interaction_state,
+        state_cache,
+    ):
+        if (
+            interaction_state is None
+            or controller_world is None
+            or current_anchor is None
+            or next_target is None
+            or controller_runtime_base_target is None
+        ):
+            state_cache[source] = None
+            return
+
+        target_point_indices = self._controller_target_point_indices_for_state(
+            source,
+            controller_source_masks,
+            interaction_state,
+        )
+        if int(target_point_indices.numel()) <= 0:
+            state_cache[source] = None
+            return
+
+        current_controller_position = controller_world["position"]
+        current_target_points = next_target[target_point_indices]
+        rest_target_points = controller_runtime_base_target[target_point_indices]
+        start_controller_position = interaction_state.get(
+            "start_controller_position_world",
+            current_controller_position,
+        )
+        start_anchor_world = interaction_state.get("start_anchor_world", current_anchor)
+
+        controller_delta = float(
+            torch.linalg.norm(current_controller_position - start_controller_position).item()
+        )
+        anchor_delta = float(torch.linalg.norm(current_anchor - start_anchor_world).item())
+        target_rest_delta = float(
+            torch.linalg.norm(
+                current_target_points - rest_target_points,
+                dim=1,
+            ).mean().item()
+        )
+
+        spring_stats = self._controller_spring_subset_stats(
+            source,
+            controller_attachment_metadata,
+        )
+        sample_id = controller_world.get("sample_id")
+
+        previous_cache = state_cache.get(source) or {}
+        previous_controller_position = previous_cache.get("controller_position")
+        previous_target_points = previous_cache.get("target_points")
+        controller_frame_delta = 0.0
+        if previous_controller_position is not None:
+            controller_frame_delta = float(
+                torch.linalg.norm(
+                    current_controller_position - previous_controller_position
+                ).item()
+            )
+        target_frame_delta = 0.0
+        if previous_target_points is not None:
+            target_frame_delta = float(
+                torch.linalg.norm(
+                    current_target_points - previous_target_points,
+                    dim=1,
+                ).mean().item()
+            )
+
+        parity_failure = (
+            controller_frame_delta > self.LIVE_CONTROLLER_ACTIVE_MOTION_EPS
+            and target_frame_delta <= self.LIVE_CONTROLLER_ACTIVE_TARGET_EPS
+        )
+        state = (
+            interaction_state.get("anchor_name"),
+            round(controller_delta, 4),
+            round(anchor_delta, 4),
+            round(target_frame_delta, 5),
+            round(target_rest_delta, 4),
+            int(spring_stats["spring_active"]),
+            round(spring_stats["spring_max"], 4),
+        )
+        last_state = previous_cache.get("state")
+        last_frame = previous_cache.get("frame_index")
+        should_log = (
+            last_state != state
+            or parity_failure
+            or last_frame is None
+            or (frame_index - last_frame) >= self.LIVE_CONTROLLER_ACTIVE_DEBUG_LOG_INTERVAL
+        )
+        if should_log:
+            log_prefix = (
+                "[live_openxr_controller] "
+                f"{runtime_label} motion_parity "
+            )
+            if parity_failure:
+                log_prefix += "parity_failure=1 "
+            print(
+                log_prefix
+                + f"frame={frame_index} "
+                + ("" if sample_id is None else f"sample={int(sample_id)} ")
+                + f"source={source} "
+                f"anchor={interaction_state.get('anchor_name')} "
+                f"controller_delta={controller_delta:.4f} "
+                f"controller_frame_delta={controller_frame_delta:.4f} "
+                f"anchor_delta={anchor_delta:.4f} "
+                f"target_frame_delta={target_frame_delta:.5f} "
+                f"target_rest_delta={target_rest_delta:.4f} "
+                f"spring_active={int(spring_stats['spring_active'])} "
+                f"spring_mean={spring_stats['spring_mean']:.4f} "
+                f"spring_max={spring_stats['spring_max']:.4f}",
+                flush=True,
+            )
+
+        state_cache[source] = {
+            "state": state,
+            "frame_index": frame_index,
+            "controller_position": current_controller_position.detach().clone(),
+            "target_points": current_target_points.detach().clone(),
+        }
+
     def _render_gaussian_rgba(
         self,
         view,
@@ -3380,13 +5635,14 @@ class InvPhyTrainerWarp:
         render_pipe,
         background_black,
         background_white,
+        use_gsplat=False,
     ):
         black_results = render_gaussian(
             view,
             gaussians,
             render_pipe,
             background_black,
-            use_gsplat=False,
+            use_gsplat=use_gsplat,
         )
         rendering_black = black_results["render"].clamp(0.0, 1.0)
 
@@ -3398,7 +5654,7 @@ class InvPhyTrainerWarp:
             gaussians,
             render_pipe,
             background_white,
-            use_gsplat=False,
+            use_gsplat=use_gsplat,
         )
         rendering_white = white_results["render"].clamp(0.0, 1.0)
 
@@ -3413,6 +5669,223 @@ class InvPhyTrainerWarp:
         ).clamp(0.0, 1.0)
         rgba = torch.cat([rgb, alpha], dim=0)
         return rgba, black_results.get("depth")
+
+    def _render_immersive_eye_frame(
+        self,
+        eye_pose_world,
+        intrinsic,
+        eye_height,
+        eye_width,
+        scene_color,
+        scene_depth,
+        gaussians,
+        render_pipe,
+        background_black,
+        background_white,
+    ):
+        eye_w2c_cv = self._camera_pose_world_to_cv_w2c(eye_pose_world)
+        eye_view, _ = self._create_gs_view(
+            eye_w2c_cv,
+            intrinsic,
+            eye_height,
+            eye_width,
+        )
+        gaussian_rgba, gaussian_depth = self._render_gaussian_rgba(
+            eye_view,
+            gaussians,
+            render_pipe,
+            background_black,
+            background_white,
+            use_gsplat=True,
+        )
+        composed = self._compose_immersive_eye_frame(
+            scene_color,
+            scene_depth,
+            gaussian_rgba,
+            gaussian_depth,
+        )
+        return composed, gaussian_rgba, gaussian_depth
+
+    def _build_live_controller_world_overlay(
+        self,
+        source,
+        controller_world,
+        object_points,
+        object_bounds_min,
+        object_bounds_max,
+    ):
+        if controller_world is None:
+            return None
+
+        origin_world, direction_world = self._controller_world_ray_pose(controller_world)
+        if origin_world is None or direction_world is None:
+            return None
+        hit_world = self._ray_object_intersection(
+            origin_world,
+            direction_world,
+            object_points,
+            object_bounds_min,
+            object_bounds_max,
+        )
+        ray_end_world = (
+            hit_world
+            if hit_world is not None
+            else origin_world + direction_world * self.LIVE_CONTROLLER_RAY_LENGTH
+        )
+        return {
+            "source": source,
+            "origin_world": origin_world,
+            "direction_world": direction_world,
+            "hit_world": hit_world,
+            "ray_end_world": ray_end_world,
+            "color": (
+                self.LIVE_CONTROLLER_LEFT_COLOR
+                if source == "left"
+                else self.LIVE_CONTROLLER_RIGHT_COLOR
+            ),
+            "select_available": controller_world["select_available"],
+            "select_pressed": controller_world.get(
+                "select_hold_active",
+                controller_world["select_pressed"],
+            ),
+            "select_value": controller_world["select_value"],
+            "select_source": controller_world["select_source"],
+            "anchor_cycle_available": controller_world["anchor_cycle_available"],
+            "anchor_cycle_pressed": controller_world["anchor_cycle_pressed"],
+            "anchor_cycle_source": controller_world["anchor_cycle_source"],
+            "snap_assist_available": controller_world["snap_assist_available"],
+            "snap_assist_pressed": controller_world["snap_assist_pressed"],
+            "snap_assist_source": controller_world["snap_assist_source"],
+        }
+
+    def _project_live_controller_world_overlay(
+        self,
+        overlay_world,
+        intrinsic,
+        w2c,
+        height,
+        width,
+    ):
+        if overlay_world is None:
+            return None
+
+        origin_pixel = self._project_world_point_to_pixel(
+            overlay_world.get("origin_world"),
+            intrinsic,
+            w2c,
+            height,
+            width,
+        )
+        end_pixel = self._project_world_point_to_pixel(
+            overlay_world.get("ray_end_world"),
+            intrinsic,
+            w2c,
+            height,
+            width,
+        )
+        if origin_pixel is None or end_pixel is None:
+            return None
+
+        projected = {
+            "source": overlay_world["source"],
+            "origin_pixel": origin_pixel,
+            "end_pixel": end_pixel,
+            "hit_pixel": self._project_world_point_to_pixel(
+                overlay_world.get("hit_world"),
+                intrinsic,
+                w2c,
+                height,
+                width,
+            ),
+            "attach_candidate_pixel": self._project_world_point_to_pixel(
+                overlay_world.get("attach_candidate_world"),
+                intrinsic,
+                w2c,
+                height,
+                width,
+            ),
+            "attach_active_pixel": self._project_world_point_to_pixel(
+                overlay_world.get("attach_active_world"),
+                intrinsic,
+                w2c,
+                height,
+                width,
+            ),
+            "attach_candidate": bool(overlay_world.get("attach_candidate", False)),
+            "attachment_active": bool(overlay_world.get("attachment_active", False)),
+            "color": overlay_world["color"],
+            "select_available": overlay_world["select_available"],
+            "select_pressed": overlay_world["select_pressed"],
+            "select_value": overlay_world["select_value"],
+            "select_source": overlay_world["select_source"],
+            "anchor_cycle_available": overlay_world["anchor_cycle_available"],
+            "anchor_cycle_pressed": overlay_world["anchor_cycle_pressed"],
+            "anchor_cycle_source": overlay_world["anchor_cycle_source"],
+            "snap_assist_available": overlay_world["snap_assist_available"],
+            "snap_assist_pressed": overlay_world["snap_assist_pressed"],
+            "snap_assist_source": overlay_world["snap_assist_source"],
+            "anchor_preview_entries": [],
+        }
+        for preview_entry in overlay_world.get("anchor_preview_entries_world", []):
+            preview_pixel = self._project_world_point_to_pixel(
+                preview_entry.get("world"),
+                intrinsic,
+                w2c,
+                height,
+                width,
+            )
+            if preview_pixel is None:
+                continue
+            projected["anchor_preview_entries"].append(
+                {
+                    "pixel": preview_pixel,
+                    "name": preview_entry["name"],
+                    "selected": preview_entry["selected"],
+                    "active": preview_entry["active"],
+                }
+            )
+        return projected
+
+    def _compose_immersive_eye_frame(
+        self,
+        scene_color_rgba,
+        scene_depth,
+        gaussian_rgba,
+        gaussian_depth,
+    ):
+        scene_color = torch.from_numpy(
+            np.ascontiguousarray(scene_color_rgba)
+        ).to(device=cfg.device, dtype=torch.float32)
+        scene_depth_t = torch.from_numpy(
+            np.ascontiguousarray(scene_depth)
+        ).to(device=cfg.device, dtype=torch.float32)
+
+        object_rgba = gaussian_rgba.permute(1, 2, 0).contiguous().clamp(0.0, 1.0)
+        object_alpha = object_rgba[..., 3:4]
+        if gaussian_depth is None:
+            effective_alpha = object_alpha
+        else:
+            gaussian_depth = self._normalize_gaussian_depth(gaussian_depth)
+            scene_has_geometry = scene_depth_t > 0.0
+            object_has_depth = gaussian_depth > 0.0
+            object_visible = object_has_depth & (
+                (~scene_has_geometry) | (gaussian_depth <= (scene_depth_t + 5e-3))
+            )
+            effective_alpha = object_alpha * object_visible.unsqueeze(-1).to(
+                object_alpha.dtype
+            )
+
+        composed_rgb = scene_color[..., :3] * (1.0 - effective_alpha) + (
+            object_rgba[..., :3] * 255.0
+        ) * effective_alpha
+        composed = torch.empty(
+            scene_color.shape,
+            dtype=torch.uint8,
+            device=cfg.device,
+        )
+        composed[..., :3] = composed_rgb.clamp(0.0, 255.0).to(torch.uint8)
+        composed[..., 3] = 255
+        return composed
 
     #init_start with morton reordering for both mass node and spring (current last working version)
     def _init_start(
@@ -4183,23 +6656,1291 @@ class InvPhyTrainerWarp:
                 with open(log_file_path, "w") as log_file:
                     log_file.write("\n".join(log_lines))
 
+    def _interactive_playground_batched_visualization_immersive(
+        self,
+        model_path,
+        gs_path,
+        eval_image_path,
+        window,
+        cuda_ctx,
+        input_source,
+        controller_mode,
+        interactive_window_mode,
+        scene_preset,
+        scene_assets_root,
+    ):
+        if input_source != "live_openxr_controller":
+            raise ValueError(
+                "Immersive Quest mode currently supports only input_source=live_openxr_controller"
+            )
+        if controller_mode != "multi_points":
+            raise ValueError(f"Unsupported controller_mode for immersive mode: {controller_mode}")
+        if scene_preset != "simple_lab":
+            raise ValueError(
+                "Immersive Quest mode currently requires --scene_preset simple_lab"
+            )
 
-    #this is basically baseline + rendering (to verify correctness)        
+        logger.info(f"Load model from {model_path}")
+        checkpoint = torch.load(model_path, map_location=cfg.device)
+
+        trained_spring_Y = checkpoint["spring_Y"][self.spring_permutation]
+        trained_collide_elas = checkpoint["collide_elas"]
+        trained_collide_fric = checkpoint["collide_fric"]
+        trained_collide_object_elas = checkpoint["collide_object_elas"]
+        trained_collide_object_fric = checkpoint["collide_object_fric"]
+
+        intrinsic = cfg.intrinsics[0]
+        w2c = cfg.w2cs[0]
+        intrinsic_torch = torch.tensor(intrinsic, dtype=torch.float32, device=cfg.device)
+        w2c_torch = torch.tensor(w2c, dtype=torch.float32, device=cfg.device)
+        obj_init_vertices = self.init_vertices[: self.num_all_points]
+        ctrl_init_vertices = self.init_vertices[self.num_all_points :]
+        init_springs_for_sim = self.init_springs
+        init_rest_lengths_for_sim = self.init_rest_lengths
+        trained_spring_Y_for_sim = trained_spring_Y
+        init_masses_for_sim = self.init_masses[: self.num_all_points].clone()
+
+        recorded_base_target = self.controller_points_group[0][0].clone()
+        controller_masks = self._build_controller_part_masks(
+            recorded_base_target,
+            n_ctrl_parts=2,
+            intrinsic=intrinsic,
+            w2c=w2c,
+        )
+        recorded_anchor_centers = [
+            recorded_base_target[mask].mean(dim=0) for mask in controller_masks
+        ]
+
+        self._object_graph_neighbors()
+        original_controller_source_masks = self._build_controller_source_masks(
+            recorded_base_target,
+            intrinsic=intrinsic,
+            w2c=w2c,
+        )
+        original_controller_source_anchor_centers = [
+            recorded_base_target[mask].mean(dim=0)
+            for mask in original_controller_source_masks
+        ]
+        gaussians = GaussianModel(sh_degree=3)
+        gaussians.load_ply(gs_path)
+        gaussians = remove_gaussians_with_low_opacity(gaussians, 0.1)
+        gaussians.isotropic = True
+
+        startup_yaw_debug = self._apply_immersive_startup_yaw(
+            obj_init_vertices,
+            None,
+            gaussians,
+            recorded_base_target,
+            recorded_anchor_centers,
+            original_controller_source_anchor_centers,
+        )
+        obj_init_vertices = startup_yaw_debug["object_vertices"]
+        recorded_base_target = startup_yaw_debug["recorded_base_target"]
+        recorded_anchor_centers = startup_yaw_debug["recorded_anchor_centers"]
+        original_controller_source_anchor_centers = startup_yaw_debug[
+            "controller_source_anchor_centers"
+        ]
+        controller_predefined_anchor_defs = self._build_predefined_interaction_anchors(
+            obj_init_vertices,
+            intrinsic_torch,
+            w2c_torch,
+        )
+        two_point_runtime = self._build_two_point_live_controller_runtime(
+            obj_init_vertices,
+            trained_spring_Y_for_sim,
+            original_controller_source_masks,
+            original_controller_source_anchor_centers,
+            controller_predefined_anchor_defs,
+        )
+        controller_runtime_base_target = two_point_runtime["controller_rest_points"].clone()
+        controller_source_masks = two_point_runtime["controller_source_masks"]
+        controller_source_anchor_centers = two_point_runtime[
+            "controller_source_anchor_centers"
+        ]
+        init_springs_for_sim = two_point_runtime["init_springs"]
+        init_rest_lengths_for_sim = two_point_runtime["init_rest_lengths"]
+        trained_spring_Y_for_sim = two_point_runtime["spring_y"]
+        controller_attachment_metadata = self._build_controller_attachment_metadata(
+            init_springs_for_sim,
+            init_rest_lengths_for_sim,
+            self.num_all_points,
+            controller_source_masks,
+        )
+        for source, runtime_meta in two_point_runtime["source_runtime"].items():
+            controller_attachment_metadata[source].update(runtime_meta)
+        controller_anchor_templates = {"left": {}, "right": {}}
+        ctrl_init_vertices = controller_runtime_base_target
+        print(
+            "[quest_display] immersive startup yaw: "
+            f"axis={startup_yaw_debug['yaw_axis'].detach().cpu().numpy().tolist()} "
+            f"angle={startup_yaw_debug['yaw_angle']:.4f} "
+            f"pivot={startup_yaw_debug['yaw_pivot'].detach().cpu().numpy().tolist()} "
+            f"support_center={startup_yaw_debug['rotated_support_center'].detach().cpu().numpy().tolist()} "
+            "controller_runtime_rotated=1",
+            flush=True,
+        )
+
+        n_vert_single_obj = obj_init_vertices.shape[0]
+        n_vert_single_ctrl = ctrl_init_vertices.shape[0]
+        n_springs_single_obj = int(self.num_object_springs)
+        n_spring_single_ctrl = int(
+            init_springs_for_sim.shape[0] - self.num_object_springs
+        )
+        base_ctrl_vert_offset = n_vert_single_obj
+
+        self.batch_init_vertices = torch.cat(
+            [obj_init_vertices, ctrl_init_vertices], dim=0
+        )
+        self.batch_init_velocities = (
+            self.init_velocities.clone() if self.init_velocities is not None else None
+        )
+        self.batch_controller_points = controller_runtime_base_target.unsqueeze(0).repeat(
+            self.frame_len, 1, 1
+        )
+
+        self.simulator = SpringMassSystemWarp(
+            init_springs=init_springs_for_sim,
+            init_rest_lengths=init_rest_lengths_for_sim,
+            init_masses=init_masses_for_sim,
+            init_masks=self.init_masks,
+            init_vertices=self.batch_init_vertices,
+            init_velocities=self.batch_init_velocities,
+            dt=cfg.dt,
+            num_substeps=cfg.num_substeps,
+            dashpot_damping=cfg.dashpot_damping,
+            drag_damping=cfg.drag_damping,
+            collision_dist=cfg.collision_dist,
+            reverse_z=cfg.reverse_z,
+            spring_Y_max=cfg.spring_Y_max,
+            spring_Y_min=cfg.spring_Y_min,
+            self_collision=cfg.self_collision,
+            collide_elas=trained_collide_elas,
+            collide_fric=trained_collide_fric,
+            collide_object_elas=trained_collide_object_elas,
+            collide_object_fric=trained_collide_object_fric,
+            spring_Y=trained_spring_Y_for_sim,
+            object_massnodes_total=base_ctrl_vert_offset,
+            object_massnodes_single=n_vert_single_obj,
+            object_springs_total=n_springs_single_obj,
+            object_springs_single=n_springs_single_obj,
+            controller_massnodes_single=n_vert_single_ctrl,
+            controller_springs_single=n_spring_single_ctrl,
+            controller_rest_location=self.batch_controller_points[0],
+            number_of_instance=1,
+            use_ground_plane=False,
+        )
+        self.simulator.set_init_state(
+            self.simulator.wp_init_vertices, self.simulator.wp_init_velocities
+        )
+
+        prev_x = wp.to_torch(
+            self.simulator.wp_states[0].wp_x, requires_grad=False
+        ).clone()
+        current_pos = gaussians.get_xyz
+        current_rot = gaussians.get_rotation
+        relations_single = get_topk_indices(prev_x, K=3)
+        weights_single, weights_indices_single = knn_weights_sparse(
+            prev_x,
+            current_pos,
+            K=3,
+        )
+        rotation_cache = build_rotation_reuse_cache(
+            weights_indices=weights_indices_single,
+            weights=weights_single,
+            relations=relations_single,
+            mass_nodes_rest=prev_x,
+            gaussians_xyz_rest=current_pos,
+            gaussians_quat_rest=current_rot,
+            device=cfg.device,
+            mass_node_per_instance=n_vert_single_obj,
+            gaussians_per_instance=current_pos.shape[0],
+            number_of_instance=1,
+        )
+
+        background_black = torch.tensor(
+            [0.0, 0.0, 0.0], dtype=torch.float32, device="cuda"
+        )
+        background_white = torch.tensor(
+            [1.0, 1.0, 1.0], dtype=torch.float32, device="cuda"
+        )
+        render_pipe = SimpleNamespace(
+            debug=False,
+            antialiasing=True,
+            compute_cov3D_python=False,
+            convert_SHs_python=False,
+        )
+
+        repo_root = Path(__file__).resolve().parents[2]
+        ensure_simple_lab_assets(scene_assets_root)
+        eye_width = int(self.IMMERSIVE_EYE_WIDTH)
+        eye_height = int(self.IMMERSIVE_EYE_HEIGHT)
+        immersive_bridge = None
+        scene_renderer = None
+        preview_tex = None
+        preview_prog = None
+        preview_vao = None
+        preview_display_active = interactive_window_mode == "visible"
+        left_eye_frame = None
+        right_eye_frame = None
+        frame_count = 0
+
+        live_head_alignment = None
+        head_pose_state = None
+        live_controller_alignment = None
+        live_controller_alignment_mode = "unset"
+        current_live_left_controller = None
+        current_live_right_controller = None
+        controller_select_state_cache = {"left": None, "right": None}
+        controller_select_hold_state = {"left": {}, "right": {}}
+        controller_select_hold_state_cache = {"left": None, "right": None}
+        controller_anchor_cycle_state_cache = {"left": None, "right": None}
+        controller_anchor_cycle_edge_cache = {"left": False, "right": False}
+        controller_snap_state_cache = {"left": None, "right": None}
+        controller_snap_edge_cache = {"left": False, "right": False}
+        controller_anchor_preview_state = {
+            "left": {"visible": False, "selected_anchor_name": None},
+            "right": {"visible": False, "selected_anchor_name": None},
+        }
+        controller_anchor_preview_state_cache = {"left": None, "right": None}
+        controller_interaction_state = {"left": None, "right": None}
+        controller_interaction_state_cache = {"left": None, "right": None}
+        controller_motion_state_cache = {"left": None, "right": None}
+        last_left_eye_pose_world = None
+        last_right_eye_pose_world = None
+        last_immersive_sample = None
+
+        view_render_path = None
+        if eval_image_path:
+            eval_render_path = os.path.join(eval_image_path, "0")
+            view_render_path = os.path.join(eval_image_path, "immersive_output")
+            os.makedirs(view_render_path, exist_ok=True)
+            os.makedirs(eval_render_path, exist_ok=True)
+
+        sim_timer = Timer("Immersive Simulator")
+        interp_timer = Timer("Immersive Interpolation")
+        render_timer = Timer("Immersive Rendering")
+        total_timer = Timer("Immersive Total")
+        component_times = {
+            "simulator": [],
+            "full_motion_interpolation": [],
+            "rendering": [],
+            "total": [],
+        }
+
+        try:
+            immersive_bridge = OpenXRImmersiveBridge(
+                repo_root,
+                width=eye_width,
+                height=eye_height,
+            )
+            immersive_bridge.start()
+            initial_sample = self._wait_for_valid_immersive_startup_sample(
+                immersive_bridge,
+                timeout=10.0,
+            )
+            last_immersive_sample = initial_sample
+            print(
+                "[quest_display] immersive bridge target eye resolution="
+                f"{eye_width}x{eye_height}",
+                flush=True,
+            )
+            print(
+                "[quest_display] runtime recommended eye sizes: "
+                f"left={initial_sample.left_eye.recommended_width}x{initial_sample.left_eye.recommended_height} "
+                f"right={initial_sample.right_eye.recommended_width}x{initial_sample.right_eye.recommended_height}",
+                flush=True,
+            )
+            print(
+                "[quest_display] immersive startup sample: "
+                + self._format_immersive_sample_startup_state(initial_sample),
+                flush=True,
+            )
+
+            live_head_alignment = self._compute_immersive_head_alignment(initial_sample)
+            if live_head_alignment is None:
+                raise RuntimeError(
+                    "Immersive mode did not receive a valid eye pose for startup.\n"
+                    f"last_sample: {self._format_immersive_sample_startup_state(initial_sample)}"
+                )
+            print(
+                "[quest_display] immersive scene frame: "
+                f"up={live_head_alignment['scene_up'].tolist()} "
+                f"forward={live_head_alignment['scene_forward'].tolist()} "
+                f"right={live_head_alignment['scene_right'].tolist()} "
+                f"det={live_head_alignment['basis_det']:.5f} "
+                f"ortho_err={live_head_alignment['basis_orthogonality_error']:.6f}",
+                flush=True,
+            )
+
+            controller_runtime_state = self._update_live_controller_runtime_from_sample(
+                initial_sample,
+                live_controller_alignment,
+                live_controller_alignment_mode,
+                controller_source_anchor_centers,
+                w2c,
+                controller_select_state_cache,
+                controller_select_hold_state,
+                controller_select_hold_state_cache,
+                controller_anchor_cycle_state_cache,
+                controller_snap_state_cache,
+                controller_snap_edge_cache,
+                basis_override=live_head_alignment["basis"],
+                collect_reset_edges=False,
+                alignment_pose_role="grip",
+                controller_position_pose_role="grip",
+                controller_ray_pose_role="aim",
+            )
+            live_controller_alignment = controller_runtime_state["alignment"]
+            live_controller_alignment_mode = controller_runtime_state["alignment_mode"]
+            if live_controller_alignment is None:
+                print(
+                    "[live_openxr_controller] immersive controller alignment pending; "
+                    "scene startup will continue without controller interaction",
+                    flush=True,
+                )
+            else:
+                print(
+                    "[live_openxr_controller] immersive controller alignment acquired "
+                    f"during startup mode={live_controller_alignment_mode}",
+                    flush=True,
+                )
+            current_live_left_controller = controller_runtime_state["left_controller"]
+            current_live_right_controller = controller_runtime_state["right_controller"]
+
+            (
+                initial_left_eye_pose_world,
+                initial_right_eye_pose_world,
+                head_pose_state,
+            ) = self._update_immersive_head_pose_state(
+                initial_sample,
+                live_head_alignment,
+                head_pose_state,
+                frame_index=0,
+            )
+            valid_eye_poses = [
+                pose
+                for pose in (initial_left_eye_pose_world, initial_right_eye_pose_world)
+                if pose is not None
+            ]
+            if not valid_eye_poses:
+                raise RuntimeError(
+                    "Immersive mode needs at least one valid eye pose from the Quest runtime."
+                )
+            head_position = np.mean(
+                [pose[:3, 3] for pose in valid_eye_poses], axis=0
+            ).astype(np.float32)
+            head_forward = np.mean(
+                [self._eye_forward_world(pose) for pose in valid_eye_poses],
+                axis=0,
+            ).astype(np.float32)
+            forward_norm = float(np.linalg.norm(head_forward))
+            if forward_norm < 1e-5:
+                head_forward = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+            else:
+                head_forward /= forward_norm
+
+            layout = make_simple_lab_layout(
+                head_position,
+                head_forward,
+                scene_up=live_head_alignment["scene_up"],
+            )
+            scene_renderer = SimpleLabSceneRenderer(
+                scene_assets_root=scene_assets_root,
+                width=eye_width,
+                height=eye_height,
+            )
+            scene_renderer.set_layout(layout)
+            table_alignment_debug = scene_renderer.table_alignment_debug()
+            table_surface_center_world = layout.table_top_center
+            if table_alignment_debug is not None:
+                collider_top_plane_height = float(
+                    table_alignment_debug["collider_top_plane_height"]
+                )
+                world_surface_plane_height = float(
+                    table_alignment_debug["world_surface_plane_height"]
+                )
+                table_surface_center_world = np.asarray(
+                    table_alignment_debug["world_surface_center"],
+                    dtype=np.float32,
+                )
+                if (
+                    abs(world_surface_plane_height - collider_top_plane_height)
+                    > self.IMMERSIVE_STARTUP_PLANE_EPS
+                ):
+                    raise RuntimeError(
+                        "Immersive scene table alignment validation failed: "
+                        f"{table_alignment_debug}"
+                    )
+                print(
+                    "[quest_display] table alignment: "
+                    f"asset_transform={table_alignment_debug['asset_transform']} "
+                    f"surface_normal={table_alignment_debug['world_surface_normal']} "
+                    f"normal_alignment={table_alignment_debug['surface_normal_alignment']:.4f} "
+                    f"surface_center={table_alignment_debug['world_surface_center']} "
+                    f"surface_plane={world_surface_plane_height:.4f} "
+                    f"collider_plane={collider_top_plane_height:.4f}",
+                    flush=True,
+                )
+            print(
+                "[quest_display] immersive layout: "
+                f"head_position={head_position.tolist()} "
+                f"table_top_center={layout.table_top_center.tolist()}",
+                flush=True,
+            )
+
+            spawn_shift = self._compute_scene_spawn_shift(
+                obj_init_vertices,
+                layout.table_top_center,
+            )
+            self._apply_scene_spawn_offset_runtime(
+                spawn_shift,
+                gaussians,
+                controller_runtime_base_target=controller_runtime_base_target,
+                recorded_base_target=recorded_base_target,
+                recorded_anchor_centers=recorded_anchor_centers,
+                controller_source_anchor_centers=controller_source_anchor_centers,
+            )
+            spawn_support_center = self._validate_scene_spawn_alignment(
+                self.batch_init_vertices[: self.num_all_points],
+                layout,
+                context="spawn shift",
+                table_surface_center_world=table_surface_center_world,
+            )
+            print(
+                "[quest_display] immersive spawn shift: "
+                f"shift={spawn_shift.detach().cpu().numpy().tolist()} "
+                f"support_center={spawn_support_center.detach().cpu().numpy().tolist()}",
+                flush=True,
+            )
+            live_controller_alignment = None
+            live_controller_alignment_mode = "unset"
+            controller_runtime_state = self._update_live_controller_runtime_from_sample(
+                initial_sample,
+                live_controller_alignment,
+                live_controller_alignment_mode,
+                controller_source_anchor_centers,
+                w2c,
+                controller_select_state_cache,
+                controller_select_hold_state,
+                controller_select_hold_state_cache,
+                controller_anchor_cycle_state_cache,
+                controller_snap_state_cache,
+                controller_snap_edge_cache,
+                basis_override=live_head_alignment["basis"],
+                collect_reset_edges=False,
+                alignment_pose_role="grip",
+                controller_position_pose_role="grip",
+                controller_ray_pose_role="aim",
+            )
+            live_controller_alignment = controller_runtime_state["alignment"]
+            live_controller_alignment_mode = controller_runtime_state["alignment_mode"]
+            if live_controller_alignment is None:
+                print(
+                    "[live_openxr_controller] immersive controller alignment still pending "
+                    "after scene spawn shift",
+                    flush=True,
+                )
+            else:
+                print(
+                    "[live_openxr_controller] immersive controller alignment ready "
+                    f"after scene spawn shift mode={live_controller_alignment_mode}",
+                    flush=True,
+                )
+            current_live_left_controller = controller_runtime_state["left_controller"]
+            current_live_right_controller = controller_runtime_state["right_controller"]
+            print(
+                "[live_openxr_controller] immersive using shared 2D controller runtime",
+                flush=True,
+            )
+            (
+                last_left_eye_pose_world,
+                last_right_eye_pose_world,
+                head_pose_state,
+            ) = self._update_immersive_head_pose_state(
+                initial_sample,
+                live_head_alignment,
+                head_pose_state,
+                frame_index=0,
+            )
+            if last_left_eye_pose_world is None:
+                last_left_eye_pose_world = last_right_eye_pose_world
+            if last_right_eye_pose_world is None:
+                last_right_eye_pose_world = last_left_eye_pose_world
+
+            self._set_scene_collider_boxes(layout)
+            if self.simulator.object_collision_flag:
+                self.simulator.create_resting_case()
+            self.simulator.create_cuda_graph()
+
+            current_target = controller_runtime_base_target.clone()
+            prev_target = current_target.clone()
+            scene_rest_state = self._settle_scene_rest_state(current_target.clone())
+            self._restore_sim_state(scene_rest_state)
+            x = wp.to_torch(
+                self.simulator.wp_states[0].wp_x,
+                requires_grad=False,
+            ).clone()
+            current_pos, current_rot = lbs_with_rotation_reuse(
+                current_mass_nodes=x,
+                cache=rotation_cache,
+            )
+            gaussians._xyz = current_pos
+            gaussians._rotation = current_rot
+            prev_x = x.clone()
+            settled_support_center = self._validate_scene_spawn_alignment(
+                x[: self.num_all_points],
+                layout,
+                context="settled rest state",
+                table_surface_center_world=table_surface_center_world,
+            )
+            settled_bounds_min = (
+                x[: self.num_all_points].min(dim=0).values.detach().cpu().numpy().tolist()
+            )
+            settled_bounds_max = (
+                x[: self.num_all_points].max(dim=0).values.detach().cpu().numpy().tolist()
+            )
+            print(
+                "[quest_display] immersive settled rest state: "
+                f"support_center={settled_support_center.detach().cpu().numpy().tolist()} "
+                f"bounds_min={settled_bounds_min} bounds_max={settled_bounds_max}",
+                flush=True,
+            )
+            controller_anchor_templates = self._build_predefined_controller_anchor_templates(
+                controller_runtime_base_target,
+                x[: self.num_all_points],
+                controller_source_masks,
+                controller_source_anchor_centers,
+                controller_attachment_metadata,
+                controller_predefined_anchor_defs,
+            )
+            startup_render_debug = self._validate_immersive_startup_render(
+                live_head_alignment,
+                layout,
+                scene_renderer,
+                initial_sample.left_eye,
+                initial_sample.right_eye,
+                last_left_eye_pose_world,
+                last_right_eye_pose_world,
+                eye_width,
+                eye_height,
+                gaussians,
+                render_pipe,
+                background_black,
+                background_white,
+                view_render_path,
+            )
+            print(
+                "[quest_display] immersive startup render validation: "
+                + str(startup_render_debug),
+                flush=True,
+            )
+            last_valid_sim_state = self._capture_sim_state()
+            last_valid_target = current_target.clone()
+            last_valid_gaussian_state = self._capture_gaussian_runtime_state(gaussians)
+            last_valid_object_center = x[: self.num_all_points].mean(dim=0).clone()
+
+            glfw.make_context_current(window)
+            if preview_display_active:
+                preview_tex = gl.glGenTextures(1)
+                gl.glBindTexture(gl.GL_TEXTURE_2D, preview_tex)
+                gl.glTexParameteri(
+                    gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MIN_FILTER, gl.GL_LINEAR
+                )
+                gl.glTexParameteri(
+                    gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MAG_FILTER, gl.GL_LINEAR
+                )
+                gl.glTexImage2D(
+                    gl.GL_TEXTURE_2D,
+                    0,
+                    gl.GL_RGBA8,
+                    eye_width,
+                    eye_height,
+                    0,
+                    gl.GL_RGBA,
+                    gl.GL_UNSIGNED_BYTE,
+                    None,
+                )
+                gl.glBindTexture(gl.GL_TEXTURE_2D, 0)
+
+                vertex_shader = """
+                #version 330 core
+                out vec2 uv;
+                const vec2 V[4]=vec2[4](vec2(-1,-1),vec2(1,-1),vec2(-1,1),vec2(1,1));
+                const vec2 T[4]=vec2[4](vec2(0,0),vec2(1,0),vec2(0,1),vec2(1,1));
+                void main(){ gl_Position=vec4(V[gl_VertexID],0,1); uv=T[gl_VertexID]; }
+                """
+                fragment_shader = """
+                #version 330 core
+                in vec2 uv; out vec4 frag; uniform sampler2D uTex;
+                void main(){ frag = texture(uTex, vec2(uv.x, 1.0 - uv.y)); }
+                """
+
+                def _compile_shader(kind, source):
+                    shader_id = gl.glCreateShader(kind)
+                    gl.glShaderSource(shader_id, source)
+                    gl.glCompileShader(shader_id)
+                    if not gl.glGetShaderiv(shader_id, gl.GL_COMPILE_STATUS):
+                        raise RuntimeError(gl.glGetShaderInfoLog(shader_id).decode())
+                    return shader_id
+
+                preview_prog = gl.glCreateProgram()
+                gl.glAttachShader(
+                    preview_prog, _compile_shader(gl.GL_VERTEX_SHADER, vertex_shader)
+                )
+                gl.glAttachShader(
+                    preview_prog, _compile_shader(gl.GL_FRAGMENT_SHADER, fragment_shader)
+                )
+                gl.glLinkProgram(preview_prog)
+                if not gl.glGetProgramiv(preview_prog, gl.GL_LINK_STATUS):
+                    raise RuntimeError(gl.glGetProgramInfoLog(preview_prog).decode())
+                gl.glUseProgram(preview_prog)
+                gl.glUniform1i(gl.glGetUniformLocation(preview_prog, "uTex"), 0)
+                gl.glUseProgram(0)
+                preview_vao = gl.glGenVertexArrays(1)
+
+            while True:
+                total_timer.start()
+                controller_reset_triggered = False
+                controller_overlay_by_source = {}
+
+                latest_sample = immersive_bridge.get_latest_sample()
+                if latest_sample is not None:
+                    last_immersive_sample = latest_sample
+                    controller_runtime_state = self._update_live_controller_runtime_from_sample(
+                        latest_sample,
+                        live_controller_alignment,
+                        live_controller_alignment_mode,
+                        controller_source_anchor_centers,
+                        w2c,
+                        controller_select_state_cache,
+                        controller_select_hold_state,
+                        controller_select_hold_state_cache,
+                        controller_anchor_cycle_state_cache,
+                        controller_snap_state_cache,
+                        controller_snap_edge_cache,
+                        basis_override=live_head_alignment["basis"],
+                        alignment_pose_role="grip",
+                        controller_position_pose_role="grip",
+                        controller_ray_pose_role="aim",
+                    )
+                    live_controller_alignment = controller_runtime_state["alignment"]
+                    live_controller_alignment_mode = controller_runtime_state["alignment_mode"]
+                    if controller_runtime_state["alignment_acquired"]:
+                        print(
+                            "[live_openxr_controller] immersive controller alignment acquired "
+                            f"after startup mode={live_controller_alignment_mode}",
+                            flush=True,
+                        )
+                    current_live_left_controller = controller_runtime_state["left_controller"]
+                    current_live_right_controller = controller_runtime_state["right_controller"]
+                    (
+                        left_eye_pose_world,
+                        right_eye_pose_world,
+                        head_pose_state,
+                    ) = self._update_immersive_head_pose_state(
+                        latest_sample,
+                        live_head_alignment,
+                        head_pose_state,
+                        frame_index=frame_count,
+                    )
+                    if left_eye_pose_world is not None:
+                        last_left_eye_pose_world = left_eye_pose_world
+                    if right_eye_pose_world is not None:
+                        last_right_eye_pose_world = right_eye_pose_world
+                    if last_left_eye_pose_world is None:
+                        last_left_eye_pose_world = last_right_eye_pose_world
+                    if last_right_eye_pose_world is None:
+                        last_right_eye_pose_world = last_left_eye_pose_world
+
+                    controller_reset_sources = controller_runtime_state["reset_sources"]
+                    if controller_reset_sources:
+                        pressed_buttons = [
+                            "Y" if source == "left" else "B"
+                            for source in controller_reset_sources
+                        ]
+                        print(
+                            "[live_openxr_controller] immersive reset requested via "
+                            + "/".join(pressed_buttons)
+                            + "; restoring the settled table pose",
+                            flush=True,
+                        )
+                        reset_target = self._reset_live_controller_runtime(
+                            controller_runtime_base_target,
+                            controller_interaction_state,
+                            controller_anchor_preview_state,
+                            controller_attachment_metadata,
+                            reset_state=scene_rest_state,
+                        )
+                        prev_target = reset_target.clone()
+                        current_target = reset_target
+                        controller_reset_triggered = True
+                else:
+                    current_live_left_controller = None
+                    current_live_right_controller = None
+
+                sim_timer.start()
+
+                pre_step_left_anchor = None
+                pre_step_right_anchor = None
+                if (
+                    controller_interaction_state["left"] is not None
+                    and current_live_left_controller is not None
+                ):
+                    pre_step_left_anchor = self._controller_interaction_anchor(
+                        current_live_left_controller,
+                        controller_interaction_state["left"],
+                    )
+                if (
+                    controller_interaction_state["right"] is not None
+                    and current_live_right_controller is not None
+                ):
+                    pre_step_right_anchor = self._controller_interaction_anchor(
+                        current_live_right_controller,
+                        controller_interaction_state["right"],
+                    )
+                self._apply_live_controller_anchor_kinematic_overrides(
+                    pre_step_left_anchor,
+                    pre_step_right_anchor,
+                    controller_interaction_state,
+                )
+
+                self.simulator.set_controller_interactive(prev_target, current_target)
+                if self.simulator.object_collision_flag:
+                    self.simulator.update_collision_graph()
+                wp.capture_launch(self.simulator.forward_graph)
+                wp.synchronize()
+                self._apply_live_controller_anchor_kinematic_overrides(
+                    pre_step_left_anchor,
+                    pre_step_right_anchor,
+                    controller_interaction_state,
+                    state_index=-1,
+                )
+
+                self.simulator.set_init_state(
+                    self.simulator.wp_states[-1].wp_x,
+                    self.simulator.wp_states[-1].wp_v,
+                )
+                self._snap_to_scene_rest_if_idle(
+                    scene_rest_state,
+                    controller_interaction_state,
+                )
+                x = wp.to_torch(
+                    self.simulator.wp_states[0].wp_x,
+                    requires_grad=False,
+                ).clone()
+                sim_time = sim_timer.stop()
+                if frame_count > 1:
+                    component_times["simulator"].append(sim_time)
+
+                interp_timer.start()
+                current_pos, current_rot = lbs_with_rotation_reuse(
+                    current_mass_nodes=x,
+                    cache=rotation_cache,
+                )
+                gaussians._xyz = current_pos
+                gaussians._rotation = current_rot
+                interp_time = interp_timer.stop()
+                if frame_count > 1:
+                    component_times["full_motion_interpolation"].append(interp_time)
+                prev_x = x.clone()
+
+                object_points = x[: self.num_all_points]
+                object_bounds_min = object_points.min(dim=0).values - 0.01
+                object_bounds_max = object_points.max(dim=0).values + 0.01
+                controller_predefined_anchor_states = (
+                    self._compute_predefined_interaction_anchor_states(
+                        controller_predefined_anchor_defs,
+                        object_points,
+                    )
+                )
+                current_interaction_anchor_by_source = {"left": None, "right": None}
+                for source, controller_world in (
+                    ("left", current_live_left_controller),
+                    ("right", current_live_right_controller),
+                ):
+                    interaction_state = controller_interaction_state[source]
+                    if interaction_state is not None and controller_world is not None:
+                        current_interaction_anchor_by_source[source] = (
+                            self._controller_interaction_anchor(
+                                controller_world,
+                                interaction_state,
+                            )
+                        )
+                controller_overlay_by_source = {}
+                for source, controller_world in (
+                    ("left", current_live_left_controller),
+                    ("right", current_live_right_controller),
+                ):
+                    overlay_entry = self._build_live_controller_world_overlay(
+                        source,
+                        controller_world,
+                        object_points,
+                        object_bounds_min,
+                        object_bounds_max,
+                    )
+                    if overlay_entry is not None:
+                        cycle_edge = self._controller_anchor_cycle_edge(
+                            source,
+                            controller_world,
+                            controller_anchor_cycle_edge_cache,
+                        )
+                        selected_preview_anchor = self._update_controller_anchor_preview_state(
+                            source,
+                            controller_world,
+                            overlay_entry,
+                            controller_predefined_anchor_states,
+                            controller_anchor_preview_state,
+                            cycle_edge,
+                            controller_interaction_state[source],
+                        )
+                        overlay_entry["anchor_preview_entries_world"] = []
+                        if controller_anchor_preview_state[source]["visible"]:
+                            for anchor_state in controller_predefined_anchor_states:
+                                overlay_entry["anchor_preview_entries_world"].append(
+                                    {
+                                        "world": anchor_state["center_world"],
+                                        "name": anchor_state["name"],
+                                        "selected": (
+                                            anchor_state["name"]
+                                            == controller_anchor_preview_state[source][
+                                                "selected_anchor_name"
+                                            ]
+                                        ),
+                                        "active": (
+                                            controller_interaction_state[source] is not None
+                                            and anchor_state["name"]
+                                            == controller_interaction_state[source].get(
+                                                "anchor_name"
+                                            )
+                                        ),
+                                    }
+                                )
+                        nearest_anchor = None
+                        if overlay_entry["hit_world"] is not None:
+                            nearest_anchor = self._select_predefined_interaction_anchor(
+                                overlay_entry["hit_world"],
+                                controller_predefined_anchor_states,
+                            )
+                        ray_origin_world, ray_direction_world = self._controller_world_ray_pose(
+                            controller_world
+                        )
+                        if (
+                            nearest_anchor is None
+                            and ray_origin_world is not None
+                            and ray_direction_world is not None
+                        ):
+                            nearest_anchor = self._select_predefined_interaction_anchor_for_ray(
+                                ray_origin_world,
+                                ray_direction_world,
+                                controller_predefined_anchor_states,
+                            )
+                        attach_candidate_anchor = (
+                            selected_preview_anchor
+                            if selected_preview_anchor is not None
+                            else nearest_anchor
+                        )
+                        overlay_entry["attach_candidate"] = (
+                            attach_candidate_anchor is not None
+                            or overlay_entry["hit_world"] is not None
+                        )
+                        overlay_entry["attach_candidate_world"] = (
+                            attach_candidate_anchor["center_world"]
+                            if attach_candidate_anchor is not None
+                            else overlay_entry["hit_world"]
+                        )
+                        interaction_state = controller_interaction_state[source]
+                        overlay_entry["attachment_active"] = interaction_state is not None
+                        overlay_entry["attach_active_world"] = (
+                            self._current_controller_attach_center_world(
+                                interaction_state,
+                                current_interaction_anchor_by_source[source],
+                            )
+                        )
+                        controller_overlay_by_source[source] = overlay_entry
+                    self._log_controller_anchor_preview_transition(
+                        source,
+                        controller_anchor_preview_state[source],
+                        controller_anchor_preview_state_cache,
+                    )
+
+                if last_immersive_sample is None:
+                    raise RuntimeError("Immersive bridge stopped providing pose samples.")
+                if last_left_eye_pose_world is None or last_right_eye_pose_world is None:
+                    raise RuntimeError("Immersive eye poses became unavailable.")
+
+                render_timer.start()
+                left_intrinsic = self._eye_sample_intrinsic(
+                    last_immersive_sample.left_eye,
+                    eye_width,
+                    eye_height,
+                )
+                right_intrinsic = self._eye_sample_intrinsic(
+                    last_immersive_sample.right_eye,
+                    eye_width,
+                    eye_height,
+                )
+
+                left_scene_color, left_scene_depth = scene_renderer.render_eye(
+                    last_left_eye_pose_world,
+                    left_intrinsic,
+                )
+                left_eye_frame, left_gaussian_rgba, left_gaussian_depth = (
+                    self._render_immersive_eye_frame(
+                        last_left_eye_pose_world,
+                        left_intrinsic,
+                        eye_height,
+                        eye_width,
+                        left_scene_color,
+                        left_scene_depth,
+                        gaussians,
+                        render_pipe,
+                        background_black,
+                        background_white,
+                    )
+                )
+
+                right_scene_color, right_scene_depth = scene_renderer.render_eye(
+                    last_right_eye_pose_world,
+                    right_intrinsic,
+                )
+                right_eye_frame, right_gaussian_rgba, right_gaussian_depth = (
+                    self._render_immersive_eye_frame(
+                        last_right_eye_pose_world,
+                        right_intrinsic,
+                        eye_height,
+                        eye_width,
+                        right_scene_color,
+                        right_scene_depth,
+                        gaussians,
+                        render_pipe,
+                        background_black,
+                        background_white,
+                    )
+                )
+
+                left_eye_overlay_entries = []
+                right_eye_overlay_entries = []
+                left_intrinsic_t = torch.as_tensor(
+                    left_intrinsic,
+                    dtype=torch.float32,
+                    device=cfg.device,
+                )
+                right_intrinsic_t = torch.as_tensor(
+                    right_intrinsic,
+                    dtype=torch.float32,
+                    device=cfg.device,
+                )
+                left_w2c_cv = torch.as_tensor(
+                    self._camera_pose_world_to_cv_w2c(last_left_eye_pose_world),
+                    dtype=torch.float32,
+                    device=cfg.device,
+                )
+                right_w2c_cv = torch.as_tensor(
+                    self._camera_pose_world_to_cv_w2c(last_right_eye_pose_world),
+                    dtype=torch.float32,
+                    device=cfg.device,
+                )
+                for overlay_world in controller_overlay_by_source.values():
+                    left_overlay = self._project_live_controller_world_overlay(
+                        overlay_world,
+                        left_intrinsic_t,
+                        left_w2c_cv,
+                        eye_height,
+                        eye_width,
+                    )
+                    if left_overlay is not None:
+                        left_eye_overlay_entries.append(left_overlay)
+                    right_overlay = self._project_live_controller_world_overlay(
+                        overlay_world,
+                        right_intrinsic_t,
+                        right_w2c_cv,
+                        eye_height,
+                        eye_width,
+                    )
+                    if right_overlay is not None:
+                        right_eye_overlay_entries.append(right_overlay)
+                if left_eye_overlay_entries:
+                    left_eye_frame = left_eye_frame.to(dtype=torch.float32)
+                    self._draw_live_controller_overlay(
+                        left_eye_frame,
+                        left_eye_overlay_entries,
+                    )
+                    left_eye_frame = left_eye_frame.clamp(0.0, 255.0).to(torch.uint8)
+                if right_eye_overlay_entries:
+                    right_eye_frame = right_eye_frame.to(dtype=torch.float32)
+                    self._draw_live_controller_overlay(
+                        right_eye_frame,
+                        right_eye_overlay_entries,
+                    )
+                    right_eye_frame = right_eye_frame.clamp(0.0, 255.0).to(torch.uint8)
+
+                validation_sources = []
+                for source in self._sources_pending_grab_start_validation(
+                    controller_interaction_state
+                ):
+                    interaction_state = controller_interaction_state.get(source)
+                    if interaction_state is None:
+                        continue
+                    delay_frames = int(
+                        interaction_state.get("startup_validation_delay_frames", 0)
+                    )
+                    if delay_frames > 0:
+                        interaction_state["startup_validation_delay_frames"] = (
+                            delay_frames - 1
+                        )
+                        continue
+                    validation_sources.append(source)
+
+                if validation_sources:
+                    validation_reason, validation_debug = self._validate_immersive_grab_start_frame(
+                        x,
+                        current_pos,
+                        current_rot,
+                        last_valid_object_center,
+                        last_immersive_sample,
+                        last_left_eye_pose_world,
+                        last_right_eye_pose_world,
+                        eye_width,
+                        eye_height,
+                        left_gaussian_rgba,
+                        left_gaussian_depth,
+                        right_gaussian_rgba,
+                        right_gaussian_depth,
+                    )
+                    if validation_reason is not None:
+                        print(
+                            "[live_openxr_controller] immersive interaction_rollback "
+                            f"sources={validation_sources} reason={validation_reason} "
+                            f"debug={validation_debug}",
+                            flush=True,
+                        )
+                        current_target = self._rollback_immersive_grab_start(
+                            validation_sources,
+                            controller_interaction_state,
+                            controller_attachment_metadata,
+                            last_valid_sim_state,
+                            last_valid_target,
+                            gaussians,
+                            last_valid_gaussian_state,
+                        )
+                        x = last_valid_sim_state["x"].clone()
+                        current_pos = gaussians.get_xyz
+                        current_rot = gaussians.get_rotation
+                        object_points = x[: self.num_all_points]
+                        object_bounds_min = object_points.min(dim=0).values - 0.01
+                        object_bounds_max = object_points.max(dim=0).values + 0.01
+                        left_scene_color, left_scene_depth = scene_renderer.render_eye(
+                            last_left_eye_pose_world,
+                            left_intrinsic,
+                        )
+                        left_eye_frame, left_gaussian_rgba, left_gaussian_depth = (
+                            self._render_immersive_eye_frame(
+                                last_left_eye_pose_world,
+                                left_intrinsic,
+                                eye_height,
+                                eye_width,
+                                left_scene_color,
+                                left_scene_depth,
+                                gaussians,
+                                render_pipe,
+                                background_black,
+                                background_white,
+                            )
+                        )
+                        right_scene_color, right_scene_depth = scene_renderer.render_eye(
+                            last_right_eye_pose_world,
+                            right_intrinsic,
+                        )
+                        right_eye_frame, right_gaussian_rgba, right_gaussian_depth = (
+                            self._render_immersive_eye_frame(
+                                last_right_eye_pose_world,
+                                right_intrinsic,
+                                eye_height,
+                                eye_width,
+                                right_scene_color,
+                                right_scene_depth,
+                                gaussians,
+                                render_pipe,
+                                background_black,
+                                background_white,
+                            )
+                        )
+                    else:
+                        for source in validation_sources:
+                            interaction_state = controller_interaction_state.get(source)
+                            if interaction_state is None:
+                                continue
+                            remaining = int(
+                                interaction_state.get(
+                                    "startup_validation_frames_remaining",
+                                    0,
+                                )
+                            )
+                            if remaining > 0:
+                                interaction_state["startup_validation_frames_remaining"] = (
+                                    remaining - 1
+                                )
+
+                publish_ok, _ = immersive_bridge.publish_stereo_frames(
+                    left_eye_frame,
+                    right_eye_frame,
+                )
+                if not publish_ok:
+                    raise RuntimeError(
+                        "Quest immersive bridge stopped accepting stereo frames.\n"
+                        + immersive_bridge.debug_summary()
+                    )
+
+                if preview_display_active and preview_tex is not None:
+                    glfw.make_context_current(window)
+                    left_preview = left_eye_frame.detach().cpu().numpy()
+                    gl.glBindTexture(gl.GL_TEXTURE_2D, preview_tex)
+                    gl.glTexSubImage2D(
+                        gl.GL_TEXTURE_2D,
+                        0,
+                        0,
+                        0,
+                        eye_width,
+                        eye_height,
+                        gl.GL_RGBA,
+                        gl.GL_UNSIGNED_BYTE,
+                        left_preview,
+                    )
+                    gl.glBindTexture(gl.GL_TEXTURE_2D, 0)
+                    fb_width, fb_height = glfw.get_framebuffer_size(window)
+                    gl.glViewport(0, 0, fb_width, fb_height)
+                    gl.glDisable(gl.GL_DEPTH_TEST)
+                    gl.glClear(gl.GL_COLOR_BUFFER_BIT)
+                    gl.glUseProgram(preview_prog)
+                    gl.glBindVertexArray(preview_vao)
+                    gl.glActiveTexture(gl.GL_TEXTURE0)
+                    gl.glBindTexture(gl.GL_TEXTURE_2D, preview_tex)
+                    gl.glDrawArrays(gl.GL_TRIANGLE_STRIP, 0, 4)
+                    gl.glBindTexture(gl.GL_TEXTURE_2D, 0)
+                    gl.glBindVertexArray(0)
+                    gl.glUseProgram(0)
+                    glfw.swap_buffers(window)
+
+                glfw.poll_events()
+                render_time = render_timer.stop()
+                if frame_count > 1:
+                    component_times["rendering"].append(render_time)
+
+                if (
+                    self._is_finite_tensor(x)
+                    and self._is_finite_tensor(current_pos)
+                    and self._is_finite_tensor(current_rot)
+                ):
+                    last_valid_sim_state = self._capture_sim_state()
+                    last_valid_target = current_target.clone()
+                    last_valid_gaussian_state = self._capture_gaussian_runtime_state(
+                        gaussians
+                    )
+                    last_valid_object_center = (
+                        x[: self.num_all_points].mean(dim=0).detach().clone()
+                    )
+
+                total_time = total_timer.stop()
+                if frame_count > 1:
+                    component_times["total"].append(total_time)
+
+                if eval_image_path:
+                    should_save_frame = frame_count < 5 or (frame_count % 30 == 0)
+                    if should_save_frame and left_eye_frame is not None:
+                        save_path = os.path.join(
+                            view_render_path,
+                            f"{frame_count:05d}.png",
+                        )
+                        img_rgb = left_eye_frame[..., :3].permute(2, 0, 1).float() / 255.0
+                        torchvision.utils.save_image(img_rgb, save_path)
+
+                next_prev_target = current_target.clone()
+                next_target = self._compute_next_live_controller_target(
+                    controller_runtime_base_target,
+                    next_prev_target,
+                    controller_interaction_state,
+                    controller_interaction_state_cache,
+                    controller_source_masks,
+                    controller_source_anchor_centers,
+                    controller_attachment_metadata,
+                    controller_anchor_templates,
+                    controller_predefined_anchor_states,
+                    controller_anchor_preview_state,
+                    controller_overlay_by_source,
+                    current_live_left_controller,
+                    current_live_right_controller,
+                    x[: self.num_all_points],
+                    controller_reset_triggered=controller_reset_triggered,
+                    controller_motion_state_cache=controller_motion_state_cache,
+                    frame_index=frame_count,
+                    runtime_label="immersive",
+                )
+                frame_count += 1
+                prev_target = next_prev_target
+                current_target = next_target
+
+                if preview_display_active and glfw.window_should_close(window):
+                    break
+
+        finally:
+            if frame_count > 1 and component_times["total"]:
+                frames_used_for_stats = len(component_times["total"])
+                print(
+                    f"\n=== Immersive Summary (averaged over {frames_used_for_stats} frames) ==="
+                )
+                total_frame_times = component_times["total"]
+                total_time_seconds = sum(total_frame_times)
+                average_fps = frames_used_for_stats / total_time_seconds
+                average_frame_time = np.mean(total_frame_times)
+                print(f"Average FPS: {average_fps:.2f}")
+                print(f"Average Total Frame Time: {average_frame_time * 1000:.2f} ms")
+                for component_name in (
+                    "simulator",
+                    "full_motion_interpolation",
+                    "rendering",
+                ):
+                    component_times_list = component_times.get(component_name, [])
+                    if component_times_list:
+                        average_component_time = np.mean(component_times_list)
+                        time_share_percentage = (
+                            average_component_time / average_frame_time
+                        ) * 100.0
+                        readable_name = component_name.replace("_", " ").capitalize()
+                        print(
+                            f"{readable_name}: {average_component_time * 1000:.2f} ms "
+                            f"({time_share_percentage:.1f}%)"
+                        )
+            if immersive_bridge is not None:
+                immersive_bridge.stop()
+            if scene_renderer is not None:
+                scene_renderer.delete()
+            if preview_prog is not None:
+                gl.glDeleteProgram(preview_prog)
+            if preview_tex is not None:
+                gl.glDeleteTextures([preview_tex])
+            if preview_vao is not None:
+                gl.glDeleteVertexArrays(1, [preview_vao])
+            if cuda_ctx is not None:
+                cuda_ctx.pop()
+
+    #this is basically baseline + rendering (to verify correctness)
     def interactive_playground_batched_visualization(
         self, model_path, gs_path,
-        eval_image_path, n_dup=0, 
+        eval_image_path, n_dup=0,
         window=None,
         cuda_ctx=None,
         input_source="recorded",
         controller_mode="multi_points",
         quest_display_mode="off",
-        interactive_window_mode="visible"):
+        interactive_window_mode="visible",
+        scene_preset="none",
+        scene_assets_root="./data/open_scene_assets"):
 
         if cfg.self_collision:
             print(f"collision dist {cfg.collision_dist}")
         else:
             print("no collision flag set")
-        
+
         # Load the model
         logger.info(f"Load model from {model_path}")
         checkpoint = torch.load(model_path, map_location=cfg.device)
@@ -4213,15 +7954,30 @@ class InvPhyTrainerWarp:
             raise ValueError(f"Unsupported input_source: {input_source}")
         if controller_mode != "multi_points":
             raise ValueError(f"Unsupported controller_mode: {controller_mode}")
-        if quest_display_mode not in {"off", "panel", "primary"}:
+        if quest_display_mode not in {"off", "panel", "primary", "immersive"}:
             raise ValueError(f"Unsupported quest_display_mode: {quest_display_mode}")
         if quest_display_mode != "off" and input_source != "live_openxr_controller":
             raise ValueError(
                 "Quest display mode currently supports only input_source=live_openxr_controller"
             )
+        if scene_preset not in {"none", "simple_lab"}:
+            raise ValueError(f"Unsupported scene_preset: {scene_preset}")
         if input_source in {"live_openxr", "live_openxr_controller"} and n_dup != 0:
             raise ValueError(
                 f"{input_source} input currently supports only the single-instance case (--n_dup 0)"
+            )
+        if quest_display_mode == "immersive":
+            return self._interactive_playground_batched_visualization_immersive(
+                model_path=model_path,
+                gs_path=gs_path,
+                eval_image_path=eval_image_path,
+                window=window,
+                cuda_ctx=cuda_ctx,
+                input_source=input_source,
+                controller_mode=controller_mode,
+                interactive_window_mode=interactive_window_mode,
+                scene_preset=scene_preset,
+                scene_assets_root=scene_assets_root,
             )
 
         #load trained parameter, collide* are 1D tensor of length 1 
@@ -4257,6 +8013,7 @@ class InvPhyTrainerWarp:
         controller_source_masks = None
         controller_source_anchor_centers = None
         controller_attachment_metadata = None
+        controller_anchor_templates = {"left": {}, "right": {}}
         controller_predefined_anchor_defs = None
         controller_runtime_base_target = None
         if recorded_base_target is not None:
@@ -4310,6 +8067,14 @@ class InvPhyTrainerWarp:
             )
             for source, runtime_meta in two_point_runtime["source_runtime"].items():
                 controller_attachment_metadata[source].update(runtime_meta)
+            controller_anchor_templates = self._build_predefined_controller_anchor_templates(
+                controller_runtime_base_target,
+                obj_init_vertices,
+                controller_source_masks,
+                controller_source_anchor_centers,
+                controller_attachment_metadata,
+                controller_predefined_anchor_defs,
+            )
             ctrl_init_vertices = controller_runtime_base_target
 
         n_vert_single_obj = obj_init_vertices.shape[0]
@@ -4616,6 +8381,8 @@ class InvPhyTrainerWarp:
         current_live_left_controller = None
         current_live_right_controller = None
         controller_select_state_cache = {"left": None, "right": None}
+        controller_select_hold_state = {"left": {}, "right": {}}
+        controller_select_hold_state_cache = {"left": None, "right": None}
         controller_anchor_cycle_state_cache = {"left": None, "right": None}
         controller_anchor_cycle_edge_cache = {"left": False, "right": False}
         controller_snap_state_cache = {"left": None, "right": None}
@@ -4629,6 +8396,7 @@ class InvPhyTrainerWarp:
         controller_attach_candidate_state_cache = {"left": None, "right": None}
         controller_interaction_state = {"left": None, "right": None}
         controller_interaction_state_cache = {"left": None, "right": None}
+        controller_motion_state_cache = {"left": None, "right": None}
         quest_frame_panel = None
         repo_root = Path(__file__).resolve().parents[2]
 
@@ -4716,51 +8484,24 @@ class InvPhyTrainerWarp:
                     live_controller_stream = OpenXRControllerStream(repo_root)
                     live_controller_stream.start()
                 initial_controller_sample = live_controller_stream.wait_for_sample(timeout=10.0)
-                live_controller_alignment, live_controller_alignment_mode = (
-                    self._update_live_controller_alignment(
-                        live_controller_alignment,
-                        live_controller_alignment_mode,
-                        initial_controller_sample,
-                        controller_source_anchor_centers,
-                        w2c,
-                    )
-                )
-                current_live_left_controller = self._convert_live_controller_to_world(
-                    "left",
-                    initial_controller_sample.left,
+                controller_runtime_state = self._update_live_controller_runtime_from_sample(
+                    initial_controller_sample,
                     live_controller_alignment,
-                )
-                current_live_right_controller = self._convert_live_controller_to_world(
-                    "right",
-                    initial_controller_sample.right,
-                    live_controller_alignment,
-                )
-                self._log_controller_select_transition(
-                    "left", initial_controller_sample.left, controller_select_state_cache
-                )
-                self._log_controller_select_transition(
-                    "right", initial_controller_sample.right, controller_select_state_cache
-                )
-                self._log_controller_anchor_cycle_transition(
-                    "left",
-                    initial_controller_sample.left,
+                    live_controller_alignment_mode,
+                    controller_source_anchor_centers,
+                    w2c,
+                    controller_select_state_cache,
+                    controller_select_hold_state,
+                    controller_select_hold_state_cache,
                     controller_anchor_cycle_state_cache,
-                )
-                self._log_controller_anchor_cycle_transition(
-                    "right",
-                    initial_controller_sample.right,
-                    controller_anchor_cycle_state_cache,
-                )
-                self._log_controller_snap_transition(
-                    "left",
-                    initial_controller_sample.left,
                     controller_snap_state_cache,
+                    controller_snap_edge_cache,
+                    collect_reset_edges=False,
                 )
-                self._log_controller_snap_transition(
-                    "right",
-                    initial_controller_sample.right,
-                    controller_snap_state_cache,
-                )
+                live_controller_alignment = controller_runtime_state["alignment"]
+                live_controller_alignment_mode = controller_runtime_state["alignment_mode"]
+                current_live_left_controller = controller_runtime_state["left_controller"]
+                current_live_right_controller = controller_runtime_state["right_controller"]
             if input_source == "live_openxr_controller":
                 current_target = controller_runtime_base_target.clone()
             else:
@@ -4852,70 +8593,31 @@ class InvPhyTrainerWarp:
                         current_live_right_anchor = None
                 elif input_source == "live_openxr_controller":
                     latest_controller_sample = live_controller_stream.get_latest_sample()
-                    controller_reset_sources = []
                     if latest_controller_sample is not None:
-                        live_controller_alignment, live_controller_alignment_mode = (
-                            self._update_live_controller_alignment(
+                        controller_runtime_state = (
+                            self._update_live_controller_runtime_from_sample(
+                                latest_controller_sample,
                                 live_controller_alignment,
                                 live_controller_alignment_mode,
-                                latest_controller_sample,
                                 controller_source_anchor_centers,
                                 w2c,
+                                controller_select_state_cache,
+                                controller_select_hold_state,
+                                controller_select_hold_state_cache,
+                                controller_anchor_cycle_state_cache,
+                                controller_snap_state_cache,
+                                controller_snap_edge_cache,
                             )
                         )
-                        current_live_left_controller = self._convert_live_controller_to_world(
-                            "left",
-                            latest_controller_sample.left,
-                            live_controller_alignment,
-                        )
-                        current_live_right_controller = self._convert_live_controller_to_world(
-                            "right",
-                            latest_controller_sample.right,
-                            live_controller_alignment,
-                        )
-                        self._log_controller_select_transition(
-                            "left",
-                            latest_controller_sample.left,
-                            controller_select_state_cache,
-                        )
-                        self._log_controller_select_transition(
-                            "right",
-                            latest_controller_sample.right,
-                            controller_select_state_cache,
-                        )
-                        self._log_controller_anchor_cycle_transition(
-                            "left",
-                            latest_controller_sample.left,
-                            controller_anchor_cycle_state_cache,
-                        )
-                        self._log_controller_anchor_cycle_transition(
-                            "right",
-                            latest_controller_sample.right,
-                            controller_anchor_cycle_state_cache,
-                        )
-                        self._log_controller_snap_transition(
-                            "left",
-                            latest_controller_sample.left,
-                            controller_snap_state_cache,
-                        )
-                        self._log_controller_snap_transition(
-                            "right",
-                            latest_controller_sample.right,
-                            controller_snap_state_cache,
-                        )
-                        for source, controller_sample in (
-                            ("left", latest_controller_sample.left),
-                            ("right", latest_controller_sample.right),
-                        ):
-                            if self._controller_snap_edge(
-                                source,
-                                controller_sample,
-                                controller_snap_edge_cache,
-                            ):
-                                controller_reset_sources.append(source)
+                        live_controller_alignment = controller_runtime_state["alignment"]
+                        live_controller_alignment_mode = controller_runtime_state["alignment_mode"]
+                        current_live_left_controller = controller_runtime_state["left_controller"]
+                        current_live_right_controller = controller_runtime_state["right_controller"]
+                        controller_reset_sources = controller_runtime_state["reset_sources"]
                     else:
                         current_live_left_controller = None
                         current_live_right_controller = None
+                        controller_reset_sources = []
 
                     if controller_reset_sources:
                         pressed_buttons = [
@@ -5191,10 +8893,17 @@ class InvPhyTrainerWarp:
                                     overlay_entry["hit_world"],
                                     controller_predefined_anchor_states,
                                 )
-                            if nearest_anchor is None:
+                            ray_origin_world, ray_direction_world = (
+                                self._controller_world_ray_pose(controller_world)
+                            )
+                            if (
+                                nearest_anchor is None
+                                and ray_origin_world is not None
+                                and ray_direction_world is not None
+                            ):
                                 nearest_anchor = self._select_predefined_interaction_anchor_for_ray(
-                                    controller_world["position"],
-                                    controller_world["direction"],
+                                    ray_origin_world,
+                                    ray_direction_world,
                                     controller_predefined_anchor_states,
                                 )
                             attach_candidate_anchor = (
@@ -5413,56 +9122,26 @@ class InvPhyTrainerWarp:
                     else:
                         current_target = recorded_base_target.clone()
                     if input_source == "live_openxr_controller":
-                        if not controller_reset_triggered:
-                            (
-                                current_left_interaction_anchor,
-                                current_right_interaction_anchor,
-                            ) = self._resolve_live_controller_interaction_anchors(
-                                current_live_left_controller,
-                                current_live_right_controller,
-                                controller_overlay_by_source,
-                                controller_interaction_state,
-                                controller_source_anchor_centers,
-                                controller_attachment_metadata,
-                                controller_predefined_anchor_states,
-                                controller_anchor_preview_state,
-                                x[: self.num_all_points],
-                            )
-                            self._log_controller_interaction_transition(
-                                "left",
-                                controller_interaction_state["left"],
-                                controller_interaction_state_cache,
-                            )
-                            self._log_controller_interaction_transition(
-                                "right",
-                                controller_interaction_state["right"],
-                                controller_interaction_state_cache,
-                            )
-                            current_target = self._make_live_controller_target_from_anchors(
-                                current_target,
-                                current_left_interaction_anchor,
-                                current_right_interaction_anchor,
-                                controller_source_masks,
-                                controller_source_anchor_centers,
-                                controller_interaction_state,
-                            )
-                            self._apply_controller_start_prev_target_overrides(
-                                prev_target,
-                                current_target,
-                                controller_source_masks,
-                                controller_interaction_state,
-                            )
-                        else:
-                            self._log_controller_interaction_transition(
-                                "left",
-                                controller_interaction_state["left"],
-                                controller_interaction_state_cache,
-                            )
-                            self._log_controller_interaction_transition(
-                                "right",
-                                controller_interaction_state["right"],
-                                controller_interaction_state_cache,
-                            )
+                        current_target = self._compute_next_live_controller_target(
+                            current_target,
+                            prev_target,
+                            controller_interaction_state,
+                            controller_interaction_state_cache,
+                            controller_source_masks,
+                            controller_source_anchor_centers,
+                            controller_attachment_metadata,
+                            controller_anchor_templates,
+                            controller_predefined_anchor_states,
+                            controller_anchor_preview_state,
+                            controller_overlay_by_source,
+                            current_live_left_controller,
+                            current_live_right_controller,
+                            x[: self.num_all_points],
+                            controller_reset_triggered=controller_reset_triggered,
+                            controller_motion_state_cache=controller_motion_state_cache,
+                            frame_index=frame_count,
+                            runtime_label="2d",
+                        )
                 else:
                     if frame_count < self.frame_len:
                         current_target = self.batch_controller_points[frame_count]

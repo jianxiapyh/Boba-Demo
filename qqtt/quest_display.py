@@ -17,9 +17,13 @@ import torch
 
 from qqtt.live_openxr import (
     ControllerPoseSample,
+    EyeFovSample,
+    EyePoseSample,
     LiveControllerSample,
+    LiveImmersiveSample,
     _ensure_jsoncpp_compat_dir,
     _prepend_env_path,
+    parse_controller_payload,
 )
 
 
@@ -405,32 +409,7 @@ class OpenXRFramePanelMirror:
 
     @staticmethod
     def _parse_controller(payload: dict) -> ControllerPoseSample:
-        position = np.asarray(payload["position"], dtype=np.float32)
-        orientation = np.asarray(payload["orientation"], dtype=np.float32)
-        if position.shape != (3,):
-            raise ValueError(f"controller position shape {position.shape} != (3,)")
-        if orientation.shape != (4,):
-            raise ValueError(f"controller orientation shape {orientation.shape} != (4,)")
-        return ControllerPoseSample(
-            source=str(payload["source"]),
-            active=bool(payload["active"]),
-            position_valid=bool(payload["position_valid"]),
-            orientation_valid=bool(payload["orientation_valid"]),
-            position_tracked=bool(payload["position_tracked"]),
-            orientation_tracked=bool(payload["orientation_tracked"]),
-            position=position,
-            orientation=orientation,
-            select_available=bool(payload["select_available"]),
-            select_pressed=bool(payload["select_pressed"]),
-            select_value=float(payload["select_value"]),
-            select_source=str(payload["select_source"]),
-            anchor_cycle_available=bool(payload["anchor_cycle_available"]),
-            anchor_cycle_pressed=bool(payload["anchor_cycle_pressed"]),
-            anchor_cycle_source=str(payload["anchor_cycle_source"]),
-            snap_assist_available=bool(payload["snap_assist_available"]),
-            snap_assist_pressed=bool(payload["snap_assist_pressed"]),
-            snap_assist_source=str(payload["snap_assist_source"]),
-        )
+        return parse_controller_payload(payload)
 
     @staticmethod
     def _default_runtime_json_path() -> Optional[str]:
@@ -460,3 +439,207 @@ class OpenXRFramePanelMirror:
             / "linux64"
         )
         return str(candidate) if candidate.exists() else None
+
+
+class OpenXRImmersiveBridge(OpenXRFramePanelMirror):
+    HEADER_MAGIC = b"BOBAQIM1"
+    EYE_COUNT = 2
+
+    def __init__(self, repo_root: Path, width: int, height: int):
+        super().__init__(repo_root=repo_root, width=width, height=height)
+        self.frame_bytes = self.width * self.height * self.channels * self.EYE_COUNT
+        pin_memory = torch.cuda.is_available()
+        self._cpu_stage_buffers = [
+            torch.empty(
+                (self.EYE_COUNT, self.height, self.width, self.channels),
+                dtype=torch.uint8,
+                device="cpu",
+                pin_memory=pin_memory,
+            )
+            for _ in range(self.STAGING_BUFFER_COUNT)
+        ]
+        self._cpu_stage_arrays = [buffer.numpy() for buffer in self._cpu_stage_buffers]
+        self.binary_path = self.repo_root / "linux_pose_probe" / "openxr_immersive_bridge"
+        self.build_script_path = (
+            self.repo_root / "linux_pose_probe" / "build_openxr_immersive_bridge.sh"
+        )
+        self.source_path = self.repo_root / "linux_pose_probe" / "openxr_frame_panel.cpp"
+
+    def publish_stereo_frames(
+        self,
+        left_frame_rgba: torch.Tensor,
+        right_frame_rgba: torch.Tensor,
+    ) -> tuple[bool, dict[str, float]]:
+        timing = {
+            "process_check_wall": 0.0,
+            "pending_drain_nonblock_wall": 0.0,
+            "pending_drain_block_wall": 0.0,
+            "gpu_to_cpu_wait_wall": 0.0,
+            "gpu_to_cpu_copy_cuda": 0.0,
+            "cpu_mmap_copy_wall": 0.0,
+            "header_write_wall": 0.0,
+            "stage_enqueue_wall": 0.0,
+            "fallback_copy_wall": 0.0,
+            "total_wall": 0.0,
+        }
+        publish_start = time.perf_counter()
+        if self._shared_mmap is None:
+            raise RuntimeError("Immersive Quest shared buffer is not initialized.")
+        expected_shape = (self.height, self.width, self.channels)
+        for name, frame in (("left", left_frame_rgba), ("right", right_frame_rgba)):
+            if frame.shape != expected_shape:
+                raise ValueError(
+                    f"{name} immersive frame shape {tuple(frame.shape)} != {expected_shape}"
+                )
+            if frame.dtype != torch.uint8:
+                raise ValueError(
+                    f"{name} immersive frame dtype {frame.dtype} != torch.uint8"
+                )
+
+        stereo_frame = torch.stack([left_frame_rgba, right_frame_rgba], dim=0)
+        process_check_start = time.perf_counter()
+        if self.process is not None and self.process.poll() is not None:
+            if not self._exit_logged:
+                print(
+                    "[quest_display] immersive bridge exited unexpectedly; "
+                    "disabling immersive Quest publishing for this run.\n"
+                    + self.debug_summary(),
+                    flush=True,
+                )
+                self._exit_logged = True
+            timing["process_check_wall"] = time.perf_counter() - process_check_start
+            timing["total_wall"] = time.perf_counter() - publish_start
+            return False, timing
+        timing["process_check_wall"] = time.perf_counter() - process_check_start
+
+        slot = self._frame_counter % self.SLOT_COUNT
+        frame_id = self._frame_counter + 1
+        self._frame_counter = frame_id
+        drain_nonblock_start = time.perf_counter()
+        drain_nonblock_stats = self._drain_pending_stage_copies(block=False)
+        timing["pending_drain_nonblock_wall"] = time.perf_counter() - drain_nonblock_start
+        timing["gpu_to_cpu_wait_wall"] += drain_nonblock_stats["wait_wall"]
+        timing["gpu_to_cpu_copy_cuda"] += drain_nonblock_stats["gpu_to_cpu_copy_cuda"]
+        timing["cpu_mmap_copy_wall"] += drain_nonblock_stats["cpu_mmap_copy_wall"]
+        timing["header_write_wall"] += drain_nonblock_stats["header_write_wall"]
+
+        if self._staging_copy_stream is None:
+            fallback_start = time.perf_counter()
+            stage_array = self._cpu_stage_arrays[0]
+            np.copyto(stage_array, stereo_frame.cpu().numpy())
+            commit_stats = self._commit_stage_array(stage_array, slot=slot, frame_id=frame_id)
+            timing["fallback_copy_wall"] = time.perf_counter() - fallback_start
+            timing["cpu_mmap_copy_wall"] += commit_stats["cpu_mmap_copy_wall"]
+            timing["header_write_wall"] += commit_stats["header_write_wall"]
+            timing["total_wall"] = time.perf_counter() - publish_start
+            return True, timing
+
+        if len(self._pending_stage_copies) >= self.STAGING_BUFFER_COUNT:
+            drain_block_start = time.perf_counter()
+            drain_block_stats = self._drain_pending_stage_copies(block=True)
+            timing["pending_drain_block_wall"] = time.perf_counter() - drain_block_start
+            timing["gpu_to_cpu_wait_wall"] += drain_block_stats["wait_wall"]
+            timing["gpu_to_cpu_copy_cuda"] += drain_block_stats["gpu_to_cpu_copy_cuda"]
+            timing["cpu_mmap_copy_wall"] += drain_block_stats["cpu_mmap_copy_wall"]
+            timing["header_write_wall"] += drain_block_stats["header_write_wall"]
+
+        stage_index = self._next_stage_index
+        stage_buffer = self._cpu_stage_buffers[stage_index]
+        stage_array = self._cpu_stage_arrays[stage_index]
+        producer_ready_event = torch.cuda.Event()
+        copy_start_event = torch.cuda.Event(enable_timing=True)
+        copy_end_event = torch.cuda.Event(enable_timing=True)
+        enqueue_start = time.perf_counter()
+        producer_ready_event.record(torch.cuda.current_stream())
+        with torch.cuda.stream(self._staging_copy_stream):
+            self._staging_copy_stream.wait_event(producer_ready_event)
+            copy_start_event.record(self._staging_copy_stream)
+            stage_buffer.copy_(stereo_frame, non_blocking=True)
+            copy_end_event.record(self._staging_copy_stream)
+        timing["stage_enqueue_wall"] = time.perf_counter() - enqueue_start
+        self._pending_stage_copies.append(
+            {
+                "start_event": copy_start_event,
+                "end_event": copy_end_event,
+                "stage_array": stage_array,
+                "slot": slot,
+                "frame_id": frame_id,
+            }
+        )
+        self._next_stage_index = (stage_index + 1) % self.STAGING_BUFFER_COUNT
+        timing["total_wall"] = time.perf_counter() - publish_start
+        return True, timing
+
+    def wait_for_sample(self, timeout: float = 10.0) -> LiveImmersiveSample:
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            sample = self.get_latest_sample()
+            if sample is not None:
+                return sample
+            if self.process is not None and self.process.poll() is not None:
+                raise RuntimeError(
+                    "Quest immersive bridge exited before producing pose data.\n"
+                    + self.debug_summary()
+                )
+            time.sleep(0.05)
+        raise RuntimeError(
+            "Timed out waiting for Quest immersive pose sample.\n" + self.debug_summary()
+        )
+
+    def _create_shared_frame_file(self) -> None:
+        total_bytes = self.HEADER_STRUCT.size + self.SLOT_COUNT * self.frame_bytes
+        fd, path = tempfile.mkstemp(
+            prefix="boba_quest_immersive_",
+            suffix=".bin",
+            dir="/tmp",
+        )
+        self.shared_frame_path = Path(path)
+        self._shared_file = os.fdopen(fd, "r+b", buffering=0)
+        self._shared_file.truncate(total_bytes)
+        self._shared_mmap = mmap.mmap(self._shared_file.fileno(), total_bytes)
+        self._write_header(latest_frame_id=0, latest_slot=0)
+        self._slot_views = []
+        for slot_index in range(self.SLOT_COUNT):
+            offset = self.HEADER_STRUCT.size + slot_index * self.frame_bytes
+            self._slot_views.append(
+                np.ndarray(
+                    (self.EYE_COUNT, self.height, self.width, self.channels),
+                    dtype=np.uint8,
+                    buffer=self._shared_mmap,
+                    offset=offset,
+                )
+            )
+            self._slot_views[-1].fill(0)
+
+    @staticmethod
+    def _parse_sample(payload: dict) -> LiveImmersiveSample:
+        return LiveImmersiveSample(
+            sample=int(payload["sample"]),
+            left=OpenXRFramePanelMirror._parse_controller(payload["left"]),
+            right=OpenXRFramePanelMirror._parse_controller(payload["right"]),
+            left_eye=OpenXRImmersiveBridge._parse_eye(payload["left_eye"]),
+            right_eye=OpenXRImmersiveBridge._parse_eye(payload["right_eye"]),
+        )
+
+    @staticmethod
+    def _parse_eye(payload: dict) -> EyePoseSample:
+        position = np.asarray(payload["position"], dtype=np.float32)
+        orientation = np.asarray(payload["orientation"], dtype=np.float32)
+        if position.shape != (3,):
+            raise ValueError(f"eye position shape {position.shape} != (3,)")
+        if orientation.shape != (4,):
+            raise ValueError(f"eye orientation shape {orientation.shape} != (4,)")
+        return EyePoseSample(
+            pose_valid=bool(payload["pose_valid"]),
+            pose_tracked=bool(payload["pose_tracked"]),
+            position=position,
+            orientation=orientation,
+            fov=EyeFovSample(
+                angle_left=float(payload["fov"]["angle_left"]),
+                angle_right=float(payload["fov"]["angle_right"]),
+                angle_up=float(payload["fov"]["angle_up"]),
+                angle_down=float(payload["fov"]["angle_down"]),
+            ),
+            recommended_width=int(payload["recommended_width"]),
+            recommended_height=int(payload["recommended_height"]),
+        )

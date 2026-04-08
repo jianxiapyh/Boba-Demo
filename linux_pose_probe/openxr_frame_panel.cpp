@@ -34,6 +34,13 @@ namespace {
 constexpr int kPanelWindowWidth = 64;
 constexpr int kPanelWindowHeight = 64;
 constexpr uint32_t kExpectedHeaderVersion = 1;
+#ifdef BOBA_IMMERSIVE_BRIDGE
+constexpr const char* kExpectedSharedFrameMagic = "BOBAQIM1";
+constexpr const char* kBinaryUsageName = "openxr_immersive_bridge";
+#else
+constexpr const char* kExpectedSharedFrameMagic = "BOBAQST1";
+constexpr const char* kBinaryUsageName = "openxr_frame_panel";
+#endif
 constexpr float kPanelDistanceMeters = 1.1f;
 constexpr float kPanelWidthMeters = 1.2f;
 constexpr float kPanelYOffsetMeters = 0.0f;
@@ -142,7 +149,8 @@ bool ParseArgs(int argc, char** argv, std::string* frame_path) {
             *frame_path = argv[++i];
             continue;
         }
-        std::cerr << "Usage: openxr_frame_panel --frame-path /tmp/boba_quest_frame.bin\n";
+        std::cerr << "Usage: " << kBinaryUsageName
+                  << " --frame-path /tmp/boba_quest_frame.bin\n";
         return false;
     }
 
@@ -403,6 +411,8 @@ bool QuerySelectValueState(
 }
 
 void PrintControllerJson(const char* prefix, const ControllerPoseSample& pose,
+                         const ControllerPoseSample& grip,
+                         const ControllerPoseSample& aim,
                          const SelectStateSample& select,
                          const SelectStateSample& anchor_cycle,
                          const SelectStateSample& snap_assist) {
@@ -419,6 +429,30 @@ void PrintControllerJson(const char* prefix, const ControllerPoseSample& pose,
     std::cout << "\"orientation\":["
               << pose.pose.orientation.x << "," << pose.pose.orientation.y << ","
               << pose.pose.orientation.z << "," << pose.pose.orientation.w << "],";
+    std::cout << "\"grip_active\":" << (grip.action_active ? 1 : 0) << ",";
+    std::cout << "\"grip_position_valid\":" << (grip.position_valid ? 1 : 0) << ",";
+    std::cout << "\"grip_orientation_valid\":" << (grip.orientation_valid ? 1 : 0) << ",";
+    std::cout << "\"grip_position_tracked\":" << (grip.position_tracked ? 1 : 0) << ",";
+    std::cout << "\"grip_orientation_tracked\":" << (grip.orientation_tracked ? 1 : 0)
+              << ",";
+    std::cout << "\"grip_position\":["
+              << grip.pose.position.x << "," << grip.pose.position.y << ","
+              << grip.pose.position.z << "],";
+    std::cout << "\"grip_orientation\":["
+              << grip.pose.orientation.x << "," << grip.pose.orientation.y << ","
+              << grip.pose.orientation.z << "," << grip.pose.orientation.w << "],";
+    std::cout << "\"aim_active\":" << (aim.action_active ? 1 : 0) << ",";
+    std::cout << "\"aim_position_valid\":" << (aim.position_valid ? 1 : 0) << ",";
+    std::cout << "\"aim_orientation_valid\":" << (aim.orientation_valid ? 1 : 0) << ",";
+    std::cout << "\"aim_position_tracked\":" << (aim.position_tracked ? 1 : 0) << ",";
+    std::cout << "\"aim_orientation_tracked\":" << (aim.orientation_tracked ? 1 : 0)
+              << ",";
+    std::cout << "\"aim_position\":["
+              << aim.pose.position.x << "," << aim.pose.position.y << ","
+              << aim.pose.position.z << "],";
+    std::cout << "\"aim_orientation\":["
+              << aim.pose.orientation.x << "," << aim.pose.orientation.y << ","
+              << aim.pose.orientation.z << "," << aim.pose.orientation.w << "],";
     std::cout << "\"select_available\":" << (select.available ? 1 : 0) << ",";
     std::cout << "\"select_pressed\":" << (select.pressed ? 1 : 0) << ",";
     std::cout << "\"select_value\":" << select.value << ",";
@@ -431,6 +465,29 @@ void PrintControllerJson(const char* prefix, const ControllerPoseSample& pose,
     std::cout << "\"snap_assist_source\":\"" << snap_assist.source << "\"";
     std::cout << "}";
 }
+
+#ifdef BOBA_IMMERSIVE_BRIDGE
+void PrintEyeJson(const char* prefix, const XrView& view, const SwapchainView& swapchain_view,
+                  bool pose_valid, bool pose_tracked) {
+    std::cout << "\"" << prefix << "\":{";
+    std::cout << "\"pose_valid\":" << (pose_valid ? 1 : 0) << ",";
+    std::cout << "\"pose_tracked\":" << (pose_tracked ? 1 : 0) << ",";
+    std::cout << "\"position\":["
+              << view.pose.position.x << "," << view.pose.position.y << ","
+              << view.pose.position.z << "],";
+    std::cout << "\"orientation\":["
+              << view.pose.orientation.x << "," << view.pose.orientation.y << ","
+              << view.pose.orientation.z << "," << view.pose.orientation.w << "],";
+    std::cout << "\"fov\":{"
+              << "\"angle_left\":" << view.fov.angleLeft << ","
+              << "\"angle_right\":" << view.fov.angleRight << ","
+              << "\"angle_up\":" << view.fov.angleUp << ","
+              << "\"angle_down\":" << view.fov.angleDown << "},";
+    std::cout << "\"recommended_width\":" << swapchain_view.width << ",";
+    std::cout << "\"recommended_height\":" << swapchain_view.height;
+    std::cout << "}";
+}
+#endif
 
 bool OpenSharedFrameFile(const std::string& frame_path, SharedFrameFile* file) {
     file->fd = open(frame_path.c_str(), O_RDONLY);
@@ -457,7 +514,7 @@ bool OpenSharedFrameFile(const std::string& frame_path, SharedFrameFile* file) {
     }
 
     file->header = static_cast<const SharedFrameHeader*>(file->mapped);
-    if (std::memcmp(file->header->magic, "BOBAQST1", 8) != 0) {
+    if (std::memcmp(file->header->magic, kExpectedSharedFrameMagic, 8) != 0) {
         std::cerr << "Shared frame header magic mismatch.\n";
         munmap(file->mapped, file->mapped_size);
         close(file->fd);
@@ -485,6 +542,20 @@ bool OpenSharedFrameFile(const std::string& frame_path, SharedFrameFile* file) {
         file->fd = -1;
         return false;
     }
+#ifdef BOBA_IMMERSIVE_BRIDGE
+    const uint32_t eye_frame_bytes =
+        file->header->width * file->header->height * file->header->channels;
+    if (file->header->frame_bytes != eye_frame_bytes * 2u) {
+        std::cerr << "Immersive shared frame_bytes mismatch: got "
+                  << file->header->frame_bytes << " expected " << (eye_frame_bytes * 2u)
+                  << "\n";
+        munmap(file->mapped, file->mapped_size);
+        close(file->fd);
+        file->mapped = MAP_FAILED;
+        file->fd = -1;
+        return false;
+    }
+#endif
 
     file->payload = static_cast<const uint8_t*>(file->mapped) + sizeof(SharedFrameHeader);
     std::cerr << "Opened shared frame file " << frame_path << " ("
@@ -525,6 +596,30 @@ bool UpdateDisplayFrameIfNeeded(const SharedFrameFile& file, uint64_t* latest_fr
     *latest_frame_id = header.latest_frame_id;
     return true;
 }
+
+#ifdef BOBA_IMMERSIVE_BRIDGE
+bool UpdateStereoFramesIfNeeded(const SharedFrameFile& file, uint64_t* latest_frame_id,
+                                std::vector<uint8_t>* left_eye_rgba,
+                                std::vector<uint8_t>* right_eye_rgba) {
+    const SharedFrameHeader header = *file.header;
+    if (header.latest_frame_id == *latest_frame_id) {
+        return false;
+    }
+    if (header.latest_slot >= header.slot_count) {
+        std::cerr << "Invalid latest_slot in shared frame header: " << header.latest_slot
+                  << "\n";
+        return false;
+    }
+
+    const uint32_t eye_frame_bytes = header.width * header.height * header.channels;
+    const size_t slot_offset = static_cast<size_t>(header.latest_slot) * header.frame_bytes;
+    const uint8_t* source = file.payload + slot_offset;
+    left_eye_rgba->assign(source, source + eye_frame_bytes);
+    right_eye_rgba->assign(source + eye_frame_bytes, source + header.frame_bytes);
+    *latest_frame_id = header.latest_frame_id;
+    return true;
+}
+#endif
 
 bool ResolveGlxBinding(GLFWwindow* window, Display** xdisplay, uint32_t* visual_id,
                        GLXFBConfig* fb_config, GLXDrawable* drawable, GLXContext* context) {
@@ -1313,20 +1408,30 @@ int main(int argc, char** argv) {
         return 16;
     }
 
-    GLuint source_texture = 0;
-    glGenTextures(1, &source_texture);
-    glBindTexture(GL_TEXTURE_2D, source_texture);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, shared_frame.header->width,
-                 shared_frame.header->height, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+    const uint32_t eye_frame_bytes =
+        shared_frame.header->width * shared_frame.header->height * shared_frame.header->channels;
+    GLuint source_textures[2] = {0, 0};
+#ifdef BOBA_IMMERSIVE_BRIDGE
+    glGenTextures(2, source_textures);
+    const int source_texture_count = 2;
+#else
+    glGenTextures(1, source_textures);
+    const int source_texture_count = 1;
+#endif
+    for (int texture_index = 0; texture_index < source_texture_count; ++texture_index) {
+        glBindTexture(GL_TEXTURE_2D, source_textures[texture_index]);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, shared_frame.header->width,
+                     shared_frame.header->height, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+    }
     glBindTexture(GL_TEXTURE_2D, 0);
 
     const GLuint program = CreatePanelProgram();
     if (program == 0) {
-        glDeleteTextures(1, &source_texture);
+        glDeleteTextures(source_texture_count, source_textures);
         DestroyViewSwapchains(&swapchain_views);
         xrDestroySession(session);
         xrDestroyInstance(instance);
@@ -1353,7 +1458,7 @@ int main(int argc, char** argv) {
         glDeleteFramebuffers(1, &framebuffer);
         glDeleteVertexArrays(1, &vao);
         glDeleteProgram(program);
-        glDeleteTextures(1, &source_texture);
+        glDeleteTextures(source_texture_count, source_textures);
         DestroyViewSwapchains(&swapchain_views);
         xrDestroySession(session);
         xrDestroyInstance(instance);
@@ -1378,6 +1483,10 @@ int main(int argc, char** argv) {
     uint64_t latest_frame_id = 0;
     uint64_t logged_source_frame_id = 0;
     uint64_t controller_sample_count = 0;
+#ifdef BOBA_IMMERSIVE_BRIDGE
+    std::vector<uint8_t> display_rgba_left(eye_frame_bytes, 0);
+    std::vector<uint8_t> display_rgba_right(eye_frame_bytes, 0);
+#else
     std::vector<uint8_t> display_rgba(shared_frame.header->frame_bytes, 0);
     const float panel_height_meters =
         kPanelWidthMeters *
@@ -1385,6 +1494,7 @@ int main(int argc, char** argv) {
          static_cast<float>(shared_frame.header->width));
     Mat4 panel_model = IdentityMatrix();
     bool panel_anchor_initialized = false;
+#endif
     XrActiveActionSet active_action_set{action_set, XR_NULL_PATH};
     XrActionsSyncInfo sync_info = MakeXrStruct<XrActionsSyncInfo>(XR_TYPE_ACTIONS_SYNC_INFO);
     sync_info.countActiveActionSets = 1;
@@ -1469,15 +1579,66 @@ int main(int argc, char** argv) {
             break;
         }
 
+        XrViewLocateInfo locate_info =
+            MakeXrStruct<XrViewLocateInfo>(XR_TYPE_VIEW_LOCATE_INFO);
+        locate_info.viewConfigurationType = view_configuration_type;
+        locate_info.displayTime = frame_state.predictedDisplayTime;
+        locate_info.space = local_space;
+        XrViewState view_state = MakeXrStruct<XrViewState>(XR_TYPE_VIEW_STATE);
+        uint32_t view_count_output = 0;
+        if (!CheckXr(instance,
+                     xrLocateViews(session, &locate_info, &view_state,
+                                   static_cast<uint32_t>(views.size()), &view_count_output,
+                                   views.data()),
+                     "xrLocateViews")) {
+            break;
+        }
+        const bool eye_pose_valid =
+            (view_state.viewStateFlags & XR_VIEW_STATE_POSITION_VALID_BIT) != 0 &&
+            (view_state.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT) != 0;
+        const bool eye_pose_tracked =
+            (view_state.viewStateFlags & XR_VIEW_STATE_POSITION_TRACKED_BIT) != 0 &&
+            (view_state.viewStateFlags & XR_VIEW_STATE_ORIENTATION_TRACKED_BIT) != 0;
+
         std::cout << "{";
         std::cout << "\"sample\":" << controller_sample_count << ",";
         PrintControllerJson(
-            "left", selected_left, select_left, anchor_cycle_left, snap_assist_left
+            "left",
+            selected_left,
+            grip_left,
+            aim_left,
+            select_left,
+            anchor_cycle_left,
+            snap_assist_left
         );
         std::cout << ",";
         PrintControllerJson(
-            "right", selected_right, select_right, anchor_cycle_right, snap_assist_right
+            "right",
+            selected_right,
+            grip_right,
+            aim_right,
+            select_right,
+            anchor_cycle_right,
+            snap_assist_right
         );
+#ifdef BOBA_IMMERSIVE_BRIDGE
+        std::cout << ",";
+        PrintEyeJson(
+            "left_eye",
+            views[0],
+            swapchain_views[0],
+            eye_pose_valid && view_count_output > 0,
+            eye_pose_tracked && view_count_output > 0
+        );
+        std::cout << ",";
+        PrintEyeJson(
+            "right_eye",
+            views[std::min<uint32_t>(1u, static_cast<uint32_t>(views.size() - 1))],
+            swapchain_views[std::min<size_t>(1u, swapchain_views.size() - 1)],
+            eye_pose_valid && view_count_output > 1,
+            eye_pose_tracked && view_count_output > 1
+        );
+#endif
         std::cout << "}\n";
         ++controller_sample_count;
 
@@ -1486,6 +1647,28 @@ int main(int argc, char** argv) {
             MakeXrStruct<XrCompositionLayerProjection>(XR_TYPE_COMPOSITION_LAYER_PROJECTION);
 
         if (frame_state.shouldRender == XR_TRUE) {
+#ifdef BOBA_IMMERSIVE_BRIDGE
+            if (UpdateStereoFramesIfNeeded(
+                    shared_frame, &latest_frame_id, &display_rgba_left, &display_rgba_right)) {
+                if (latest_frame_id == 1 || latest_frame_id >= logged_source_frame_id + 120) {
+                    std::cerr << "Immersive bridge received source frame " << latest_frame_id
+                              << "\n";
+                    logged_source_frame_id = latest_frame_id;
+                }
+            }
+
+            glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+            glBindTexture(GL_TEXTURE_2D, source_textures[0]);
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, shared_frame.header->width,
+                            shared_frame.header->height, GL_RGBA, GL_UNSIGNED_BYTE,
+                            display_rgba_left.data());
+            glBindTexture(GL_TEXTURE_2D, 0);
+            glBindTexture(GL_TEXTURE_2D, source_textures[1]);
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, shared_frame.header->width,
+                            shared_frame.header->height, GL_RGBA, GL_UNSIGNED_BYTE,
+                            display_rgba_right.data());
+            glBindTexture(GL_TEXTURE_2D, 0);
+#else
             if (UpdateDisplayFrameIfNeeded(shared_frame, &latest_frame_id, &display_rgba)) {
                 if (latest_frame_id == 1 || latest_frame_id >= logged_source_frame_id + 120) {
                     std::cerr << "Panel received source frame " << latest_frame_id << "\n";
@@ -1493,28 +1676,15 @@ int main(int argc, char** argv) {
                 }
             }
 
-            glBindTexture(GL_TEXTURE_2D, source_texture);
+            glBindTexture(GL_TEXTURE_2D, source_textures[0]);
             glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
             glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, shared_frame.header->width,
                             shared_frame.header->height, GL_RGBA, GL_UNSIGNED_BYTE,
                             display_rgba.data());
             glBindTexture(GL_TEXTURE_2D, 0);
+#endif
 
-            XrViewLocateInfo locate_info =
-                MakeXrStruct<XrViewLocateInfo>(XR_TYPE_VIEW_LOCATE_INFO);
-            locate_info.viewConfigurationType = view_configuration_type;
-            locate_info.displayTime = frame_state.predictedDisplayTime;
-            locate_info.space = local_space;
-            XrViewState view_state = MakeXrStruct<XrViewState>(XR_TYPE_VIEW_STATE);
-            uint32_t view_count_output = 0;
-            if (!CheckXr(instance,
-                         xrLocateViews(session, &locate_info, &view_state,
-                                       static_cast<uint32_t>(views.size()), &view_count_output,
-                                       views.data()),
-                         "xrLocateViews")) {
-                break;
-            }
-
+#ifndef BOBA_IMMERSIVE_BRIDGE
             if (!panel_anchor_initialized && view_count_output > 0) {
                 const Mat4 initial_head_pose = PoseMatrix(views[0].pose);
                 panel_model = Multiply(
@@ -1528,6 +1698,7 @@ int main(int argc, char** argv) {
                           << " width=" << kPanelWidthMeters
                           << " height=" << panel_height_meters << "\n";
             }
+#endif
 
             projection_layer.space = local_space;
             projection_layer.viewCount = view_count_output;
@@ -1571,12 +1742,16 @@ int main(int argc, char** argv) {
                     std::cerr << "Framebuffer incomplete for view " << view_index << "\n";
                     exit_requested = true;
                 } else {
+#ifdef BOBA_IMMERSIVE_BRIDGE
+                    const Mat4 mvp_matrix = ScaleMatrix(2.0f, 2.0f, 1.0f);
+#else
                     const Mat4 view_matrix =
                         InverseRigidTransform(PoseMatrix(views[view_index].pose));
                     const Mat4 projection_matrix =
                         ProjectionMatrix(views[view_index].fov, kNearZ, kFarZ);
                     const Mat4 mvp_matrix =
                         Multiply(projection_matrix, Multiply(view_matrix, panel_model));
+#endif
                     glViewport(0, 0, static_cast<GLsizei>(swapchain_view.width),
                                static_cast<GLsizei>(swapchain_view.height));
                     glDisable(GL_DEPTH_TEST);
@@ -1586,7 +1761,14 @@ int main(int argc, char** argv) {
                     glUseProgram(program);
                     glBindVertexArray(vao);
                     glActiveTexture(GL_TEXTURE0);
-                    glBindTexture(GL_TEXTURE_2D, source_texture);
+                    glBindTexture(
+                        GL_TEXTURE_2D,
+#ifdef BOBA_IMMERSIVE_BRIDGE
+                        source_textures[std::min<uint32_t>(view_index, 1u)]
+#else
+                        source_textures[0]
+#endif
+                    );
                     glUniform1i(source_location, 0);
                     glUniformMatrix4fv(mvp_location, 1, GL_FALSE, mvp_matrix.m);
                     glDrawArrays(GL_TRIANGLES, 0, 6);
@@ -1642,7 +1824,7 @@ int main(int argc, char** argv) {
     glDeleteFramebuffers(1, &framebuffer);
     glDeleteVertexArrays(1, &vao);
     glDeleteProgram(program);
-    glDeleteTextures(1, &source_texture);
+    glDeleteTextures(source_texture_count, source_textures);
     DestroyViewSwapchains(&swapchain_views);
     xrDestroyActionSet(action_set);
     xrDestroySession(session);

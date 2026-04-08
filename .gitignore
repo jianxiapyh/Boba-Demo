@@ -36,3 +36,13 @@ linux_pose_probe/openxr_hand_controller_probe
 linux_pose_probe/openxr_hand_joint_stream
 linux_pose_probe/openxr_controller_stream
 linux_pose_probe/openxr_frame_panel
+linux_pose_probe/openxr_immersive_bridge
+
+# Track immersive scene manifest but keep downloaded assets ignored.
+!data/
+data/*
+!data/open_scene_assets/
+data/open_scene_assets/*
+!data/open_scene_assets/simple_lab/
+data/open_scene_assets/simple_lab/*
+!data/open_scene_assets/simple_lab/manifest.json

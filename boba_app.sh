@@ -17,6 +17,26 @@ python interactive_playground_batched_view_orin.py \
   --scene_preset simple_lab \
   --interactive_window_mode hidden
 
+# Quest immersive stereo scene with detailed render profiling enabled.
+python interactive_playground_batched_view_orin.py \
+  --case_name double_stretch_sloth -exp --n_dup 0 \
+  --input_source live_openxr_controller \
+  --quest_display_mode immersive \
+  --scene_preset simple_lab \
+  --interactive_window_mode hidden \
+  --immersive_render_preset balanced \
+  --render_profile \
+  --render_profile_every 30
+
+# Quest immersive experimental fast mode using center-view stereo reprojection.
+python interactive_playground_batched_view_orin.py \
+  --case_name double_stretch_sloth -exp --n_dup 0 \
+  --input_source live_openxr_controller \
+  --quest_display_mode immersive \
+  --scene_preset simple_lab \
+  --interactive_window_mode hidden \
+  --immersive_render_preset performance
+
 # Quest panel mirror while keeping the local window visible.
 python interactive_playground_batched_view_orin.py \
   --case_name double_stretch_sloth -exp -eval --n_dup 0 \

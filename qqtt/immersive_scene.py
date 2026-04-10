@@ -242,11 +242,13 @@ class SimpleLabSceneRenderer:
         scene_assets_root: str | Path,
         width: int,
         height: int,
+        lighting_mode: str = "full",
     ):
         import pyrender
 
         self.width = int(width)
         self.height = int(height)
+        self.lighting_mode = str(lighting_mode)
         self._pyrender = pyrender
         self.simple_lab_root = ensure_simple_lab_assets(scene_assets_root)
         self.manifest = load_simple_lab_manifest(scene_assets_root)
@@ -259,7 +261,15 @@ class SimpleLabSceneRenderer:
             viewport_width=self.width,
             viewport_height=self.height,
         )
-        self.camera_node = None
+        self.camera = self._pyrender.IntrinsicsCamera(
+            fx=1.0,
+            fy=1.0,
+            cx=float(self.width) * 0.5,
+            cy=float(self.height) * 0.5,
+            znear=0.02,
+            zfar=100.0,
+        )
+        self.camera_node = self.scene.add(self.camera, pose=np.eye(4, dtype=np.float32))
         self.table_node = None
         self.floor_node = None
         self.wall_nodes: list[Any] = []
@@ -302,17 +312,11 @@ class SimpleLabSceneRenderer:
         if self.layout is None:
             raise RuntimeError("Simple lab layout has not been configured.")
 
-        camera = self._pyrender.IntrinsicsCamera(
-            fx=float(intrinsic[0, 0]),
-            fy=float(intrinsic[1, 1]),
-            cx=float(intrinsic[0, 2]),
-            cy=float(intrinsic[1, 2]),
-            znear=0.02,
-            zfar=100.0,
-        )
-        if self.camera_node is not None:
-            self.scene.remove_node(self.camera_node)
-        self.camera_node = self.scene.add(camera, pose=np.asarray(camera_pose_world))
+        self.camera.fx = float(intrinsic[0, 0])
+        self.camera.fy = float(intrinsic[1, 1])
+        self.camera.cx = float(intrinsic[0, 2])
+        self.camera.cy = float(intrinsic[1, 2])
+        self.scene.set_pose(self.camera_node, pose=np.asarray(camera_pose_world))
         color, depth = self.renderer.render(self.scene, flags=self._pyrender.RenderFlags.RGBA)
         return color, depth.astype(np.float32)
 
@@ -321,20 +325,24 @@ class SimpleLabSceneRenderer:
             color=np.ones(3, dtype=np.float32),
             intensity=3.5,
         )
-        fill_light = self._pyrender.DirectionalLight(
-            color=np.array([0.86, 0.90, 1.0], dtype=np.float32),
-            intensity=1.4,
-        )
-        point_light = self._pyrender.PointLight(
-            color=np.ones(3, dtype=np.float32),
-            intensity=22.0,
-        )
         self.scene.add(key_light, pose=trimesh.transformations.euler_matrix(-0.7, 0.35, 0.0))
-        self.scene.add(fill_light, pose=trimesh.transformations.euler_matrix(-1.1, -0.4, 0.0))
-        self.scene.add(
-            point_light,
-            pose=trimesh.transformations.translation_matrix([0.0, 0.0, -0.2]),
-        )
+        if self.lighting_mode == "full":
+            fill_light = self._pyrender.DirectionalLight(
+                color=np.array([0.86, 0.90, 1.0], dtype=np.float32),
+                intensity=1.4,
+            )
+            point_light = self._pyrender.PointLight(
+                color=np.ones(3, dtype=np.float32),
+                intensity=22.0,
+            )
+            self.scene.add(
+                fill_light,
+                pose=trimesh.transformations.euler_matrix(-1.1, -0.4, 0.0),
+            )
+            self.scene.add(
+                point_light,
+                pose=trimesh.transformations.translation_matrix([0.0, 0.0, -0.2]),
+            )
 
     def _load_table_mesh(self) -> trimesh.Trimesh:
         table_path = self.simple_lab_root / "table" / "wooden_table_02_2k.gltf"

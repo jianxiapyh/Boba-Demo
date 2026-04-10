@@ -148,6 +148,41 @@ def main():
         default="visible",
         help="whether to show the local Interactive Playground window or keep it hidden as an offscreen GL context",
     )
+    parser.add_argument(
+        "--render_profile",
+        action="store_true",
+        help="print detailed render profiling for Quest rendering paths",
+    )
+    parser.add_argument(
+        "--render_profile_every",
+        type=int,
+        default=30,
+        help="print one detailed render profile line every N profiled frames",
+    )
+    parser.add_argument(
+        "--immersive_render_preset",
+        choices=("quality", "balanced", "performance"),
+        default="quality",
+        help="immersive-only room rendering preset; balanced targets lower render cost with modest quality reduction",
+    )
+    parser.add_argument(
+        "--immersive_scene_render_scale",
+        type=float,
+        default=None,
+        help="optional immersive-only override for room-scene render scale before upsampling",
+    )
+    parser.add_argument(
+        "--immersive_scene_stereo_mode",
+        choices=("per_eye", "mono_head_center", "reproject_from_center"),
+        default=None,
+        help="optional immersive-only override for room-scene stereo rendering mode",
+    )
+    parser.add_argument(
+        "--immersive_overlay_mode",
+        choices=("full", "minimal"),
+        default=None,
+        help="optional immersive-only override for controller overlay detail in immersive mode",
+    )
 
     # Compatibility flag (accepted but not used)
     parser.add_argument(
@@ -285,6 +320,12 @@ def main():
             interactive_window_mode=args.interactive_window_mode,
             scene_preset=args.scene_preset,
             scene_assets_root=args.scene_assets_root,
+            render_profile=args.render_profile,
+            render_profile_every=args.render_profile_every,
+            immersive_render_preset=args.immersive_render_preset,
+            immersive_scene_render_scale=args.immersive_scene_render_scale,
+            immersive_scene_stereo_mode=args.immersive_scene_stereo_mode,
+            immersive_overlay_mode=args.immersive_overlay_mode,
         )
     finally:
         import glfw

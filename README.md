@@ -32,6 +32,14 @@ This repo provides the live demo code around them:
 
 The intended environment is the existing `phystwin` Conda environment used for the Boba demo. ALVR/SteamVR/OpenXR runtime setup is assumed to already be installed on the machine.
 
+This demo resolves `gsplat` from the sibling `Boba_OpenSource` checkout instead of a stock pip wheel. The default expected source tree is:
+
+```text
+../Boba_OpenSource/gaussian_splatting/submodules/gsplat/
+```
+
+If your `Boba_OpenSource` checkout lives elsewhere, set `BOBA_GSPLAT_SOURCE_ROOT` to that vendored `gsplat` source root before launching.
+
 If you need the RTX 5090 environment helper used during development, see:
 
 ```bash
@@ -43,7 +51,7 @@ env_install/5090_env_install.sh
 Desktop + Quest primary display:
 
 ```bash
-python interactive_playground_batched_view_orin.py \
+conda run -n phystwin env PYTHONNOUSERSITE=1 python interactive_playground_batched_view_orin.py \
   --case_name double_stretch_sloth -exp -eval --n_dup 0 \
   --input_source live_openxr_controller \
   --quest_display_mode primary \
@@ -53,14 +61,14 @@ python interactive_playground_batched_view_orin.py \
 Desktop-only replay baseline:
 
 ```bash
-python interactive_playground_batched_view_orin.py \
+conda run -n phystwin env PYTHONNOUSERSITE=1 python interactive_playground_batched_view_orin.py \
   --case_name double_stretch_sloth -exp -eval --n_dup 0
 ```
 
 Quest panel mirror:
 
 ```bash
-python interactive_playground_batched_view_orin.py \
+conda run -n phystwin env PYTHONNOUSERSITE=1 python interactive_playground_batched_view_orin.py \
   --case_name double_stretch_sloth -exp -eval --n_dup 0 \
   --input_source live_openxr_controller \
   --quest_display_mode panel

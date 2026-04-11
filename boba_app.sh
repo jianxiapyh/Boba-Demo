@@ -2,6 +2,10 @@
 
 # Example launcher snippets for the trimmed Boba demo export.
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export PYTHONNOUSERSITE="${PYTHONNOUSERSITE:-1}"
+export BOBA_GSPLAT_SOURCE_ROOT="${BOBA_GSPLAT_SOURCE_ROOT:-${SCRIPT_DIR}/../Boba_OpenSource/gaussian_splatting/submodules/gsplat}"
+
 # Quest primary display with live Quest controllers.
 python interactive_playground_batched_view_orin.py \
   --case_name double_stretch_sloth -exp -eval --n_dup 0 \

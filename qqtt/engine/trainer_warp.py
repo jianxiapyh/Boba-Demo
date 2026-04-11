@@ -5,6 +5,7 @@ from qqtt.model.diff_simulator import (
     SpringMassSystemWarp,
 )
 import csv
+import json
 import open3d as o3d
 import numpy as np
 import torch
@@ -195,6 +196,12 @@ class InvPhyTrainerWarp:
     IMMERSIVE_STARTUP_DEPTH_EPS = 1e-4
     IMMERSIVE_STARTUP_PIXEL_MARGIN = 8.0
     IMMERSIVE_STARTUP_YAW_RADIANS = 0.5 * np.pi
+    IMMERSIVE_COMPOSE_ALPHA_EPS = 1.0 / 255.0
+    IMMERSIVE_COMPOSE_RAW_MIN_COVERAGE_RATIO = 5e-4
+    IMMERSIVE_COMPOSE_VISIBLE_MIN_COVERAGE_RATIO = 1e-4
+    IMMERSIVE_COMPOSE_MIN_RETENTION_RATIO = 0.08
+    IMMERSIVE_SCENE_DEPTH_MIN_FINITE_RATIO = 0.95
+    IMMERSIVE_SCENE_DEPTH_MIN_POSITIVE_RATIO = 0.02
     IMMERSIVE_GRAB_START_VALIDATION_DELAY_FRAMES = 1
     IMMERSIVE_GRAB_START_VALIDATION_FRAMES = 2
     IMMERSIVE_GRAB_START_MAX_TARGET_DELTA = 0.12
@@ -2670,6 +2677,41 @@ class InvPhyTrainerWarp:
             return
         frame_profile[key] = frame_profile.get(key, 0.0) + float(elapsed_seconds)
 
+    def _render_profile_record_immersive_compose_metrics(
+        self,
+        frame_profile,
+        eye_label,
+        compose_metrics,
+    ):
+        if frame_profile is None or compose_metrics is None:
+            return
+        eye_label = str(eye_label)
+        frame_profile[f"gaussian_raw_{eye_label}_ratio"] = float(
+            compose_metrics.get("raw_gaussian_coverage_ratio", 0.0)
+        )
+        frame_profile[f"gaussian_visible_{eye_label}_ratio"] = float(
+            compose_metrics.get("visible_gaussian_coverage_ratio", 0.0)
+        )
+        frame_profile[f"gaussian_retention_{eye_label}_ratio"] = float(
+            compose_metrics.get("visible_retention_ratio", 0.0)
+        )
+        frame_profile[f"scene_depth_finite_{eye_label}_ratio"] = float(
+            compose_metrics.get("scene_depth_finite_ratio", 0.0)
+        )
+        frame_profile[f"scene_depth_positive_{eye_label}_ratio"] = float(
+            compose_metrics.get("scene_depth_positive_ratio", 0.0)
+        )
+        frame_profile[f"scene_depth_invalid_{eye_label}_ratio"] = float(
+            1.0 if compose_metrics.get("scene_depth_invalid", False) else 0.0
+        )
+        frame_profile[f"scene_depth_suppressed_{eye_label}_ratio"] = float(
+            1.0 if compose_metrics.get("scene_depth_suppressed", False) else 0.0
+        )
+        frame_profile["compose_fallback_active_ratio"] = max(
+            float(frame_profile.get("compose_fallback_active_ratio", 0.0)),
+            float(1.0 if compose_metrics.get("compose_mode") != "depth_aware" else 0.0),
+        )
+
     def _render_profile_begin_cuda_span(self, frame_profile, key):
         if frame_profile is None or not torch.cuda.is_available():
             return None
@@ -2805,6 +2847,15 @@ class InvPhyTrainerWarp:
             f"R{frame_profile.get('gaussian_render_right_cuda', 0.0) * 1000.0:.2f}ms "
             f"compose=L{frame_profile.get('compose_left_cuda', 0.0) * 1000.0:.2f}/"
             f"R{frame_profile.get('compose_right_cuda', 0.0) * 1000.0:.2f}ms "
+            f"diag=rawL{frame_profile.get('gaussian_raw_left_ratio', 0.0) * 100.0:.2f}->"
+            f"{frame_profile.get('gaussian_visible_left_ratio', 0.0) * 100.0:.2f}%/"
+            f"R{frame_profile.get('gaussian_raw_right_ratio', 0.0) * 100.0:.2f}->"
+            f"{frame_profile.get('gaussian_visible_right_ratio', 0.0) * 100.0:.2f}% "
+            f"depth=L{frame_profile.get('scene_depth_finite_left_ratio', 0.0) * 100.0:.0f}/"
+            f"{frame_profile.get('scene_depth_positive_left_ratio', 0.0) * 100.0:.0f}% "
+            f"R{frame_profile.get('scene_depth_finite_right_ratio', 0.0) * 100.0:.0f}/"
+            f"{frame_profile.get('scene_depth_positive_right_ratio', 0.0) * 100.0:.0f}% "
+            f"fallback={int(frame_profile.get('compose_fallback_active_ratio', 0.0) >= 0.5)} "
             f"overlay=proj{frame_profile.get('overlay_projection_wall', 0.0) * 1000.0:.2f} "
             f"drawL{frame_profile.get('overlay_draw_left_wall', 0.0) * 1000.0:.2f} "
             f"drawR{frame_profile.get('overlay_draw_right_wall', 0.0) * 1000.0:.2f}ms "
@@ -4070,6 +4121,67 @@ class InvPhyTrainerWarp:
             elif array.shape[2] == 3:
                 cv2.imwrite(output_path, cv2.cvtColor(array, cv2.COLOR_RGB2BGR))
 
+    def _save_immersive_startup_debug_bundle(self, output_dir, frames, metadata=None):
+        if not output_dir:
+            return
+        self._save_immersive_startup_debug_images(output_dir, frames)
+        if metadata is None:
+            return
+        os.makedirs(output_dir, exist_ok=True)
+        metadata_path = os.path.join(output_dir, "startup_debug.json")
+        with open(metadata_path, "w") as metadata_file:
+            json.dump(metadata, metadata_file, indent=2, sort_keys=True)
+
+    def _visualize_immersive_depth_debug_image(self, depth_map):
+        if torch.is_tensor(depth_map):
+            depth_np = depth_map.detach().cpu().numpy()
+        else:
+            depth_np = np.asarray(depth_map)
+        depth_np = np.asarray(depth_np, dtype=np.float32).squeeze()
+        if depth_np.ndim != 2:
+            raise ValueError(
+                f"Expected a 2D depth map for visualization, got shape {depth_np.shape}"
+            )
+        height, width = depth_np.shape
+        vis = np.zeros((height, width, 3), dtype=np.uint8)
+        finite_mask = np.isfinite(depth_np)
+        positive_mask = finite_mask & (depth_np > self.IMMERSIVE_STARTUP_DEPTH_EPS)
+        vis[~finite_mask] = np.array([255, 0, 255], dtype=np.uint8)
+        if np.any(positive_mask):
+            valid_depth = depth_np[positive_mask]
+            lo = float(np.percentile(valid_depth, 5.0))
+            hi = float(np.percentile(valid_depth, 95.0))
+            if not np.isfinite(lo):
+                lo = float(valid_depth.min())
+            if not np.isfinite(hi):
+                hi = float(valid_depth.max())
+            scale = max(hi - lo, 1e-6)
+            normalized = np.zeros_like(depth_np, dtype=np.float32)
+            normalized[positive_mask] = np.clip(
+                (depth_np[positive_mask] - lo) / scale,
+                0.0,
+                1.0,
+            )
+            depth_u8 = np.round((1.0 - normalized) * 255.0).astype(np.uint8)
+            vis[positive_mask] = np.stack(
+                [depth_u8, depth_u8, depth_u8],
+                axis=-1,
+            )[positive_mask]
+        return vis
+
+    def _visualize_immersive_alpha_debug_image(self, alpha_map):
+        if torch.is_tensor(alpha_map):
+            alpha_np = alpha_map.detach().cpu().numpy()
+        else:
+            alpha_np = np.asarray(alpha_map)
+        alpha_np = np.asarray(alpha_np, dtype=np.float32).squeeze()
+        if alpha_np.ndim != 2:
+            raise ValueError(
+                f"Expected a 2D alpha map for visualization, got shape {alpha_np.shape}"
+            )
+        alpha_u8 = np.clip(alpha_np * 255.0, 0.0, 255.0).astype(np.uint8)
+        return np.repeat(alpha_u8[..., None], 3, axis=2)
+
     @torch.no_grad()
     def _validate_immersive_startup_render(
         self,
@@ -4086,7 +4198,8 @@ class InvPhyTrainerWarp:
         render_pipe,
         background_black,
         background_white,
-        view_render_path,
+        debug_output_dir,
+        save_success_bundle=False,
     ):
         table_top_center = np.asarray(layout.table_top_center, dtype=np.float32)
         object_points = gaussians.get_xyz.detach()
@@ -4115,6 +4228,8 @@ class InvPhyTrainerWarp:
         }
         gaussian_visible_any = False
         projection_failures = []
+        suppressed_by_scene_depth_eyes = []
+        invalid_scene_depth_eyes = []
 
         for eye_name, eye_sample, eye_pose_world in (
             ("left", left_eye_sample, left_eye_pose_world),
@@ -4182,33 +4297,108 @@ class InvPhyTrainerWarp:
                 use_gsplat=True,
             )
             gaussian_depth = self._normalize_gaussian_depth(gaussian_depth)
-            composed = self._compose_immersive_eye_frame(
+            composed, compose_metrics, compose_debug_maps = self._compose_immersive_eye_frame(
                 scene_color,
                 scene_depth,
                 gaussian_rgba,
                 gaussian_depth,
+                collect_debug=True,
+                collect_debug_maps=True,
             )
             debug_renders[f"{eye_name}_scene"] = scene_color
+            debug_renders[f"{eye_name}_scene_depth"] = (
+                self._visualize_immersive_depth_debug_image(
+                    compose_debug_maps["scene_depth"]
+                )
+            )
+            debug_renders[f"{eye_name}_gaussian_rgba"] = (
+                (
+                    gaussian_rgba.detach()
+                    .permute(1, 2, 0)
+                    .contiguous()
+                    .clamp(0.0, 1.0)
+                    * 255.0
+                ).to(torch.uint8)
+            )
+            debug_renders[f"{eye_name}_gaussian_alpha"] = (
+                self._visualize_immersive_alpha_debug_image(
+                    compose_debug_maps["raw_alpha"]
+                )
+            )
+            debug_renders[f"{eye_name}_visible_alpha"] = (
+                self._visualize_immersive_alpha_debug_image(
+                    compose_debug_maps["visible_alpha"]
+                )
+            )
             debug_renders[f"{eye_name}_composed"] = composed
             gaussian_alpha = gaussian_rgba[3]
             gaussian_alpha_max = float(gaussian_alpha.max().item())
             gaussian_depth_nonzero = int((gaussian_depth > 0.0).sum().item()) if gaussian_depth is not None else 0
             startup_debug[f"{eye_name}_gaussian_alpha_max"] = gaussian_alpha_max
             startup_debug[f"{eye_name}_gaussian_depth_nonzero"] = gaussian_depth_nonzero
+            startup_debug[f"{eye_name}_scene_depth_metrics"] = {
+                "finite_ratio": float(compose_metrics["scene_depth_finite_ratio"]),
+                "positive_ratio": float(compose_metrics["scene_depth_positive_ratio"]),
+                "valid_min": float(compose_metrics["scene_depth_valid_min"]),
+                "valid_max": float(compose_metrics["scene_depth_valid_max"]),
+                "invalid": bool(compose_metrics["scene_depth_invalid"]),
+            }
+            startup_debug[f"{eye_name}_compose_metrics"] = {
+                "compose_mode": str(compose_metrics["compose_mode"]),
+                "raw_gaussian_coverage_ratio": float(
+                    compose_metrics["raw_gaussian_coverage_ratio"]
+                ),
+                "visible_gaussian_coverage_ratio": float(
+                    compose_metrics["visible_gaussian_coverage_ratio"]
+                ),
+                "visible_retention_ratio": float(
+                    compose_metrics["visible_retention_ratio"]
+                ),
+                "scene_depth_suppressed": bool(
+                    compose_metrics["scene_depth_suppressed"]
+                ),
+                "composed_luma_mean": float(compose_metrics["composed_luma_mean"]),
+                "composed_luma_variance": float(
+                    compose_metrics["composed_luma_variance"]
+                ),
+            }
             if gaussian_alpha_max > self.IMMERSIVE_STARTUP_ALPHA_EPS or gaussian_depth_nonzero > 0:
                 gaussian_visible_any = True
+            if compose_metrics.get("scene_depth_invalid", False):
+                invalid_scene_depth_eyes.append(eye_name)
+            if compose_metrics.get("scene_depth_suppressed", False):
+                suppressed_by_scene_depth_eyes.append(eye_name)
 
+        startup_debug["projection_failures"] = projection_failures
+        startup_debug["scene_depth_invalid_eyes"] = invalid_scene_depth_eyes
+        startup_debug["suppressed_by_scene_depth_eyes"] = suppressed_by_scene_depth_eyes
+        compose_fallback_required = bool(
+            invalid_scene_depth_eyes or suppressed_by_scene_depth_eyes
+        )
+        startup_debug["compose_fallback_required"] = compose_fallback_required
+        startup_debug["recommended_compose_mode"] = (
+            "alpha_overlay" if compose_fallback_required else "depth_aware"
+        )
         if projection_failures or not gaussian_visible_any:
             failure_dir = (
-                os.path.join(view_render_path, "startup_failure")
-                if view_render_path is not None
+                os.path.join(debug_output_dir, "startup_failure")
+                if debug_output_dir is not None
                 else None
             )
-            self._save_immersive_startup_debug_images(failure_dir, debug_renders)
-            startup_debug["projection_failures"] = projection_failures
+            self._save_immersive_startup_debug_bundle(
+                failure_dir,
+                debug_renders,
+                startup_debug,
+            )
             raise RuntimeError(
                 "Immersive startup render validation failed.\n"
                 + str(startup_debug)
+            )
+        if (save_success_bundle or compose_fallback_required) and debug_output_dir is not None:
+            self._save_immersive_startup_debug_bundle(
+                os.path.join(debug_output_dir, "startup_debug"),
+                debug_renders,
+                startup_debug,
             )
         return startup_debug
 
@@ -5915,6 +6105,9 @@ class InvPhyTrainerWarp:
         render_profile_frame=None,
         eye_label=None,
         compose_cache=None,
+        compose_mode="depth_aware",
+        collect_compose_debug=False,
+        collect_debug_maps=False,
     ):
         view_setup_start = time.perf_counter() if render_profile_frame is not None else None
         eye_w2c_cv = self._camera_pose_world_to_cv_w2c(eye_pose_world)
@@ -5947,17 +6140,42 @@ class InvPhyTrainerWarp:
             render_profile_frame,
             f"compose_{eye_label}_cuda",
         )
-        composed = self._compose_immersive_eye_frame(
-            scene_color,
-            scene_depth,
+        compose_metrics = None
+        compose_debug_maps = None
+        if collect_compose_debug or collect_debug_maps:
+            composed, compose_metrics, compose_debug_maps = (
+                self._compose_immersive_eye_frame(
+                    scene_color,
+                    scene_depth,
+                    gaussian_rgba,
+                    gaussian_depth,
+                    target_height=eye_height,
+                    target_width=eye_width,
+                    compose_cache=compose_cache,
+                    compose_mode=compose_mode,
+                    collect_debug=True,
+                    collect_debug_maps=collect_debug_maps,
+                )
+            )
+        else:
+            composed = self._compose_immersive_eye_frame(
+                scene_color,
+                scene_depth,
+                gaussian_rgba,
+                gaussian_depth,
+                target_height=eye_height,
+                target_width=eye_width,
+                compose_cache=compose_cache,
+                compose_mode=compose_mode,
+            )
+        self._render_profile_end_cuda_span(render_profile_frame, compose_span)
+        return (
+            composed,
             gaussian_rgba,
             gaussian_depth,
-            target_height=eye_height,
-            target_width=eye_width,
-            compose_cache=compose_cache,
+            compose_metrics,
+            compose_debug_maps,
         )
-        self._render_profile_end_cuda_span(render_profile_frame, compose_span)
-        return composed, gaussian_rgba, gaussian_depth
 
     def _build_live_controller_world_overlay(
         self,
@@ -6109,6 +6327,9 @@ class InvPhyTrainerWarp:
         target_height=None,
         target_width=None,
         compose_cache=None,
+        compose_mode="depth_aware",
+        collect_debug=False,
+        collect_debug_maps=False,
     ):
         if target_height is None or target_width is None:
             target_height = int(gaussian_rgba.shape[1])
@@ -6124,18 +6345,26 @@ class InvPhyTrainerWarp:
 
         object_rgba = gaussian_rgba.detach().permute(1, 2, 0).contiguous().clamp(0.0, 1.0)
         object_alpha = object_rgba[..., 3:4]
-        if gaussian_depth is None:
+        raw_visible = object_alpha[..., 0] > float(self.IMMERSIVE_COMPOSE_ALPHA_EPS)
+        if compose_mode == "alpha_overlay":
             effective_alpha = object_alpha
+            visible_mask = raw_visible
         else:
-            gaussian_depth = self._normalize_gaussian_depth(gaussian_depth)
-            scene_has_geometry = scene_depth_t > 0.0
-            object_has_depth = gaussian_depth > 0.0
-            object_visible = object_has_depth & (
-                (~scene_has_geometry) | (gaussian_depth <= (scene_depth_t + 5e-3))
-            )
-            effective_alpha = object_alpha * object_visible.unsqueeze(-1).to(
-                object_alpha.dtype
-            )
+            if compose_mode != "depth_aware":
+                raise ValueError(f"Unsupported immersive compose_mode: {compose_mode}")
+            if gaussian_depth is None:
+                effective_alpha = object_alpha
+                visible_mask = raw_visible
+            else:
+                gaussian_depth = self._normalize_gaussian_depth(gaussian_depth)
+                scene_has_geometry = scene_depth_t > 0.0
+                object_has_depth = gaussian_depth > 0.0
+                visible_mask = object_has_depth & (
+                    (~scene_has_geometry) | (gaussian_depth <= (scene_depth_t + 5e-3))
+                )
+                effective_alpha = object_alpha * visible_mask.unsqueeze(-1).to(
+                    object_alpha.dtype
+                )
 
         composed_rgb = scene_color[..., :3] * (1.0 - effective_alpha) + (
             object_rgba[..., :3] * 255.0
@@ -6147,7 +6376,89 @@ class InvPhyTrainerWarp:
         )
         composed[..., :3] = composed_rgb.clamp(0.0, 255.0).to(torch.uint8)
         composed[..., 3] = 255
-        return composed
+        if not (collect_debug or collect_debug_maps):
+            return composed
+
+        finite_mask = torch.isfinite(scene_depth_t)
+        positive_mask = finite_mask & (scene_depth_t > self.IMMERSIVE_STARTUP_DEPTH_EPS)
+        scene_depth_finite_ratio = float(finite_mask.to(dtype=torch.float32).mean().item())
+        scene_depth_positive_ratio = float(
+            positive_mask.to(dtype=torch.float32).mean().item()
+        )
+        if bool(positive_mask.any().item()):
+            scene_depth_valid_min = float(scene_depth_t[positive_mask].min().item())
+            scene_depth_valid_max = float(scene_depth_t[positive_mask].max().item())
+        else:
+            scene_depth_valid_min = 0.0
+            scene_depth_valid_max = 0.0
+
+        visible_alpha = effective_alpha[..., 0]
+        visible_gaussian_coverage_ratio = float(
+            (visible_alpha > float(self.IMMERSIVE_COMPOSE_ALPHA_EPS))
+            .to(dtype=torch.float32)
+            .mean()
+            .item()
+        )
+        raw_gaussian_coverage_ratio = float(
+            raw_visible.to(dtype=torch.float32).mean().item()
+        )
+        visible_retention_ratio = (
+            visible_gaussian_coverage_ratio / max(raw_gaussian_coverage_ratio, 1e-6)
+            if raw_gaussian_coverage_ratio > 0.0
+            else 1.0
+        )
+        scene_depth_invalid = bool(
+            scene_depth_finite_ratio < float(self.IMMERSIVE_SCENE_DEPTH_MIN_FINITE_RATIO)
+            or scene_depth_positive_ratio < float(self.IMMERSIVE_SCENE_DEPTH_MIN_POSITIVE_RATIO)
+            or (
+                positive_mask.any().item()
+                and (
+                    (not np.isfinite(scene_depth_valid_min))
+                    or (not np.isfinite(scene_depth_valid_max))
+                    or scene_depth_valid_max <= scene_depth_valid_min
+                )
+            )
+        )
+        scene_depth_suppressed = bool(
+            compose_mode == "depth_aware"
+            and raw_gaussian_coverage_ratio
+            >= float(self.IMMERSIVE_COMPOSE_RAW_MIN_COVERAGE_RATIO)
+            and visible_gaussian_coverage_ratio
+            <= float(self.IMMERSIVE_COMPOSE_VISIBLE_MIN_COVERAGE_RATIO)
+            and visible_retention_ratio
+            < float(self.IMMERSIVE_COMPOSE_MIN_RETENTION_RATIO)
+        )
+        composed_rgb_f = composed[..., :3].to(dtype=torch.float32)
+        composed_luma = (
+            0.2126 * composed_rgb_f[..., 0]
+            + 0.7152 * composed_rgb_f[..., 1]
+            + 0.0722 * composed_rgb_f[..., 2]
+        )
+        compose_metrics = {
+            "compose_mode": compose_mode,
+            "raw_gaussian_coverage_ratio": raw_gaussian_coverage_ratio,
+            "visible_gaussian_coverage_ratio": visible_gaussian_coverage_ratio,
+            "visible_retention_ratio": float(visible_retention_ratio),
+            "scene_depth_finite_ratio": scene_depth_finite_ratio,
+            "scene_depth_positive_ratio": scene_depth_positive_ratio,
+            "scene_depth_valid_min": float(scene_depth_valid_min),
+            "scene_depth_valid_max": float(scene_depth_valid_max),
+            "scene_depth_invalid": scene_depth_invalid,
+            "scene_depth_suppressed": scene_depth_suppressed,
+            "composed_luma_mean": float(composed_luma.mean().item()),
+            "composed_luma_variance": float(
+                composed_luma.var(unbiased=False).item()
+            ),
+        }
+        compose_debug_maps = None
+        if collect_debug_maps:
+            compose_debug_maps = {
+                "scene_color": scene_color.detach(),
+                "scene_depth": scene_depth_t.detach(),
+                "raw_alpha": object_alpha[..., 0].detach(),
+                "visible_alpha": visible_alpha.detach(),
+            }
+        return composed, compose_metrics, compose_debug_maps
 
     #init_start with morton reordering for both mass node and spring (current last working version)
     def _init_start(
@@ -6923,6 +7234,7 @@ class InvPhyTrainerWarp:
         model_path,
         gs_path,
         eval_image_path,
+        render_profile_output_path,
         window,
         cuda_ctx,
         input_source,
@@ -7190,12 +7502,21 @@ class InvPhyTrainerWarp:
         last_left_eye_pose_world = None
         last_right_eye_pose_world = None
         last_immersive_sample = None
+        immersive_compose_mode = "depth_aware"
+        startup_render_debug = None
 
-        view_render_path = None
+        diagnostic_output_path = render_profile_output_path
+        if diagnostic_output_path is None and eval_image_path is not None:
+            diagnostic_output_path = eval_image_path
+        diagnostic_view_render_path = None
+        if diagnostic_output_path is not None:
+            diagnostic_view_render_path = os.path.join(
+                diagnostic_output_path,
+                "immersive_output",
+            )
+            os.makedirs(diagnostic_view_render_path, exist_ok=True)
         if eval_image_path:
             eval_render_path = os.path.join(eval_image_path, "0")
-            view_render_path = os.path.join(eval_image_path, "immersive_output")
-            os.makedirs(view_render_path, exist_ok=True)
             os.makedirs(eval_render_path, exist_ok=True)
 
         sim_timer = Timer("Immersive Simulator")
@@ -7214,6 +7535,21 @@ class InvPhyTrainerWarp:
             "scene_render_center_wall",
             "scene_render_left_wall",
             "scene_render_right_wall",
+            "gaussian_raw_left_ratio",
+            "gaussian_visible_left_ratio",
+            "gaussian_retention_left_ratio",
+            "gaussian_raw_right_ratio",
+            "gaussian_visible_right_ratio",
+            "gaussian_retention_right_ratio",
+            "scene_depth_finite_left_ratio",
+            "scene_depth_positive_left_ratio",
+            "scene_depth_invalid_left_ratio",
+            "scene_depth_suppressed_left_ratio",
+            "scene_depth_finite_right_ratio",
+            "scene_depth_positive_right_ratio",
+            "scene_depth_invalid_right_ratio",
+            "scene_depth_suppressed_right_ratio",
+            "compose_fallback_active_ratio",
             "scene_reproject_left_cuda",
             "scene_reproject_right_cuda",
             "scene_reproject_hole_fill_left_cuda",
@@ -7612,17 +7948,27 @@ class InvPhyTrainerWarp:
                 render_pipe,
                 background_black,
                 background_white,
-                view_render_path,
+                diagnostic_view_render_path,
+                save_success_bundle=render_profile,
             )
             startup_render_debug["requested_scene_stereo_mode"] = (
                 immersive_render_options["scene_stereo_mode"]
             )
             startup_render_debug["active_scene_stereo_mode"] = active_scene_stereo_mode
+            immersive_compose_mode = str(
+                startup_render_debug.get("recommended_compose_mode", "depth_aware")
+            )
             print(
                 "[quest_display] immersive startup render validation: "
                 + str(startup_render_debug),
                 flush=True,
             )
+            if immersive_compose_mode != "depth_aware":
+                print(
+                    "[quest_display] immersive startup compose validation failed; "
+                    "falling back to alpha_overlay object compositing for this run",
+                    flush=True,
+                )
             last_valid_sim_state = self._capture_sim_state()
             last_valid_target = current_target.clone()
             last_valid_gaussian_state = self._capture_gaussian_runtime_state(gaussians)
@@ -8013,7 +8359,13 @@ class InvPhyTrainerWarp:
                     reproject_caches=shared_scene_reproject_caches,
                     render_profile_frame=render_profile_frame,
                 )
-                left_eye_frame, left_gaussian_rgba, left_gaussian_depth = (
+                (
+                    left_eye_frame,
+                    left_gaussian_rgba,
+                    left_gaussian_depth,
+                    left_compose_metrics,
+                    _,
+                ) = (
                     self._render_immersive_eye_frame(
                         last_left_eye_pose_world,
                         left_intrinsic,
@@ -8027,9 +8379,17 @@ class InvPhyTrainerWarp:
                         background_white,
                         render_profile_frame=render_profile_frame,
                         eye_label="left",
+                        compose_mode=immersive_compose_mode,
+                        collect_compose_debug=render_profile_frame is not None,
                     )
                 )
-                right_eye_frame, right_gaussian_rgba, right_gaussian_depth = (
+                (
+                    right_eye_frame,
+                    right_gaussian_rgba,
+                    right_gaussian_depth,
+                    right_compose_metrics,
+                    _,
+                ) = (
                     self._render_immersive_eye_frame(
                         last_right_eye_pose_world,
                         right_intrinsic,
@@ -8043,8 +8403,21 @@ class InvPhyTrainerWarp:
                         background_white,
                         render_profile_frame=render_profile_frame,
                         eye_label="right",
+                        compose_mode=immersive_compose_mode,
+                        collect_compose_debug=render_profile_frame is not None,
                     )
                 )
+                if render_profile_frame is not None:
+                    self._render_profile_record_immersive_compose_metrics(
+                        render_profile_frame,
+                        "left",
+                        left_compose_metrics,
+                    )
+                    self._render_profile_record_immersive_compose_metrics(
+                        render_profile_frame,
+                        "right",
+                        right_compose_metrics,
+                    )
 
                 overlay_projection_start = (
                     time.perf_counter() if render_profile_frame is not None else None
@@ -8217,7 +8590,13 @@ class InvPhyTrainerWarp:
                             shared_scene_compose_cache=shared_scene_compose_cache,
                             reproject_caches=shared_scene_reproject_caches,
                         )
-                        left_eye_frame, left_gaussian_rgba, left_gaussian_depth = (
+                        (
+                            left_eye_frame,
+                            left_gaussian_rgba,
+                            left_gaussian_depth,
+                            _,
+                            _,
+                        ) = (
                             self._render_immersive_eye_frame(
                                 last_left_eye_pose_world,
                                 left_intrinsic,
@@ -8229,9 +8608,16 @@ class InvPhyTrainerWarp:
                                 render_pipe,
                                 background_black,
                                 background_white,
+                                compose_mode=immersive_compose_mode,
                             )
                         )
-                        right_eye_frame, right_gaussian_rgba, right_gaussian_depth = (
+                        (
+                            right_eye_frame,
+                            right_gaussian_rgba,
+                            right_gaussian_depth,
+                            _,
+                            _,
+                        ) = (
                             self._render_immersive_eye_frame(
                                 last_right_eye_pose_world,
                                 right_intrinsic,
@@ -8243,6 +8629,7 @@ class InvPhyTrainerWarp:
                                 render_pipe,
                                 background_black,
                                 background_white,
+                                compose_mode=immersive_compose_mode,
                             )
                         )
                     else:
@@ -8388,7 +8775,7 @@ class InvPhyTrainerWarp:
                     if should_save_frame and left_eye_frame is not None:
                         save_start = time.perf_counter()
                         save_path = os.path.join(
-                            view_render_path,
+                            diagnostic_view_render_path,
                             f"{frame_count:05d}.png",
                         )
                         img_rgb = left_eye_frame[..., :3].permute(2, 0, 1).float() / 255.0
@@ -8443,15 +8830,33 @@ class InvPhyTrainerWarp:
         finally:
             if frame_count > 1 and component_times["total"]:
                 frames_used_for_stats = len(component_times["total"])
-                print(
+                summary_header = (
                     f"\n=== Immersive Summary (averaged over {frames_used_for_stats} frames) ==="
                 )
+                print(summary_header)
+                log_lines = [summary_header.lstrip("\n")]
                 total_frame_times = component_times["total"]
                 total_time_seconds = sum(total_frame_times)
                 average_fps = frames_used_for_stats / total_time_seconds
                 average_frame_time = np.mean(total_frame_times)
                 print(f"Average FPS: {average_fps:.2f}")
                 print(f"Average Total Frame Time: {average_frame_time * 1000:.2f} ms")
+                log_lines.append(f"Average FPS: {average_fps:.2f}")
+                log_lines.append(
+                    f"Average Total Frame Time: {average_frame_time * 1000:.2f} ms"
+                )
+                if startup_render_debug is not None:
+                    startup_compose_line = (
+                        "Startup compose mode: "
+                        f"{startup_render_debug.get('recommended_compose_mode', 'depth_aware')}"
+                    )
+                    if startup_render_debug.get("compose_fallback_required", False):
+                        startup_compose_line += (
+                            f" suppressed={startup_render_debug.get('suppressed_by_scene_depth_eyes', [])}"
+                            f" invalid_depth={startup_render_debug.get('scene_depth_invalid_eyes', [])}"
+                        )
+                    print(startup_compose_line)
+                    log_lines.append(startup_compose_line)
                 for component_name in (
                     "simulator",
                     "full_motion_interpolation",
@@ -8468,6 +8873,10 @@ class InvPhyTrainerWarp:
                             f"{readable_name}: {average_component_time * 1000:.2f} ms "
                             f"({time_share_percentage:.1f}%)"
                         )
+                        log_lines.append(
+                            f"{readable_name}: {average_component_time * 1000:.2f} ms "
+                            f"({time_share_percentage:.1f}%)"
+                        )
                 if render_profile:
                     render_profile_lines = self._render_profile_summary_lines(
                         "immersive",
@@ -8476,11 +8885,19 @@ class InvPhyTrainerWarp:
                     )
                     for line in render_profile_lines:
                         print(line)
+                    log_lines.extend(render_profile_lines)
                     self._write_render_profile_outputs(
-                        eval_image_path,
+                        diagnostic_output_path,
                         render_profile_lines,
                         immersive_render_profile_rows,
                     )
+                if diagnostic_output_path is not None:
+                    os.makedirs(diagnostic_output_path, exist_ok=True)
+                    with open(
+                        os.path.join(diagnostic_output_path, "performance_summary.txt"),
+                        "w",
+                    ) as log_file:
+                        log_file.write("\n".join(log_lines) + "\n")
             if immersive_bridge is not None:
                 immersive_bridge.stop()
             if scene_renderer is not None:
@@ -8498,6 +8915,7 @@ class InvPhyTrainerWarp:
     def interactive_playground_batched_visualization(
         self, model_path, gs_path,
         eval_image_path, n_dup=0,
+        render_profile_output_path=None,
         window=None,
         cuda_ctx=None,
         input_source="recorded",
@@ -8548,6 +8966,7 @@ class InvPhyTrainerWarp:
                 model_path=model_path,
                 gs_path=gs_path,
                 eval_image_path=eval_image_path,
+                render_profile_output_path=render_profile_output_path,
                 window=window,
                 cuda_ctx=cuda_ctx,
                 input_source=input_source,

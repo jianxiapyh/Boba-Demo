@@ -303,14 +303,21 @@ def main():
     best_model_path = glob.glob(f"experiments/{case_name}/train/best_*.pth")[0]
 
     eval_image_path = None
+    render_profile_output_path = None
+    if args.eval_image_quality or args.render_profile:
+        render_profile_output_path = os.path.join(
+            "./gaussian_output_dynamic",
+            case_name,
+        )
     if args.eval_image_quality:
-        eval_image_path = os.path.join("./gaussian_output_dynamic", case_name)
+        eval_image_path = render_profile_output_path
 
     try:
         trainer.interactive_playground_batched_visualization(
             best_model_path,
             gaussians_path,
             eval_image_path=eval_image_path,
+            render_profile_output_path=render_profile_output_path,
             n_dup=args.n_dup,
             window=window,
             cuda_ctx=ctx,

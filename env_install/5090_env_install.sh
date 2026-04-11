@@ -1,10 +1,26 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+WORKSPACE_ROOT="$(cd "${REPO_ROOT}/.." && pwd)"
+BOBA_OPENSOURCE_ROOT="${BOBA_OPENSOURCE_ROOT:-${WORKSPACE_ROOT}/Boba_OpenSource}"
+BOBA_GSPLAT_SOURCE_ROOT="${BOBA_GSPLAT_SOURCE_ROOT:-${BOBA_OPENSOURCE_ROOT}/gaussian_splatting/submodules/gsplat}"
+
+if [[ ! -d "${BOBA_GSPLAT_SOURCE_ROOT}" ]]; then
+  echo "Expected vendored gsplat source at: ${BOBA_GSPLAT_SOURCE_ROOT}" >&2
+  echo "Set BOBA_GSPLAT_SOURCE_ROOT or place Boba_OpenSource alongside Boba-Demo-upload." >&2
+  exit 1
+fi
+
 conda install -y numpy==1.26.4
 pip install warp-lang
 pip install usd-core matplotlib
 pip install "pyglet<2"
 pip install open3d
 pip install trimesh
-pip install rtree 
+pip install rtree
 pip install pyrender
 
 pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
@@ -36,17 +52,18 @@ pip install cma
 # pip install diffusers
 # pip install accelerate
 
-pip install gsplat==1.4.0
+python -m pip uninstall -y gsplat || true
+PYTHONNOUSERSITE=1 BUILD_NO_CUDA=1 python -m pip install -e "${BOBA_GSPLAT_SOURCE_ROOT}"
 pip install kornia
 cd gaussian_splatting/submodules/diff-gaussian-rasterization/
-#better force to use gcc and g++ here
+# better force to use gcc and g++ here
 python setup.py build_ext --inplace
-#pip install -e .
-#use 
+# pip install -e .
+# use
 pip install --no-build-isolation -e .
 cd ../simple-knn/
-#pip install -e .
-#use 
+# pip install -e .
+# use
 pip install --no-build-isolation -e .
 cd ../../../
 
@@ -54,8 +71,8 @@ pip install plyfile
 
 git clone https://github.com/facebookresearch/pytorch3d.git
 cd pytorch3d/
-#pip install -e .
-#pip install --no-build-isolation -e .
+# pip install -e .
+# pip install --no-build-isolation -e .
 python setup.py build_ext --inplace
 cd ../
 

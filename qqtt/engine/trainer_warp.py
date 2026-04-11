@@ -4144,7 +4144,8 @@ class InvPhyTrainerWarp:
     #this is basically baseline + rendering (to verify correctness)        
     def interactive_playground_batched_visualization(
         self, model_path, gs_path,
-        eval_image_path, n_dup=0, 
+        summary_output_path, n_dup=0,
+        save_eval_artifacts=False,
         window=None,
         cuda_ctx=None,
         input_source="recorded",
@@ -4724,10 +4725,14 @@ class InvPhyTrainerWarp:
                 current_target = recorded_base_target.clone()
             prev_target = current_target.clone()
 
-        #for saving output videos
-        if eval_image_path:
-            eval_render_path = os.path.join(eval_image_path, '0')
-            view_render_path = os.path.join(eval_image_path, 'output')
+        # Summary output is always written; capture artifacts remain opt-in via -eval.
+        capture_eval_artifacts = bool(save_eval_artifacts and summary_output_path)
+        view_render_path = None
+        if summary_output_path:
+            os.makedirs(summary_output_path, exist_ok=True)
+        if capture_eval_artifacts:
+            eval_render_path = os.path.join(summary_output_path, '0')
+            view_render_path = os.path.join(summary_output_path, 'output')
             os.makedirs(view_render_path, exist_ok=True)
             os.makedirs(eval_render_path, exist_ok=True)
 
@@ -5302,10 +5307,19 @@ class InvPhyTrainerWarp:
                 
 
                 prev_x = x.clone()
-
+                if capture_eval_artifacts and input_source in {"live_openxr", "live_openxr_controller"}:
+                    should_save_frame = frame_count < 5 or (frame_count % 30 == 0)
+                    if should_save_frame:
+                        save_start = time.perf_counter()
+                        save_path = os.path.join(view_render_path, f"{frame_count:05d}.png")
+                        img_rgb = frame_u8.permute(2, 0, 1).float() / 255.0
+                        torchvision.utils.save_image(img_rgb, save_path)
+                        save_wall_time = time.perf_counter() - save_start
+                        if frame_count > 1:
+                            component_times["eval_png_write_wall"].append(save_wall_time)
 
                 ############### Temporary timer ###############
-                # Total loop time
+                # Total loop time, including optional eval artifact writes.
                 total_time = total_timer.stop()
                 if frame_count > 1:
                     component_times["total"].append(total_time)
@@ -5315,18 +5329,6 @@ class InvPhyTrainerWarp:
                 if frame_count > 1:
                     fps_history.append(fps)
                 last_total_time = total_time
-
-                if eval_image_path and input_source in {"live_openxr", "live_openxr_controller"}:
-                    should_save_frame = frame_count < 5 or (frame_count % 30 == 0)
-                    if should_save_frame:
-                        save_start = time.perf_counter()
-                        save_path = os.path.join(view_render_path, f"{frame_count:05d}.png")
-                        img_rgb = frame_u8.permute(2, 0, 1).float() / 255.0
-                        torchvision.utils.save_image(img_rgb, save_path)
-                        if frame_count > 1:
-                            component_times["eval_png_write_wall"].append(
-                                time.perf_counter() - save_start
-                            )
 
                 frame_count += 1
 
@@ -5422,44 +5424,45 @@ class InvPhyTrainerWarp:
                         print(f"{readable_name}: {average_component_time * 1000:.2f} ms ({time_share_percentage:.1f}%)")
                         log_lines.append(f"{readable_name}: {average_component_time * 1000:.2f} ms ({time_share_percentage:.1f}%)")
 
-                frame_comp_breakdown = [
-                    ("frame_compositing_gpu_timer", "Frame compositing gpu timer"),
-                    ("frame_comp_overlay_draw_submit", "Frame comp overlay draw submit"),
-                    ("frame_comp_timing_overlay_submit", "Frame comp timing text submit"),
-                    ("frame_comp_rgba_pack_submit", "Frame comp rgba pack submit"),
-                    ("frame_comp_quest_publish_wall", "Frame comp quest publish"),
-                    ("frame_comp_quest_process_check", "Frame comp quest process check"),
-                    ("frame_comp_quest_pending_drain_nonblock", "Frame comp quest pending drain nonblock"),
-                    ("frame_comp_quest_pending_drain_block", "Frame comp quest pending drain block"),
-                    ("frame_comp_quest_gpu_to_cpu_wait", "Frame comp quest gpu->cpu wait"),
-                    ("frame_comp_quest_gpu_to_cpu_copy", "Frame comp quest gpu->cpu copy"),
-                    ("frame_comp_quest_cpu_mmap_copy", "Frame comp quest cpu mmap copy"),
-                    ("frame_comp_quest_header_write", "Frame comp quest header write"),
-                    ("frame_comp_quest_stage_enqueue", "Frame comp quest stage enqueue"),
-                    ("frame_comp_quest_fallback_copy", "Frame comp quest fallback copy"),
-                    ("frame_comp_preview_path_wall", "Frame comp local preview path"),
-                    ("frame_comp_preview_sync_wall", "Frame comp local preview sync"),
-                    ("frame_comp_preview_copy_wall", "Frame comp local preview copy"),
-                    ("frame_comp_preview_upload_draw_wall", "Frame comp local preview upload draw"),
-                    ("frame_comp_glfw_poll_wall", "Frame comp glfw poll"),
-                    ("frame_comp_timer_stop_wall", "Frame comp final synchronize wait"),
-                    ("eval_png_write_wall", "Eval png write"),
-                ]
-                print("Frame compositing breakdown:")
-                log_lines.append("Frame compositing breakdown:")
-                for component_name, readable_name in frame_comp_breakdown:
-                    component_times_list = component_times.get(component_name, [])
-                    if component_times_list:
-                        average_component_time = np.mean(component_times_list)
-                        print(f"{readable_name}: {average_component_time * 1000:.2f} ms")
-                        log_lines.append(
-                            f"{readable_name}: {average_component_time * 1000:.2f} ms"
-                        )
+                if capture_eval_artifacts:
+                    frame_comp_breakdown = [
+                        ("frame_compositing_gpu_timer", "Frame compositing gpu timer"),
+                        ("frame_comp_overlay_draw_submit", "Frame comp overlay draw submit"),
+                        ("frame_comp_timing_overlay_submit", "Frame comp timing text submit"),
+                        ("frame_comp_rgba_pack_submit", "Frame comp rgba pack submit"),
+                        ("frame_comp_quest_publish_wall", "Frame comp quest publish"),
+                        ("frame_comp_quest_process_check", "Frame comp quest process check"),
+                        ("frame_comp_quest_pending_drain_nonblock", "Frame comp quest pending drain nonblock"),
+                        ("frame_comp_quest_pending_drain_block", "Frame comp quest pending drain block"),
+                        ("frame_comp_quest_gpu_to_cpu_wait", "Frame comp quest gpu->cpu wait"),
+                        ("frame_comp_quest_gpu_to_cpu_copy", "Frame comp quest gpu->cpu copy"),
+                        ("frame_comp_quest_cpu_mmap_copy", "Frame comp quest cpu mmap copy"),
+                        ("frame_comp_quest_header_write", "Frame comp quest header write"),
+                        ("frame_comp_quest_stage_enqueue", "Frame comp quest stage enqueue"),
+                        ("frame_comp_quest_fallback_copy", "Frame comp quest fallback copy"),
+                        ("frame_comp_preview_path_wall", "Frame comp local preview path"),
+                        ("frame_comp_preview_sync_wall", "Frame comp local preview sync"),
+                        ("frame_comp_preview_copy_wall", "Frame comp local preview copy"),
+                        ("frame_comp_preview_upload_draw_wall", "Frame comp local preview upload draw"),
+                        ("frame_comp_glfw_poll_wall", "Frame comp glfw poll"),
+                        ("frame_comp_timer_stop_wall", "Frame comp final synchronize wait"),
+                        ("eval_png_write_wall", "Eval png write"),
+                    ]
+                    print("Frame compositing breakdown:")
+                    log_lines.append("Frame compositing breakdown:")
+                    for component_name, readable_name in frame_comp_breakdown:
+                        component_times_list = component_times.get(component_name, [])
+                        if component_times_list:
+                            average_component_time = np.mean(component_times_list)
+                            print(f"{readable_name}: {average_component_time * 1000:.2f} ms")
+                            log_lines.append(
+                                f"{readable_name}: {average_component_time * 1000:.2f} ms"
+                            )
 
                 #pyh save the performance log to a file
-                if eval_image_path:
-                    os.makedirs(eval_image_path, exist_ok=True)
-                    log_file_path = os.path.join(eval_image_path, "performance_summary.txt")
+                if summary_output_path:
+                    os.makedirs(summary_output_path, exist_ok=True)
+                    log_file_path = os.path.join(summary_output_path, "performance_summary.txt")
                     with open(log_file_path, "w") as log_file:
                         log_file.write("\n".join(log_lines))
 

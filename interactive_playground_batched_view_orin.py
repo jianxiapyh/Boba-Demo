@@ -87,7 +87,15 @@ def main():
     parser.add_argument("--gaussian_path", type=str, default="./gaussian_output")
     parser.add_argument("--bg_img_path", type=str, default="./data/bg.png")
     parser.add_argument("--case_name", type=str, default="double_lift_cloth_3")
-    parser.add_argument("-eval", "--eval_image_quality", action="store_true")
+    parser.add_argument(
+        "-eval",
+        "--eval_image_quality",
+        action="store_true",
+        help=(
+            "write capture artifacts and verbose frame-compositing timing under "
+            "./gaussian_output_dynamic/<case_name>"
+        ),
+    )
     parser.add_argument("--n_dup", type=int, default=0, help="number of object duplicates")
     parser.add_argument(
         "--input_source",
@@ -226,15 +234,14 @@ def main():
 
     best_model_path = glob.glob(f"experiments/{case_name}/train/best_*.pth")[0]
 
-    eval_image_path = None
-    if args.eval_image_quality:
-        eval_image_path = os.path.join("./gaussian_output_dynamic", case_name)
+    summary_output_path = os.path.join("./gaussian_output_dynamic", case_name)
 
     try:
         trainer.interactive_playground_batched_visualization(
             best_model_path,
             gaussians_path,
-            eval_image_path=eval_image_path,
+            summary_output_path=summary_output_path,
+            save_eval_artifacts=args.eval_image_quality,
             n_dup=args.n_dup,
             window=window,
             cuda_ctx=ctx,

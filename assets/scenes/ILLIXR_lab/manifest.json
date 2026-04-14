@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "scene_preset": "ILLIXR_lab",
+  "scene_model": "scene.obj",
+  "scene_material": "scene.mtl",
+  "textures": [
+    "FloorBake.png",
+    "WallBake.png",
+    "LogoBake.png",
+    "OUTPUT_light.png"
+  ],
+  "asset_up_axis": "y",
+  "scene_up_axis": "-z",
+  "x_rotation_degrees": -90.0,
+  "target_table_size_m": [
+    0.95,
+    0.68
+  ],
+  "floor_materials": [
+    "Material.004"
+  ],
+  "wall_materials": [
+    "Wall",
+    "WallLight",
+    "WallLogo"
+  ],
+  "furniture_materials": [
+    "Output.001"
+  ]
+}

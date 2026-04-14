@@ -6215,14 +6215,17 @@ class InvPhyTrainerWarp:
         self.simulator.set_init_state(wp_x, wp_v)
 
     def _set_scene_collider_boxes(self, layout):
-        boxes = torch.tensor(
-            [
-                [layout.table_box.mins, layout.table_box.maxs],
-                [layout.floor_box.mins, layout.floor_box.maxs],
-            ],
-            dtype=torch.float32,
-            device=cfg.device,
-        )
+        if layout.static_collider_boxes is not None:
+            boxes_np = np.asarray(layout.static_collider_boxes, dtype=np.float32)
+        else:
+            boxes_np = np.array(
+                [
+                    [layout.table_box.mins, layout.table_box.maxs],
+                    [layout.floor_box.mins, layout.floor_box.maxs],
+                ],
+                dtype=np.float32,
+            )
+        boxes = torch.as_tensor(boxes_np, dtype=torch.float32, device=cfg.device)
         self.simulator.set_static_collision_boxes(boxes)
 
     def _settle_scene_rest_state(self, rest_target):
@@ -9298,7 +9301,8 @@ class InvPhyTrainerWarp:
                     f"normal_alignment={table_alignment_debug['surface_normal_alignment']:.4f} "
                     f"surface_center={table_alignment_debug['world_surface_center']} "
                     f"surface_plane={world_surface_plane_height:.4f} "
-                    f"collider_plane={collider_top_plane_height:.4f}",
+                    f"collider_plane={collider_top_plane_height:.4f} "
+                    f"collider_boxes={table_alignment_debug.get('collider_box_count', 'n/a')}",
                     flush=True,
                 )
             print(
@@ -11773,9 +11777,13 @@ class InvPhyTrainerWarp:
         else:
             forward_xy /= forward_xy_norm
 
-        room_center_xy = np.array(
-            [layout.table_top_center[0], layout.table_top_center[1]],
-            dtype=np.float32,
+        room_center_xy = (
+            np.asarray(layout.room_center_xy, dtype=np.float32)
+            if getattr(layout, "room_center_xy", None) is not None
+            else np.array(
+                [layout.table_top_center[0], layout.table_top_center[1]],
+                dtype=np.float32,
+            )
         )
         room_mins_xy = room_center_xy - np.asarray(layout.room_half_extent, dtype=np.float32)
         room_maxs_xy = room_center_xy + np.asarray(layout.room_half_extent, dtype=np.float32)

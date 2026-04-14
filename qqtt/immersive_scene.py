@@ -1,27 +1,35 @@
 from __future__ import annotations
 
-import hashlib
 import json
-import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import torch
 import trimesh
-from PIL import Image
-from trimesh.visual.texture import TextureVisuals
+from trimesh.graph import connected_component_labels
 
 from .pyrender_cuda_bridge import (
     PyrenderCudaInteropOffscreenRenderer,
     probe_pyrender_cuda_bridge_support,
 )
-from .simple_lab_gpu_renderer import SimpleLabGpuRenderer
 
 
-MANIFEST_RELATIVE_PATH = Path("assets/scenes/simple_lab/manifest.json")
-USER_AGENT = "BobaQuestImmersiveDemo/1.0"
+MANIFEST_RELATIVE_PATH = Path("assets/scenes/ILLIXR_lab/manifest.json")
+ILLIXR_SCENE_NAME = "ILLIXR_lab"
+
+TARGET_TABLE_SIZE_X = 0.95
+TARGET_TABLE_SIZE_Y = 0.68
+TABLE_SUPPORT_HEIGHT_MIN = 0.12
+TABLE_SUPPORT_AREA_MIN = 0.08
+TABLE_SUPPORT_GAP_Y = 0.03
+COLLIDER_COMPONENT_AREA_MIN = 0.30
+COLLIDER_HORIZONTAL_AREA_MIN = 0.12
+COLLIDER_VERTICAL_HEIGHT_MIN = 0.32
+COLLIDER_MIN_THICKNESS = 0.035
+FLOOR_COLLIDER_THICKNESS = 0.05
+WALL_COLLIDER_THICKNESS = 0.08
 
 
 @dataclass
@@ -38,6 +46,8 @@ class SimpleLabLayout:
     room_half_extent: np.ndarray
     wall_height: float
     scene_up: np.ndarray
+    room_center_xy: np.ndarray | None = None
+    static_collider_boxes: np.ndarray | None = None
 
     @property
     def scene_down(self) -> np.ndarray:
@@ -74,18 +84,23 @@ class SimpleLabLayout:
 
     @property
     def floor_box(self) -> SceneColliderBox:
+        room_center_xy = (
+            np.asarray(self.room_center_xy, dtype=np.float32)
+            if self.room_center_xy is not None
+            else np.asarray(self.table_top_center[:2], dtype=np.float32)
+        )
         mins = np.array(
             [
-                self.table_top_center[0] - self.room_half_extent[0],
-                self.table_top_center[1] - self.room_half_extent[1],
+                room_center_xy[0] - self.room_half_extent[0],
+                room_center_xy[1] - self.room_half_extent[1],
                 self.floor_z if float(self.scene_up[2]) < 0.0 else self.floor_z - 0.06,
             ],
             dtype=np.float32,
         )
         maxs = np.array(
             [
-                self.table_top_center[0] + self.room_half_extent[0],
-                self.table_top_center[1] + self.room_half_extent[1],
+                room_center_xy[0] + self.room_half_extent[0],
+                room_center_xy[1] + self.room_half_extent[1],
                 self.floor_z + 0.06 if float(self.scene_up[2]) < 0.0 else self.floor_z,
             ],
             dtype=np.float32,
@@ -93,84 +108,174 @@ class SimpleLabLayout:
         return SceneColliderBox(mins=mins, maxs=maxs)
 
 
-def simple_lab_manifest_path(scene_assets_root: str | Path) -> Path:
+def _normalize(vec: np.ndarray, eps: float = 1e-6) -> np.ndarray:
+    vec = np.asarray(vec, dtype=np.float32)
+    norm = float(np.linalg.norm(vec))
+    if norm < eps:
+        raise ValueError("Cannot normalize near-zero vector")
+    return vec / norm
+
+
+def _cluster_support_levels(
+    heights: np.ndarray,
+    areas: np.ndarray,
+    bounds_mins: np.ndarray,
+    bounds_maxs: np.ndarray,
+    centers: np.ndarray,
+    gap: float = TABLE_SUPPORT_GAP_Y,
+) -> list[dict[str, Any]]:
+    if heights.size == 0:
+        return []
+    order = np.argsort(heights)
+    heights = heights[order]
+    areas = areas[order]
+    bounds_mins = bounds_mins[order]
+    bounds_maxs = bounds_maxs[order]
+    centers = centers[order]
+    levels: list[dict[str, Any]] = []
+    start = 0
+    for idx in range(1, heights.shape[0] + 1):
+        if idx == heights.shape[0] or abs(float(heights[idx] - heights[idx - 1])) > gap:
+            seg = slice(start, idx)
+            seg_areas = areas[seg]
+            total_area = float(np.sum(seg_areas))
+            if total_area > 1e-6:
+                weights = seg_areas / total_area
+                level_center = np.sum(centers[seg] * weights[:, None], axis=0)
+                level_bounds_min = np.min(bounds_mins[seg], axis=0)
+                level_bounds_max = np.max(bounds_maxs[seg], axis=0)
+                levels.append(
+                    {
+                        "y": float(np.sum(heights[seg] * weights)),
+                        "area": total_area,
+                        "center": level_center.astype(np.float32),
+                        "bounds_min": level_bounds_min.astype(np.float32),
+                        "bounds_max": level_bounds_max.astype(np.float32),
+                    }
+                )
+            start = idx
+    levels.sort(key=lambda level: (level["area"], level["y"]), reverse=True)
+    return levels
+
+
+def _transform_points(points: np.ndarray, transform: np.ndarray) -> np.ndarray:
+    points = np.asarray(points, dtype=np.float32)
+    ones = np.ones((points.shape[0], 1), dtype=np.float32)
+    homogeneous = np.concatenate([points, ones], axis=1)
+    transformed = (transform @ homogeneous.T).T
+    return transformed[:, :3].astype(np.float32)
+
+
+def _transform_bounds(
+    bounds_min: np.ndarray,
+    bounds_max: np.ndarray,
+    transform: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    bounds_min = np.asarray(bounds_min, dtype=np.float32)
+    bounds_max = np.asarray(bounds_max, dtype=np.float32)
+    corners = np.array(
+        [
+            [bounds_min[0], bounds_min[1], bounds_min[2]],
+            [bounds_min[0], bounds_min[1], bounds_max[2]],
+            [bounds_min[0], bounds_max[1], bounds_min[2]],
+            [bounds_min[0], bounds_max[1], bounds_max[2]],
+            [bounds_max[0], bounds_min[1], bounds_min[2]],
+            [bounds_max[0], bounds_min[1], bounds_max[2]],
+            [bounds_max[0], bounds_max[1], bounds_min[2]],
+            [bounds_max[0], bounds_max[1], bounds_max[2]],
+        ],
+        dtype=np.float32,
+    )
+    transformed = _transform_points(corners, transform)
+    return (
+        transformed.min(axis=0).astype(np.float32),
+        transformed.max(axis=0).astype(np.float32),
+    )
+
+
+def _expand_bounds_min_thickness(
+    bounds_min: np.ndarray,
+    bounds_max: np.ndarray,
+    min_thickness: float = COLLIDER_MIN_THICKNESS,
+    support_axis: int | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    bounds_min = np.asarray(bounds_min, dtype=np.float32).copy()
+    bounds_max = np.asarray(bounds_max, dtype=np.float32).copy()
+    extents = bounds_max - bounds_min
+    for axis in range(3):
+        if extents[axis] >= min_thickness:
+            continue
+        if support_axis is not None and axis == int(support_axis):
+            bounds_min[axis] = bounds_max[axis] - min_thickness
+        else:
+            pad = 0.5 * (min_thickness - extents[axis])
+            bounds_min[axis] -= pad
+            bounds_max[axis] += pad
+    return bounds_min, bounds_max
+
+
+def illixr_lab_manifest_path(scene_assets_root: str | Path) -> Path:
     assets_root = Path(scene_assets_root).resolve()
     candidates = []
-    if assets_root.name == "simple_lab":
+    if assets_root.name == ILLIXR_SCENE_NAME:
         candidates.append(assets_root / "manifest.json")
     candidates.extend(
         [
-            assets_root / "simple_lab" / "manifest.json",
-            assets_root / "scenes" / "simple_lab" / "manifest.json",
-            assets_root / "assets" / "scenes" / "simple_lab" / "manifest.json",
+            assets_root / ILLIXR_SCENE_NAME / "manifest.json",
+            assets_root / "scenes" / ILLIXR_SCENE_NAME / "manifest.json",
+            assets_root / "assets" / "scenes" / ILLIXR_SCENE_NAME / "manifest.json",
         ]
     )
     for candidate in candidates:
         if candidate.exists():
             return candidate
-    if assets_root.name == "simple_lab":
+    if assets_root.name == ILLIXR_SCENE_NAME:
         return assets_root / "manifest.json"
     if assets_root.name == "scenes":
-        return assets_root / "simple_lab" / "manifest.json"
+        return assets_root / ILLIXR_SCENE_NAME / "manifest.json"
     if assets_root.name == "assets":
-        return assets_root / "scenes" / "simple_lab" / "manifest.json"
-    return assets_root / "simple_lab" / "manifest.json"
+        return assets_root / "scenes" / ILLIXR_SCENE_NAME / "manifest.json"
+    return assets_root / ILLIXR_SCENE_NAME / "manifest.json"
 
 
-def load_simple_lab_manifest(scene_assets_root: str | Path) -> dict[str, Any]:
-    manifest_path = simple_lab_manifest_path(scene_assets_root)
+def simple_lab_manifest_path(scene_assets_root: str | Path) -> Path:
+    return illixr_lab_manifest_path(scene_assets_root)
+
+
+def load_illixr_lab_manifest(scene_assets_root: str | Path) -> dict[str, Any]:
+    manifest_path = illixr_lab_manifest_path(scene_assets_root)
     with open(manifest_path, "r", encoding="utf-8") as handle:
         return json.load(handle)
 
 
-def _md5(path: Path) -> str:
-    digest = hashlib.md5()
-    with open(path, "rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+def load_simple_lab_manifest(scene_assets_root: str | Path) -> dict[str, Any]:
+    return load_illixr_lab_manifest(scene_assets_root)
 
 
-def _download(url: str, destination: Path) -> None:
-    request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    with urllib.request.urlopen(request, timeout=60) as response, open(
-        destination, "wb"
-    ) as handle:
-        while True:
-            chunk = response.read(1024 * 1024)
-            if not chunk:
-                break
-            handle.write(chunk)
+def ensure_illixr_lab_assets(scene_assets_root: str | Path) -> Path:
+    assets_root = Path(scene_assets_root).resolve()
+    manifest_path = illixr_lab_manifest_path(assets_root)
+    scene_root = manifest_path.parent
+    manifest = load_illixr_lab_manifest(assets_root)
+    required_paths = [
+        scene_root / manifest["scene_model"],
+        scene_root / manifest["scene_material"],
+    ]
+    required_paths.extend(scene_root / texture for texture in manifest.get("textures", []))
+    missing = [str(path) for path in required_paths if not path.exists()]
+    if missing:
+        raise FileNotFoundError(
+            "The shipped ILLIXR_lab scene bundle is incomplete. Missing files:\n"
+            + "\n".join(missing)
+        )
+    return scene_root
 
 
 def ensure_simple_lab_assets(scene_assets_root: str | Path) -> Path:
-    assets_root = Path(scene_assets_root).resolve()
-    manifest = load_simple_lab_manifest(assets_root)
-    if assets_root.name == "simple_lab":
-        simple_lab_root = assets_root
-    elif assets_root.name == "scenes":
-        simple_lab_root = assets_root / "simple_lab"
-    else:
-        simple_lab_root = assets_root / "simple_lab"
-    for entry in manifest["assets"].values():
-        relative_path = Path(entry["relative_path"])
-        destination = simple_lab_root / relative_path
-        expected_md5 = entry.get("md5")
-        if destination.exists() and (
-            expected_md5 is None or _md5(destination) == expected_md5
-        ):
-            continue
-        _download(entry["url"], destination)
-        if expected_md5 is not None and _md5(destination) != expected_md5:
-            raise RuntimeError(
-                f"Downloaded asset checksum mismatch for {destination}: "
-                f"expected {expected_md5}"
-            )
-    return simple_lab_root
+    return ensure_illixr_lab_assets(scene_assets_root)
 
 
-def make_simple_lab_layout(
+def make_illixr_lab_layout(
     head_position: np.ndarray,
     forward_direction: np.ndarray,
     scene_up: np.ndarray | None = None,
@@ -181,10 +286,7 @@ def make_simple_lab_layout(
         scene_up = np.array([0.0, 0.0, -1.0], dtype=np.float32)
     else:
         scene_up = np.asarray(scene_up, dtype=np.float32)
-    scene_up_norm = float(np.linalg.norm(scene_up))
-    if scene_up_norm < 1e-5:
-        raise ValueError("scene_up must have non-zero length")
-    scene_up = scene_up / scene_up_norm
+    scene_up = _normalize(scene_up)
 
     horizontal_forward = forward_direction - float(np.dot(forward_direction, scene_up)) * scene_up
     norm = float(np.linalg.norm(horizontal_forward))
@@ -206,11 +308,25 @@ def make_simple_lab_layout(
     floor_point = head_position + scene_down * 1.35
     return SimpleLabLayout(
         table_top_center=table_top_center.astype(np.float32),
-        table_size=np.array([0.95, 0.68, 0.76], dtype=np.float32),
+        table_size=np.array([TARGET_TABLE_SIZE_X, TARGET_TABLE_SIZE_Y, 0.40], dtype=np.float32),
         floor_z=float(floor_point[2]),
         room_half_extent=np.array([2.7, 2.7], dtype=np.float32),
         wall_height=2.8,
         scene_up=scene_up.astype(np.float32),
+        room_center_xy=np.asarray(table_top_center[:2], dtype=np.float32).copy(),
+        static_collider_boxes=None,
+    )
+
+
+def make_simple_lab_layout(
+    head_position: np.ndarray,
+    forward_direction: np.ndarray,
+    scene_up: np.ndarray | None = None,
+) -> SimpleLabLayout:
+    return make_illixr_lab_layout(
+        head_position,
+        forward_direction,
+        scene_up=scene_up,
     )
 
 
@@ -222,35 +338,6 @@ def _as_trimesh(mesh_or_scene: trimesh.Trimesh | trimesh.Scene) -> trimesh.Trime
         raise ValueError("No geometry found in immersive scene asset.")
     return trimesh.util.concatenate(geometries)
 
-
-def _make_textured_quad(
-    width: float,
-    height: float,
-    texture_path: Path,
-    uv_scale: tuple[float, float],
-) -> trimesh.Trimesh:
-    vertices = np.array(
-        [
-            [-0.5 * width, -0.5 * height, 0.0],
-            [0.5 * width, -0.5 * height, 0.0],
-            [0.5 * width, 0.5 * height, 0.0],
-            [-0.5 * width, 0.5 * height, 0.0],
-        ],
-        dtype=np.float32,
-    )
-    faces = np.array([[0, 1, 2], [0, 2, 3]], dtype=np.int64)
-    uvs = np.array(
-        [
-            [0.0, 0.0],
-            [uv_scale[0], 0.0],
-            [uv_scale[0], uv_scale[1]],
-            [0.0, uv_scale[1]],
-        ],
-        dtype=np.float32,
-    )
-    image = Image.open(texture_path).convert("RGB")
-    visual = TextureVisuals(uv=uvs, image=image)
-    return trimesh.Trimesh(vertices=vertices, faces=faces, visual=visual, process=False)
 
 class SimpleLabSceneRenderer:
     def __init__(
@@ -266,11 +353,12 @@ class SimpleLabSceneRenderer:
         self.width = int(width)
         self.height = int(height)
         self.lighting_mode = str(lighting_mode)
-        self.balanced_render_backend = str(balanced_render_backend)
+        self.balanced_render_backend = "pyrender"
         self._pyrender = pyrender
-        self.simple_lab_root = ensure_simple_lab_assets(scene_assets_root)
-        self.manifest = load_simple_lab_manifest(scene_assets_root)
+        self.scene_root = ensure_illixr_lab_assets(scene_assets_root)
+        self.manifest = load_illixr_lab_manifest(scene_assets_root)
         self.layout: SimpleLabLayout | None = None
+
         self._scene_clear_color = np.array([243, 244, 246, 255], dtype=np.uint8)
         self._table_clear_color = np.array([0, 0, 0, 0], dtype=np.uint8)
         self._ambient_light = np.array([0.22, 0.22, 0.22], dtype=np.float32)
@@ -314,42 +402,107 @@ class SimpleLabSceneRenderer:
         self._eager_layer_names = {"background", "table"}
         self._layer_entries: dict[str, dict[str, Any]] = {}
         self._table_alignment_debug: dict[str, Any] | None = None
-        self._table_transform_debug: dict[str, Any] | None = None
         self._table_world_bounds: tuple[np.ndarray, np.ndarray] | None = None
         self._wall_world_bounds: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+        self._scene_collider_boxes: np.ndarray | None = None
         self._pyrender_readback_mode = "cpu_fallback"
         self._pyrender_readback_reason: str | None = None
         self._pyrender_cuda_interop_supported = False
-        if self.balanced_render_backend == "pyrender":
-            (
-                self._pyrender_cuda_interop_supported,
-                self._pyrender_readback_reason,
-            ) = probe_pyrender_cuda_bridge_support()
-            self._pyrender_readback_mode = (
-                "gl_cuda_interop"
-                if self._pyrender_cuda_interop_supported
-                else "cpu_fallback"
-            )
-        self._gpu_renderer = (
-            None
-            if self.balanced_render_backend == "pyrender"
-            else SimpleLabGpuRenderer(lighting_mode=self.lighting_mode)
+        (
+            self._pyrender_cuda_interop_supported,
+            self._pyrender_readback_reason,
+        ) = probe_pyrender_cuda_bridge_support()
+        self._pyrender_readback_mode = (
+            "gl_cuda_interop"
+            if self._pyrender_cuda_interop_supported
+            else "cpu_fallback"
         )
-        self._table_mesh = self._load_table_mesh()
-        self._floor_quad = _make_textured_quad(
-            width=1.0,
-            height=1.0,
-            texture_path=self.simple_lab_root / "floor" / "concrete_floor_diff_2k.jpg",
-            uv_scale=(4.0, 4.0),
-        )
-        self._wall_quad = _make_textured_quad(
-            width=1.0,
-            height=1.0,
-            texture_path=self.simple_lab_root / "walls" / "rough_concrete_diff_2k.jpg",
-            uv_scale=(3.0, 2.0),
-        )
+
         for layer_name in self._eager_layer_names:
             self._layer_entries[layer_name] = self._make_layer_entry(layer_name)
+
+        self._asset_up = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+        self._scene_x_rotation_degrees = float(self.manifest.get("x_rotation_degrees", -90.0))
+        self._target_table_size_xy = np.asarray(
+            self.manifest.get("target_table_size_m", [TARGET_TABLE_SIZE_X, TARGET_TABLE_SIZE_Y]),
+            dtype=np.float32,
+        )
+        self._scene_asset = trimesh.load(
+            self.scene_root / self.manifest["scene_model"],
+            force="scene",
+            process=False,
+        )
+        self._floor_asset_mesh = self._concat_geometries(self.manifest.get("floor_materials", []))
+        self._wall_asset_mesh = self._concat_geometries(self.manifest.get("wall_materials", []))
+        self._furniture_asset_mesh = self._concat_geometries(
+            self.manifest.get("furniture_materials", [])
+        )
+        self._full_asset_mesh = _as_trimesh(self._scene_asset)
+
+        self._asset_floor_y = float(np.median(self._floor_asset_mesh.vertices[:, 1]))
+        self._asset_room_bounds = self._full_asset_mesh.bounds.astype(np.float32)
+        self._asset_room_center_xz = np.array(
+            [
+                0.5 * float(self._asset_room_bounds[0, 0] + self._asset_room_bounds[1, 0]),
+                0.5 * float(self._asset_room_bounds[0, 2] + self._asset_room_bounds[1, 2]),
+            ],
+            dtype=np.float32,
+        )
+
+        self._wall_face_masks = self._split_wall_faces(self._wall_asset_mesh)
+        self._furniture_component_labels = connected_component_labels(
+            self._furniture_asset_mesh.face_adjacency,
+            node_count=len(self._furniture_asset_mesh.faces),
+        )
+        self._furniture_component_records = self._build_component_records(
+            self._furniture_asset_mesh,
+            self._furniture_component_labels,
+        )
+        (
+            self._table_component_ids,
+            self._table_support_component_ids,
+            self._asset_table_support_bounds,
+            self._asset_table_support_center,
+            self._asset_table_support_height,
+        ) = self._select_table_components(self._furniture_component_records)
+        self._table_asset_mesh = self._slice_mesh_by_component_ids(
+            self._furniture_asset_mesh,
+            self._furniture_component_labels,
+            self._table_component_ids,
+        )
+        self._left_wall_asset_mesh = self._slice_mesh_by_face_mask(
+            self._wall_asset_mesh,
+            self._wall_face_masks["left"],
+        )
+        self._right_wall_asset_mesh = self._slice_mesh_by_face_mask(
+            self._wall_asset_mesh,
+            self._wall_face_masks["right"],
+        )
+        self._front_back_asset_mesh = self._slice_mesh_by_face_mask(
+            self._wall_asset_mesh,
+            self._wall_face_masks["front"] | self._wall_face_masks["back"],
+        )
+        self._collision_component_records = self._select_collision_component_records(
+            self._furniture_component_records,
+            self._table_component_ids,
+        )
+        self._full_scene_mesh_world: trimesh.Trimesh | None = None
+        self._background_mesh_world: trimesh.Trimesh | None = None
+        self._table_mesh_world: trimesh.Trimesh | None = None
+        self._floor_mesh_world: trimesh.Trimesh | None = None
+        self._left_wall_mesh_world: trimesh.Trimesh | None = None
+        self._right_wall_mesh_world: trimesh.Trimesh | None = None
+        self._front_back_mesh_world: trimesh.Trimesh | None = None
+
+    def _concat_geometries(self, names: list[str]) -> trimesh.Trimesh:
+        geometries: list[trimesh.Trimesh] = []
+        for name in names:
+            geom = self._scene_asset.geometry.get(name)
+            if geom is not None:
+                geometries.append(geom.copy())
+        if not geometries:
+            raise ValueError(f"Could not resolve scene geometry group: {names}")
+        return trimesh.util.concatenate(geometries)
 
     def _make_layer_entry(self, layer_name: str) -> dict[str, Any]:
         layer_spec = self._layer_specs[layer_name]
@@ -375,6 +528,7 @@ class SimpleLabSceneRenderer:
             "table_node": None,
             "floor_node": None,
             "wall_nodes": [],
+            "background_nodes": [],
             "table_role": layer_spec["table_role"],
             "background_role": layer_spec["background_role"],
         }
@@ -395,8 +549,6 @@ class SimpleLabSceneRenderer:
             if renderer is not None:
                 renderer.delete()
                 entry["renderer"] = None
-        if self._gpu_renderer is not None:
-            self._gpu_renderer.delete()
 
     def pyrender_readback_mode(self) -> str:
         return str(self._pyrender_readback_mode)
@@ -407,25 +559,13 @@ class SimpleLabSceneRenderer:
         return str(self._pyrender_readback_reason)
 
     def uses_gpu_balanced_table_renderer(self) -> bool:
-        return bool(
-            self._gpu_renderer is not None
-            and self._gpu_renderer.table_available
-            and self.balanced_render_backend in {"gpu", "gpu_all"}
-        )
+        return False
 
     def uses_gpu_balanced_plane_renderer(self) -> bool:
-        return bool(
-            self._gpu_renderer is not None
-            and self._gpu_renderer.available
-            and self.balanced_render_backend == "gpu_all"
-        )
+        return False
 
     def uses_gpu_balanced_side_wall_renderer(self) -> bool:
-        return bool(
-            self._gpu_renderer is not None
-            and self._gpu_renderer.available
-            and self.balanced_render_backend in {"gpu", "gpu_all"}
-        )
+        return False
 
     def table_alignment_debug(self) -> dict[str, Any] | None:
         if self._table_alignment_debug is None:
@@ -435,8 +575,10 @@ class SimpleLabSceneRenderer:
     def table_world_bounds(self) -> tuple[np.ndarray, np.ndarray] | None:
         if self._table_world_bounds is None:
             return None
-        bounds_min, bounds_max = self._table_world_bounds
-        return np.array(bounds_min, copy=True), np.array(bounds_max, copy=True)
+        return (
+            np.array(self._table_world_bounds[0], copy=True),
+            np.array(self._table_world_bounds[1], copy=True),
+        )
 
     def wall_world_bounds(self, wall_name: str) -> tuple[np.ndarray, np.ndarray] | None:
         wall_key = str(wall_name)
@@ -444,6 +586,11 @@ class SimpleLabSceneRenderer:
             return None
         bounds_min, bounds_max = self._wall_world_bounds[wall_key]
         return np.array(bounds_min, copy=True), np.array(bounds_max, copy=True)
+
+    def static_collider_boxes(self) -> np.ndarray | None:
+        if self._scene_collider_boxes is None:
+            return None
+        return np.array(self._scene_collider_boxes, copy=True)
 
     def set_layout(self, layout: SimpleLabLayout) -> None:
         self.layout = layout
@@ -456,13 +603,7 @@ class SimpleLabSceneRenderer:
         width: int | None = None,
         height: int | None = None,
     ) -> tuple[np.ndarray, np.ndarray]:
-        return self._render_layer_eye(
-            "full",
-            camera_pose_world,
-            intrinsic,
-            width=width,
-            height=height,
-        )
+        return self._render_layer_eye("full", camera_pose_world, intrinsic, width=width, height=height)
 
     def render_background_eye(
         self,
@@ -471,13 +612,7 @@ class SimpleLabSceneRenderer:
         width: int | None = None,
         height: int | None = None,
     ) -> tuple[np.ndarray, np.ndarray]:
-        return self._render_layer_eye(
-            "background",
-            camera_pose_world,
-            intrinsic,
-            width=width,
-            height=height,
-        )
+        return self._render_layer_eye("background", camera_pose_world, intrinsic, width=width, height=height)
 
     def render_background_eye_roi(
         self,
@@ -485,12 +620,7 @@ class SimpleLabSceneRenderer:
         full_intrinsic: np.ndarray,
         roi_bounds: tuple[int, int, int, int],
     ) -> tuple[np.ndarray, np.ndarray] | tuple[torch.Tensor, torch.Tensor]:
-        return self._render_layer_eye_roi(
-            "background",
-            camera_pose_world,
-            full_intrinsic,
-            roi_bounds,
-        )
+        return self._render_layer_eye_roi("background", camera_pose_world, full_intrinsic, roi_bounds)
 
     def render_balanced_far_front_back_walls_eye(
         self,
@@ -599,22 +729,7 @@ class SimpleLabSceneRenderer:
         width: int | None = None,
         height: int | None = None,
     ) -> tuple[np.ndarray, np.ndarray] | tuple[torch.Tensor, torch.Tensor]:
-        if self.uses_gpu_balanced_table_renderer():
-            render_width = self.width if width is None else int(width)
-            render_height = self.height if height is None else int(height)
-            return self._gpu_renderer.render_table(
-                camera_pose_world,
-                intrinsic,
-                width=render_width,
-                height=render_height,
-            )
-        return self._render_layer_eye(
-            "table",
-            camera_pose_world,
-            intrinsic,
-            width=width,
-            height=height,
-        )
+        return self._render_layer_eye("table", camera_pose_world, intrinsic, width=width, height=height)
 
     def render_table_eye_roi(
         self,
@@ -623,24 +738,12 @@ class SimpleLabSceneRenderer:
         roi_bounds: tuple[int, int, int, int],
         render_scale: float = 1.0,
         return_render_info: bool = False,
-    ) -> tuple[np.ndarray, np.ndarray] | tuple[np.ndarray, np.ndarray, dict[str, Any]] | tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
-        if self.uses_gpu_balanced_table_renderer():
-            roi_intrinsic, render_width, render_height, render_info = (
-                self._resolve_roi_render_params(
-                    full_intrinsic,
-                    roi_bounds,
-                    render_scale=render_scale,
-                )
-            )
-            render_color, render_depth = self._gpu_renderer.render_table(
-                camera_pose_world,
-                roi_intrinsic,
-                width=render_width,
-                height=render_height,
-            )
-            if return_render_info:
-                return render_color, render_depth, render_info
-            return render_color, render_depth
+    ) -> (
+        tuple[np.ndarray, np.ndarray]
+        | tuple[np.ndarray, np.ndarray, dict[str, Any]]
+        | tuple[torch.Tensor, torch.Tensor]
+        | tuple[torch.Tensor, torch.Tensor, dict[str, Any]]
+    ):
         return self._render_layer_eye_roi(
             "table",
             camera_pose_world,
@@ -658,26 +761,7 @@ class SimpleLabSceneRenderer:
         width: int | None = None,
         height: int | None = None,
     ) -> tuple[np.ndarray, np.ndarray] | tuple[torch.Tensor, torch.Tensor]:
-        if self._should_use_gpu_balanced_layer(layer_name):
-            render_width = self.width if width is None else int(width)
-            render_height = self.height if height is None else int(height)
-            try:
-                return self._gpu_renderer.render_plane_layer(
-                    layer_name,
-                    camera_pose_world,
-                    intrinsic,
-                    width=render_width,
-                    height=render_height,
-                )
-            except Exception:
-                pass
-        return self._render_layer_eye(
-            layer_name,
-            camera_pose_world,
-            intrinsic,
-            width=width,
-            height=height,
-        )
+        return self._render_layer_eye(layer_name, camera_pose_world, intrinsic, width=width, height=height)
 
     def _render_balanced_layer_roi(
         self,
@@ -686,34 +770,11 @@ class SimpleLabSceneRenderer:
         full_intrinsic: np.ndarray,
         roi_bounds: tuple[int, int, int, int],
     ) -> tuple[np.ndarray, np.ndarray] | tuple[torch.Tensor, torch.Tensor]:
-        if self._should_use_gpu_balanced_layer(layer_name):
-            roi_intrinsic, render_width, render_height, _ = self._resolve_roi_render_params(
-                full_intrinsic,
-                roi_bounds,
-                render_scale=1.0,
-            )
-            try:
-                return self._gpu_renderer.render_plane_layer(
-                    layer_name,
-                    camera_pose_world,
-                    roi_intrinsic,
-                    width=render_width,
-                    height=render_height,
-                )
-            except Exception:
-                pass
-        return self._render_layer_eye_roi(
-            layer_name,
-            camera_pose_world,
-            full_intrinsic,
-            roi_bounds,
-        )
+        return self._render_layer_eye_roi(layer_name, camera_pose_world, full_intrinsic, roi_bounds)
 
     def _should_use_gpu_balanced_layer(self, layer_name: str) -> bool:
-        layer_name = str(layer_name)
-        if layer_name in {"balanced_left_wall", "balanced_right_wall"}:
-            return self.uses_gpu_balanced_side_wall_renderer()
-        return self.uses_gpu_balanced_plane_renderer()
+        _ = layer_name
+        return False
 
     def _resolve_roi_render_params(
         self,
@@ -737,14 +798,8 @@ class SimpleLabSceneRenderer:
             roi_intrinsic[1, 1] *= render_scale
             roi_intrinsic[0, 2] *= render_scale
             roi_intrinsic[1, 2] *= render_scale
-            render_width = max(
-                4,
-                int(np.ceil((float(roi_width) * render_scale) / 4.0) * 4),
-            )
-            render_height = max(
-                4,
-                int(np.ceil((float(roi_height) * render_scale) / 4.0) * 4),
-            )
+            render_width = max(4, int(np.ceil((float(roi_width) * render_scale) / 4.0) * 4))
+            render_height = max(4, int(np.ceil((float(roi_height) * render_scale) / 4.0) * 4))
         return (
             roi_intrinsic,
             render_width,
@@ -773,61 +828,454 @@ class SimpleLabSceneRenderer:
                 color=np.ones(3, dtype=np.float32),
                 intensity=22.0,
             )
-            scene.add(
-                fill_light,
-                pose=trimesh.transformations.euler_matrix(-1.1, -0.4, 0.0),
-            )
-            scene.add(
-                point_light,
-                pose=trimesh.transformations.translation_matrix([0.0, 0.0, -0.2]),
-            )
+            scene.add(fill_light, pose=trimesh.transformations.euler_matrix(-1.1, -0.4, 0.0))
+            scene.add(point_light, pose=trimesh.transformations.translation_matrix([0.0, 0.0, -0.2]))
 
-    def _load_table_mesh(self) -> trimesh.Trimesh:
-        table_path = self.simple_lab_root / "table" / "wooden_table_02_2k.gltf"
-        table_mesh = _as_trimesh(trimesh.load(table_path, force="scene", process=False))
-        transform_cfg = dict(self.manifest.get("table_mesh_transform", {}))
-        x_rotation_degrees = float(
-            transform_cfg.get(
-                "x_rotation_degrees",
-                transform_cfg.get("flip_x_degrees", 0.0),
+    def _slice_mesh_by_face_mask(self, mesh: trimesh.Trimesh, face_mask: np.ndarray) -> trimesh.Trimesh:
+        face_mask = np.asarray(face_mask, dtype=bool)
+        if face_mask.size == 0 or not np.any(face_mask):
+            return trimesh.Trimesh(vertices=np.zeros((0, 3)), faces=np.zeros((0, 3), dtype=np.int64), process=False)
+        return mesh.submesh([face_mask], append=True, only_watertight=False)
+
+    def _slice_mesh_by_component_ids(
+        self,
+        mesh: trimesh.Trimesh,
+        labels: np.ndarray,
+        component_ids: list[int],
+    ) -> trimesh.Trimesh:
+        if not component_ids:
+            return trimesh.Trimesh(vertices=np.zeros((0, 3)), faces=np.zeros((0, 3), dtype=np.int64), process=False)
+        face_mask = np.isin(labels, np.asarray(component_ids, dtype=np.int64))
+        return self._slice_mesh_by_face_mask(mesh, face_mask)
+
+    def _split_wall_faces(self, mesh: trimesh.Trimesh) -> dict[str, np.ndarray]:
+        face_centroids = np.asarray(mesh.triangles_center, dtype=np.float32)
+        bounds = mesh.bounds.astype(np.float32)
+        dist_left = np.abs(face_centroids[:, 0] - bounds[0, 0])
+        dist_right = np.abs(bounds[1, 0] - face_centroids[:, 0])
+        dist_back = np.abs(face_centroids[:, 2] - bounds[0, 2])
+        dist_front = np.abs(bounds[1, 2] - face_centroids[:, 2])
+        distances = np.stack([dist_left, dist_right, dist_back, dist_front], axis=1)
+        face_labels = np.argmin(distances, axis=1)
+        return {
+            "left": face_labels == 0,
+            "right": face_labels == 1,
+            "back": face_labels == 2,
+            "front": face_labels == 3,
+        }
+
+    def _build_component_records(
+        self,
+        mesh: trimesh.Trimesh,
+        labels: np.ndarray,
+    ) -> list[dict[str, Any]]:
+        face_normals = np.asarray(mesh.face_normals, dtype=np.float32)
+        face_centroids = np.asarray(mesh.triangles_center, dtype=np.float32)
+        face_areas = np.asarray(mesh.area_faces, dtype=np.float32)
+        horizontal_face_mask = (face_normals @ self._asset_up) >= 0.90
+        component_records: list[dict[str, Any]] = []
+        for component_id in np.unique(labels):
+            component_face_mask = labels == component_id
+            area = float(np.sum(face_areas[component_face_mask]))
+            if area <= 1e-6:
+                continue
+            component_faces = mesh.faces[component_face_mask]
+            vertex_ids = np.unique(component_faces.reshape(-1))
+            component_vertices = np.asarray(mesh.vertices[vertex_ids], dtype=np.float32)
+            bounds_min = component_vertices.min(axis=0)
+            bounds_max = component_vertices.max(axis=0)
+            horizontal_mask = component_face_mask & horizontal_face_mask
+            support_levels: list[dict[str, Any]] = []
+            if np.any(horizontal_mask):
+                support_face_indices = np.nonzero(horizontal_mask)[0]
+                support_bounds_min = np.zeros((support_face_indices.shape[0], 3), dtype=np.float32)
+                support_bounds_max = np.zeros((support_face_indices.shape[0], 3), dtype=np.float32)
+                for idx, face_index in enumerate(support_face_indices):
+                    face_vertices = np.asarray(mesh.vertices[mesh.faces[face_index]], dtype=np.float32)
+                    support_bounds_min[idx] = face_vertices.min(axis=0)
+                    support_bounds_max[idx] = face_vertices.max(axis=0)
+                support_levels = _cluster_support_levels(
+                    face_centroids[support_face_indices, 1],
+                    face_areas[support_face_indices],
+                    support_bounds_min,
+                    support_bounds_max,
+                    face_centroids[support_face_indices],
+                )
+            support_top_level = support_levels[0] if support_levels else None
+            component_records.append(
+                {
+                    "id": int(component_id),
+                    "area": area,
+                    "bounds_min": bounds_min.astype(np.float32),
+                    "bounds_max": bounds_max.astype(np.float32),
+                    "center": (0.5 * (bounds_min + bounds_max)).astype(np.float32),
+                    "extents": (bounds_max - bounds_min).astype(np.float32),
+                    "horizontal_area": float(
+                        np.sum(
+                            [
+                                level["area"]
+                                for level in support_levels
+                                if level["y"] >= (self._asset_floor_y + TABLE_SUPPORT_HEIGHT_MIN)
+                            ]
+                        )
+                    ),
+                    "support_levels": support_levels,
+                    "support_top_level": support_top_level,
+                }
+            )
+        return component_records
+
+    def _select_table_components(
+        self,
+        component_records: list[dict[str, Any]],
+    ) -> tuple[list[int], list[int], tuple[np.ndarray, np.ndarray], np.ndarray, float]:
+        room_center_xz = self._asset_room_center_xz
+        candidates: list[tuple[float, dict[str, Any]]] = []
+        for record in component_records:
+            level = record["support_top_level"]
+            if level is None:
+                continue
+            if level["y"] <= (self._asset_floor_y + TABLE_SUPPORT_HEIGHT_MIN):
+                continue
+            support_bounds = level["bounds_max"] - level["bounds_min"]
+            if min(float(support_bounds[0]), float(support_bounds[2])) < 0.10:
+                continue
+            dist = float(np.linalg.norm(level["center"][[0, 2]] - room_center_xz))
+            score = float(level["area"]) / (0.15 + dist * dist)
+            candidates.append((score, record))
+        if not candidates:
+            raise RuntimeError("Could not identify a central table support surface in ILLIXR_lab.")
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        primary_record = candidates[0][1]
+        primary_level = primary_record["support_top_level"]
+        assert primary_level is not None
+        primary_center_xz = primary_level["center"][[0, 2]]
+        primary_y = float(primary_level["y"])
+
+        support_component_ids: list[int] = []
+        for record in component_records:
+            level = record["support_top_level"]
+            if level is None:
+                continue
+            dist = float(np.linalg.norm(level["center"][[0, 2]] - primary_center_xz))
+            if dist > 1.4:
+                continue
+            if abs(float(level["y"]) - primary_y) > 0.08:
+                continue
+            if float(level["area"]) < TABLE_SUPPORT_AREA_MIN:
+                continue
+            support_component_ids.append(int(record["id"]))
+        if not support_component_ids:
+            support_component_ids = [int(primary_record["id"])]
+
+        support_bounds_min = np.min(
+            [
+                next(
+                    level["bounds_min"]
+                    for level in record["support_levels"]
+                    if abs(float(level["y"]) - primary_y) <= 0.08
+                )
+                for record in component_records
+                if int(record["id"]) in support_component_ids
+            ],
+            axis=0,
+        ).astype(np.float32)
+        support_bounds_max = np.max(
+            [
+                next(
+                    level["bounds_max"]
+                    for level in record["support_levels"]
+                    if abs(float(level["y"]) - primary_y) <= 0.08
+                )
+                for record in component_records
+                if int(record["id"]) in support_component_ids
+            ],
+            axis=0,
+        ).astype(np.float32)
+        support_center = np.array(
+            [
+                0.5 * float(support_bounds_min[0] + support_bounds_max[0]),
+                primary_y,
+                0.5 * float(support_bounds_min[2] + support_bounds_max[2]),
+            ],
+            dtype=np.float32,
+        )
+
+        support_expand = np.array([0.18, 0.02, 0.18], dtype=np.float32)
+        expanded_min = support_bounds_min.copy()
+        expanded_max = support_bounds_max.copy()
+        expanded_min[[0, 2]] -= support_expand[[0, 2]]
+        expanded_max[[0, 2]] += support_expand[[0, 2]]
+        table_component_ids = set(support_component_ids)
+        for record in component_records:
+            if int(record["id"]) in table_component_ids:
+                continue
+            bounds_min = record["bounds_min"]
+            bounds_max = record["bounds_max"]
+            overlaps_xz = not (
+                float(bounds_max[0]) < float(expanded_min[0])
+                or float(bounds_min[0]) > float(expanded_max[0])
+                or float(bounds_max[2]) < float(expanded_min[2])
+                or float(bounds_min[2]) > float(expanded_max[2])
+            )
+            if not overlaps_xz:
+                continue
+            if float(bounds_min[1]) < float(self._asset_floor_y - 0.02):
+                continue
+            if float(bounds_max[1]) > float(primary_y + 0.14):
+                continue
+            table_component_ids.add(int(record["id"]))
+
+        return (
+            sorted(table_component_ids),
+            sorted(support_component_ids),
+            (support_bounds_min, support_bounds_max),
+            support_center,
+            primary_y,
+        )
+
+    def _select_collision_component_records(
+        self,
+        component_records: list[dict[str, Any]],
+        table_component_ids: list[int],
+    ) -> list[dict[str, Any]]:
+        table_component_id_set = set(table_component_ids)
+        retained: list[dict[str, Any]] = []
+        for record in component_records:
+            extents = np.asarray(record["extents"], dtype=np.float32)
+            is_table_component = int(record["id"]) in table_component_id_set
+            area_threshold = 0.18 if is_table_component else 0.50
+            horizontal_threshold = 0.08 if is_table_component else 0.18
+            vertical_height_threshold = 0.14 if is_table_component else 0.45
+            horizontal_span_threshold = 0.12 if is_table_component else 0.25
+            if float(record["area"]) >= area_threshold:
+                retained.append(record)
+                continue
+            if float(record["horizontal_area"]) >= horizontal_threshold:
+                retained.append(record)
+                continue
+            if (
+                float(extents[1]) >= vertical_height_threshold
+                and max(float(extents[0]), float(extents[2])) >= horizontal_span_threshold
+            ):
+                retained.append(record)
+        return retained
+
+    def _table_target_size_xy(self) -> np.ndarray:
+        target_xy = np.asarray(self._target_table_size_xy, dtype=np.float32)
+        if target_xy.shape[0] != 2:
+            raise ValueError("target_table_size_m must contain two values")
+        return target_xy
+
+    def _asset_to_world_rotation(self) -> np.ndarray:
+        return trimesh.transformations.rotation_matrix(
+            np.deg2rad(self._scene_x_rotation_degrees), [1.0, 0.0, 0.0]
+        ).astype(np.float32)
+
+    def _prepare_positioned_scene(self) -> None:
+        assert self.layout is not None
+        target_xy = self._table_target_size_xy()
+        support_bounds_min, support_bounds_max = self._asset_table_support_bounds
+        support_extent_xy = np.array(
+            [
+                float(support_bounds_max[0] - support_bounds_min[0]),
+                float(support_bounds_max[2] - support_bounds_min[2]),
+            ],
+            dtype=np.float32,
+        )
+        scene_scale = float(
+            max(
+                float(target_xy[0]) / max(float(support_extent_xy[0]), 1e-4),
+                float(target_xy[1]) / max(float(support_extent_xy[1]), 1e-4),
             )
         )
-        if abs(x_rotation_degrees) > 1e-4:
-            table_mesh.apply_transform(
-                trimesh.transformations.rotation_matrix(
-                    np.deg2rad(x_rotation_degrees), [1.0, 0.0, 0.0]
-                )
-            )
-        self._table_transform_debug = {
-            "asset_up_axis": transform_cfg.get("asset_up_axis", "unknown"),
-            "scene_up_axis": transform_cfg.get("scene_up_axis", "unknown"),
-            "x_rotation_degrees": x_rotation_degrees,
+
+        asset_to_world = self._asset_to_world_rotation()
+        scale_transform = np.diag([scene_scale, scene_scale, scene_scale, 1.0]).astype(np.float32)
+        pre_translation = asset_to_world @ scale_transform
+        support_center_world = _transform_points(
+            self._asset_table_support_center.reshape(1, 3), pre_translation
+        )[0]
+        translation = (
+            np.asarray(self.layout.table_top_center, dtype=np.float32) - support_center_world
+        )
+        world_transform = trimesh.transformations.translation_matrix(translation).astype(np.float32) @ pre_translation
+
+        self._full_scene_mesh_world = self._full_asset_mesh.copy()
+        self._full_scene_mesh_world.apply_transform(world_transform)
+        self._background_mesh_world = self._full_scene_mesh_world.copy()
+
+        self._table_mesh_world = self._table_asset_mesh.copy()
+        self._table_mesh_world.apply_transform(world_transform)
+
+        self._floor_mesh_world = self._floor_asset_mesh.copy()
+        self._floor_mesh_world.apply_transform(world_transform)
+
+        self._left_wall_mesh_world = self._left_wall_asset_mesh.copy()
+        self._left_wall_mesh_world.apply_transform(world_transform)
+        self._right_wall_mesh_world = self._right_wall_asset_mesh.copy()
+        self._right_wall_mesh_world.apply_transform(world_transform)
+        self._front_back_mesh_world = self._front_back_asset_mesh.copy()
+        self._front_back_mesh_world.apply_transform(world_transform)
+
+        full_bounds = self._full_scene_mesh_world.bounds.astype(np.float32)
+        floor_z = float(np.median(self._floor_mesh_world.vertices[:, 2]))
+        room_center_xy = np.array(
+            [
+                0.5 * float(full_bounds[0, 0] + full_bounds[1, 0]),
+                0.5 * float(full_bounds[0, 1] + full_bounds[1, 1]),
+            ],
+            dtype=np.float32,
+        )
+        self.layout.room_center_xy = room_center_xy
+        self.layout.room_half_extent = np.array(
+            [
+                0.5 * float(full_bounds[1, 0] - full_bounds[0, 0]),
+                0.5 * float(full_bounds[1, 1] - full_bounds[0, 1]),
+            ],
+            dtype=np.float32,
+        )
+        self.layout.floor_z = floor_z
+        self.layout.wall_height = float(max(floor_z - float(full_bounds[0, 2]), 0.1))
+
+        table_world_bounds = self._table_mesh_world.bounds.astype(np.float32)
+        self._table_world_bounds = (
+            table_world_bounds[0].copy(),
+            table_world_bounds[1].copy(),
+        )
+        self.layout.table_size = np.array(
+            [
+                float(self._asset_table_support_bounds[1][0] - self._asset_table_support_bounds[0][0]) * scene_scale,
+                float(self._asset_table_support_bounds[1][2] - self._asset_table_support_bounds[0][2]) * scene_scale,
+                float(max(table_world_bounds[1, 2] - table_world_bounds[0, 2], 0.12)),
+            ],
+            dtype=np.float32,
+        )
+
+        self._wall_world_bounds = {}
+        for wall_name, wall_mesh in (
+            ("left", self._left_wall_mesh_world),
+            ("right", self._right_wall_mesh_world),
+        ):
+            if wall_mesh.vertices.shape[0] == 0 or wall_mesh.faces.shape[0] == 0:
+                continue
+            bounds = wall_mesh.bounds.astype(np.float32)
+            self._wall_world_bounds[wall_name] = (bounds[0].copy(), bounds[1].copy())
+
+        collider_boxes: list[np.ndarray] = []
+
+        floor_bounds_min = self._floor_mesh_world.bounds[0].astype(np.float32).copy()
+        floor_bounds_max = self._floor_mesh_world.bounds[1].astype(np.float32).copy()
+        floor_bounds_min[2] = floor_z
+        floor_bounds_max[2] = floor_z
+        floor_bounds_min, floor_bounds_max = _expand_bounds_min_thickness(
+            floor_bounds_min,
+            floor_bounds_max,
+            min_thickness=FLOOR_COLLIDER_THICKNESS,
+            support_axis=2,
+        )
+        collider_boxes.append(np.stack([floor_bounds_min, floor_bounds_max], axis=0))
+
+        wall_bounds = {
+            "left": _transform_bounds(
+                np.array([full_bounds[0, 0], full_bounds[0, 1], full_bounds[0, 2]], dtype=np.float32),
+                np.array([full_bounds[0, 0], full_bounds[1, 1], floor_z], dtype=np.float32),
+                np.eye(4, dtype=np.float32),
+            ),
+            "right": _transform_bounds(
+                np.array([full_bounds[1, 0], full_bounds[0, 1], full_bounds[0, 2]], dtype=np.float32),
+                np.array([full_bounds[1, 0], full_bounds[1, 1], floor_z], dtype=np.float32),
+                np.eye(4, dtype=np.float32),
+            ),
+            "back": _transform_bounds(
+                np.array([full_bounds[0, 0], full_bounds[0, 1], full_bounds[0, 2]], dtype=np.float32),
+                np.array([full_bounds[1, 0], full_bounds[0, 1], floor_z], dtype=np.float32),
+                np.eye(4, dtype=np.float32),
+            ),
+            "front": _transform_bounds(
+                np.array([full_bounds[0, 0], full_bounds[1, 1], full_bounds[0, 2]], dtype=np.float32),
+                np.array([full_bounds[1, 0], full_bounds[1, 1], floor_z], dtype=np.float32),
+                np.eye(4, dtype=np.float32),
+            ),
         }
-        return table_mesh
+        for wall_name, (wall_min, wall_max) in wall_bounds.items():
+            support_axis = 0 if wall_name in {"left", "right"} else 1
+            wall_min, wall_max = _expand_bounds_min_thickness(
+                wall_min,
+                wall_max,
+                min_thickness=WALL_COLLIDER_THICKNESS,
+                support_axis=support_axis,
+            )
+            collider_boxes.append(np.stack([wall_min, wall_max], axis=0))
+
+        for record in self._collision_component_records:
+            bounds_min = np.asarray(record["bounds_min"], dtype=np.float32).copy()
+            bounds_max = np.asarray(record["bounds_max"], dtype=np.float32).copy()
+            support_axis = None
+            if int(record["id"]) in set(self._table_support_component_ids) and (
+                float(bounds_max[1] - bounds_min[1]) < COLLIDER_MIN_THICKNESS
+            ):
+                support_axis = 1
+            bounds_min, bounds_max = _expand_bounds_min_thickness(
+                bounds_min,
+                bounds_max,
+                min_thickness=COLLIDER_MIN_THICKNESS,
+                support_axis=support_axis,
+            )
+            world_min, world_max = _transform_bounds(bounds_min, bounds_max, world_transform)
+            collider_boxes.append(np.stack([world_min, world_max], axis=0))
+
+        self._scene_collider_boxes = np.stack(collider_boxes, axis=0).astype(np.float32)
+        self.layout.static_collider_boxes = np.array(self._scene_collider_boxes, copy=True)
+
+        scene_up = np.asarray(self.layout.scene_up, dtype=np.float32)
+        collider_top_center = np.asarray(self.layout.table_top_center, dtype=np.float32)
+        collider_top_plane = float(np.dot(collider_top_center, scene_up))
+        world_surface_center = np.asarray(self.layout.table_top_center, dtype=np.float32)
+        world_surface_plane = float(np.dot(world_surface_center, scene_up))
+        world_surface_normal = np.array([0.0, 0.0, -1.0], dtype=np.float32)
+        self._table_alignment_debug = {
+            "scene_preset": ILLIXR_SCENE_NAME,
+            "asset_transform": {
+                "asset_up_axis": self.manifest.get("asset_up_axis", "y"),
+                "scene_up_axis": self.manifest.get("scene_up_axis", "-z"),
+                "x_rotation_degrees": self._scene_x_rotation_degrees,
+                "uniform_scene_scale": scene_scale,
+            },
+            "table_component_ids": [int(v) for v in self._table_component_ids],
+            "support_component_ids": [int(v) for v in self._table_support_component_ids],
+            "local_surface_center": self._asset_table_support_center.astype(np.float32).tolist(),
+            "local_surface_plane_height": float(self._asset_table_support_height),
+            "local_surface_normal": self._asset_up.astype(np.float32).tolist(),
+            "surface_normal_alignment": float(np.dot(world_surface_normal, scene_up)),
+            "world_surface_center": world_surface_center.astype(np.float32).tolist(),
+            "world_surface_plane_height": world_surface_plane,
+            "world_surface_normal": world_surface_normal.astype(np.float32).tolist(),
+            "collider_top_center": collider_top_center.astype(np.float32).tolist(),
+            "collider_top_plane_height": collider_top_plane,
+            "scaled_table_support_size_xy": self.layout.table_size[:2].astype(np.float32).tolist(),
+            "room_bounds": full_bounds.astype(np.float32).tolist(),
+            "collider_box_count": int(self._scene_collider_boxes.shape[0]),
+        }
 
     def _rebuild_scene_nodes(self) -> None:
         if self.layout is None:
             return
-        positioned_table_mesh = self._make_positioned_table_mesh()
-        self._table_world_bounds = (
-            positioned_table_mesh.bounds[0].astype(np.float32).copy(),
-            positioned_table_mesh.bounds[1].astype(np.float32).copy(),
-        )
-        floor_mesh = self._make_floor_mesh()
-        wall_meshes = self._make_wall_meshes()
-        self._wall_world_bounds = {
-            wall_name: (
-                wall_mesh.bounds[0].astype(np.float32).copy(),
-                wall_mesh.bounds[1].astype(np.float32).copy(),
-            )
-            for wall_name, wall_mesh in wall_meshes.items()
+        self._prepare_positioned_scene()
+        assert self._background_mesh_world is not None
+        assert self._table_mesh_world is not None
+        assert self._floor_mesh_world is not None
+        assert self._left_wall_mesh_world is not None
+        assert self._right_wall_mesh_world is not None
+        assert self._front_back_mesh_world is not None
+
+        mesh_by_role = {
+            "all": self._background_mesh_world,
+            "front_back_walls": self._front_back_mesh_world,
+            "left_wall": self._left_wall_mesh_world,
+            "right_wall": self._right_wall_mesh_world,
+            "floor": self._floor_mesh_world,
         }
-        if self._gpu_renderer is not None:
-            self._gpu_renderer.update_scene_geometry(
-                positioned_table_mesh,
-                floor_mesh,
-                wall_meshes,
-            )
         for entry in self._layer_entries.values():
             scene = entry["scene"]
             if entry["table_node"] is not None:
@@ -839,85 +1287,41 @@ class SimpleLabSceneRenderer:
             for node in entry["wall_nodes"]:
                 scene.remove_node(node)
             entry["wall_nodes"] = []
+            for node in entry.get("background_nodes", []):
+                scene.remove_node(node)
+            entry["background_nodes"] = []
 
-            table_role = entry.get("table_role")
-            if table_role is not None:
-                table_mesh = positioned_table_mesh if table_role == "full" else None
-                if (
-                    table_mesh is not None
-                    and table_mesh.vertices.shape[0] > 0
-                    and table_mesh.faces.shape[0] > 0
-                ):
-                    entry["table_node"] = scene.add(
-                        self._pyrender.Mesh.from_trimesh(
-                            table_mesh.copy(),
-                            smooth=False,
-                        )
-                    )
-                else:
-                    entry["table_node"] = None
+            if entry.get("table_role") is not None and self._table_mesh_world.faces.shape[0] > 0:
+                entry["table_node"] = scene.add(
+                    self._pyrender.Mesh.from_trimesh(self._table_mesh_world.copy(), smooth=False)
+                )
+
             background_role = entry.get("background_role")
-            if background_role in {"all", "floor"}:
-                entry["floor_node"] = scene.add(
-                    self._pyrender.Mesh.from_trimesh(
-                        floor_mesh.copy(),
-                        smooth=False,
+            if background_role is not None:
+                mesh = mesh_by_role.get(background_role)
+                if mesh is not None and mesh.faces.shape[0] > 0:
+                    node = scene.add(
+                        self._pyrender.Mesh.from_trimesh(mesh.copy(), smooth=False)
                     )
-                )
-            if background_role in {"all", "front_back_walls"}:
-                for wall_name in ("front", "back"):
-                    entry["wall_nodes"].append(
-                        scene.add(
-                            self._pyrender.Mesh.from_trimesh(
-                                wall_meshes[wall_name].copy(),
-                                smooth=False,
-                            )
-                        )
-                    )
-            if background_role in {"all", "left_wall", "right_wall"}:
-                wall_names = (
-                    ("left", "right")
-                    if background_role == "all"
-                    else ("left",)
-                    if background_role == "left_wall"
-                    else ("right",)
-                )
-                for wall_name in wall_names:
-                    entry["wall_nodes"].append(
-                        scene.add(
-                            self._pyrender.Mesh.from_trimesh(
-                                wall_meshes[wall_name].copy(),
-                                smooth=False,
-                            )
-                        )
-                    )
+                    entry["background_nodes"].append(node)
 
     def _get_layer_renderer(self, layer_name: str, width: int, height: int):
         entry = self._ensure_layer_entry(layer_name)
         renderer = entry.get("renderer")
         if renderer is None:
-            if self.balanced_render_backend == "pyrender":
-                renderer_cls = (
-                    PyrenderCudaInteropOffscreenRenderer
-                    if self._pyrender_cuda_interop_supported
-                    else self._pyrender.OffscreenRenderer
-                )
-                renderer_kwargs = {}
-                if renderer_cls is PyrenderCudaInteropOffscreenRenderer:
-                    renderer_kwargs["device"] = torch.device(
-                        "cuda",
-                        torch.cuda.current_device(),
-                    )
-                renderer = renderer_cls(
-                    viewport_width=int(width),
-                    viewport_height=int(height),
-                    **renderer_kwargs,
-                )
-            else:
-                renderer = self._pyrender.OffscreenRenderer(
-                    viewport_width=int(width),
-                    viewport_height=int(height),
-                )
+            renderer_cls = (
+                PyrenderCudaInteropOffscreenRenderer
+                if self._pyrender_cuda_interop_supported
+                else self._pyrender.OffscreenRenderer
+            )
+            renderer_kwargs = {}
+            if renderer_cls is PyrenderCudaInteropOffscreenRenderer:
+                renderer_kwargs["device"] = torch.device("cuda", torch.cuda.current_device())
+            renderer = renderer_cls(
+                viewport_width=int(width),
+                viewport_height=int(height),
+                **renderer_kwargs,
+            )
             entry["renderer"] = renderer
         else:
             renderer.viewport_width = int(width)
@@ -942,7 +1346,7 @@ class SimpleLabSceneRenderer:
         height: int | None = None,
     ) -> tuple[np.ndarray, np.ndarray] | tuple[torch.Tensor, torch.Tensor]:
         if self.layout is None:
-            raise RuntimeError("Simple lab layout has not been configured.")
+            raise RuntimeError("Immersive scene layout has not been configured.")
         if width is None:
             width = self.width
         if height is None:
@@ -981,12 +1385,10 @@ class SimpleLabSceneRenderer:
         | tuple[np.ndarray, np.ndarray, dict[str, Any]]
         | tuple[torch.Tensor, torch.Tensor, dict[str, Any]]
     ):
-        roi_intrinsic, render_width, render_height, render_info = (
-            self._resolve_roi_render_params(
-                full_intrinsic,
-                roi_bounds,
-                render_scale=render_scale,
-            )
+        roi_intrinsic, render_width, render_height, render_info = self._resolve_roi_render_params(
+            full_intrinsic,
+            roi_bounds,
+            render_scale=render_scale,
         )
         render_color, render_depth = self._render_layer_eye(
             layer_name,
@@ -999,198 +1401,6 @@ class SimpleLabSceneRenderer:
             return render_color, render_depth, render_info
         return render_color, render_depth
 
-    def _make_positioned_table_mesh(self) -> trimesh.Trimesh:
-        assert self.layout is not None
-        mesh = self._table_mesh.copy()
-        bounds = mesh.bounds
-        extents = np.maximum(bounds[1] - bounds[0], 1e-5)
-        scale = np.array(
-            [
-                self.layout.table_size[0] / extents[0],
-                self.layout.table_size[1] / extents[1],
-                self.layout.table_size[2] / extents[2],
-            ],
-            dtype=np.float32,
-        )
-        mesh.apply_scale(scale)
-        tabletop_debug = self._extract_tabletop_surface(mesh, self.layout.scene_up)
-        local_surface_center = tabletop_debug["local_surface_center"]
-        mesh.apply_translation(-local_surface_center)
-        mesh.apply_translation(self.layout.table_top_center)
-        collider_top_center = np.asarray(self.layout.table_top_center, dtype=np.float32)
-        collider_top_plane = float(np.dot(collider_top_center, self.layout.scene_up))
-        world_surface_center = collider_top_center.copy()
-        world_surface_plane = float(np.dot(world_surface_center, self.layout.scene_up))
-        self._table_alignment_debug = {
-            "asset_transform": dict(self._table_transform_debug or {}),
-            "local_surface_center": local_surface_center.astype(np.float32).tolist(),
-            "local_surface_plane_height": float(tabletop_debug["local_surface_plane_height"]),
-            "local_surface_normal": tabletop_debug["local_surface_normal"].astype(np.float32).tolist(),
-            "surface_normal_alignment": float(tabletop_debug["surface_normal_alignment"]),
-            "surface_face_count": int(tabletop_debug["surface_face_count"]),
-            "world_surface_center": world_surface_center.astype(np.float32).tolist(),
-            "world_surface_plane_height": world_surface_plane,
-            "world_surface_normal": tabletop_debug["local_surface_normal"].astype(np.float32).tolist(),
-            "collider_top_center": collider_top_center.astype(np.float32).tolist(),
-            "collider_top_plane_height": collider_top_plane,
-        }
-        if tabletop_debug["surface_normal_alignment"] < 0.92:
-            raise RuntimeError(
-                "Selected tabletop normal is not aligned with scene up: "
-                f"{self._table_alignment_debug}"
-            )
-        if abs(world_surface_plane - collider_top_plane) > 0.02:
-            raise RuntimeError(
-                "Visual tabletop does not align with collider top plane: "
-                f"{self._table_alignment_debug}"
-            )
-        return mesh
 
-    def _extract_tabletop_surface(
-        self,
-        mesh: trimesh.Trimesh,
-        scene_up: np.ndarray,
-    ) -> dict[str, Any]:
-        scene_up = np.asarray(scene_up, dtype=np.float32)
-        scene_up_norm = float(np.linalg.norm(scene_up))
-        if scene_up_norm < 1e-6:
-            raise ValueError("scene_up must have non-zero length")
-        scene_up = scene_up / scene_up_norm
-
-        face_normals = np.asarray(mesh.face_normals, dtype=np.float32)
-        face_centroids = np.asarray(mesh.triangles_center, dtype=np.float32)
-        face_areas = np.asarray(mesh.area_faces, dtype=np.float32)
-        if face_normals.size == 0 or face_centroids.size == 0:
-            raise RuntimeError("Table mesh has no faces for tabletop extraction.")
-
-        normal_alignment = face_normals @ scene_up
-        aligned_mask = normal_alignment >= 0.85
-        if not np.any(aligned_mask):
-            raise RuntimeError(
-                "Could not find any table faces aligned with scene up for tabletop extraction."
-            )
-
-        face_support_depth = face_centroids @ scene_up
-        max_support_depth = float(face_support_depth[aligned_mask].max())
-        bounds = mesh.bounds
-        support_extent = max(
-            float(np.dot(bounds[1] - bounds[0], np.abs(scene_up))),
-            1e-4,
-        )
-        plane_eps = max(0.006, support_extent * 0.02)
-        surface_mask = aligned_mask & (
-            face_support_depth >= (max_support_depth - plane_eps)
-        )
-        if not np.any(surface_mask):
-            raise RuntimeError(
-                "Could not isolate a tabletop surface near the top support plane."
-            )
-
-        selected_areas = face_areas[surface_mask]
-        area_sum = float(selected_areas.sum())
-        if area_sum <= 1e-8:
-            raise RuntimeError("Selected tabletop faces have zero area.")
-        weights = selected_areas / area_sum
-        selected_centroids = face_centroids[surface_mask]
-        selected_normals = face_normals[surface_mask]
-        local_surface_center = np.sum(selected_centroids * weights[:, None], axis=0)
-        local_surface_normal = np.sum(selected_normals * weights[:, None], axis=0)
-        local_surface_normal /= max(float(np.linalg.norm(local_surface_normal)), 1e-6)
-        local_surface_plane_height = float(np.sum(face_support_depth[surface_mask] * weights))
-        local_surface_center = local_surface_center - scene_up * (
-            float(np.dot(local_surface_center, scene_up)) - local_surface_plane_height
-        )
-        surface_normal_alignment = float(np.dot(local_surface_normal, scene_up))
-        return {
-            "local_surface_center": local_surface_center.astype(np.float32),
-            "local_surface_normal": local_surface_normal.astype(np.float32),
-            "local_surface_plane_height": local_surface_plane_height,
-            "surface_normal_alignment": surface_normal_alignment,
-            "surface_face_count": int(surface_mask.sum()),
-        }
-
-    def _make_floor_mesh(self) -> trimesh.Trimesh:
-        assert self.layout is not None
-        mesh = self._floor_quad.copy()
-        width = float(self.layout.room_half_extent[0] * 2.0)
-        depth = float(self.layout.room_half_extent[1] * 2.0)
-        mesh.apply_scale([width, depth, 1.0])
-        mesh.apply_transform(
-            trimesh.transformations.translation_matrix(
-                [
-                    self.layout.table_top_center[0],
-                    self.layout.table_top_center[1],
-                    self.layout.floor_z,
-                ]
-            )
-        )
-        return mesh
-
-    def _make_wall_meshes(self) -> dict[str, trimesh.Trimesh]:
-        assert self.layout is not None
-        room_width = float(self.layout.room_half_extent[0] * 2.0)
-        room_depth = float(self.layout.room_half_extent[1] * 2.0)
-        wall_height = float(self.layout.wall_height)
-        center_x = float(self.layout.table_top_center[0])
-        center_y = float(self.layout.table_top_center[1])
-        floor_z = float(self.layout.floor_z)
-        wall_z = floor_z - 0.5 * wall_height
-        meshes: dict[str, trimesh.Trimesh] = {}
-
-        back_wall = self._wall_quad.copy()
-        back_wall.apply_scale([room_width, wall_height, 1.0])
-        back_wall.apply_transform(
-            trimesh.transformations.rotation_matrix(np.pi / 2.0, [1.0, 0.0, 0.0])
-        )
-        back_wall.apply_transform(
-            trimesh.transformations.translation_matrix(
-                [center_x, center_y - self.layout.room_half_extent[1], wall_z]
-            )
-        )
-        meshes["back"] = back_wall
-
-        front_wall = self._wall_quad.copy()
-        front_wall.apply_scale([room_width, wall_height, 1.0])
-        front_wall.apply_transform(
-            trimesh.transformations.rotation_matrix(np.pi / 2.0, [1.0, 0.0, 0.0])
-        )
-        front_wall.apply_transform(
-            trimesh.transformations.rotation_matrix(np.pi, [0.0, 0.0, 1.0])
-        )
-        front_wall.apply_transform(
-            trimesh.transformations.translation_matrix(
-                [center_x, center_y + self.layout.room_half_extent[1], wall_z]
-            )
-        )
-        meshes["front"] = front_wall
-
-        left_wall = self._wall_quad.copy()
-        left_wall.apply_scale([room_depth, wall_height, 1.0])
-        left_wall.apply_transform(
-            trimesh.transformations.rotation_matrix(np.pi / 2.0, [1.0, 0.0, 0.0])
-        )
-        left_wall.apply_transform(
-            trimesh.transformations.rotation_matrix(np.pi / 2.0, [0.0, 0.0, 1.0])
-        )
-        left_wall.apply_transform(
-            trimesh.transformations.translation_matrix(
-                [center_x - self.layout.room_half_extent[0], center_y, wall_z]
-            )
-        )
-        meshes["left"] = left_wall
-
-        right_wall = self._wall_quad.copy()
-        right_wall.apply_scale([room_depth, wall_height, 1.0])
-        right_wall.apply_transform(
-            trimesh.transformations.rotation_matrix(np.pi / 2.0, [1.0, 0.0, 0.0])
-        )
-        right_wall.apply_transform(
-            trimesh.transformations.rotation_matrix(-np.pi / 2.0, [0.0, 0.0, 1.0])
-        )
-        right_wall.apply_transform(
-            trimesh.transformations.translation_matrix(
-                [center_x + self.layout.room_half_extent[0], center_y, wall_z]
-            )
-        )
-        meshes["right"] = right_wall
-        return meshes
+ImmersiveSceneRenderer = SimpleLabSceneRenderer
+make_immersive_scene_layout = make_illixr_lab_layout

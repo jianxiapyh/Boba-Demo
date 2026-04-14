@@ -6,7 +6,7 @@ The only public packaged demo cases in this branch are:
 - `sloth`
 - `rope`
 
-Each case resolves entirely from `assets/<case>/`, and the simple-lab room assets live under `assets/scenes/simple_lab/`.
+Each case resolves entirely from `assets/<case>/`, and the shipped room assets live under `assets/scenes/ILLIXR_lab/`.
 
 ## Runtime assets
 
@@ -72,5 +72,5 @@ conda run -n phystwin env PYTHONNOUSERSITE=1 python boba_quest_immersive.py \
 The launcher is intentionally fixed to:
 - `input_source=live_openxr_controller`
 - `quest_display_mode=immersive`
-- `scene_preset=simple_lab`
+- `scene_preset=ILLIXR_lab`
 - `immersive_render_preset=balanced`

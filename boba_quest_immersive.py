@@ -161,7 +161,7 @@ def build_parser() -> ArgumentParser:
         description=(
             "Run the shipped Boba Quest immersive demo. "
             "This launcher is fixed to live OpenXR controllers, immersive Quest display, "
-            "the simple_lab scene, and the balanced immersive preset. "
+            "the ILLIXR_lab scene, and the balanced immersive preset. "
             "Runtime demo assets are resolved from ./assets/."
         )
     )
@@ -220,7 +220,7 @@ def main(argv: list[str] | None = None):
     print("[quest_display] input_source=live_openxr_controller", flush=True)
     print("[quest_display] controller_mode=multi_points", flush=True)
     print("[quest_display] mode=immersive", flush=True)
-    print("[quest_display] scene_preset=simple_lab", flush=True)
+    print("[quest_display] scene_preset=ILLIXR_lab", flush=True)
     print("[quest_display] immersive_render_preset=balanced", flush=True)
     print(
         f"[quest_display] interactive_window_mode={args.interactive_window_mode}",

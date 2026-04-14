@@ -7,6 +7,7 @@ import json
 import os
 import pickle
 import random
+import shutil
 import sys
 from argparse import ArgumentParser
 from pathlib import Path
@@ -104,6 +105,31 @@ def configure_local_python_paths():
 
         if path not in sys.path:
             sys.path.insert(0, path)
+
+
+def prefer_system_ninja_binary():
+    current_ninja = shutil.which("ninja")
+    system_ninja = Path("/usr/bin/ninja")
+    if current_ninja is None or not system_ninja.exists():
+        return
+    current_path = Path(current_ninja)
+    try:
+        if current_path.resolve() == system_ninja.resolve():
+            return
+    except OSError:
+        return
+    try:
+        launcher_text = current_path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return
+    if "from ninja import ninja" not in launcher_text:
+        return
+    existing_path = os.environ.get("PATH", "")
+    os.environ["PATH"] = f"/usr/bin:/bin:{existing_path}"
+    print(
+        f"[startup] preferring system ninja binary over Python wrapper: {current_path} -> {system_ninja}",
+        flush=True,
+    )
 
 
 def attach_pycuda_context_for_current_torch_device():
@@ -245,6 +271,7 @@ def main(argv: list[str] | None = None):
     ctx = attach_pycuda_context_for_current_torch_device()
 
     prioritize_conda_bin()
+    prefer_system_ninja_binary()
     configure_local_python_paths()
     from qqtt import InvPhyTrainerWarp
     from qqtt.utils import logger, cfg

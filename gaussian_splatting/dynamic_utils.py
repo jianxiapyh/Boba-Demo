@@ -880,6 +880,43 @@ def quat_mul_norm_fused(q, rest):
     inv = torch.rsqrt((quat * quat).sum(dim=-1, keepdim=True) + 1e-6)
     return quat * inv
 
+
+def _polar_rotation_from_svd(X: torch.Tensor) -> torch.Tensor:
+    U, _, Vh = torch.linalg.svd(X, full_matrices=False)
+    need_flip = (torch.linalg.det(U) * torch.linalg.det(Vh)) < 0
+    if need_flip.any():
+        Vh[need_flip, 2, :] *= -1
+    return (U @ Vh).to(X.dtype)
+
+
+def _polar_rotation_from_eigh(X: torch.Tensor, eps: float = 1e-10) -> torch.Tensor:
+    G = X.transpose(-2, -1) @ X
+    G = 0.5 * (G + G.transpose(-2, -1))
+    eye = torch.eye(3, device=X.device, dtype=X.dtype).unsqueeze(0)
+    G = G + eye * eps
+    eigenvalues, eigenvectors = torch.linalg.eigh(G)
+
+    sort_idx = torch.argsort(eigenvalues, dim=-1, descending=True)
+    eigenvalues = eigenvalues.gather(-1, sort_idx)
+    eigenvectors = eigenvectors.gather(
+        -1, sort_idx.unsqueeze(-2).expand_as(eigenvectors)
+    )
+
+    max_component_idx = eigenvectors.abs().argmax(dim=-2, keepdim=True)
+    sign = torch.sign(eigenvectors.gather(-2, max_component_idx))
+    sign = torch.where(sign == 0, torch.ones_like(sign), sign)
+    eigenvectors = eigenvectors * sign
+
+    singular_values = eigenvalues.clamp_min(1e-12).sqrt()
+    singular_values_inv = torch.diag_embed(1.0 / singular_values)
+    U = (X @ eigenvectors) @ singular_values_inv
+    Vh = eigenvectors.transpose(-2, -1)
+
+    needs_reflection_fix = (torch.linalg.det(U) * torch.linalg.det(Vh)) < 0
+    if needs_reflection_fix.any():
+        U[needs_reflection_fix, :, 2] *= -1
+    return (U @ Vh).to(X.dtype)
+
 #pyh updated for batched version
 @torch.no_grad()
 def lbs_with_rotation_reuse(
@@ -940,35 +977,47 @@ def lbs_with_rotation_reuse(
     
     if bones_to_recompute.numel() > 0:
         F_to_compute = F.index_select(0, bones_to_recompute)  # (m, 3, 3)
-
-        # Polar decomposition via eigenvalue decomposition
         X = F_to_compute
-        G = X.transpose(-2, -1) @ X
-        G = 0.5 * (G + G.transpose(-2, -1))
-        eigenvalues, eigenvectors = torch.linalg.eigh(G)
-        
-        # Sort eigenvalues/vectors in descending order
-        sort_idx = torch.argsort(eigenvalues, dim=-1, descending=True)
-        eigenvalues = eigenvalues.gather(-1, sort_idx)
-        eigenvectors = eigenvectors.gather(-1, sort_idx.unsqueeze(-2).expand_as(eigenvectors))
-        
-        # Fix sign ambiguity
-        max_component_idx = eigenvectors.abs().argmax(dim=-2, keepdim=True)
-        sign = torch.sign(eigenvectors.gather(-2, max_component_idx))
-        eigenvectors = eigenvectors * sign
-        
-        # Compute rotation
-        singular_values = eigenvalues.clamp_min(1e-12).sqrt()
-        singular_values_inv = torch.diag_embed(1.0 / singular_values)
-        U = (X @ eigenvectors) @ singular_values_inv
-        Vh = eigenvectors.transpose(-2, -1)
-        
-        # Ensure proper rotation (determinant = +1)
-        needs_reflection_fix = (torch.linalg.det(U) * torch.linalg.det(Vh)) < 0
-        if needs_reflection_fix.any():
-            U[needs_reflection_fix, :, 2] *= -1
-            
-        R_computed = (U @ Vh).to(F.dtype)  
+        cached_rotations = R_cache.index_select(0, bones_to_recompute).to(torch.float32)
+        R_computed = cached_rotations.clone()
+        finite_mask = torch.isfinite(X).all(dim=(-2, -1))
+        fallback_eigh_count = 0
+        reused_nonfinite_count = int((~finite_mask).sum().item())
+
+        if finite_mask.any():
+            finite_local_idx = finite_mask.nonzero(as_tuple=False).squeeze(1)
+            X_finite = X.index_select(0, finite_local_idx)
+            try:
+                R_finite = _polar_rotation_from_eigh(X_finite)
+            except torch._C._LinAlgError:
+                R_finite = torch.empty_like(X_finite)
+                fallback_local: list[int] = []
+                for local_idx in range(X_finite.shape[0]):
+                    Xi = X_finite[local_idx : local_idx + 1]
+                    try:
+                        R_finite[local_idx : local_idx + 1] = _polar_rotation_from_eigh(Xi)
+                    except torch._C._LinAlgError:
+                        fallback_local.append(local_idx)
+                        R_finite[local_idx : local_idx + 1] = _polar_rotation_from_svd(Xi)
+                fallback_eigh_count = len(fallback_local)
+            R_computed.index_copy_(0, finite_local_idx, R_finite.to(R_computed.dtype))
+
+        if fallback_eigh_count > 0 or reused_nonfinite_count > 0:
+            total_eigh_fallbacks = int(cache.get("eigh_fallback_total", 0)) + fallback_eigh_count
+            total_nonfinite_reuses = int(cache.get("nonfinite_rotation_reuse_total", 0)) + reused_nonfinite_count
+            cache["eigh_fallback_total"] = total_eigh_fallbacks
+            cache["nonfinite_rotation_reuse_total"] = total_nonfinite_reuses
+            report_key = (total_eigh_fallbacks, total_nonfinite_reuses)
+            if cache.get("rotation_robustness_last_report") != report_key:
+                print(
+                    "[dynamic_utils] lbs_with_rotation_reuse robustness fallback: "
+                    f"eigh_fallbacks={fallback_eigh_count} "
+                    f"reused_cached_nonfinite={reused_nonfinite_count} "
+                    f"total_eigh_fallbacks={total_eigh_fallbacks} "
+                    f"total_nonfinite_reuses={total_nonfinite_reuses}",
+                    flush=True,
+                )
+                cache["rotation_robustness_last_report"] = report_key
 
         # sign stabilize vs previous cached quat
         Q_new_f32 = rotmat_to_quat_fast(R_computed).float()  # (m,4)
@@ -985,8 +1034,18 @@ def lbs_with_rotation_reuse(
         
         # Update caches 
         R_cache.index_copy_(0, bones_to_recompute, R_computed.to(torch.float16))
-        F_prev.index_copy_(0, bones_to_recompute, F_to_compute)
-        rotation_computed.index_fill_(0, bones_to_recompute, True)
+        if finite_mask.any():
+            valid_bones_to_recompute = bones_to_recompute.index_select(
+                0, finite_mask.nonzero(as_tuple=False).squeeze(1)
+            )
+            F_prev.index_copy_(
+                0,
+                valid_bones_to_recompute,
+                F_to_compute.index_select(
+                    0, finite_mask.nonzero(as_tuple=False).squeeze(1)
+                ),
+            )
+            rotation_computed.index_fill_(0, valid_bones_to_recompute, True)
         
     # --- Gather bone data for each Gaussian ---
     R_per_instance = R_cache.view(number_of_instance, mass_nodes_per_instance, 3, 3)

@@ -20,7 +20,7 @@ from .pyrender_cuda_bridge import (
 from .simple_lab_gpu_renderer import SimpleLabGpuRenderer
 
 
-MANIFEST_RELATIVE_PATH = Path("data/open_scene_assets/simple_lab/manifest.json")
+MANIFEST_RELATIVE_PATH = Path("assets/scenes/simple_lab/manifest.json")
 USER_AGENT = "BobaQuestImmersiveDemo/1.0"
 
 
@@ -93,20 +93,28 @@ class SimpleLabLayout:
         return SceneColliderBox(mins=mins, maxs=maxs)
 
 
-def _repo_root_from_assets_root(scene_assets_root: str | Path) -> Path:
-    assets_root = Path(scene_assets_root).resolve()
-    if assets_root.name == "open_scene_assets":
-        return assets_root.parents[1]
-    return assets_root.parents[2]
-
-
 def simple_lab_manifest_path(scene_assets_root: str | Path) -> Path:
     assets_root = Path(scene_assets_root).resolve()
+    candidates = []
+    if assets_root.name == "simple_lab":
+        candidates.append(assets_root / "manifest.json")
+    candidates.extend(
+        [
+            assets_root / "simple_lab" / "manifest.json",
+            assets_root / "scenes" / "simple_lab" / "manifest.json",
+            assets_root / "assets" / "scenes" / "simple_lab" / "manifest.json",
+        ]
+    )
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
     if assets_root.name == "simple_lab":
         return assets_root / "manifest.json"
-    if assets_root.name == "open_scene_assets":
+    if assets_root.name == "scenes":
         return assets_root / "simple_lab" / "manifest.json"
-    return _repo_root_from_assets_root(assets_root) / MANIFEST_RELATIVE_PATH
+    if assets_root.name == "assets":
+        return assets_root / "scenes" / "simple_lab" / "manifest.json"
+    return assets_root / "simple_lab" / "manifest.json"
 
 
 def load_simple_lab_manifest(scene_assets_root: str | Path) -> dict[str, Any]:
@@ -141,6 +149,8 @@ def ensure_simple_lab_assets(scene_assets_root: str | Path) -> Path:
     manifest = load_simple_lab_manifest(assets_root)
     if assets_root.name == "simple_lab":
         simple_lab_root = assets_root
+    elif assets_root.name == "scenes":
+        simple_lab_root = assets_root / "simple_lab"
     else:
         simple_lab_root = assets_root / "simple_lab"
     for entry in manifest["assets"].values():

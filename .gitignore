@@ -43,6 +43,18 @@ linux_pose_probe/boba_immersive_bridge
 tools/compare_immersive_gpu_path_smoke/
 tools/compare_immersive_gpu_path_smoke_repair/
 
+# Track packaged runtime assets and vendored scene assets in this repo.
+!assets/
+!assets/**/
+!assets/**/*.json
+!assets/**/*.pkl
+!assets/**/*.ply
+!assets/**/*.pth
+!assets/**/*.png
+!assets/**/*.obj
+!assets/**/*.mtl
+!assets/**/*.jpg
+
 # Track immersive scene manifest but keep downloaded assets ignored.
 !data/
 data/*

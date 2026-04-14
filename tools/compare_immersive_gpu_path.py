@@ -872,7 +872,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--scene-assets-root",
-        default=str(REPO_ROOT / "data" / "open_scene_assets"),
+        default=str(REPO_ROOT / "assets" / "scenes"),
         help="Path to the open scene assets root.",
     )
     parser.add_argument(

@@ -1,38 +1,36 @@
 # Boba Demo
 
-This repo contains the code for the shipped Quest-enabled Boba demo path: live OpenXR controller input on Linux, immersive desktop compositing, and Quest immersive display.
+This repo contains the shipped Quest immersive Boba demo path: live OpenXR controller input on Linux, immersive desktop compositing, and Quest immersive display.
 
-This export is intentionally trimmed. It does not include:
+The only public packaged demo cases in this branch are:
+- `sloth`
+- `rope`
+
+Each case resolves entirely from `assets/<case>/`, and the simple-lab room assets live under `assets/scenes/simple_lab/`.
+
+## Runtime assets
+
+The immersive demo no longer depends on runtime assets from:
 - `data/`
 - `experiments/`
 - `experiments_optimization/`
-- `gaussian_splatting/`
-- generated outputs, logs, or probe binaries
+- `gaussian_output/`
 
-Those large assets are expected to already exist alongside this repo on the target machine.
+The packaged runtime bundles live under:
+- `assets/sloth/`
+- `assets/rope/`
 
-## Expected layout
+For the shipped runtime Gaussian PLYs:
+- `assets/sloth/sloth.ply` is copied from `Boba/gaussian_output/double_stretch_sloth/.../iteration_10000/point_cloud.ply`
+- `assets/rope/rope.ply` is copied from `Boba/gaussian_output/single_lift_rope/.../iteration_10000/point_cloud.ply`
 
-The following directories should already be present in the repo root before running:
-
-```text
-data/
-experiments/
-experiments_optimization/
-gaussian_splatting/
-```
-
-This repo provides the live demo code around them:
-- `boba_quest_immersive.py`
-- `qqtt/`
-- `configs/`
-- `linux_pose_probe/`
+No alignment, annotation, filler-training, or candidate-generation workflow is kept in this branch anymore. This repo is now a runtime-only demo package.
 
 ## Environment
 
 The intended environment is the existing `phystwin` Conda environment used for the Boba demo. ALVR/SteamVR/OpenXR runtime setup is assumed to already be installed on the machine.
 
-This demo resolves `gsplat` from the sibling `Boba_OpenSource` checkout instead of a stock pip wheel. The default expected source tree is:
+This demo still resolves `gsplat` from the sibling `Boba_OpenSource` checkout instead of a stock pip wheel. The default expected source tree is:
 
 ```text
 ../Boba_OpenSource/gaussian_splatting/submodules/gsplat/
@@ -40,19 +38,22 @@ This demo resolves `gsplat` from the sibling `Boba_OpenSource` checkout instead 
 
 If your `Boba_OpenSource` checkout lives elsewhere, set `BOBA_GSPLAT_SOURCE_ROOT` to that vendored `gsplat` source root before launching.
 
-If you need the RTX 5090 environment helper used during development, see:
-
-```bash
-env_install/5090_env_install.sh
-```
-
 ## Main run commands
 
 Default Quest immersive run:
 
 ```bash
 conda run -n phystwin env PYTHONNOUSERSITE=1 python boba_quest_immersive.py \
-  --case_name double_stretch_sloth \
+  --case_name sloth \
+  --n_dup 0 \
+  --interactive_window_mode hidden
+```
+
+Alternate packaged case:
+
+```bash
+conda run -n phystwin env PYTHONNOUSERSITE=1 python boba_quest_immersive.py \
+  --case_name rope \
   --n_dup 0 \
   --interactive_window_mode hidden
 ```
@@ -61,7 +62,7 @@ Quest immersive run with render profiling:
 
 ```bash
 conda run -n phystwin env PYTHONNOUSERSITE=1 python boba_quest_immersive.py \
-  --case_name double_stretch_sloth \
+  --case_name sloth \
   --n_dup 0 \
   --interactive_window_mode hidden \
   --render_profile \
@@ -73,7 +74,3 @@ The launcher is intentionally fixed to:
 - `quest_display_mode=immersive`
 - `scene_preset=simple_lab`
 - `immersive_render_preset=balanced`
-
-## OpenXR helper programs
-
-`linux_pose_probe/` contains the standalone OpenXR/Linux helper programs used for headset, hand, controller, and Quest frame-panel bring-up. Build scripts are included; binaries are intentionally not committed.

@@ -11,7 +11,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--scene-assets-root",
-        default="./data/open_scene_assets",
+        default="./assets/scenes",
         help="Root directory that contains the tracked simple_lab manifest.",
     )
     args = parser.parse_args()

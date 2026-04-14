@@ -1,0 +1,2 @@
+assets/sloth/sloth.ply filter=lfs diff=lfs merge=lfs -text
+assets/sloth/multi_ctrls.pkl filter=lfs diff=lfs merge=lfs -text

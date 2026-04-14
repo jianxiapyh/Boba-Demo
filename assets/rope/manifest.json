@@ -1,0 +1,9 @@
+{
+  "best_model": "best_model.pth",
+  "calibrate": "calibrate.pkl",
+  "config": "configs/real.yaml",
+  "final_data": "final_data.pkl",
+  "gaussian_ply": "rope.ply",
+  "metadata": "metadata.json",
+  "optimal_params": "optimal_params.pkl"
+}

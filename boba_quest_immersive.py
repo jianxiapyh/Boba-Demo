@@ -9,9 +9,34 @@ import pickle
 import random
 import sys
 from argparse import ArgumentParser
+from pathlib import Path
 
 np = None
 torch = None
+REPO_ROOT = Path(__file__).resolve().parent
+DEFAULT_SCENE_ASSETS_ROOT = REPO_ROOT / "assets" / "scenes"
+PUBLIC_DEMO_CASES = ("sloth", "rope")
+
+
+def resolve_demo_case_manifest(case_name: str) -> tuple[str, Path, dict]:
+    canonical_case = case_name
+    manifest_path = REPO_ROOT / "assets" / canonical_case / "manifest.json"
+    if not manifest_path.exists():
+        raise FileNotFoundError(
+            f"Immersive demo assets for case '{case_name}' were not found at {manifest_path}. "
+            "This branch expects self-contained demo runtime assets under ./assets/<case>/. "
+            f"Public packaged cases in this branch are: {', '.join(PUBLIC_DEMO_CASES)}."
+        )
+    with open(manifest_path, "r", encoding="utf-8") as handle:
+        manifest = json.load(handle)
+    return canonical_case, manifest_path.parent, manifest
+
+
+def manifest_file_path(manifest_dir: Path, manifest: dict, key: str) -> str:
+    relative_path = manifest.get(key)
+    if relative_path is None:
+        raise KeyError(f"Manifest is missing required key: {key}")
+    return str((manifest_dir / relative_path).resolve())
 
 
 def set_all_seeds(seed: int):
@@ -136,19 +161,23 @@ def build_parser() -> ArgumentParser:
         description=(
             "Run the shipped Boba Quest immersive demo. "
             "This launcher is fixed to live OpenXR controllers, immersive Quest display, "
-            "the simple_lab scene, and the balanced immersive preset."
+            "the simple_lab scene, and the balanced immersive preset. "
+            "Runtime demo assets are resolved from ./assets/."
         )
     )
-    parser.add_argument("--base_path", type=str, default="./data/different_types")
-    parser.add_argument("--gaussian_path", type=str, default="./gaussian_output")
-    parser.add_argument("--bg_img_path", type=str, default="./data/bg.png")
-    parser.add_argument("--case_name", type=str, default="double_stretch_sloth")
+    parser.add_argument(
+        "--case_name",
+        type=str,
+        choices=PUBLIC_DEMO_CASES,
+        default="sloth",
+        help="public packaged demo case: sloth or rope",
+    )
     parser.add_argument("--n_dup", type=int, default=0, help="must remain 0 for the shipped Quest demo")
     parser.add_argument(
         "--scene_assets_root",
         type=str,
-        default="./data/open_scene_assets",
-        help="root directory for the immersive scene assets",
+        default=str(DEFAULT_SCENE_ASSETS_ROOT),
+        help="root directory for immersive scene assets",
     )
     parser.add_argument(
         "--interactive_window_mode",
@@ -220,48 +249,44 @@ def main(argv: list[str] | None = None):
     from qqtt import InvPhyTrainerWarp
     from qqtt.utils import logger, cfg
 
-    base_path = args.base_path
     case_name = args.case_name
+    canonical_case_name, manifest_dir, case_manifest = resolve_demo_case_manifest(case_name)
 
-    if ("cloth" in case_name) or ("package" in case_name):
-        cfg.load_from_yaml("configs/cloth.yaml")
-    else:
-        cfg.load_from_yaml("configs/real.yaml")
+    cfg.load_from_yaml(case_manifest.get("config", "configs/real.yaml"))
+    cfg.demo_case_name = canonical_case_name
 
-    base_dir = f"./temp_experiments/{case_name}"
+    base_dir = f"./temp_experiments/{canonical_case_name}"
 
-    optimal_path = f"./experiments_optimization/{case_name}/optimal_params.pkl"
-    assert os.path.exists(optimal_path), f"{case_name}: Optimal parameters not found: {optimal_path}"
+    optimal_path = manifest_file_path(manifest_dir, case_manifest, "optimal_params")
     with open(optimal_path, "rb") as f:
         optimal_params = pickle.load(f)
     cfg.set_optimal_params(optimal_params)
 
-    with open(f"{base_path}/{case_name}/calibrate.pkl", "rb") as f:
+    with open(manifest_file_path(manifest_dir, case_manifest, "calibrate"), "rb") as f:
         c2ws = pickle.load(f)
     w2cs = [np.linalg.inv(c2w) for c2w in c2ws]
     cfg.c2ws = np.array(c2ws)
     cfg.w2cs = np.array(w2cs)
 
-    with open(f"{base_path}/{case_name}/metadata.json", "r") as f:
+    with open(
+        manifest_file_path(manifest_dir, case_manifest, "metadata"),
+        "r",
+        encoding="utf-8",
+    ) as f:
         data = json.load(f)
     cfg.intrinsics = np.array(data["intrinsics"])
     cfg.WH = data["WH"]
-    cfg.bg_img_path = args.bg_img_path
-
-    exp_name = "init=hybrid_iso=True_ldepth=0.001_lnormal=0.0_laniso_0.0_lseg=1.0"
-    gaussians_path = (
-        f"{args.gaussian_path}/{case_name}/{exp_name}/point_cloud/iteration_10000/point_cloud.ply"
-    )
+    gaussians_path = manifest_file_path(manifest_dir, case_manifest, "gaussian_ply")
 
     logger.set_log_file(path=base_dir, name="inference_log")
 
     trainer = InvPhyTrainerWarp(
-        data_path=f"{base_path}/{case_name}/final_data.pkl",
+        data_path=manifest_file_path(manifest_dir, case_manifest, "final_data"),
         base_dir=base_dir,
     )
 
-    best_model_path = glob.glob(f"experiments/{case_name}/train/best_*.pth")[0]
-    output_dir = os.path.join("./gaussian_output_dynamic", case_name)
+    best_model_path = manifest_file_path(manifest_dir, case_manifest, "best_model")
+    output_dir = os.path.join("./gaussian_output_dynamic", canonical_case_name)
 
     try:
         trainer.interactive_playground_quest_immersive_balanced(

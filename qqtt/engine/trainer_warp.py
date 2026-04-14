@@ -137,7 +137,12 @@ class InvPhyTrainerWarp:
     LIVE_CONTROLLER_SELECT_IDLE_COLOR = [255.0, 220.0, 64.0]
     LIVE_CONTROLLER_ATTACH_CANDIDATE_COLOR = [255.0, 176.0, 64.0]
     LIVE_CONTROLLER_ATTACH_ACTIVE_COLOR = [255.0, 64.0, 255.0]
-    LIVE_CONTROLLER_TRANSLATION_SCALE = 1.0
+    LIVE_CONTROLLER_TRANSLATION_SCALE_DEFAULT = 1.0
+    LIVE_CONTROLLER_CASE_TRANSLATION_SCALE = {
+        "sloth": 2.0,
+        "rope": 4,
+    }
+    IMMERSIVE_LIVE_HEAD_TRANSLATION_SCALE = 1.0
     LIVE_CONTROLLER_HIT_WORLD_RADIUS = 0.03
     LIVE_CONTROLLER_ATTACH_MAX_REST_LENGTH = 0.01
     LIVE_CONTROLLER_PREDEFINED_ANCHOR_NODE_COUNT = 96
@@ -670,7 +675,58 @@ class InvPhyTrainerWarp:
         order = torch.argsort(candidate_scores, descending=prefer_largest)
         return int(candidate_indices[order[0]].item())
 
-    def _build_predefined_interaction_anchors(self, object_points, intrinsic, w2c):
+    def _interaction_anchor_case_name(self):
+        return str(getattr(cfg, "demo_case_name", "sloth")).strip().lower()
+
+    def _live_controller_case_profile(self, case_name=None):
+        if case_name is None:
+            case_name = self._interaction_anchor_case_name()
+        case_name = str(case_name).strip().lower()
+        default_anchor_names = {"left": None, "right": None}
+        if case_name == "rope":
+            default_anchor_names = {"left": "left_end", "right": "right_end"}
+        translation_scale = self.LIVE_CONTROLLER_CASE_TRANSLATION_SCALE.get(
+            case_name,
+            self.LIVE_CONTROLLER_TRANSLATION_SCALE_DEFAULT,
+        )
+        return {
+            "case_name": case_name,
+            "post_select_grab_mode": "translation_only",
+            "post_select_translation_only": True,
+            "default_anchor_names": dict(default_anchor_names),
+            "controller_translation_scale": float(translation_scale),
+        }
+
+    def _build_anchor_def_from_seed(
+        self,
+        name,
+        seed_idx,
+        object_points,
+        region_node_count,
+    ):
+        if seed_idx is None:
+            return None
+        region_indices = self._graph_region_from_seed(
+            int(seed_idx),
+            region_node_count,
+            object_points,
+        )
+        if int(region_indices.numel()) == 0:
+            return None
+        region_points = object_points[region_indices]
+        center_world = region_points.mean(dim=0)
+        radius = torch.linalg.norm(
+            region_points - center_world.unsqueeze(0), dim=1
+        ).max()
+        return {
+            "name": name,
+            "seed_index": int(seed_idx),
+            "region_indices": region_indices,
+            "rest_center_world": center_world,
+            "rest_radius": float(radius.item()),
+        }
+
+    def _build_sloth_interaction_anchors(self, object_points, intrinsic, w2c):
         pixels, depth_valid = self._project_points_to_pixels(object_points, intrinsic, w2c)
         if not bool(depth_valid.any().item()):
             return []
@@ -716,26 +772,166 @@ class InvPhyTrainerWarp:
             if seed_idx is None:
                 continue
             used_indices.add(seed_idx)
-            region_indices = self._graph_region_from_seed(
+            anchor_def = self._build_anchor_def_from_seed(
+                name,
                 seed_idx,
-                region_node_count,
                 object_points,
+                region_node_count,
             )
-            region_points = object_points[region_indices]
-            center_world = region_points.mean(dim=0)
-            radius = torch.linalg.norm(
-                region_points - center_world.unsqueeze(0), dim=1
-            ).max()
-            anchors.append(
-                {
-                    "name": name,
-                    "seed_index": seed_idx,
-                    "region_indices": region_indices,
-                    "rest_center_world": center_world,
-                    "rest_radius": float(radius.item()),
-                }
-            )
+            if anchor_def is not None:
+                anchors.append(anchor_def)
         return anchors
+
+    def _graph_shortest_path_indices(self, start_idx, end_idx, object_points):
+        if start_idx is None or end_idx is None:
+            return []
+        start_idx = int(start_idx)
+        end_idx = int(end_idx)
+        if start_idx == end_idx:
+            return [start_idx]
+
+        neighbors = self._object_graph_neighbors()
+        points_np = object_points.detach().cpu().numpy()
+        best_distance = {start_idx: 0.0}
+        predecessors = {}
+        visited = set()
+        heap = [(0.0, start_idx)]
+
+        while heap:
+            distance, current = heapq.heappop(heap)
+            if current in visited:
+                continue
+            visited.add(current)
+            if current == end_idx:
+                break
+            current_point = points_np[current]
+            for neighbor in neighbors[current]:
+                if neighbor in visited:
+                    continue
+                edge_cost = float(np.linalg.norm(current_point - points_np[neighbor]))
+                new_distance = distance + edge_cost
+                if new_distance >= best_distance.get(neighbor, float("inf")):
+                    continue
+                best_distance[neighbor] = new_distance
+                predecessors[neighbor] = current
+                heapq.heappush(heap, (new_distance, neighbor))
+
+        if end_idx not in best_distance:
+            return []
+
+        path = [end_idx]
+        current = end_idx
+        while current != start_idx:
+            current = predecessors.get(current)
+            if current is None:
+                return []
+            path.append(current)
+        path.reverse()
+        return path
+
+    def _rope_midpoint_seed_index(self, endpoint_indices, object_points):
+        start_idx, end_idx = int(endpoint_indices[0]), int(endpoint_indices[1])
+        path = self._graph_shortest_path_indices(start_idx, end_idx, object_points)
+        if len(path) >= 3:
+            points_np = object_points.detach().cpu().numpy()
+            cumulative = [0.0]
+            for prev_idx, next_idx in zip(path[:-1], path[1:]):
+                edge_length = float(
+                    np.linalg.norm(points_np[next_idx] - points_np[prev_idx])
+                )
+                cumulative.append(cumulative[-1] + edge_length)
+            half_length = cumulative[-1] * 0.5
+            midpoint_path_index = min(
+                range(len(path)),
+                key=lambda idx: abs(cumulative[idx] - half_length),
+            )
+            midpoint_seed = int(path[midpoint_path_index])
+            if midpoint_seed not in {start_idx, end_idx}:
+                return midpoint_seed
+
+        midpoint_world = (
+            object_points[start_idx] + object_points[end_idx]
+        ) * 0.5
+        distances = torch.linalg.norm(
+            object_points - midpoint_world.unsqueeze(0), dim=1
+        )
+        order = torch.argsort(distances)
+        for candidate in order.tolist():
+            if candidate not in {start_idx, end_idx}:
+                return int(candidate)
+        return int(order[0].item()) if int(order.numel()) > 0 else start_idx
+
+    def _build_rope_interaction_anchors(self, object_points, intrinsic, w2c):
+        if int(object_points.shape[0]) < 3:
+            return []
+
+        points_centered = object_points - object_points.mean(dim=0, keepdim=True)
+        covariance = torch.matmul(points_centered.t(), points_centered)
+        eigenvalues, eigenvectors = torch.linalg.eigh(covariance)
+        rope_axis = eigenvectors[:, int(torch.argmax(eigenvalues).item())]
+        projections = torch.matmul(points_centered, rope_axis)
+        endpoint_order = torch.argsort(projections)
+        left_seed = int(endpoint_order[0].item())
+        right_seed = int(endpoint_order[-1].item())
+        if left_seed == right_seed:
+            return []
+
+        midpoint_seed = self._rope_midpoint_seed_index(
+            (left_seed, right_seed),
+            object_points,
+        )
+        region_node_count = min(
+            int(object_points.shape[0]),
+            self.LIVE_CONTROLLER_PREDEFINED_ANCHOR_NODE_COUNT,
+        )
+
+        left_def = self._build_anchor_def_from_seed(
+            "left_end",
+            left_seed,
+            object_points,
+            region_node_count,
+        )
+        right_def = self._build_anchor_def_from_seed(
+            "right_end",
+            right_seed,
+            object_points,
+            region_node_count,
+        )
+        middle_def = self._build_anchor_def_from_seed(
+            "middle",
+            midpoint_seed,
+            object_points,
+            region_node_count,
+        )
+        if left_def is None or right_def is None or middle_def is None:
+            return []
+
+        endpoint_defs = [left_def, right_def]
+        endpoint_projected = []
+        endpoint_valid = []
+        for anchor_def in endpoint_defs:
+            screen_x, _, valid = self._project_world_point_to_startup_screen_x(
+                anchor_def["rest_center_world"],
+                intrinsic,
+                w2c,
+            )
+            endpoint_projected.append(screen_x)
+            endpoint_valid.append(valid)
+        if all(endpoint_valid):
+            order = sorted(
+                range(2),
+                key=lambda idx: (endpoint_projected[idx], idx),
+            )
+            endpoint_defs = [endpoint_defs[idx] for idx in order]
+
+        endpoint_defs[0]["name"] = "left_end"
+        endpoint_defs[1]["name"] = "right_end"
+        return [endpoint_defs[0], middle_def, endpoint_defs[1]]
+
+    def _build_case_interaction_anchors(self, object_points, intrinsic, w2c):
+        if self._interaction_anchor_case_name() == "rope":
+            return self._build_rope_interaction_anchors(object_points, intrinsic, w2c)
+        return self._build_sloth_interaction_anchors(object_points, intrinsic, w2c)
 
     def _compute_predefined_interaction_anchor_states(self, anchor_defs, object_points):
         states = []
@@ -759,6 +955,83 @@ class InvPhyTrainerWarp:
                 }
             )
         return states
+
+    def _resolve_case_default_controller_anchor_names(
+        self,
+        anchor_states,
+        controller_source_anchor_centers,
+        intrinsic,
+        w2c,
+    ):
+        case_profile = self._live_controller_case_profile()
+        default_anchor_names = dict(case_profile["default_anchor_names"])
+        debug = {
+            "case_name": case_profile["case_name"],
+            "source_projected_x": {},
+            "anchor_projected_x": {},
+            "default_anchor_names": dict(default_anchor_names),
+            "resolved_default_anchor_names": dict(default_anchor_names),
+            "mapping_swapped": False,
+            "mapping_valid": False,
+        }
+
+        if case_profile["case_name"] != "rope":
+            return default_anchor_names, debug
+
+        for source, center in zip(("left", "right"), controller_source_anchor_centers):
+            screen_x, _, valid = self._project_world_point_to_startup_screen_x(
+                center,
+                intrinsic,
+                w2c,
+            )
+            debug["source_projected_x"][source] = (
+                float(screen_x) if valid and screen_x is not None else None
+            )
+
+        for anchor_name in ("left_end", "right_end"):
+            anchor_state = self._anchor_state_by_name(anchor_states, anchor_name)
+            if anchor_state is None:
+                debug["anchor_projected_x"][anchor_name] = None
+                continue
+            screen_x, _, valid = self._project_world_point_to_startup_screen_x(
+                anchor_state["center_world"],
+                intrinsic,
+                w2c,
+            )
+            debug["anchor_projected_x"][anchor_name] = (
+                float(screen_x) if valid and screen_x is not None else None
+            )
+
+        left_source_x = debug["source_projected_x"].get("left")
+        right_source_x = debug["source_projected_x"].get("right")
+        left_anchor_x = debug["anchor_projected_x"].get("left_end")
+        right_anchor_x = debug["anchor_projected_x"].get("right_end")
+        if None in (left_source_x, right_source_x, left_anchor_x, right_anchor_x):
+            return default_anchor_names, debug
+
+        source_in_order = left_source_x <= right_source_x
+        anchor_in_order = left_anchor_x <= right_anchor_x
+        debug["mapping_valid"] = True
+        if source_in_order != anchor_in_order:
+            default_anchor_names = {"left": "right_end", "right": "left_end"}
+            debug["mapping_swapped"] = True
+
+        debug["resolved_default_anchor_names"] = dict(default_anchor_names)
+        return default_anchor_names, debug
+
+    def _log_case_controller_anchor_mapping(self, prefix, mapping_debug):
+        if mapping_debug.get("case_name") != "rope":
+            return
+        print(
+            f"{prefix} rope runtime anchor mapping: "
+            f"source_projected_x={mapping_debug['source_projected_x']} "
+            f"anchor_projected_x={mapping_debug['anchor_projected_x']} "
+            f"default_anchor_names={mapping_debug['default_anchor_names']} "
+            f"resolved_default_anchor_names={mapping_debug['resolved_default_anchor_names']} "
+            f"mapping_valid={int(bool(mapping_debug['mapping_valid']))} "
+            f"swap={int(bool(mapping_debug['mapping_swapped']))}",
+            flush=True,
+        )
 
     def _make_controller_anchor_preview_state_entry(self):
         return {
@@ -1356,6 +1629,7 @@ class InvPhyTrainerWarp:
         original_controller_source_masks,
         original_controller_source_anchor_centers,
         controller_predefined_anchor_defs,
+        default_anchor_names=None,
     ):
         original_source_meta = self._build_controller_attachment_metadata(
             self.init_springs,
@@ -1392,12 +1666,20 @@ class InvPhyTrainerWarp:
         controller_rest_lengths = []
         controller_spring_y = []
         spring_cursor = int(object_springs.shape[0])
-        default_anchor_names = {"left": "left_arm", "right": "right_arm"}
+        case_profile = self._live_controller_case_profile()
+        resolved_default_anchor_names = (
+            dict(default_anchor_names)
+            if default_anchor_names is not None
+            else dict(case_profile["default_anchor_names"])
+        )
 
         for source in ("left", "right"):
             source_index = self._controller_source_index(source)
-            default_anchor = self._anchor_state_by_name(
-                anchor_states, default_anchor_names.get(source)
+            preferred_anchor_name = resolved_default_anchor_names.get(source)
+            default_anchor = (
+                self._anchor_state_by_name(anchor_states, preferred_anchor_name)
+                if preferred_anchor_name is not None
+                else None
             )
             if default_anchor is None:
                 default_anchor = self._select_predefined_interaction_anchor(
@@ -2634,7 +2916,7 @@ class InvPhyTrainerWarp:
         object_points,
         controller_reset_triggered=False,
         allow_implicit_fallback_start=True,
-        preview_selected_translation_only=False,
+        post_select_translation_only=False,
         controller_motion_state_cache=None,
         frame_index=0,
         runtime_label="shared",
@@ -2656,7 +2938,7 @@ class InvPhyTrainerWarp:
                 controller_anchor_preview_state,
                 object_points,
                 allow_implicit_fallback_start=allow_implicit_fallback_start,
-                preview_selected_translation_only=preview_selected_translation_only,
+                post_select_translation_only=post_select_translation_only,
             )
             self._log_controller_interaction_transition(
                 "left",
@@ -3800,7 +4082,7 @@ class InvPhyTrainerWarp:
         return {
             "basis": basis,
             "translation_scale": torch.tensor(
-                self.LIVE_CONTROLLER_TRANSLATION_SCALE,
+                self._live_controller_case_profile()["controller_translation_scale"],
                 dtype=torch.float32,
                 device=cfg.device,
             ),
@@ -3835,7 +4117,7 @@ class InvPhyTrainerWarp:
         return {
             "basis": basis,
             "translation_scale": torch.tensor(
-                self.LIVE_CONTROLLER_TRANSLATION_SCALE,
+                self._live_controller_case_profile()["controller_translation_scale"],
                 dtype=torch.float32,
                 device=cfg.device,
             ),
@@ -4483,7 +4765,7 @@ class InvPhyTrainerWarp:
         return {
             "basis": torch.as_tensor(basis_np, dtype=torch.float32, device=cfg.device),
             "translation_scale": torch.tensor(
-                self.LIVE_CONTROLLER_TRANSLATION_SCALE,
+                self.IMMERSIVE_LIVE_HEAD_TRANSLATION_SCALE,
                 dtype=torch.float32,
                 device=cfg.device,
             ),
@@ -5572,10 +5854,19 @@ class InvPhyTrainerWarp:
                 debug_renders,
                 startup_debug,
             )
-            raise RuntimeError(
-                "Immersive startup render validation failed.\n"
-                + str(startup_debug)
+            startup_debug["validation_failed"] = True
+            startup_debug["validation_warning"] = (
+                "initial_sample_out_of_view"
+                if projection_failures
+                else "initial_sample_gaussian_not_visible"
             )
+            print(
+                "[quest_display] immersive startup render validation warning: "
+                f"{startup_debug['validation_warning']}; continuing so the live demo can recover "
+                "as the headset pose settles",
+                flush=True,
+            )
+            return startup_debug
         if (save_success_bundle or compose_fallback_required) and debug_output_dir is not None:
             self._save_immersive_startup_debug_bundle(
                 os.path.join(debug_output_dir, "startup_debug"),
@@ -6412,7 +6703,7 @@ class InvPhyTrainerWarp:
         controller_anchor_preview_state,
         object_points,
         allow_implicit_fallback_start=True,
-        preview_selected_translation_only=False,
+        post_select_translation_only=False,
     ):
         anchors = {"left": None, "right": None}
         controller_world_by_source = {
@@ -6534,11 +6825,7 @@ class InvPhyTrainerWarp:
                     controller_world,
                     remap_candidate["attach_anchor_world"].clone(),
                     controller_source_anchor_centers,
-                    translation_only=(
-                        cycle_locked
-                        and bool(selected_preview_anchor is not None)
-                        and preview_selected_translation_only
-                    ),
+                    translation_only=bool(post_select_translation_only),
                 )
                 interaction_state.update(
                     {
@@ -8592,11 +8879,12 @@ class InvPhyTrainerWarp:
             "controller_runtime_rotated=1",
             flush=True,
         )
-        controller_predefined_anchor_defs = self._build_predefined_interaction_anchors(
+        controller_predefined_anchor_defs = self._build_case_interaction_anchors(
             obj_init_vertices,
             intrinsic_torch,
             w2c_torch,
         )
+        live_controller_case_profile = self._live_controller_case_profile()
         controller_runtime_base_target = None
         controller_source_masks = None
         controller_source_anchor_centers = None
@@ -9070,6 +9358,31 @@ class InvPhyTrainerWarp:
                 "[quest_display] immersive",
                 startup_controller_source_assignment,
             )
+            startup_predefined_anchor_states = (
+                self._compute_predefined_interaction_anchor_states(
+                    controller_predefined_anchor_defs,
+                    obj_init_vertices,
+                )
+            )
+            resolved_default_anchor_names, anchor_mapping_debug = (
+                self._resolve_case_default_controller_anchor_names(
+                    startup_predefined_anchor_states,
+                    original_controller_source_anchor_centers,
+                    immersive_center_intrinsic,
+                    immersive_center_w2c,
+                )
+            )
+            self._log_case_controller_anchor_mapping(
+                "[quest_display] immersive",
+                anchor_mapping_debug,
+            )
+            print(
+                "[live_openxr_controller] immersive controller case profile: "
+                f"case={live_controller_case_profile['case_name']} "
+                f"translation_scale={live_controller_case_profile['controller_translation_scale']:.2f} "
+                f"post_select_grab_mode={live_controller_case_profile['post_select_grab_mode']}",
+                flush=True,
+            )
 
             two_point_runtime = self._build_two_point_live_controller_runtime(
                 obj_init_vertices,
@@ -9077,6 +9390,7 @@ class InvPhyTrainerWarp:
                 original_controller_source_masks,
                 original_controller_source_anchor_centers,
                 controller_predefined_anchor_defs,
+                default_anchor_names=resolved_default_anchor_names,
             )
             controller_runtime_base_target = two_point_runtime["controller_rest_points"].clone()
             controller_source_masks = two_point_runtime["controller_source_masks"]
@@ -9152,11 +9466,11 @@ class InvPhyTrainerWarp:
             ).clone()
             current_pos = gaussians.get_xyz
             current_rot = gaussians.get_rotation
-            relations_single = get_topk_indices(prev_x, K=3)
+            relations_single = get_topk_indices(prev_x, K=4)
             weights_single, weights_indices_single = knn_weights_sparse(
                 prev_x,
                 current_pos,
-                K=3,
+                K=4,
             )
             rotation_cache = build_rotation_reuse_cache(
                 weights_indices=weights_indices_single,
@@ -10334,6 +10648,9 @@ class InvPhyTrainerWarp:
                     current_live_right_controller,
                     x[: self.num_all_points],
                     controller_reset_triggered=controller_reset_triggered,
+                    post_select_translation_only=live_controller_case_profile[
+                        "post_select_translation_only"
+                    ],
                     controller_motion_state_cache=controller_motion_state_cache,
                     frame_index=frame_count,
                     runtime_label="immersive",
@@ -10445,7 +10762,7 @@ class InvPhyTrainerWarp:
         window=None,
         cuda_ctx=None,
         interactive_window_mode="visible",
-        scene_assets_root="./data/open_scene_assets",
+        scene_assets_root="./assets/scenes",
         render_profile=False,
         render_profile_every=30,
     ):

@@ -17,6 +17,8 @@ from pyrender.renderer import Renderer
 _SUPPORT_CACHE: tuple[bool, str] | None = None
 _UNPACK_MODULE = None
 _UNPACK_FUNCTION = None
+_PREVIEW_COPY_MODULE = None
+_PREVIEW_COPY_FUNCTION = None
 
 
 def probe_pyrender_cuda_bridge_support() -> tuple[bool, str]:
@@ -106,22 +108,55 @@ def _get_unpack_function():
     return _UNPACK_FUNCTION
 
 
+def _get_preview_copy_function():
+    global _PREVIEW_COPY_MODULE, _PREVIEW_COPY_FUNCTION
+    if _PREVIEW_COPY_FUNCTION is not None:
+        return _PREVIEW_COPY_FUNCTION
+
+    _PREVIEW_COPY_MODULE = SourceModule(
+        r"""
+        extern "C" __global__ void copy_preview_rgba(
+            const uchar4* src_rgba,
+            uchar4* dst_rgba,
+            int pixel_count
+        ) {
+            int pixel_index = blockIdx.x * blockDim.x + threadIdx.x;
+            if (pixel_index >= pixel_count) {
+                return;
+            }
+            dst_rgba[pixel_index] = src_rgba[pixel_index];
+        }
+        """,
+        no_extern_c=True,
+    )
+    _PREVIEW_COPY_FUNCTION = _PREVIEW_COPY_MODULE.get_function("copy_preview_rgba")
+    _PREVIEW_COPY_FUNCTION.prepare("PPi")
+    return _PREVIEW_COPY_FUNCTION
+
+
 @dataclass
-class _PixelPackBuffer:
+class _InteropBuffer:
     target: int
     gl_id: int
     registered_buffer: RegisteredBuffer
     size_bytes: int
 
     @classmethod
-    def create(cls, target: int, size_bytes: int):
+    def create(
+        cls,
+        target: int,
+        size_bytes: int,
+        *,
+        usage: int,
+        map_flags,
+    ):
         gl_id = int(gl.glGenBuffers(1))
         gl.glBindBuffer(target, gl_id)
-        gl.glBufferData(target, int(size_bytes), None, gl.GL_STREAM_READ)
+        gl.glBufferData(target, int(size_bytes), None, int(usage))
         gl.glBindBuffer(target, 0)
         registered_buffer = RegisteredBuffer(
             gl_id,
-            graphics_map_flags.READ_ONLY,
+            map_flags,
         )
         return cls(
             target=int(target),
@@ -156,8 +191,8 @@ class PyrenderCudaInteropRenderer(Renderer):
         self.readback_mode = "gl_cuda_interop"
         self.fallback_reason: str | None = None
         self._interop_enabled = True
-        self._color_pbo: _PixelPackBuffer | None = None
-        self._depth_pbo: _PixelPackBuffer | None = None
+        self._color_pbo: _InteropBuffer | None = None
+        self._depth_pbo: _InteropBuffer | None = None
         self._interop_dims: tuple[int, int] | None = None
         self._output_ring_size = 4
         self._output_ring_index = 0
@@ -204,8 +239,18 @@ class PyrenderCudaInteropRenderer(Renderer):
         self._delete_interop_resources()
         color_bytes = width * height * 4
         depth_bytes = width * height * np.dtype(np.float32).itemsize
-        self._color_pbo = _PixelPackBuffer.create(gl.GL_PIXEL_PACK_BUFFER, color_bytes)
-        self._depth_pbo = _PixelPackBuffer.create(gl.GL_PIXEL_PACK_BUFFER, depth_bytes)
+        self._color_pbo = _InteropBuffer.create(
+            gl.GL_PIXEL_PACK_BUFFER,
+            color_bytes,
+            usage=gl.GL_STREAM_READ,
+            map_flags=graphics_map_flags.READ_ONLY,
+        )
+        self._depth_pbo = _InteropBuffer.create(
+            gl.GL_PIXEL_PACK_BUFFER,
+            depth_bytes,
+            usage=gl.GL_STREAM_READ,
+            map_flags=graphics_map_flags.READ_ONLY,
+        )
         self._color_tensors = [
             torch.empty(
                 (height, width, 4),
@@ -342,6 +387,115 @@ class PyrenderCudaInteropRenderer(Renderer):
                 color_mapping.unmap()
 
         return output_color_tensor, output_depth_tensor
+
+
+class PreviewTextureCudaUploader:
+    def __init__(
+        self,
+        texture_id: int,
+        width: int,
+        height: int,
+        *,
+        device: torch.device | str | None = None,
+        ring_size: int = 3,
+    ):
+        if device is None:
+            device = torch.device("cuda", torch.cuda.current_device())
+        self.device = torch.device(device)
+        self.texture_id = int(texture_id)
+        self.width = int(width)
+        self.height = int(height)
+        self.ring_size = max(int(ring_size), 1)
+        self._buffer_size_bytes = self.width * self.height * 4
+        self._buffers: list[_InteropBuffer] = [
+            _InteropBuffer.create(
+                gl.GL_PIXEL_UNPACK_BUFFER,
+                self._buffer_size_bytes,
+                usage=gl.GL_STREAM_DRAW,
+                map_flags=graphics_map_flags.WRITE_DISCARD,
+            )
+            for _ in range(self.ring_size)
+        ]
+        self._ring_index = 0
+
+    def delete(self) -> None:
+        for buffer in self._buffers:
+            buffer.delete()
+        self._buffers = []
+
+    def _next_buffer(self) -> _InteropBuffer:
+        buffer = self._buffers[self._ring_index]
+        self._ring_index = (self._ring_index + 1) % len(self._buffers)
+        return buffer
+
+    def _copy_preview_frame(self, frame_rgba_u8: torch.Tensor, dst_ptr: int) -> None:
+        pixel_count = self.width * self.height
+        block_size = 256
+        grid_size = max((pixel_count + block_size - 1) // block_size, 1)
+        copy_function = _get_preview_copy_function()
+        copy_function.prepared_call(
+            (grid_size, 1, 1),
+            (block_size, 1, 1),
+            int(frame_rgba_u8.data_ptr()),
+            int(dst_ptr),
+            int(pixel_count),
+        )
+
+    def upload(self, frame_rgba_u8: torch.Tensor) -> None:
+        if not torch.is_tensor(frame_rgba_u8):
+            raise TypeError(
+                "PreviewTextureCudaUploader.upload expects a torch.Tensor frame."
+            )
+        if frame_rgba_u8.device.type != "cuda":
+            raise TypeError(
+                "PreviewTextureCudaUploader.upload expects a CUDA tensor frame."
+            )
+        if frame_rgba_u8.dtype != torch.uint8:
+            raise TypeError(
+                f"PreviewTextureCudaUploader.upload expects torch.uint8, got {frame_rgba_u8.dtype}."
+            )
+        expected_shape = (self.height, self.width, 4)
+        if tuple(frame_rgba_u8.shape) != expected_shape:
+            raise ValueError(
+                f"PreviewTextureCudaUploader frame shape {tuple(frame_rgba_u8.shape)} "
+                f"!= expected {expected_shape}."
+            )
+        if frame_rgba_u8.device != self.device:
+            frame_rgba_u8 = frame_rgba_u8.to(device=self.device)
+        if not frame_rgba_u8.is_contiguous():
+            frame_rgba_u8 = frame_rgba_u8.contiguous()
+
+        # The preview path previously synchronized implicitly through `.cpu().numpy()`;
+        # keep ordering correct before and after the PyCUDA write into the mapped PBO.
+        torch.cuda.current_stream(device=self.device).synchronize()
+        buffer = self._next_buffer()
+        mapping = buffer.registered_buffer.map()
+        try:
+            dst_ptr, mapped_size = mapping.device_ptr_and_size()
+            if int(mapped_size) < int(self._buffer_size_bytes):
+                raise RuntimeError(
+                    f"Mapped preview PBO too small: {mapped_size} < {self._buffer_size_bytes}"
+                )
+            self._copy_preview_frame(frame_rgba_u8, dst_ptr)
+            torch.cuda.synchronize(device=self.device)
+        finally:
+            mapping.unmap()
+
+        gl.glBindTexture(gl.GL_TEXTURE_2D, self.texture_id)
+        gl.glBindBuffer(gl.GL_PIXEL_UNPACK_BUFFER, int(buffer.gl_id))
+        gl.glTexSubImage2D(
+            gl.GL_TEXTURE_2D,
+            0,
+            0,
+            0,
+            self.width,
+            self.height,
+            gl.GL_RGBA,
+            gl.GL_UNSIGNED_BYTE,
+            ctypes.c_void_p(0),
+        )
+        gl.glBindBuffer(gl.GL_PIXEL_UNPACK_BUFFER, 0)
+        gl.glBindTexture(gl.GL_TEXTURE_2D, 0)
 
 
 class PyrenderCudaInteropOffscreenRenderer:

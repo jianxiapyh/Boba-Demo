@@ -59,6 +59,7 @@ from qqtt.immersive_scene import (
     ensure_simple_lab_assets,
     make_simple_lab_layout,
 )
+from qqtt.pyrender_cuda_bridge import PreviewTextureCudaUploader
 
 TINY_BITMAP_FONT = {
     "0": ("111", "101", "101", "101", "111"),
@@ -7723,15 +7724,15 @@ class InvPhyTrainerWarp:
     ):
         target_height = int(target_height)
         target_width = int(target_width)
+        if not torch.is_tensor(overlay_color_rgba) or not torch.is_tensor(overlay_depth):
+            raise TypeError(
+                "Supersampled immersive overlay downsample expects tensor inputs."
+            )
         overlay_color_t, overlay_depth_t = self._prepare_immersive_scene_frame_for_compose(
             overlay_color_rgba,
             overlay_depth,
-            int(np.asarray(overlay_depth).shape[0])
-            if not torch.is_tensor(overlay_depth)
-            else int(overlay_depth.shape[0]),
-            int(np.asarray(overlay_depth).shape[1])
-            if not torch.is_tensor(overlay_depth)
-            else int(overlay_depth.shape[1]),
+            int(overlay_depth.shape[0]),
+            int(overlay_depth.shape[1]),
             compose_cache=None,
         )
         if overlay_color_t.shape[:2] == (target_height, target_width):
@@ -8635,6 +8636,7 @@ class InvPhyTrainerWarp:
         immersive_bridge = None
         scene_renderer = None
         preview_tex = None
+        preview_uploader = None
         preview_prog = None
         preview_vao = None
         preview_display_active = interactive_window_mode == "visible"
@@ -8969,13 +8971,17 @@ class InvPhyTrainerWarp:
                 f"[quest_display] pyrender_readback_mode={scene_renderer.pyrender_readback_mode()}",
                 flush=True,
             )
-            if scene_renderer.pyrender_readback_mode() == "cpu_fallback":
+            if scene_renderer.pyrender_readback_mode() != "gl_cuda_interop":
                 readback_reason = scene_renderer.pyrender_readback_reason()
                 if readback_reason:
                     print(
                         f"[quest_display] pyrender_readback_reason={readback_reason}",
                         flush=True,
                     )
+                raise RuntimeError(
+                    "Quest immersive runtime requires pyrender_readback_mode=gl_cuda_interop "
+                    "so scene/background/table compose stays tensor-only."
+                )
             table_alignment_debug = scene_renderer.table_alignment_debug()
             table_surface_center_world = layout.table_top_center
             if table_alignment_debug is not None:
@@ -9481,6 +9487,12 @@ class InvPhyTrainerWarp:
                     None,
                 )
                 gl.glBindTexture(gl.GL_TEXTURE_2D, 0)
+                preview_uploader = PreviewTextureCudaUploader(
+                    preview_tex,
+                    eye_width,
+                    eye_height,
+                    device=torch.device(cfg.device),
+                )
 
                 vertex_shader = """
                 #version 330 core
@@ -10230,20 +10242,11 @@ class InvPhyTrainerWarp:
                         time.perf_counter() if render_profile_frame is not None else None
                     )
                     glfw.make_context_current(window)
-                    left_preview = left_eye_frame.detach().cpu().numpy()
-                    gl.glBindTexture(gl.GL_TEXTURE_2D, preview_tex)
-                    gl.glTexSubImage2D(
-                        gl.GL_TEXTURE_2D,
-                        0,
-                        0,
-                        0,
-                        eye_width,
-                        eye_height,
-                        gl.GL_RGBA,
-                        gl.GL_UNSIGNED_BYTE,
-                        left_preview,
-                    )
-                    gl.glBindTexture(gl.GL_TEXTURE_2D, 0)
+                    if preview_uploader is None:
+                        raise RuntimeError(
+                            "Preview window is active but PreviewTextureCudaUploader was not initialized."
+                        )
+                    preview_uploader.upload(left_eye_frame)
                     fb_width, fb_height = glfw.get_framebuffer_size(window)
                     gl.glViewport(0, 0, fb_width, fb_height)
                     gl.glDisable(gl.GL_DEPTH_TEST)
@@ -10415,14 +10418,21 @@ class InvPhyTrainerWarp:
                         log_file.write("\n".join(log_lines) + "\n")
             if immersive_bridge is not None:
                 immersive_bridge.stop()
-            if scene_renderer is not None:
-                scene_renderer.delete()
+            if window is not None:
+                try:
+                    glfw.make_context_current(window)
+                except Exception:
+                    pass
+            if preview_uploader is not None:
+                preview_uploader.delete()
             if preview_prog is not None:
                 gl.glDeleteProgram(preview_prog)
             if preview_tex is not None:
                 gl.glDeleteTextures([preview_tex])
             if preview_vao is not None:
                 gl.glDeleteVertexArrays(1, [preview_vao])
+            if scene_renderer is not None:
+                scene_renderer.delete()
             if cuda_ctx is not None:
                 cuda_ctx.pop()
 
@@ -10746,26 +10756,6 @@ class InvPhyTrainerWarp:
         height, width = target_shape
         compose_cache.clear()
         compose_cache["target_shape"] = target_shape
-        compose_cache["scene_color_cpu"] = torch.empty(
-            (height, width, 4),
-            dtype=torch.float32,
-            pin_memory=True,
-        )
-        compose_cache["scene_depth_cpu"] = torch.empty(
-            (height, width),
-            dtype=torch.float32,
-            pin_memory=True,
-        )
-        compose_cache["scene_color"] = torch.empty(
-            (height, width, 4),
-            dtype=torch.float32,
-            device=cfg.device,
-        )
-        compose_cache["scene_depth"] = torch.empty(
-            (height, width),
-            dtype=torch.float32,
-            device=cfg.device,
-        )
         compose_cache["composed_color"] = torch.empty(
             (height, width, 4),
             dtype=torch.float32,
@@ -10785,6 +10775,11 @@ class InvPhyTrainerWarp:
         target_height,
         target_width,
     ):
+        if not torch.is_tensor(scene_color_rgba) or not torch.is_tensor(scene_depth):
+            raise TypeError(
+                "Immersive scene compose expects tensor scene/background/table inputs. "
+                "CPU/numpy scene staging has been removed from the shipped Quest runtime."
+            )
         target_device = torch.device(cfg.device)
         scene_color_t = scene_color_rgba
         scene_depth_t = scene_depth
@@ -10821,69 +10816,6 @@ class InvPhyTrainerWarp:
             scene_depth_t = scene_depth_t.contiguous()
         return scene_color_t, scene_depth_t
 
-    def _prepare_immersive_scene_numpy_for_compose(
-        self,
-        scene_color_rgba,
-        scene_depth,
-        target_height,
-        target_width,
-        compose_cache=None,
-    ):
-        target_height = int(target_height)
-        target_width = int(target_width)
-
-        scene_color_np = np.asarray(scene_color_rgba)
-        scene_depth_np = np.asarray(scene_depth, dtype=np.float32)
-        if scene_color_np.shape[:2] != (target_height, target_width):
-            scene_color_np = cv2.resize(
-                scene_color_np,
-                (target_width, target_height),
-                interpolation=cv2.INTER_LINEAR,
-            )
-        if scene_depth_np.shape[:2] != (target_height, target_width):
-            scene_depth_np = cv2.resize(
-                scene_depth_np,
-                (target_width, target_height),
-                interpolation=cv2.INTER_NEAREST,
-            )
-
-        scene_color_np = np.ascontiguousarray(scene_color_np)
-        scene_depth_np = np.ascontiguousarray(scene_depth_np, dtype=np.float32)
-        if compose_cache is None:
-            return (
-                torch.from_numpy(scene_color_np).to(
-                    device=cfg.device,
-                    dtype=torch.float32,
-                ),
-                torch.from_numpy(scene_depth_np).to(
-                    device=cfg.device,
-                    dtype=torch.float32,
-                ),
-            )
-
-        compose_cache = self._ensure_immersive_compose_cache(
-            compose_cache,
-            target_height,
-            target_width,
-        )
-        compose_cache["scene_color_cpu"].copy_(
-            torch.as_tensor(scene_color_np, dtype=torch.float32),
-            non_blocking=False,
-        )
-        compose_cache["scene_depth_cpu"].copy_(
-            torch.as_tensor(scene_depth_np, dtype=torch.float32),
-            non_blocking=False,
-        )
-        compose_cache["scene_color"].copy_(
-            compose_cache["scene_color_cpu"],
-            non_blocking=True,
-        )
-        compose_cache["scene_depth"].copy_(
-            compose_cache["scene_depth_cpu"],
-            non_blocking=True,
-        )
-        return compose_cache["scene_color"], compose_cache["scene_depth"]
-
     def _prepare_immersive_scene_frame_for_compose(
         self,
         scene_color_rgba,
@@ -10894,19 +10826,12 @@ class InvPhyTrainerWarp:
     ):
         target_height = int(target_height)
         target_width = int(target_width)
-        if torch.is_tensor(scene_color_rgba) and torch.is_tensor(scene_depth):
-            return self._prepare_immersive_scene_tensor_for_compose(
-                scene_color_rgba,
-                scene_depth,
-                target_height,
-                target_width,
-            )
-        return self._prepare_immersive_scene_numpy_for_compose(
+        _ = compose_cache
+        return self._prepare_immersive_scene_tensor_for_compose(
             scene_color_rgba,
             scene_depth,
             target_height,
             target_width,
-            compose_cache=compose_cache,
         )
 
     def _ensure_immersive_reproject_cache(

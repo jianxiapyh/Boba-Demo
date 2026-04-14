@@ -35,14 +35,11 @@ def render_gsplat(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.T
     """
     # Set up rasterization configuration
     if viewpoint_camera.K is not None:
-        # print("====== Use camera K ======")
-        # focal_length_x, focal_length_y, cx, cy = viewpoint_camera.K
-        focal_length_x, focal_length_y, cx, cy = viewpoint_camera.K[0, 0], viewpoint_camera.K[1, 1], viewpoint_camera.K[0, 2], viewpoint_camera.K[1, 2]
-        K = torch.tensor([
-            [focal_length_x, 0, cx],
-            [0, focal_length_y, cy],
-            [0, 0, 1.0]
-        ]).to(pc.get_xyz)
+        K = torch.as_tensor(
+            viewpoint_camera.K,
+            dtype=pc.get_xyz.dtype,
+            device=pc.get_xyz.device,
+        ).reshape(3, 3)
     else:
         tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
         tanfovy = math.tan(viewpoint_camera.FoVy * 0.5)

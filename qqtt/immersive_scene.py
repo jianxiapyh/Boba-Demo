@@ -8,9 +8,16 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+import torch
 import trimesh
 from PIL import Image
 from trimesh.visual.texture import TextureVisuals
+
+from .pyrender_cuda_bridge import (
+    PyrenderCudaInteropOffscreenRenderer,
+    probe_pyrender_cuda_bridge_support,
+)
+from .simple_lab_gpu_renderer import SimpleLabGpuRenderer
 
 
 MANIFEST_RELATIVE_PATH = Path("data/open_scene_assets/simple_lab/manifest.json")
@@ -235,7 +242,6 @@ def _make_textured_quad(
     visual = TextureVisuals(uv=uvs, image=image)
     return trimesh.Trimesh(vertices=vertices, faces=faces, visual=visual, process=False)
 
-
 class SimpleLabSceneRenderer:
     def __init__(
         self,
@@ -243,39 +249,82 @@ class SimpleLabSceneRenderer:
         width: int,
         height: int,
         lighting_mode: str = "full",
+        balanced_render_backend: str = "pyrender",
     ):
         import pyrender
 
         self.width = int(width)
         self.height = int(height)
         self.lighting_mode = str(lighting_mode)
+        self.balanced_render_backend = str(balanced_render_backend)
         self._pyrender = pyrender
         self.simple_lab_root = ensure_simple_lab_assets(scene_assets_root)
         self.manifest = load_simple_lab_manifest(scene_assets_root)
         self.layout: SimpleLabLayout | None = None
-        self.scene = pyrender.Scene(
-            bg_color=np.array([243, 244, 246, 255], dtype=np.uint8),
-            ambient_light=np.array([0.22, 0.22, 0.22], dtype=np.float32),
-        )
-        self.renderer = pyrender.OffscreenRenderer(
-            viewport_width=self.width,
-            viewport_height=self.height,
-        )
-        self.camera = self._pyrender.IntrinsicsCamera(
-            fx=1.0,
-            fy=1.0,
-            cx=float(self.width) * 0.5,
-            cy=float(self.height) * 0.5,
-            znear=0.02,
-            zfar=100.0,
-        )
-        self.camera_node = self.scene.add(self.camera, pose=np.eye(4, dtype=np.float32))
-        self.table_node = None
-        self.floor_node = None
-        self.wall_nodes: list[Any] = []
+        self._scene_clear_color = np.array([243, 244, 246, 255], dtype=np.uint8)
+        self._table_clear_color = np.array([0, 0, 0, 0], dtype=np.uint8)
+        self._ambient_light = np.array([0.22, 0.22, 0.22], dtype=np.float32)
+        self._layer_specs = {
+            "full": {
+                "bg_color": self._scene_clear_color,
+                "table_role": "full",
+                "background_role": "all",
+            },
+            "background": {
+                "bg_color": self._scene_clear_color,
+                "table_role": None,
+                "background_role": "all",
+            },
+            "table": {
+                "bg_color": self._table_clear_color,
+                "table_role": "full",
+                "background_role": None,
+            },
+            "balanced_far_front_back_walls": {
+                "bg_color": self._scene_clear_color,
+                "table_role": None,
+                "background_role": "front_back_walls",
+            },
+            "balanced_left_wall": {
+                "bg_color": self._scene_clear_color,
+                "table_role": None,
+                "background_role": "left_wall",
+            },
+            "balanced_right_wall": {
+                "bg_color": self._scene_clear_color,
+                "table_role": None,
+                "background_role": "right_wall",
+            },
+            "balanced_near_floor": {
+                "bg_color": self._scene_clear_color,
+                "table_role": None,
+                "background_role": "floor",
+            },
+        }
+        self._eager_layer_names = {"background", "table"}
+        self._layer_entries: dict[str, dict[str, Any]] = {}
         self._table_alignment_debug: dict[str, Any] | None = None
         self._table_transform_debug: dict[str, Any] | None = None
-        self._setup_lights()
+        self._table_world_bounds: tuple[np.ndarray, np.ndarray] | None = None
+        self._wall_world_bounds: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+        self._pyrender_readback_mode = "cpu_fallback"
+        self._pyrender_readback_reason: str | None = None
+        self._pyrender_cuda_interop_supported = False
+        if self.balanced_render_backend == "pyrender":
+            (
+                self._pyrender_cuda_interop_supported,
+                self._pyrender_readback_reason,
+            ) = probe_pyrender_cuda_bridge_support()
+            self._pyrender_readback_mode = (
+                "gl_cuda_interop"
+                if self._pyrender_cuda_interop_supported
+                else "cpu_fallback"
+            )
+        self._gpu_renderer = (
+            None
+            if self.balanced_render_backend == "pyrender"
+            else SimpleLabGpuRenderer(lighting_mode=self.lighting_mode)
+        )
         self._table_mesh = self._load_table_mesh()
         self._floor_quad = _make_textured_quad(
             width=1.0,
@@ -289,16 +338,102 @@ class SimpleLabSceneRenderer:
             texture_path=self.simple_lab_root / "walls" / "rough_concrete_diff_2k.jpg",
             uv_scale=(3.0, 2.0),
         )
+        for layer_name in self._eager_layer_names:
+            self._layer_entries[layer_name] = self._make_layer_entry(layer_name)
+
+    def _make_layer_entry(self, layer_name: str) -> dict[str, Any]:
+        layer_spec = self._layer_specs[layer_name]
+        scene = self._pyrender.Scene(
+            bg_color=np.array(layer_spec["bg_color"], copy=True),
+            ambient_light=np.array(self._ambient_light, copy=True),
+        )
+        camera = self._pyrender.IntrinsicsCamera(
+            fx=1.0,
+            fy=1.0,
+            cx=float(self.width) * 0.5,
+            cy=float(self.height) * 0.5,
+            znear=0.02,
+            zfar=100.0,
+        )
+        camera_node = scene.add(camera, pose=np.eye(4, dtype=np.float32))
+        self._setup_lights(scene)
+        return {
+            "scene": scene,
+            "camera": camera,
+            "camera_node": camera_node,
+            "renderer": None,
+            "table_node": None,
+            "floor_node": None,
+            "wall_nodes": [],
+            "table_role": layer_spec["table_role"],
+            "background_role": layer_spec["background_role"],
+        }
+
+    def _ensure_layer_entry(self, layer_name: str) -> dict[str, Any]:
+        entry = self._layer_entries.get(layer_name)
+        if entry is not None:
+            return entry
+        entry = self._make_layer_entry(layer_name)
+        self._layer_entries[layer_name] = entry
+        if self.layout is not None:
+            self._rebuild_scene_nodes()
+        return entry
 
     def delete(self) -> None:
-        if self.renderer is not None:
-            self.renderer.delete()
-            self.renderer = None
+        for entry in self._layer_entries.values():
+            renderer = entry.get("renderer")
+            if renderer is not None:
+                renderer.delete()
+                entry["renderer"] = None
+        if self._gpu_renderer is not None:
+            self._gpu_renderer.delete()
+
+    def pyrender_readback_mode(self) -> str:
+        return str(self._pyrender_readback_mode)
+
+    def pyrender_readback_reason(self) -> str | None:
+        if self._pyrender_readback_reason is None:
+            return None
+        return str(self._pyrender_readback_reason)
+
+    def uses_gpu_balanced_table_renderer(self) -> bool:
+        return bool(
+            self._gpu_renderer is not None
+            and self._gpu_renderer.table_available
+            and self.balanced_render_backend in {"gpu", "gpu_all"}
+        )
+
+    def uses_gpu_balanced_plane_renderer(self) -> bool:
+        return bool(
+            self._gpu_renderer is not None
+            and self._gpu_renderer.available
+            and self.balanced_render_backend == "gpu_all"
+        )
+
+    def uses_gpu_balanced_side_wall_renderer(self) -> bool:
+        return bool(
+            self._gpu_renderer is not None
+            and self._gpu_renderer.available
+            and self.balanced_render_backend in {"gpu", "gpu_all"}
+        )
 
     def table_alignment_debug(self) -> dict[str, Any] | None:
         if self._table_alignment_debug is None:
             return None
         return dict(self._table_alignment_debug)
+
+    def table_world_bounds(self) -> tuple[np.ndarray, np.ndarray] | None:
+        if self._table_world_bounds is None:
+            return None
+        bounds_min, bounds_max = self._table_world_bounds
+        return np.array(bounds_min, copy=True), np.array(bounds_max, copy=True)
+
+    def wall_world_bounds(self, wall_name: str) -> tuple[np.ndarray, np.ndarray] | None:
+        wall_key = str(wall_name)
+        if wall_key not in self._wall_world_bounds:
+            return None
+        bounds_min, bounds_max = self._wall_world_bounds[wall_key]
+        return np.array(bounds_min, copy=True), np.array(bounds_max, copy=True)
 
     def set_layout(self, layout: SimpleLabLayout) -> None:
         self.layout = layout
@@ -308,24 +443,317 @@ class SimpleLabSceneRenderer:
         self,
         camera_pose_world: np.ndarray,
         intrinsic: np.ndarray,
+        width: int | None = None,
+        height: int | None = None,
     ) -> tuple[np.ndarray, np.ndarray]:
-        if self.layout is None:
-            raise RuntimeError("Simple lab layout has not been configured.")
+        return self._render_layer_eye(
+            "full",
+            camera_pose_world,
+            intrinsic,
+            width=width,
+            height=height,
+        )
 
-        self.camera.fx = float(intrinsic[0, 0])
-        self.camera.fy = float(intrinsic[1, 1])
-        self.camera.cx = float(intrinsic[0, 2])
-        self.camera.cy = float(intrinsic[1, 2])
-        self.scene.set_pose(self.camera_node, pose=np.asarray(camera_pose_world))
-        color, depth = self.renderer.render(self.scene, flags=self._pyrender.RenderFlags.RGBA)
-        return color, depth.astype(np.float32)
+    def render_background_eye(
+        self,
+        camera_pose_world: np.ndarray,
+        intrinsic: np.ndarray,
+        width: int | None = None,
+        height: int | None = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        return self._render_layer_eye(
+            "background",
+            camera_pose_world,
+            intrinsic,
+            width=width,
+            height=height,
+        )
 
-    def _setup_lights(self) -> None:
+    def render_background_eye_roi(
+        self,
+        camera_pose_world: np.ndarray,
+        full_intrinsic: np.ndarray,
+        roi_bounds: tuple[int, int, int, int],
+    ) -> tuple[np.ndarray, np.ndarray] | tuple[torch.Tensor, torch.Tensor]:
+        return self._render_layer_eye_roi(
+            "background",
+            camera_pose_world,
+            full_intrinsic,
+            roi_bounds,
+        )
+
+    def render_balanced_far_front_back_walls_eye(
+        self,
+        camera_pose_world: np.ndarray,
+        intrinsic: np.ndarray,
+        width: int | None = None,
+        height: int | None = None,
+    ) -> tuple[np.ndarray, np.ndarray] | tuple[torch.Tensor, torch.Tensor]:
+        return self._render_balanced_layer(
+            "balanced_far_front_back_walls",
+            camera_pose_world,
+            intrinsic,
+            width=width,
+            height=height,
+        )
+
+    def render_balanced_far_walls_eye(
+        self,
+        camera_pose_world: np.ndarray,
+        intrinsic: np.ndarray,
+        width: int | None = None,
+        height: int | None = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        return self.render_balanced_far_front_back_walls_eye(
+            camera_pose_world,
+            intrinsic,
+            width=width,
+            height=height,
+        )
+
+    def render_balanced_left_wall_eye(
+        self,
+        camera_pose_world: np.ndarray,
+        intrinsic: np.ndarray,
+        width: int | None = None,
+        height: int | None = None,
+    ) -> tuple[np.ndarray, np.ndarray] | tuple[torch.Tensor, torch.Tensor]:
+        return self._render_balanced_layer(
+            "balanced_left_wall",
+            camera_pose_world,
+            intrinsic,
+            width=width,
+            height=height,
+        )
+
+    def render_balanced_left_wall_eye_roi(
+        self,
+        camera_pose_world: np.ndarray,
+        full_intrinsic: np.ndarray,
+        roi_bounds: tuple[int, int, int, int],
+    ) -> tuple[np.ndarray, np.ndarray] | tuple[torch.Tensor, torch.Tensor]:
+        return self._render_balanced_layer_roi(
+            "balanced_left_wall",
+            camera_pose_world,
+            full_intrinsic,
+            roi_bounds,
+        )
+
+    def render_balanced_right_wall_eye(
+        self,
+        camera_pose_world: np.ndarray,
+        intrinsic: np.ndarray,
+        width: int | None = None,
+        height: int | None = None,
+    ) -> tuple[np.ndarray, np.ndarray] | tuple[torch.Tensor, torch.Tensor]:
+        return self._render_balanced_layer(
+            "balanced_right_wall",
+            camera_pose_world,
+            intrinsic,
+            width=width,
+            height=height,
+        )
+
+    def render_balanced_right_wall_eye_roi(
+        self,
+        camera_pose_world: np.ndarray,
+        full_intrinsic: np.ndarray,
+        roi_bounds: tuple[int, int, int, int],
+    ) -> tuple[np.ndarray, np.ndarray] | tuple[torch.Tensor, torch.Tensor]:
+        return self._render_balanced_layer_roi(
+            "balanced_right_wall",
+            camera_pose_world,
+            full_intrinsic,
+            roi_bounds,
+        )
+
+    def render_balanced_near_floor_eye(
+        self,
+        camera_pose_world: np.ndarray,
+        intrinsic: np.ndarray,
+        width: int | None = None,
+        height: int | None = None,
+    ) -> tuple[np.ndarray, np.ndarray] | tuple[torch.Tensor, torch.Tensor]:
+        return self._render_balanced_layer(
+            "balanced_near_floor",
+            camera_pose_world,
+            intrinsic,
+            width=width,
+            height=height,
+        )
+
+    def render_table_eye(
+        self,
+        camera_pose_world: np.ndarray,
+        intrinsic: np.ndarray,
+        width: int | None = None,
+        height: int | None = None,
+    ) -> tuple[np.ndarray, np.ndarray] | tuple[torch.Tensor, torch.Tensor]:
+        if self.uses_gpu_balanced_table_renderer():
+            render_width = self.width if width is None else int(width)
+            render_height = self.height if height is None else int(height)
+            return self._gpu_renderer.render_table(
+                camera_pose_world,
+                intrinsic,
+                width=render_width,
+                height=render_height,
+            )
+        return self._render_layer_eye(
+            "table",
+            camera_pose_world,
+            intrinsic,
+            width=width,
+            height=height,
+        )
+
+    def render_table_eye_roi(
+        self,
+        camera_pose_world: np.ndarray,
+        full_intrinsic: np.ndarray,
+        roi_bounds: tuple[int, int, int, int],
+        render_scale: float = 1.0,
+        return_render_info: bool = False,
+    ) -> tuple[np.ndarray, np.ndarray] | tuple[np.ndarray, np.ndarray, dict[str, Any]] | tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
+        if self.uses_gpu_balanced_table_renderer():
+            roi_intrinsic, render_width, render_height, render_info = (
+                self._resolve_roi_render_params(
+                    full_intrinsic,
+                    roi_bounds,
+                    render_scale=render_scale,
+                )
+            )
+            render_color, render_depth = self._gpu_renderer.render_table(
+                camera_pose_world,
+                roi_intrinsic,
+                width=render_width,
+                height=render_height,
+            )
+            if return_render_info:
+                return render_color, render_depth, render_info
+            return render_color, render_depth
+        return self._render_layer_eye_roi(
+            "table",
+            camera_pose_world,
+            full_intrinsic,
+            roi_bounds,
+            render_scale=render_scale,
+            return_render_info=return_render_info,
+        )
+
+    def _render_balanced_layer(
+        self,
+        layer_name: str,
+        camera_pose_world: np.ndarray,
+        intrinsic: np.ndarray,
+        width: int | None = None,
+        height: int | None = None,
+    ) -> tuple[np.ndarray, np.ndarray] | tuple[torch.Tensor, torch.Tensor]:
+        if self._should_use_gpu_balanced_layer(layer_name):
+            render_width = self.width if width is None else int(width)
+            render_height = self.height if height is None else int(height)
+            try:
+                return self._gpu_renderer.render_plane_layer(
+                    layer_name,
+                    camera_pose_world,
+                    intrinsic,
+                    width=render_width,
+                    height=render_height,
+                )
+            except Exception:
+                pass
+        return self._render_layer_eye(
+            layer_name,
+            camera_pose_world,
+            intrinsic,
+            width=width,
+            height=height,
+        )
+
+    def _render_balanced_layer_roi(
+        self,
+        layer_name: str,
+        camera_pose_world: np.ndarray,
+        full_intrinsic: np.ndarray,
+        roi_bounds: tuple[int, int, int, int],
+    ) -> tuple[np.ndarray, np.ndarray] | tuple[torch.Tensor, torch.Tensor]:
+        if self._should_use_gpu_balanced_layer(layer_name):
+            roi_intrinsic, render_width, render_height, _ = self._resolve_roi_render_params(
+                full_intrinsic,
+                roi_bounds,
+                render_scale=1.0,
+            )
+            try:
+                return self._gpu_renderer.render_plane_layer(
+                    layer_name,
+                    camera_pose_world,
+                    roi_intrinsic,
+                    width=render_width,
+                    height=render_height,
+                )
+            except Exception:
+                pass
+        return self._render_layer_eye_roi(
+            layer_name,
+            camera_pose_world,
+            full_intrinsic,
+            roi_bounds,
+        )
+
+    def _should_use_gpu_balanced_layer(self, layer_name: str) -> bool:
+        layer_name = str(layer_name)
+        if layer_name in {"balanced_left_wall", "balanced_right_wall"}:
+            return self.uses_gpu_balanced_side_wall_renderer()
+        return self.uses_gpu_balanced_plane_renderer()
+
+    def _resolve_roi_render_params(
+        self,
+        full_intrinsic: np.ndarray,
+        roi_bounds: tuple[int, int, int, int],
+        render_scale: float = 1.0,
+    ) -> tuple[np.ndarray, int, int, dict[str, Any]]:
+        x0, y0, x1, y1 = [int(v) for v in roi_bounds]
+        if x1 <= x0 or y1 <= y0:
+            raise ValueError(f"Invalid ROI bounds: {roi_bounds}")
+        roi_width = x1 - x0
+        roi_height = y1 - y0
+        render_scale = max(float(render_scale), 1.0)
+        roi_intrinsic = np.array(full_intrinsic, dtype=np.float32, copy=True)
+        roi_intrinsic[0, 2] -= float(x0)
+        roi_intrinsic[1, 2] -= float(y0)
+        render_width = roi_width
+        render_height = roi_height
+        if render_scale > 1.0:
+            roi_intrinsic[0, 0] *= render_scale
+            roi_intrinsic[1, 1] *= render_scale
+            roi_intrinsic[0, 2] *= render_scale
+            roi_intrinsic[1, 2] *= render_scale
+            render_width = max(
+                4,
+                int(np.ceil((float(roi_width) * render_scale) / 4.0) * 4),
+            )
+            render_height = max(
+                4,
+                int(np.ceil((float(roi_height) * render_scale) / 4.0) * 4),
+            )
+        return (
+            roi_intrinsic,
+            render_width,
+            render_height,
+            {
+                "roi_width": int(roi_width),
+                "roi_height": int(roi_height),
+                "render_width": int(render_width),
+                "render_height": int(render_height),
+                "render_scale": float(render_scale),
+            },
+        )
+
+    def _setup_lights(self, scene) -> None:
         key_light = self._pyrender.DirectionalLight(
             color=np.ones(3, dtype=np.float32),
             intensity=3.5,
         )
-        self.scene.add(key_light, pose=trimesh.transformations.euler_matrix(-0.7, 0.35, 0.0))
+        scene.add(key_light, pose=trimesh.transformations.euler_matrix(-0.7, 0.35, 0.0))
         if self.lighting_mode == "full":
             fill_light = self._pyrender.DirectionalLight(
                 color=np.array([0.86, 0.90, 1.0], dtype=np.float32),
@@ -335,11 +763,11 @@ class SimpleLabSceneRenderer:
                 color=np.ones(3, dtype=np.float32),
                 intensity=22.0,
             )
-            self.scene.add(
+            scene.add(
                 fill_light,
                 pose=trimesh.transformations.euler_matrix(-1.1, -0.4, 0.0),
             )
-            self.scene.add(
+            scene.add(
                 point_light,
                 pose=trimesh.transformations.translation_matrix([0.0, 0.0, -0.2]),
             )
@@ -370,32 +798,196 @@ class SimpleLabSceneRenderer:
     def _rebuild_scene_nodes(self) -> None:
         if self.layout is None:
             return
-        if self.table_node is not None:
-            self.scene.remove_node(self.table_node)
-            self.table_node = None
-        if self.floor_node is not None:
-            self.scene.remove_node(self.floor_node)
-            self.floor_node = None
-        for node in self.wall_nodes:
-            self.scene.remove_node(node)
-        self.wall_nodes = []
+        positioned_table_mesh = self._make_positioned_table_mesh()
+        self._table_world_bounds = (
+            positioned_table_mesh.bounds[0].astype(np.float32).copy(),
+            positioned_table_mesh.bounds[1].astype(np.float32).copy(),
+        )
+        floor_mesh = self._make_floor_mesh()
+        wall_meshes = self._make_wall_meshes()
+        self._wall_world_bounds = {
+            wall_name: (
+                wall_mesh.bounds[0].astype(np.float32).copy(),
+                wall_mesh.bounds[1].astype(np.float32).copy(),
+            )
+            for wall_name, wall_mesh in wall_meshes.items()
+        }
+        if self._gpu_renderer is not None:
+            self._gpu_renderer.update_scene_geometry(
+                positioned_table_mesh,
+                floor_mesh,
+                wall_meshes,
+            )
+        for entry in self._layer_entries.values():
+            scene = entry["scene"]
+            if entry["table_node"] is not None:
+                scene.remove_node(entry["table_node"])
+                entry["table_node"] = None
+            if entry["floor_node"] is not None:
+                scene.remove_node(entry["floor_node"])
+                entry["floor_node"] = None
+            for node in entry["wall_nodes"]:
+                scene.remove_node(node)
+            entry["wall_nodes"] = []
 
-        self.table_node = self.scene.add(
-            self._pyrender.Mesh.from_trimesh(
-                self._make_positioned_table_mesh(),
-                smooth=False,
+            table_role = entry.get("table_role")
+            if table_role is not None:
+                table_mesh = positioned_table_mesh if table_role == "full" else None
+                if (
+                    table_mesh is not None
+                    and table_mesh.vertices.shape[0] > 0
+                    and table_mesh.faces.shape[0] > 0
+                ):
+                    entry["table_node"] = scene.add(
+                        self._pyrender.Mesh.from_trimesh(
+                            table_mesh.copy(),
+                            smooth=False,
+                        )
+                    )
+                else:
+                    entry["table_node"] = None
+            background_role = entry.get("background_role")
+            if background_role in {"all", "floor"}:
+                entry["floor_node"] = scene.add(
+                    self._pyrender.Mesh.from_trimesh(
+                        floor_mesh.copy(),
+                        smooth=False,
+                    )
+                )
+            if background_role in {"all", "front_back_walls"}:
+                for wall_name in ("front", "back"):
+                    entry["wall_nodes"].append(
+                        scene.add(
+                            self._pyrender.Mesh.from_trimesh(
+                                wall_meshes[wall_name].copy(),
+                                smooth=False,
+                            )
+                        )
+                    )
+            if background_role in {"all", "left_wall", "right_wall"}:
+                wall_names = (
+                    ("left", "right")
+                    if background_role == "all"
+                    else ("left",)
+                    if background_role == "left_wall"
+                    else ("right",)
+                )
+                for wall_name in wall_names:
+                    entry["wall_nodes"].append(
+                        scene.add(
+                            self._pyrender.Mesh.from_trimesh(
+                                wall_meshes[wall_name].copy(),
+                                smooth=False,
+                            )
+                        )
+                    )
+
+    def _get_layer_renderer(self, layer_name: str, width: int, height: int):
+        entry = self._ensure_layer_entry(layer_name)
+        renderer = entry.get("renderer")
+        if renderer is None:
+            if self.balanced_render_backend == "pyrender":
+                renderer_cls = (
+                    PyrenderCudaInteropOffscreenRenderer
+                    if self._pyrender_cuda_interop_supported
+                    else self._pyrender.OffscreenRenderer
+                )
+                renderer_kwargs = {}
+                if renderer_cls is PyrenderCudaInteropOffscreenRenderer:
+                    renderer_kwargs["device"] = torch.device(
+                        "cuda",
+                        torch.cuda.current_device(),
+                    )
+                renderer = renderer_cls(
+                    viewport_width=int(width),
+                    viewport_height=int(height),
+                    **renderer_kwargs,
+                )
+            else:
+                renderer = self._pyrender.OffscreenRenderer(
+                    viewport_width=int(width),
+                    viewport_height=int(height),
+                )
+            entry["renderer"] = renderer
+        else:
+            renderer.viewport_width = int(width)
+            renderer.viewport_height = int(height)
+        self._update_pyrender_readback_state(renderer)
+        return renderer
+
+    def _update_pyrender_readback_state(self, renderer) -> None:
+        mode = getattr(renderer, "readback_mode", None)
+        if mode is not None:
+            self._pyrender_readback_mode = str(mode)
+        reason = getattr(renderer, "fallback_reason", None)
+        if reason is not None:
+            self._pyrender_readback_reason = str(reason)
+
+    def _render_layer_eye(
+        self,
+        layer_name: str,
+        camera_pose_world: np.ndarray,
+        intrinsic: np.ndarray,
+        width: int | None = None,
+        height: int | None = None,
+    ) -> tuple[np.ndarray, np.ndarray] | tuple[torch.Tensor, torch.Tensor]:
+        if self.layout is None:
+            raise RuntimeError("Simple lab layout has not been configured.")
+        if width is None:
+            width = self.width
+        if height is None:
+            height = self.height
+        entry = self._ensure_layer_entry(layer_name)
+        camera = entry["camera"]
+        camera.fx = float(intrinsic[0, 0])
+        camera.fy = float(intrinsic[1, 1])
+        camera.cx = float(intrinsic[0, 2])
+        camera.cy = float(intrinsic[1, 2])
+        entry["scene"].set_pose(
+            entry["camera_node"],
+            pose=np.asarray(camera_pose_world, dtype=np.float32),
+        )
+        renderer = self._get_layer_renderer(layer_name, width, height)
+        color, depth = renderer.render(
+            entry["scene"],
+            flags=self._pyrender.RenderFlags.RGBA,
+        )
+        self._update_pyrender_readback_state(renderer)
+        if torch.is_tensor(depth):
+            return color, depth.to(dtype=torch.float32)
+        return color, depth.astype(np.float32)
+
+    def _render_layer_eye_roi(
+        self,
+        layer_name: str,
+        camera_pose_world: np.ndarray,
+        full_intrinsic: np.ndarray,
+        roi_bounds: tuple[int, int, int, int],
+        render_scale: float = 1.0,
+        return_render_info: bool = False,
+    ) -> (
+        tuple[np.ndarray, np.ndarray]
+        | tuple[torch.Tensor, torch.Tensor]
+        | tuple[np.ndarray, np.ndarray, dict[str, Any]]
+        | tuple[torch.Tensor, torch.Tensor, dict[str, Any]]
+    ):
+        roi_intrinsic, render_width, render_height, render_info = (
+            self._resolve_roi_render_params(
+                full_intrinsic,
+                roi_bounds,
+                render_scale=render_scale,
             )
         )
-        self.floor_node = self.scene.add(
-            self._pyrender.Mesh.from_trimesh(
-                self._make_floor_mesh(),
-                smooth=False,
-            )
+        render_color, render_depth = self._render_layer_eye(
+            layer_name,
+            camera_pose_world,
+            roi_intrinsic,
+            width=render_width,
+            height=render_height,
         )
-        for wall_mesh in self._make_wall_meshes():
-            self.wall_nodes.append(
-                self.scene.add(self._pyrender.Mesh.from_trimesh(wall_mesh, smooth=False))
-            )
+        if return_render_info:
+            return render_color, render_depth, render_info
+        return render_color, render_depth
 
     def _make_positioned_table_mesh(self) -> trimesh.Trimesh:
         assert self.layout is not None
@@ -524,7 +1116,7 @@ class SimpleLabSceneRenderer:
         )
         return mesh
 
-    def _make_wall_meshes(self) -> list[trimesh.Trimesh]:
+    def _make_wall_meshes(self) -> dict[str, trimesh.Trimesh]:
         assert self.layout is not None
         room_width = float(self.layout.room_half_extent[0] * 2.0)
         room_depth = float(self.layout.room_half_extent[1] * 2.0)
@@ -533,7 +1125,7 @@ class SimpleLabSceneRenderer:
         center_y = float(self.layout.table_top_center[1])
         floor_z = float(self.layout.floor_z)
         wall_z = floor_z - 0.5 * wall_height
-        meshes = []
+        meshes: dict[str, trimesh.Trimesh] = {}
 
         back_wall = self._wall_quad.copy()
         back_wall.apply_scale([room_width, wall_height, 1.0])
@@ -545,7 +1137,7 @@ class SimpleLabSceneRenderer:
                 [center_x, center_y - self.layout.room_half_extent[1], wall_z]
             )
         )
-        meshes.append(back_wall)
+        meshes["back"] = back_wall
 
         front_wall = self._wall_quad.copy()
         front_wall.apply_scale([room_width, wall_height, 1.0])
@@ -560,7 +1152,7 @@ class SimpleLabSceneRenderer:
                 [center_x, center_y + self.layout.room_half_extent[1], wall_z]
             )
         )
-        meshes.append(front_wall)
+        meshes["front"] = front_wall
 
         left_wall = self._wall_quad.copy()
         left_wall.apply_scale([room_depth, wall_height, 1.0])
@@ -575,7 +1167,7 @@ class SimpleLabSceneRenderer:
                 [center_x - self.layout.room_half_extent[0], center_y, wall_z]
             )
         )
-        meshes.append(left_wall)
+        meshes["left"] = left_wall
 
         right_wall = self._wall_quad.copy()
         right_wall.apply_scale([room_depth, wall_height, 1.0])
@@ -590,5 +1182,5 @@ class SimpleLabSceneRenderer:
                 [center_x + self.layout.room_half_extent[0], center_y, wall_z]
             )
         )
-        meshes.append(right_wall)
+        meshes["right"] = right_wall
         return meshes

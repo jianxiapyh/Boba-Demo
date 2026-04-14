@@ -36,10 +36,12 @@ constexpr int kPanelWindowHeight = 64;
 constexpr uint32_t kExpectedHeaderVersion = 1;
 #ifdef BOBA_IMMERSIVE_BRIDGE
 constexpr const char* kExpectedSharedFrameMagic = "BOBAQIM1";
-constexpr const char* kBinaryUsageName = "openxr_immersive_bridge";
+constexpr const char* kBinaryUsageName = "boba_immersive_bridge";
+constexpr const char* kApplicationName = "Boba Immersive Bridge";
 #else
 constexpr const char* kExpectedSharedFrameMagic = "BOBAQST1";
-constexpr const char* kBinaryUsageName = "openxr_frame_panel";
+constexpr const char* kBinaryUsageName = "boba_immersive_demo";
+constexpr const char* kApplicationName = "Boba Immersive Demo";
 #endif
 constexpr float kPanelDistanceMeters = 1.1f;
 constexpr float kPanelWidthMeters = 1.2f;
@@ -47,6 +49,7 @@ constexpr float kPanelYOffsetMeters = 0.0f;
 constexpr float kNearZ = 0.02f;
 constexpr float kFarZ = 100.0f;
 constexpr float kSelectPressedThreshold = 0.75f;
+constexpr float kExitPressedThreshold = 0.85f;
 volatile std::sig_atomic_t g_stop_requested = 0;
 
 struct SharedFrameHeader {
@@ -298,6 +301,30 @@ bool AppendSnapAssistBindings(
     return true;
 }
 
+bool AppendExitBindings(
+    XrInstance instance,
+    XrAction exit_value_action,
+    const char* profile_string,
+    std::vector<XrActionSuggestedBinding>* bindings) {
+    if (std::strcmp(profile_string, "/interaction_profiles/khr/simple_controller") == 0) {
+        return true;
+    }
+
+    const char* paths[] = {
+        "/user/hand/left/input/squeeze/value",
+        "/user/hand/right/input/squeeze/value",
+    };
+    bindings->reserve(bindings->size() + 2);
+    for (const char* path_string : paths) {
+        XrPath path = XR_NULL_PATH;
+        if (!StringToPath(instance, path_string, &path)) {
+            return false;
+        }
+        bindings->push_back({exit_value_action, path});
+    }
+    return true;
+}
+
 bool QueryControllerPose(
     XrInstance instance,
     XrSession session,
@@ -410,12 +437,39 @@ bool QuerySelectValueState(
     return true;
 }
 
+bool QueryExitValueState(
+    XrInstance instance,
+    XrSession session,
+    XrAction value_action,
+    XrPath subaction_path,
+    SelectStateSample* sample) {
+    XrActionStateGetInfo get_info =
+        MakeXrStruct<XrActionStateGetInfo>(XR_TYPE_ACTION_STATE_GET_INFO);
+    get_info.action = value_action;
+    get_info.subactionPath = subaction_path;
+
+    XrActionStateFloat state = MakeXrStruct<XrActionStateFloat>(XR_TYPE_ACTION_STATE_FLOAT);
+    if (!CheckXr(instance, xrGetActionStateFloat(session, &get_info, &state),
+                 "xrGetActionStateFloat(exit)")) {
+        return false;
+    }
+
+    if (state.isActive == XR_TRUE) {
+        sample->available = true;
+        sample->value = state.currentState;
+        sample->pressed = state.currentState >= kExitPressedThreshold;
+        sample->source = "value";
+    }
+    return true;
+}
+
 void PrintControllerJson(const char* prefix, const ControllerPoseSample& pose,
                          const ControllerPoseSample& grip,
                          const ControllerPoseSample& aim,
                          const SelectStateSample& select,
                          const SelectStateSample& anchor_cycle,
-                         const SelectStateSample& snap_assist) {
+                         const SelectStateSample& snap_assist,
+                         const SelectStateSample& exit_value) {
     std::cout << "\"" << prefix << "\":{";
     std::cout << "\"source\":\"" << pose.source << "\",";
     std::cout << "\"active\":" << (pose.action_active ? 1 : 0) << ",";
@@ -462,7 +516,11 @@ void PrintControllerJson(const char* prefix, const ControllerPoseSample& pose,
     std::cout << "\"anchor_cycle_source\":\"" << anchor_cycle.source << "\",";
     std::cout << "\"snap_assist_available\":" << (snap_assist.available ? 1 : 0) << ",";
     std::cout << "\"snap_assist_pressed\":" << (snap_assist.pressed ? 1 : 0) << ",";
-    std::cout << "\"snap_assist_source\":\"" << snap_assist.source << "\"";
+    std::cout << "\"snap_assist_source\":\"" << snap_assist.source << "\",";
+    std::cout << "\"exit_available\":" << (exit_value.available ? 1 : 0) << ",";
+    std::cout << "\"exit_pressed\":" << (exit_value.pressed ? 1 : 0) << ",";
+    std::cout << "\"exit_value\":" << exit_value.value << ",";
+    std::cout << "\"exit_source\":\"" << exit_value.source << "\"";
     std::cout << "}";
 }
 
@@ -1066,7 +1124,7 @@ int main(int argc, char** argv) {
     glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
 
     GLFWwindow* window =
-        glfwCreateWindow(kPanelWindowWidth, kPanelWindowHeight, "Boba Quest Frame Panel", nullptr,
+        glfwCreateWindow(kPanelWindowWidth, kPanelWindowHeight, "Boba Immersive Demo", nullptr,
                          nullptr);
     if (window == nullptr) {
         std::cerr << "glfwCreateWindow failed.\n";
@@ -1130,7 +1188,7 @@ int main(int argc, char** argv) {
 
     XrInstanceCreateInfo instance_info =
         MakeXrStruct<XrInstanceCreateInfo>(XR_TYPE_INSTANCE_CREATE_INFO);
-    std::strncpy(instance_info.applicationInfo.applicationName, "openxr_frame_panel",
+    std::strncpy(instance_info.applicationInfo.applicationName, kApplicationName,
                  XR_MAX_APPLICATION_NAME_SIZE - 1);
     std::strncpy(instance_info.applicationInfo.engineName, "none", XR_MAX_ENGINE_NAME_SIZE - 1);
     instance_info.applicationInfo.applicationVersion = 1;
@@ -1290,6 +1348,7 @@ int main(int argc, char** argv) {
     XrAction select_value_action = XR_NULL_HANDLE;
     XrAction anchor_cycle_click_action = XR_NULL_HANDLE;
     XrAction snap_assist_click_action = XR_NULL_HANDLE;
+    XrAction exit_value_action = XR_NULL_HANDLE;
     if (!create_action("grip_pose", "Grip Pose", XR_ACTION_TYPE_POSE_INPUT,
                        &grip_pose_action) ||
         !create_action("aim_pose", "Aim Pose", XR_ACTION_TYPE_POSE_INPUT, &aim_pose_action) ||
@@ -1300,7 +1359,9 @@ int main(int argc, char** argv) {
         !create_action("anchor_cycle_click", "Anchor Cycle Click",
                        XR_ACTION_TYPE_BOOLEAN_INPUT, &anchor_cycle_click_action) ||
         !create_action("snap_assist_click", "Snap Assist Click",
-                       XR_ACTION_TYPE_BOOLEAN_INPUT, &snap_assist_click_action)) {
+                       XR_ACTION_TYPE_BOOLEAN_INPUT, &snap_assist_click_action) ||
+        !create_action("exit_value", "Exit Value", XR_ACTION_TYPE_FLOAT_INPUT,
+                       &exit_value_action)) {
         xrDestroyActionSet(action_set);
         xrDestroySession(session);
         xrDestroyInstance(instance);
@@ -1324,6 +1385,7 @@ int main(int argc, char** argv) {
                                   &bindings) ||
             !AppendAnchorCycleBindings(instance, anchor_cycle_click_action, profile, &bindings) ||
             !AppendSnapAssistBindings(instance, snap_assist_click_action, profile, &bindings) ||
+            !AppendExitBindings(instance, exit_value_action, profile, &bindings) ||
             !SuggestBindingsForProfile(instance, profile, bindings)) {
             xrDestroyActionSet(action_set);
             xrDestroySession(session);
@@ -1560,6 +1622,8 @@ int main(int argc, char** argv) {
         SelectStateSample anchor_cycle_right;
         SelectStateSample snap_assist_left;
         SelectStateSample snap_assist_right;
+        SelectStateSample exit_left;
+        SelectStateSample exit_right;
         if (!QueryBooleanActionState(instance, session, select_click_action, left_hand_path,
                                      &select_left) ||
             !QueryBooleanActionState(instance, session, select_click_action, right_hand_path,
@@ -1575,7 +1639,11 @@ int main(int argc, char** argv) {
             !QueryBooleanActionState(instance, session, snap_assist_click_action,
                                      left_hand_path, &snap_assist_left) ||
             !QueryBooleanActionState(instance, session, snap_assist_click_action,
-                                     right_hand_path, &snap_assist_right)) {
+                                     right_hand_path, &snap_assist_right) ||
+            !QueryExitValueState(instance, session, exit_value_action, left_hand_path,
+                                 &exit_left) ||
+            !QueryExitValueState(instance, session, exit_value_action, right_hand_path,
+                                 &exit_right)) {
             break;
         }
 
@@ -1609,7 +1677,8 @@ int main(int argc, char** argv) {
             aim_left,
             select_left,
             anchor_cycle_left,
-            snap_assist_left
+            snap_assist_left,
+            exit_left
         );
         std::cout << ",";
         PrintControllerJson(
@@ -1619,7 +1688,8 @@ int main(int argc, char** argv) {
             aim_right,
             select_right,
             anchor_cycle_right,
-            snap_assist_right
+            snap_assist_right,
+            exit_right
         );
 #ifdef BOBA_IMMERSIVE_BRIDGE
         std::cout << ",";

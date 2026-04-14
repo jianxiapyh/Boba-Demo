@@ -1,6 +1,6 @@
 # Boba Demo
 
-This repo contains the code for the Quest-enabled Boba demo path: live OpenXR controller input on Linux, desktop compositing, and Quest panel display.
+This repo contains the code for the shipped Quest-enabled Boba demo path: live OpenXR controller input on Linux, immersive desktop compositing, and Quest immersive display.
 
 This export is intentionally trimmed. It does not include:
 - `data/`
@@ -23,7 +23,7 @@ gaussian_splatting/
 ```
 
 This repo provides the live demo code around them:
-- `interactive_playground_batched_view_orin.py`
+- `boba_quest_immersive.py`
 - `qqtt/`
 - `configs/`
 - `linux_pose_probe/`
@@ -48,31 +48,31 @@ env_install/5090_env_install.sh
 
 ## Main run commands
 
-Desktop + Quest primary display:
+Default Quest immersive run:
 
 ```bash
-conda run -n phystwin env PYTHONNOUSERSITE=1 python interactive_playground_batched_view_orin.py \
-  --case_name double_stretch_sloth -exp -eval --n_dup 0 \
-  --input_source live_openxr_controller \
-  --quest_display_mode primary \
+conda run -n phystwin env PYTHONNOUSERSITE=1 python boba_quest_immersive.py \
+  --case_name double_stretch_sloth \
+  --n_dup 0 \
   --interactive_window_mode hidden
 ```
 
-Desktop-only replay baseline:
+Quest immersive run with render profiling:
 
 ```bash
-conda run -n phystwin env PYTHONNOUSERSITE=1 python interactive_playground_batched_view_orin.py \
-  --case_name double_stretch_sloth -exp -eval --n_dup 0
+conda run -n phystwin env PYTHONNOUSERSITE=1 python boba_quest_immersive.py \
+  --case_name double_stretch_sloth \
+  --n_dup 0 \
+  --interactive_window_mode hidden \
+  --render_profile \
+  --render_profile_every 30
 ```
 
-Quest panel mirror:
-
-```bash
-conda run -n phystwin env PYTHONNOUSERSITE=1 python interactive_playground_batched_view_orin.py \
-  --case_name double_stretch_sloth -exp -eval --n_dup 0 \
-  --input_source live_openxr_controller \
-  --quest_display_mode panel
-```
+The launcher is intentionally fixed to:
+- `input_source=live_openxr_controller`
+- `quest_display_mode=immersive`
+- `scene_preset=simple_lab`
+- `immersive_render_preset=balanced`
 
 ## OpenXR helper programs
 

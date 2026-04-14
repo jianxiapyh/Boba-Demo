@@ -84,6 +84,10 @@ class ControllerPoseSample:
     snap_assist_available: bool
     snap_assist_pressed: bool
     snap_assist_source: str
+    exit_available: bool
+    exit_pressed: bool
+    exit_value: float
+    exit_source: str
     grip_active: bool = False
     grip_position_valid: bool = False
     grip_orientation_valid: bool = False
@@ -258,6 +262,10 @@ def parse_controller_payload(payload: dict) -> ControllerPoseSample:
         snap_assist_available=bool(payload["snap_assist_available"]),
         snap_assist_pressed=bool(payload["snap_assist_pressed"]),
         snap_assist_source=str(payload["snap_assist_source"]),
+        exit_available=bool(payload.get("exit_available", False)),
+        exit_pressed=bool(payload.get("exit_pressed", False)),
+        exit_value=float(payload.get("exit_value", 0.0)),
+        exit_source=str(payload.get("exit_source", "none")),
         grip_active=bool(payload.get("grip_active", payload["active"])),
         grip_position_valid=bool(payload.get("grip_position_valid", payload["position_valid"])),
         grip_orientation_valid=bool(

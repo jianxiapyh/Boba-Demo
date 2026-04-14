@@ -60,8 +60,8 @@ class OpenXRFramePanelMirror:
         self._pending_stage_copies: deque[dict] = deque()
         self._next_stage_index = 0
 
-        self.binary_path = self.repo_root / "linux_pose_probe" / "openxr_frame_panel"
-        self.build_script_path = self.repo_root / "linux_pose_probe" / "build_openxr_frame_panel.sh"
+        self.binary_path = self.repo_root / "linux_pose_probe" / "boba_immersive_demo"
+        self.build_script_path = self.repo_root / "linux_pose_probe" / "build_boba_immersive_demo.sh"
         self.source_path = self.repo_root / "linux_pose_probe" / "openxr_frame_panel.cpp"
         self.process: Optional[subprocess.Popen[str]] = None
         self._stdout_thread: Optional[threading.Thread] = None
@@ -110,7 +110,7 @@ class OpenXRFramePanelMirror:
         self._stdout_thread.start()
         self._stderr_thread.start()
         print(
-            f"[quest_display] started OpenXR frame panel pid={self.process.pid} "
+            f"[quest_display] started Boba Immersive Demo pid={self.process.pid} "
             f"shared_frame={self.shared_frame_path}",
             flush=True,
         )
@@ -125,7 +125,7 @@ class OpenXRFramePanelMirror:
         time.sleep(0.5)
         if self.process.poll() is not None:
             raise RuntimeError(
-                "Quest frame panel exited during startup.\n" + self.debug_summary()
+                "Boba Immersive Demo exited during startup.\n" + self.debug_summary()
             )
 
     def stop(self) -> None:
@@ -170,7 +170,7 @@ class OpenXRFramePanelMirror:
         }
         publish_start = time.perf_counter()
         if self._shared_mmap is None:
-            raise RuntimeError("Quest frame panel shared buffer is not initialized.")
+            raise RuntimeError("Boba Immersive Demo shared buffer is not initialized.")
         if frame_rgba.shape != (self.height, self.width, self.channels):
             raise ValueError(
                 f"Quest mirror frame shape {tuple(frame_rgba.shape)} != "
@@ -182,7 +182,7 @@ class OpenXRFramePanelMirror:
         if self.process is not None and self.process.poll() is not None:
             if not self._exit_logged:
                 print(
-                    "[quest_display] frame panel exited unexpectedly; "
+                    "[quest_display] Boba Immersive Demo exited unexpectedly; "
                     "disabling Quest publishing for this run.\n"
                     + self.debug_summary(),
                     flush=True,
@@ -299,7 +299,7 @@ class OpenXRFramePanelMirror:
                 return sample
             if self.process is not None and self.process.poll() is not None:
                 raise RuntimeError(
-                    "Quest frame panel exited before producing controller data.\n"
+                    "Boba Immersive Demo exited before producing controller data.\n"
                     + self.debug_summary()
                 )
             time.sleep(0.05)
@@ -459,9 +459,9 @@ class OpenXRImmersiveBridge(OpenXRFramePanelMirror):
             for _ in range(self.STAGING_BUFFER_COUNT)
         ]
         self._cpu_stage_arrays = [buffer.numpy() for buffer in self._cpu_stage_buffers]
-        self.binary_path = self.repo_root / "linux_pose_probe" / "openxr_immersive_bridge"
+        self.binary_path = self.repo_root / "linux_pose_probe" / "boba_immersive_bridge"
         self.build_script_path = (
-            self.repo_root / "linux_pose_probe" / "build_openxr_immersive_bridge.sh"
+            self.repo_root / "linux_pose_probe" / "build_boba_immersive_bridge.sh"
         )
         self.source_path = self.repo_root / "linux_pose_probe" / "openxr_frame_panel.cpp"
 

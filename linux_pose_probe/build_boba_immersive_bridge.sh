@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "${SCRIPT_DIR}"
-
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+output_path="${script_dir}/boba_immersive_bridge"
 if [[ -n "${CXX:-}" ]]; then
   compiler="${CXX}"
 elif command -v g++ >/dev/null 2>&1; then
@@ -22,8 +21,16 @@ if pkg-config --exists jsoncpp; then
   extra_flags+=("${jsoncpp_flags[@]}")
 fi
 
-"${compiler}" -std=c++17 -O2 -Wall -Wextra -pedantic \
-  openxr_frame_panel.cpp \
-  -o openxr_frame_panel \
+"${compiler}" \
+  -std=c++17 \
+  -O2 \
+  -Wall \
+  -Wextra \
+  -pedantic \
+  -DBOBA_IMMERSIVE_BRIDGE \
+  "${script_dir}/openxr_frame_panel.cpp" \
+  -o "${output_path}" \
   "${openxr_flags[@]}" \
   "${extra_flags[@]}"
+
+printf 'Built %s\n' "${output_path}"

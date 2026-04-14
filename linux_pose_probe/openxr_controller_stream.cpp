@@ -17,6 +17,7 @@ namespace {
 
 constexpr int kReadyTimeoutSeconds = 10;
 constexpr float kSelectPressedThreshold = 0.75f;
+constexpr float kExitPressedThreshold = 0.85f;
 volatile std::sig_atomic_t g_stop_requested = 0;
 
 template <typename T>
@@ -386,6 +387,30 @@ bool AppendSnapAssistBindings(
     return true;
 }
 
+bool AppendExitBindings(
+    XrInstance instance,
+    XrAction exit_value_action,
+    const char* profile_string,
+    std::vector<XrActionSuggestedBinding>* bindings) {
+    if (std::strcmp(profile_string, "/interaction_profiles/khr/simple_controller") == 0) {
+        return true;
+    }
+
+    const char* paths[] = {
+        "/user/hand/left/input/squeeze/value",
+        "/user/hand/right/input/squeeze/value",
+    };
+    bindings->reserve(bindings->size() + 2);
+    for (const char* path_string : paths) {
+        XrPath path = XR_NULL_PATH;
+        if (!StringToPath(instance, path_string, &path)) {
+            return false;
+        }
+        bindings->push_back({exit_value_action, path});
+    }
+    return true;
+}
+
 bool QueryControllerPose(
     XrInstance instance,
     XrSession session,
@@ -497,10 +522,37 @@ bool QuerySelectValueState(
     return true;
 }
 
+bool QueryExitValueState(
+    XrInstance instance,
+    XrSession session,
+    XrAction value_action,
+    XrPath subaction_path,
+    SelectStateSample* sample) {
+    XrActionStateGetInfo get_info =
+        MakeXrStruct<XrActionStateGetInfo>(XR_TYPE_ACTION_STATE_GET_INFO);
+    get_info.action = value_action;
+    get_info.subactionPath = subaction_path;
+
+    XrActionStateFloat state = MakeXrStruct<XrActionStateFloat>(XR_TYPE_ACTION_STATE_FLOAT);
+    if (!CheckXr(instance, xrGetActionStateFloat(session, &get_info, &state),
+                 "xrGetActionStateFloat(exit)")) {
+        return false;
+    }
+
+    if (state.isActive == XR_TRUE) {
+        sample->available = true;
+        sample->value = state.currentState;
+        sample->pressed = state.currentState >= kExitPressedThreshold;
+        sample->source = "value";
+    }
+    return true;
+}
+
 void PrintControllerJson(const char* prefix, const ControllerPoseSample& pose,
                          const SelectStateSample& select,
                          const SelectStateSample& anchor_cycle,
-                         const SelectStateSample& snap_assist) {
+                         const SelectStateSample& snap_assist,
+                         const SelectStateSample& exit_value) {
     std::cout << "\"" << prefix << "\":{";
     std::cout << "\"source\":\"" << pose.source << "\",";
     std::cout << "\"active\":" << (pose.action_active ? 1 : 0) << ",";
@@ -523,7 +575,11 @@ void PrintControllerJson(const char* prefix, const ControllerPoseSample& pose,
     std::cout << "\"anchor_cycle_source\":\"" << anchor_cycle.source << "\",";
     std::cout << "\"snap_assist_available\":" << (snap_assist.available ? 1 : 0) << ",";
     std::cout << "\"snap_assist_pressed\":" << (snap_assist.pressed ? 1 : 0) << ",";
-    std::cout << "\"snap_assist_source\":\"" << snap_assist.source << "\"";
+    std::cout << "\"snap_assist_source\":\"" << snap_assist.source << "\",";
+    std::cout << "\"exit_available\":" << (exit_value.available ? 1 : 0) << ",";
+    std::cout << "\"exit_pressed\":" << (exit_value.pressed ? 1 : 0) << ",";
+    std::cout << "\"exit_value\":" << exit_value.value << ",";
+    std::cout << "\"exit_source\":\"" << exit_value.source << "\"";
     std::cout << "}";
 }
 
@@ -656,6 +712,7 @@ int main(int argc, char** argv) {
     XrAction select_value_action = XR_NULL_HANDLE;
     XrAction anchor_cycle_click_action = XR_NULL_HANDLE;
     XrAction snap_assist_click_action = XR_NULL_HANDLE;
+    XrAction exit_value_action = XR_NULL_HANDLE;
     if (!create_action("grip_pose", "Grip Pose", XR_ACTION_TYPE_POSE_INPUT, &grip_pose_action) ||
         !create_action("aim_pose", "Aim Pose", XR_ACTION_TYPE_POSE_INPUT, &aim_pose_action) ||
         !create_action("select_click", "Select Click", XR_ACTION_TYPE_BOOLEAN_INPUT,
@@ -665,7 +722,9 @@ int main(int argc, char** argv) {
         !create_action("anchor_cycle_click", "Anchor Cycle Click",
                        XR_ACTION_TYPE_BOOLEAN_INPUT, &anchor_cycle_click_action) ||
         !create_action("snap_assist_click", "Snap Assist Click",
-                       XR_ACTION_TYPE_BOOLEAN_INPUT, &snap_assist_click_action)) {
+                       XR_ACTION_TYPE_BOOLEAN_INPUT, &snap_assist_click_action) ||
+        !create_action("exit_value", "Exit Value", XR_ACTION_TYPE_FLOAT_INPUT,
+                       &exit_value_action)) {
         xrDestroyActionSet(action_set);
         xrDestroyInstance(instance);
         return 1;
@@ -684,6 +743,7 @@ int main(int argc, char** argv) {
             !AppendSelectBindings(instance, select_click_action, select_value_action, profile, &bindings) ||
             !AppendAnchorCycleBindings(instance, anchor_cycle_click_action, profile, &bindings) ||
             !AppendSnapAssistBindings(instance, snap_assist_click_action, profile, &bindings) ||
+            !AppendExitBindings(instance, exit_value_action, profile, &bindings) ||
             !SuggestBindingsForProfile(instance, profile, bindings)) {
             xrDestroyActionSet(action_set);
             xrDestroyInstance(instance);
@@ -838,6 +898,8 @@ int main(int argc, char** argv) {
                 instance, session, anchor_cycle_click_action, "anchor_cycle_click");
             PrintBoundSourcesForAction(
                 instance, session, snap_assist_click_action, "snap_assist_click");
+            PrintBoundSourcesForAction(
+                instance, session, exit_value_action, "exit_value");
             printed_binding_summary = true;
         }
 
@@ -870,6 +932,8 @@ int main(int argc, char** argv) {
         SelectStateSample anchor_cycle_right;
         SelectStateSample snap_assist_left;
         SelectStateSample snap_assist_right;
+        SelectStateSample exit_left;
+        SelectStateSample exit_right;
         if (!QueryBooleanActionState(instance, session, select_click_action, left_hand_path,
                                      &select_left) ||
             !QueryBooleanActionState(instance, session, select_click_action, right_hand_path,
@@ -885,16 +949,33 @@ int main(int argc, char** argv) {
             !QueryBooleanActionState(instance, session, snap_assist_click_action,
                                      left_hand_path, &snap_assist_left) ||
             !QueryBooleanActionState(instance, session, snap_assist_click_action,
-                                     right_hand_path, &snap_assist_right)) {
+                                     right_hand_path, &snap_assist_right) ||
+            !QueryExitValueState(instance, session, exit_value_action, left_hand_path,
+                                 &exit_left) ||
+            !QueryExitValueState(instance, session, exit_value_action, right_hand_path,
+                                 &exit_right)) {
             break;
         }
 
         std::cout << "{";
         std::cout << "\"sample\":" << samples_emitted << ",";
-        PrintControllerJson("left", selected_left, select_left, anchor_cycle_left, snap_assist_left);
+        PrintControllerJson(
+            "left",
+            selected_left,
+            select_left,
+            anchor_cycle_left,
+            snap_assist_left,
+            exit_left
+        );
         std::cout << ",";
-        PrintControllerJson("right", selected_right, select_right, anchor_cycle_right,
-                            snap_assist_right);
+        PrintControllerJson(
+            "right",
+            selected_right,
+            select_right,
+            anchor_cycle_right,
+            snap_assist_right,
+            exit_right
+        );
         std::cout << "}\n";
 
         XrFrameEndInfo end_info = MakeXrStruct<XrFrameEndInfo>(XR_TYPE_FRAME_END_INFO);

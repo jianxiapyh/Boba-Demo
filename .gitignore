@@ -38,6 +38,10 @@ linux_pose_probe/openxr_hand_joint_stream
 linux_pose_probe/openxr_controller_stream
 linux_pose_probe/openxr_frame_panel
 linux_pose_probe/openxr_immersive_bridge
+linux_pose_probe/boba_immersive_demo
+linux_pose_probe/boba_immersive_bridge
+tools/compare_immersive_gpu_path_smoke/
+tools/compare_immersive_gpu_path_smoke_repair/
 
 # Track immersive scene manifest but keep downloaded assets ignored.
 !data/

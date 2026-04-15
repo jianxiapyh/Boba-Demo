@@ -18,12 +18,16 @@ from .pyrender_cuda_bridge import (
 
 MANIFEST_RELATIVE_PATH = Path("assets/scenes/ILLIXR_lab/manifest.json")
 ILLIXR_SCENE_NAME = "ILLIXR_lab"
+ILLIXR_BAKED_LIGHTING_MODE = "baked_texture_ambient"
 
 TARGET_TABLE_SIZE_X = 0.95
 TARGET_TABLE_SIZE_Y = 0.68
 TABLE_SUPPORT_HEIGHT_MIN = 0.12
 TABLE_SUPPORT_AREA_MIN = 0.08
 TABLE_SUPPORT_GAP_Y = 0.03
+TABLE_PRIMARY_PATCH_MIN_SPAN = 0.35
+TABLE_PRIMARY_PATCH_MIN_LONG_SPAN = 0.75
+TABLE_COMPONENT_VERTICAL_REACH = 0.95
 COLLIDER_COMPONENT_AREA_MIN = 0.30
 COLLIDER_HORIZONTAL_AREA_MIN = 0.12
 COLLIDER_VERTICAL_HEIGHT_MIN = 0.32
@@ -48,6 +52,8 @@ class SimpleLabLayout:
     scene_up: np.ndarray
     room_center_xy: np.ndarray | None = None
     static_collider_boxes: np.ndarray | None = None
+    active_table_bounds: np.ndarray | None = None
+    active_table_surface_center: np.ndarray | None = None
 
     @property
     def scene_down(self) -> np.ndarray:
@@ -59,6 +65,12 @@ class SimpleLabLayout:
 
     @property
     def table_box(self) -> SceneColliderBox:
+        if self.active_table_bounds is not None:
+            bounds = np.asarray(self.active_table_bounds, dtype=np.float32)
+            return SceneColliderBox(
+                mins=bounds[0].copy(),
+                maxs=bounds[1].copy(),
+            )
         table_half = self.table_size[:2] * 0.5
         mins = np.array(
             [
@@ -116,6 +128,21 @@ def _normalize(vec: np.ndarray, eps: float = 1e-6) -> np.ndarray:
     return vec / norm
 
 
+def _cluster_sorted_value_groups(values: np.ndarray, gap: float) -> list[np.ndarray]:
+    values = np.asarray(values, dtype=np.float32)
+    if values.size == 0:
+        return []
+    order = np.argsort(values)
+    ordered_values = values[order]
+    groups: list[np.ndarray] = []
+    start = 0
+    for idx in range(1, ordered_values.shape[0] + 1):
+        if idx == ordered_values.shape[0] or abs(float(ordered_values[idx] - ordered_values[idx - 1])) > gap:
+            groups.append(order[start:idx].copy())
+            start = idx
+    return groups
+
+
 def _cluster_support_levels(
     heights: np.ndarray,
     areas: np.ndarray,
@@ -156,6 +183,95 @@ def _cluster_support_levels(
             start = idx
     levels.sort(key=lambda level: (level["area"], level["y"]), reverse=True)
     return levels
+
+
+def _split_face_group_by_connectivity(
+    face_indices: np.ndarray,
+    face_adjacency: np.ndarray,
+) -> list[np.ndarray]:
+    face_indices = np.asarray(face_indices, dtype=np.int64)
+    if face_indices.size == 0:
+        return []
+    if face_indices.size == 1:
+        return [face_indices.copy()]
+
+    face_lookup = {int(face_id): idx for idx, face_id in enumerate(face_indices.tolist())}
+    parent = np.arange(face_indices.shape[0], dtype=np.int64)
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = int(parent[x])
+        return x
+
+    def union(a: int, b: int) -> None:
+        root_a = find(a)
+        root_b = find(b)
+        if root_a != root_b:
+            parent[root_b] = root_a
+
+    for edge in np.asarray(face_adjacency, dtype=np.int64):
+        local_a = face_lookup.get(int(edge[0]))
+        local_b = face_lookup.get(int(edge[1]))
+        if local_a is None or local_b is None:
+            continue
+        union(local_a, local_b)
+
+    groups: dict[int, list[int]] = {}
+    for local_idx, face_id in enumerate(face_indices.tolist()):
+        root = find(int(local_idx))
+        groups.setdefault(root, []).append(int(face_id))
+    return [np.asarray(group, dtype=np.int64) for group in groups.values()]
+
+
+def _build_support_patches(
+    mesh: trimesh.Trimesh,
+    face_indices: np.ndarray,
+    face_centroids: np.ndarray,
+    face_areas: np.ndarray,
+    gap: float = TABLE_SUPPORT_GAP_Y,
+) -> list[dict[str, Any]]:
+    face_indices = np.asarray(face_indices, dtype=np.int64)
+    if face_indices.size == 0:
+        return []
+
+    face_adjacency = np.asarray(mesh.face_adjacency, dtype=np.int64)
+    level_groups = _cluster_sorted_value_groups(face_centroids[face_indices, 1], gap=gap)
+    support_patches: list[dict[str, Any]] = []
+    patch_index = 0
+    for level_id, level_group in enumerate(level_groups):
+        level_face_indices = face_indices[level_group]
+        patch_groups = _split_face_group_by_connectivity(level_face_indices, face_adjacency)
+        for patch_face_indices in patch_groups:
+            patch_areas = np.asarray(face_areas[patch_face_indices], dtype=np.float32)
+            total_area = float(np.sum(patch_areas))
+            if total_area <= 1e-6:
+                continue
+            patch_centers = np.asarray(face_centroids[patch_face_indices], dtype=np.float32)
+            weights = patch_areas / total_area
+            patch_vertices = np.asarray(
+                mesh.vertices[mesh.faces[patch_face_indices].reshape(-1)],
+                dtype=np.float32,
+            )
+            patch_bounds_min = patch_vertices.min(axis=0)
+            patch_bounds_max = patch_vertices.max(axis=0)
+            patch_center = np.sum(patch_centers * weights[:, None], axis=0)
+            support_patches.append(
+                {
+                    "patch_index": int(patch_index),
+                    "level_id": int(level_id),
+                    "face_count": int(patch_face_indices.shape[0]),
+                    "face_indices": patch_face_indices.astype(np.int64),
+                    "y": float(np.sum(patch_centers[:, 1] * weights)),
+                    "area": total_area,
+                    "center": patch_center.astype(np.float32),
+                    "bounds_min": patch_bounds_min.astype(np.float32),
+                    "bounds_max": patch_bounds_max.astype(np.float32),
+                }
+            )
+            patch_index += 1
+    support_patches.sort(key=lambda patch: (patch["area"], patch["y"]), reverse=True)
+    return support_patches
 
 
 def _transform_points(points: np.ndarray, transform: np.ndarray) -> np.ndarray:
@@ -352,7 +468,8 @@ class SimpleLabSceneRenderer:
 
         self.width = int(width)
         self.height = int(height)
-        self.lighting_mode = str(lighting_mode)
+        self.requested_lighting_mode = str(lighting_mode)
+        self.lighting_mode = self._resolve_lighting_mode(lighting_mode)
         self.balanced_render_backend = "pyrender"
         self._pyrender = pyrender
         self.scene_root = ensure_illixr_lab_assets(scene_assets_root)
@@ -361,7 +478,7 @@ class SimpleLabSceneRenderer:
 
         self._scene_clear_color = np.array([243, 244, 246, 255], dtype=np.uint8)
         self._table_clear_color = np.array([0, 0, 0, 0], dtype=np.uint8)
-        self._ambient_light = np.array([0.22, 0.22, 0.22], dtype=np.float32)
+        self._ambient_light = self._ambient_light_for_mode(self.lighting_mode)
         self._layer_specs = {
             "full": {
                 "bg_color": self._scene_clear_color,
@@ -461,14 +578,30 @@ class SimpleLabSceneRenderer:
         (
             self._table_component_ids,
             self._table_support_component_ids,
-            self._asset_table_support_bounds,
-            self._asset_table_support_center,
-            self._asset_table_support_height,
+            self._asset_table_scale_reference_bounds,
+            self._asset_table_scale_reference_center,
+            self._asset_table_scale_reference_height,
+            self._asset_startup_table_patch,
+            self._asset_visible_tabletop_patches,
         ) = self._select_table_components(self._furniture_component_records)
         self._table_asset_mesh = self._slice_mesh_by_component_ids(
             self._furniture_asset_mesh,
             self._furniture_component_labels,
             self._table_component_ids,
+        )
+        self._startup_table_asset_mesh = self._slice_mesh_by_face_indices(
+            self._furniture_asset_mesh,
+            np.asarray(self._asset_startup_table_patch["face_indices"], dtype=np.int64),
+        )
+        self._visible_tabletop_asset_mesh = self._slice_mesh_by_face_indices(
+            self._furniture_asset_mesh,
+            np.concatenate(
+                [
+                    np.asarray(patch["face_indices"], dtype=np.int64)
+                    for patch in self._asset_visible_tabletop_patches
+                ],
+                axis=0,
+            ),
         )
         self._left_wall_asset_mesh = self._slice_mesh_by_face_mask(
             self._wall_asset_mesh,
@@ -503,6 +636,21 @@ class SimpleLabSceneRenderer:
         if not geometries:
             raise ValueError(f"Could not resolve scene geometry group: {names}")
         return trimesh.util.concatenate(geometries)
+
+    def _resolve_lighting_mode(self, lighting_mode: str) -> str:
+        requested = str(lighting_mode)
+        if requested == ILLIXR_BAKED_LIGHTING_MODE:
+            return requested
+        # The vendored room already contains a baked look in its textures, so
+        # favor a bright ambient presentation over extra relighting.
+        return ILLIXR_BAKED_LIGHTING_MODE
+
+    def _ambient_light_for_mode(self, lighting_mode: str) -> np.ndarray:
+        if str(lighting_mode) == ILLIXR_BAKED_LIGHTING_MODE:
+            return np.array([0.98, 0.98, 0.98], dtype=np.float32)
+        if str(lighting_mode) == "simple":
+            return np.array([0.40, 0.40, 0.40], dtype=np.float32)
+        return np.array([0.22, 0.22, 0.22], dtype=np.float32)
 
     def _make_layer_entry(self, layer_name: str) -> dict[str, Any]:
         layer_spec = self._layer_specs[layer_name]
@@ -814,6 +962,8 @@ class SimpleLabSceneRenderer:
         )
 
     def _setup_lights(self, scene) -> None:
+        if self.lighting_mode == ILLIXR_BAKED_LIGHTING_MODE:
+            return
         key_light = self._pyrender.DirectionalLight(
             color=np.ones(3, dtype=np.float32),
             intensity=3.5,
@@ -846,6 +996,22 @@ class SimpleLabSceneRenderer:
         if not component_ids:
             return trimesh.Trimesh(vertices=np.zeros((0, 3)), faces=np.zeros((0, 3), dtype=np.int64), process=False)
         face_mask = np.isin(labels, np.asarray(component_ids, dtype=np.int64))
+        return self._slice_mesh_by_face_mask(mesh, face_mask)
+
+    def _slice_mesh_by_face_indices(
+        self,
+        mesh: trimesh.Trimesh,
+        face_indices: np.ndarray,
+    ) -> trimesh.Trimesh:
+        face_indices = np.asarray(face_indices, dtype=np.int64)
+        if face_indices.size == 0:
+            return trimesh.Trimesh(
+                vertices=np.zeros((0, 3)),
+                faces=np.zeros((0, 3), dtype=np.int64),
+                process=False,
+            )
+        face_mask = np.zeros((mesh.faces.shape[0],), dtype=bool)
+        face_mask[face_indices] = True
         return self._slice_mesh_by_face_mask(mesh, face_mask)
 
     def _split_wall_faces(self, mesh: trimesh.Trimesh) -> dict[str, np.ndarray]:
@@ -885,22 +1051,38 @@ class SimpleLabSceneRenderer:
             bounds_min = component_vertices.min(axis=0)
             bounds_max = component_vertices.max(axis=0)
             horizontal_mask = component_face_mask & horizontal_face_mask
+            support_patches: list[dict[str, Any]] = []
             support_levels: list[dict[str, Any]] = []
             if np.any(horizontal_mask):
                 support_face_indices = np.nonzero(horizontal_mask)[0]
-                support_bounds_min = np.zeros((support_face_indices.shape[0], 3), dtype=np.float32)
-                support_bounds_max = np.zeros((support_face_indices.shape[0], 3), dtype=np.float32)
-                for idx, face_index in enumerate(support_face_indices):
-                    face_vertices = np.asarray(mesh.vertices[mesh.faces[face_index]], dtype=np.float32)
-                    support_bounds_min[idx] = face_vertices.min(axis=0)
-                    support_bounds_max[idx] = face_vertices.max(axis=0)
-                support_levels = _cluster_support_levels(
-                    face_centroids[support_face_indices, 1],
-                    face_areas[support_face_indices],
-                    support_bounds_min,
-                    support_bounds_max,
-                    face_centroids[support_face_indices],
+                support_patches = _build_support_patches(
+                    mesh,
+                    support_face_indices,
+                    face_centroids,
+                    face_areas,
                 )
+                if support_patches:
+                    patch_heights = np.asarray([patch["y"] for patch in support_patches], dtype=np.float32)
+                    patch_areas = np.asarray([patch["area"] for patch in support_patches], dtype=np.float32)
+                    patch_bounds_min = np.stack(
+                        [np.asarray(patch["bounds_min"], dtype=np.float32) for patch in support_patches],
+                        axis=0,
+                    )
+                    patch_bounds_max = np.stack(
+                        [np.asarray(patch["bounds_max"], dtype=np.float32) for patch in support_patches],
+                        axis=0,
+                    )
+                    patch_centers = np.stack(
+                        [np.asarray(patch["center"], dtype=np.float32) for patch in support_patches],
+                        axis=0,
+                    )
+                    support_levels = _cluster_support_levels(
+                        patch_heights,
+                        patch_areas,
+                        patch_bounds_min,
+                        patch_bounds_max,
+                        patch_centers,
+                    )
             support_top_level = support_levels[0] if support_levels else None
             component_records.append(
                 {
@@ -913,12 +1095,13 @@ class SimpleLabSceneRenderer:
                     "horizontal_area": float(
                         np.sum(
                             [
-                                level["area"]
-                                for level in support_levels
-                                if level["y"] >= (self._asset_floor_y + TABLE_SUPPORT_HEIGHT_MIN)
+                                patch["area"]
+                                for patch in support_patches
+                                if patch["y"] >= (self._asset_floor_y + TABLE_SUPPORT_HEIGHT_MIN)
                             ]
                         )
                     ),
+                    "support_patches": support_patches,
                     "support_levels": support_levels,
                     "support_top_level": support_top_level,
                 }
@@ -928,7 +1111,15 @@ class SimpleLabSceneRenderer:
     def _select_table_components(
         self,
         component_records: list[dict[str, Any]],
-    ) -> tuple[list[int], list[int], tuple[np.ndarray, np.ndarray], np.ndarray, float]:
+    ) -> tuple[
+        list[int],
+        list[int],
+        tuple[np.ndarray, np.ndarray],
+        np.ndarray,
+        float,
+        dict[str, Any],
+        list[dict[str, Any]],
+    ]:
         room_center_xz = self._asset_room_center_xz
         candidates: list[tuple[float, dict[str, Any]]] = []
         for record in component_records:
@@ -968,7 +1159,7 @@ class SimpleLabSceneRenderer:
         if not support_component_ids:
             support_component_ids = [int(primary_record["id"])]
 
-        support_bounds_min = np.min(
+        scale_reference_bounds_min = np.min(
             [
                 next(
                     level["bounds_min"]
@@ -980,7 +1171,7 @@ class SimpleLabSceneRenderer:
             ],
             axis=0,
         ).astype(np.float32)
-        support_bounds_max = np.max(
+        scale_reference_bounds_max = np.max(
             [
                 next(
                     level["bounds_max"]
@@ -992,18 +1183,18 @@ class SimpleLabSceneRenderer:
             ],
             axis=0,
         ).astype(np.float32)
-        support_center = np.array(
+        scale_reference_center = np.array(
             [
-                0.5 * float(support_bounds_min[0] + support_bounds_max[0]),
+                0.5 * float(scale_reference_bounds_min[0] + scale_reference_bounds_max[0]),
                 primary_y,
-                0.5 * float(support_bounds_min[2] + support_bounds_max[2]),
+                0.5 * float(scale_reference_bounds_min[2] + scale_reference_bounds_max[2]),
             ],
             dtype=np.float32,
         )
 
         support_expand = np.array([0.18, 0.02, 0.18], dtype=np.float32)
-        expanded_min = support_bounds_min.copy()
-        expanded_max = support_bounds_max.copy()
+        expanded_min = scale_reference_bounds_min.copy()
+        expanded_max = scale_reference_bounds_max.copy()
         expanded_min[[0, 2]] -= support_expand[[0, 2]]
         expanded_max[[0, 2]] += support_expand[[0, 2]]
         table_component_ids = set(support_component_ids)
@@ -1026,12 +1217,71 @@ class SimpleLabSceneRenderer:
                 continue
             table_component_ids.add(int(record["id"]))
 
+        startup_patch_candidates: list[tuple[float, float, float, dict[str, Any]]] = []
+        startup_bounds_min = scale_reference_bounds_min.copy()
+        startup_bounds_max = scale_reference_bounds_max.copy()
+        startup_bounds_min[[0, 2]] -= np.array([0.10, 0.10], dtype=np.float32)
+        startup_bounds_max[[0, 2]] += np.array([0.10, 0.10], dtype=np.float32)
+        for record in component_records:
+            if int(record["id"]) not in set(support_component_ids):
+                continue
+            for patch in record.get("support_patches", []):
+                if patch["y"] <= (self._asset_floor_y + TABLE_SUPPORT_HEIGHT_MIN):
+                    continue
+                if float(patch["area"]) < TABLE_SUPPORT_AREA_MIN:
+                    continue
+                patch_extents = np.asarray(
+                    patch["bounds_max"] - patch["bounds_min"],
+                    dtype=np.float32,
+                )
+                if min(float(patch_extents[0]), float(patch_extents[2])) < 0.10:
+                    continue
+                overlaps_xz = not (
+                    float(patch["bounds_max"][0]) < float(startup_bounds_min[0])
+                    or float(patch["bounds_min"][0]) > float(startup_bounds_max[0])
+                    or float(patch["bounds_max"][2]) < float(startup_bounds_min[2])
+                    or float(patch["bounds_min"][2]) > float(startup_bounds_max[2])
+                )
+                if not overlaps_xz:
+                    continue
+                dist = float(
+                    np.linalg.norm(
+                        np.asarray(patch["center"], dtype=np.float32)[[0, 2]]
+                        - scale_reference_center[[0, 2]]
+                    )
+                )
+                startup_patch_candidates.append(
+                    (
+                        float(patch["y"]),
+                        float(patch["area"]),
+                        -dist,
+                        patch,
+                    )
+                )
+
+        if not startup_patch_candidates:
+            raise RuntimeError(
+                "Could not identify a connected startup table patch in ILLIXR_lab."
+            )
+
+        highest_patch_y = max(candidate[0] for candidate in startup_patch_candidates)
+        highest_patch_candidates = [
+            candidate
+            for candidate in startup_patch_candidates
+            if candidate[0] >= (highest_patch_y - TABLE_SUPPORT_GAP_Y)
+        ]
+        highest_patch_candidates.sort(key=lambda item: (item[1], item[2]), reverse=True)
+        startup_patch = highest_patch_candidates[0][3]
+        visible_tabletop_patches = [candidate[3] for candidate in highest_patch_candidates]
+
         return (
             sorted(table_component_ids),
-            sorted(support_component_ids),
-            (support_bounds_min, support_bounds_max),
-            support_center,
+            sorted(set(support_component_ids)),
+            (scale_reference_bounds_min, scale_reference_bounds_max),
+            scale_reference_center,
             primary_y,
+            startup_patch,
+            visible_tabletop_patches,
         )
 
     def _select_collision_component_records(
@@ -1075,29 +1325,32 @@ class SimpleLabSceneRenderer:
     def _prepare_positioned_scene(self) -> None:
         assert self.layout is not None
         target_xy = self._table_target_size_xy()
-        support_bounds_min, support_bounds_max = self._asset_table_support_bounds
-        support_extent_xy = np.array(
+        scale_reference_bounds_min, scale_reference_bounds_max = (
+            self._asset_table_scale_reference_bounds
+        )
+        scale_reference_extent_xy = np.array(
             [
-                float(support_bounds_max[0] - support_bounds_min[0]),
-                float(support_bounds_max[2] - support_bounds_min[2]),
+                float(scale_reference_bounds_max[0] - scale_reference_bounds_min[0]),
+                float(scale_reference_bounds_max[2] - scale_reference_bounds_min[2]),
             ],
             dtype=np.float32,
         )
         scene_scale = float(
             max(
-                float(target_xy[0]) / max(float(support_extent_xy[0]), 1e-4),
-                float(target_xy[1]) / max(float(support_extent_xy[1]), 1e-4),
+                float(target_xy[0]) / max(float(scale_reference_extent_xy[0]), 1e-4),
+                float(target_xy[1]) / max(float(scale_reference_extent_xy[1]), 1e-4),
             )
         )
 
         asset_to_world = self._asset_to_world_rotation()
         scale_transform = np.diag([scene_scale, scene_scale, scene_scale, 1.0]).astype(np.float32)
         pre_translation = asset_to_world @ scale_transform
-        support_center_world = _transform_points(
-            self._asset_table_support_center.reshape(1, 3), pre_translation
+        startup_table_center_world = _transform_points(
+            np.asarray(self._asset_startup_table_patch["center"], dtype=np.float32).reshape(1, 3),
+            pre_translation,
         )[0]
         translation = (
-            np.asarray(self.layout.table_top_center, dtype=np.float32) - support_center_world
+            np.asarray(self.layout.table_top_center, dtype=np.float32) - startup_table_center_world
         )
         world_transform = trimesh.transformations.translation_matrix(translation).astype(np.float32) @ pre_translation
 
@@ -1105,7 +1358,7 @@ class SimpleLabSceneRenderer:
         self._full_scene_mesh_world.apply_transform(world_transform)
         self._background_mesh_world = self._full_scene_mesh_world.copy()
 
-        self._table_mesh_world = self._table_asset_mesh.copy()
+        self._table_mesh_world = self._visible_tabletop_asset_mesh.copy()
         self._table_mesh_world.apply_transform(world_transform)
 
         self._floor_mesh_world = self._floor_asset_mesh.copy()
@@ -1120,6 +1373,29 @@ class SimpleLabSceneRenderer:
 
         full_bounds = self._full_scene_mesh_world.bounds.astype(np.float32)
         floor_z = float(np.median(self._floor_mesh_world.vertices[:, 2]))
+        startup_patch_bounds_min = np.asarray(
+            self._asset_startup_table_patch["bounds_min"],
+            dtype=np.float32,
+        )
+        startup_patch_bounds_max = np.asarray(
+            self._asset_startup_table_patch["bounds_max"],
+            dtype=np.float32,
+        )
+        active_table_world_min, active_table_world_max = _transform_bounds(
+            startup_patch_bounds_min,
+            startup_patch_bounds_max,
+            world_transform,
+        )
+        active_table_world_bounds = np.stack(
+            [active_table_world_min, active_table_world_max],
+            axis=0,
+        ).astype(np.float32)
+        self.layout.active_table_bounds = np.array(active_table_world_bounds, copy=True)
+        startup_surface_center_world = _transform_points(
+            np.asarray(self._asset_startup_table_patch["center"], dtype=np.float32).reshape(1, 3),
+            world_transform,
+        )[0].astype(np.float32)
+        self.layout.active_table_surface_center = startup_surface_center_world.copy()
         room_center_xy = np.array(
             [
                 0.5 * float(full_bounds[0, 0] + full_bounds[1, 0]),
@@ -1138,16 +1414,16 @@ class SimpleLabSceneRenderer:
         self.layout.floor_z = floor_z
         self.layout.wall_height = float(max(floor_z - float(full_bounds[0, 2]), 0.1))
 
-        table_world_bounds = self._table_mesh_world.bounds.astype(np.float32)
+        visible_table_world_bounds = self._table_mesh_world.bounds.astype(np.float32)
         self._table_world_bounds = (
-            table_world_bounds[0].copy(),
-            table_world_bounds[1].copy(),
+            visible_table_world_bounds[0].copy(),
+            visible_table_world_bounds[1].copy(),
         )
         self.layout.table_size = np.array(
             [
-                float(self._asset_table_support_bounds[1][0] - self._asset_table_support_bounds[0][0]) * scene_scale,
-                float(self._asset_table_support_bounds[1][2] - self._asset_table_support_bounds[0][2]) * scene_scale,
-                float(max(table_world_bounds[1, 2] - table_world_bounds[0, 2], 0.12)),
+                float(visible_table_world_bounds[1, 0] - visible_table_world_bounds[0, 0]),
+                float(visible_table_world_bounds[1, 1] - visible_table_world_bounds[0, 1]),
+                float(max(visible_table_world_bounds[1, 2] - visible_table_world_bounds[0, 2], 0.12)),
             ],
             dtype=np.float32,
         )
@@ -1229,9 +1505,16 @@ class SimpleLabSceneRenderer:
         self.layout.static_collider_boxes = np.array(self._scene_collider_boxes, copy=True)
 
         scene_up = np.asarray(self.layout.scene_up, dtype=np.float32)
-        collider_top_center = np.asarray(self.layout.table_top_center, dtype=np.float32)
+        collider_top_center = np.array(
+            [
+                0.5 * float(active_table_world_bounds[0, 0] + active_table_world_bounds[1, 0]),
+                0.5 * float(active_table_world_bounds[0, 1] + active_table_world_bounds[1, 1]),
+                float(active_table_world_bounds[0, 2]),
+            ],
+            dtype=np.float32,
+        )
         collider_top_plane = float(np.dot(collider_top_center, scene_up))
-        world_surface_center = np.asarray(self.layout.table_top_center, dtype=np.float32)
+        world_surface_center = startup_surface_center_world.copy()
         world_surface_plane = float(np.dot(world_surface_center, scene_up))
         world_surface_normal = np.array([0.0, 0.0, -1.0], dtype=np.float32)
         self._table_alignment_debug = {
@@ -1244,8 +1527,12 @@ class SimpleLabSceneRenderer:
             },
             "table_component_ids": [int(v) for v in self._table_component_ids],
             "support_component_ids": [int(v) for v in self._table_support_component_ids],
-            "local_surface_center": self._asset_table_support_center.astype(np.float32).tolist(),
-            "local_surface_plane_height": float(self._asset_table_support_height),
+            "local_surface_center": np.asarray(
+                self._asset_startup_table_patch["center"],
+                dtype=np.float32,
+            ).tolist(),
+            "local_surface_plane_height": float(self._asset_startup_table_patch["y"]),
+            "active_table_support_patch_count": int(len(self._asset_visible_tabletop_patches)),
             "local_surface_normal": self._asset_up.astype(np.float32).tolist(),
             "surface_normal_alignment": float(np.dot(world_surface_normal, scene_up)),
             "world_surface_center": world_surface_center.astype(np.float32).tolist(),
@@ -1253,7 +1540,10 @@ class SimpleLabSceneRenderer:
             "world_surface_normal": world_surface_normal.astype(np.float32).tolist(),
             "collider_top_center": collider_top_center.astype(np.float32).tolist(),
             "collider_top_plane_height": collider_top_plane,
+            "native_table_support_size_xy": scale_reference_extent_xy.astype(np.float32).tolist(),
             "scaled_table_support_size_xy": self.layout.table_size[:2].astype(np.float32).tolist(),
+            "active_table_world_bounds": active_table_world_bounds.astype(np.float32).tolist(),
+            "visible_table_world_bounds": visible_table_world_bounds.astype(np.float32).tolist(),
             "room_bounds": full_bounds.astype(np.float32).tolist(),
             "collider_box_count": int(self._scene_collider_boxes.shape[0]),
         }
@@ -1337,6 +1627,22 @@ class SimpleLabSceneRenderer:
         if reason is not None:
             self._pyrender_readback_reason = str(reason)
 
+    def _postprocess_render_color(
+        self,
+        color: np.ndarray | torch.Tensor,
+    ) -> np.ndarray | torch.Tensor:
+        if self.lighting_mode != ILLIXR_BAKED_LIGHTING_MODE:
+            return color
+        gamma = 1.0 / 2.2
+        if torch.is_tensor(color):
+            color_rgb = torch.clamp(color[..., :3] / 255.0, 0.0, 1.0)
+            color[..., :3] = torch.pow(color_rgb, gamma) * 255.0
+            return color
+        color = np.array(color, copy=True)
+        color_rgb = np.clip(color[..., :3].astype(np.float32) / 255.0, 0.0, 1.0)
+        color[..., :3] = np.power(color_rgb, gamma) * 255.0
+        return color
+
     def _render_layer_eye(
         self,
         layer_name: str,
@@ -1367,6 +1673,7 @@ class SimpleLabSceneRenderer:
             flags=self._pyrender.RenderFlags.RGBA,
         )
         self._update_pyrender_readback_state(renderer)
+        color = self._postprocess_render_color(color)
         if torch.is_tensor(depth):
             return color, depth.to(dtype=torch.float32)
         return color, depth.astype(np.float32)

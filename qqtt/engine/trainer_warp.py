@@ -184,19 +184,19 @@ class InvPhyTrainerWarp:
             "scene_render_scale": 1.0,
             "scene_stereo_mode": "per_eye",
             "overlay_mode": "full",
-            "lighting_mode": "full",
+            "lighting_mode": "baked_texture_ambient",
         },
         "balanced": {
-            "scene_render_scale": 0.75,
+            "scene_render_scale": 0.875,
             "scene_stereo_mode": IMMERSIVE_BALANCED_INTERNAL_STEREO_MODE,
             "overlay_mode": "minimal",
-            "lighting_mode": "simple",
+            "lighting_mode": "baked_texture_ambient",
         },
         "performance": {
             "scene_render_scale": 0.625,
             "scene_stereo_mode": "reproject_from_center",
             "overlay_mode": "minimal",
-            "lighting_mode": "simple",
+            "lighting_mode": "baked_texture_ambient",
         },
     }
     IMMERSIVE_SCENE_RENDER_SCALE_MIN = 0.25
@@ -743,19 +743,19 @@ class InvPhyTrainerWarp:
         left_mask = pixels[:, 0] <= center_pixel[0]
         right_mask = pixels[:, 0] > center_pixel[0]
         center_score = torch.linalg.norm(pixels - center_pixel.unsqueeze(0), dim=1)
-        upper_target = center_pixel + object_points.new_tensor([0.0, -0.22 * spread_y])
-        upper_torso_mask = (
-            (torch.abs(pixels[:, 0] - center_pixel[0]) <= max(spread_x * 0.22, 8.0))
-            & upper_mask
+        torso_half_width = max(spread_x * 0.18, 8.0)
+        torso_half_height = max(spread_y * 0.16, 10.0)
+        torso_center_mask = (
+            (torch.abs(pixels[:, 0] - center_pixel[0]) <= torso_half_width)
+            & (torch.abs(pixels[:, 1] - center_pixel[1]) <= torso_half_height)
         )
-        upper_torso_score = torch.linalg.norm(pixels - upper_target.unsqueeze(0), dim=1)
 
         anchor_specs = [
             ("left_leg", left_mask & lower_mask, center_score, True),
             ("right_leg", right_mask & lower_mask, center_score, True),
             ("left_arm", left_mask & upper_mask, center_score, True),
             ("right_arm", right_mask & upper_mask, center_score, True),
-            ("upper_torso", upper_torso_mask, upper_torso_score, False),
+            ("torso_center", torso_center_mask, center_score, False),
         ]
 
         used_indices = set()
@@ -5412,9 +5412,46 @@ class InvPhyTrainerWarp:
         context,
         table_surface_center_world=None,
     ):
+        support_center, table_center, xy_error, z_error = self._scene_spawn_alignment_metrics(
+            object_points,
+            layout,
+            table_surface_center_world=table_surface_center_world,
+        )
+        if xy_error > self.IMMERSIVE_STARTUP_CENTER_EPS or z_error > self.IMMERSIVE_STARTUP_PLANE_EPS:
+            raise RuntimeError(
+                f"Immersive scene spawn validation failed during {context}: "
+                f"support_center={support_center.detach().cpu().numpy().tolist()} "
+                f"table_top_center={table_center.detach().cpu().numpy().tolist()} "
+                f"xy_error={xy_error:.4f} z_error={z_error:.4f}"
+            )
+        return support_center
+
+    def _scene_table_surface_center_world(self, layout):
+        active_table_surface_center = getattr(layout, "active_table_surface_center", None)
+        if active_table_surface_center is not None:
+            return np.asarray(active_table_surface_center, dtype=np.float32)
+        active_table_bounds = getattr(layout, "active_table_bounds", None)
+        if active_table_bounds is None:
+            return np.asarray(layout.table_top_center, dtype=np.float32)
+        bounds = np.asarray(active_table_bounds, dtype=np.float32)
+        return np.array(
+            [
+                0.5 * float(bounds[0, 0] + bounds[1, 0]),
+                0.5 * float(bounds[0, 1] + bounds[1, 1]),
+                float(bounds[0, 2]),
+            ],
+            dtype=np.float32,
+        )
+
+    def _scene_spawn_alignment_metrics(
+        self,
+        object_points,
+        layout,
+        table_surface_center_world=None,
+    ):
         support_center = self._object_support_patch_center(object_points)
         target_center = (
-            layout.table_top_center
+            self._scene_table_surface_center_world(layout)
             if table_surface_center_world is None
             else table_surface_center_world
         )
@@ -5425,14 +5462,7 @@ class InvPhyTrainerWarp:
         )
         xy_error = float(torch.linalg.norm(support_center[:2] - table_center[:2]).item())
         z_error = float(torch.abs(support_center[2] - table_center[2]).item())
-        if xy_error > self.IMMERSIVE_STARTUP_CENTER_EPS or z_error > self.IMMERSIVE_STARTUP_PLANE_EPS:
-            raise RuntimeError(
-                f"Immersive scene spawn validation failed during {context}: "
-                f"support_center={support_center.detach().cpu().numpy().tolist()} "
-                f"table_top_center={table_center.detach().cpu().numpy().tolist()} "
-                f"xy_error={xy_error:.4f} z_error={z_error:.4f}"
-            )
-        return support_center
+        return support_center, table_center, xy_error, z_error
 
     def _save_immersive_startup_debug_images(self, output_dir, frames):
         if not output_dir:
@@ -9525,7 +9555,7 @@ class InvPhyTrainerWarp:
                     "so scene/background/table compose stays tensor-only."
                 )
             table_alignment_debug = scene_renderer.table_alignment_debug()
-            table_surface_center_world = layout.table_top_center
+            table_surface_center_world = self._scene_table_surface_center_world(layout)
             if table_alignment_debug is not None:
                 collider_top_plane_height = float(
                     table_alignment_debug["collider_top_plane_height"]
@@ -9553,6 +9583,7 @@ class InvPhyTrainerWarp:
                     f"surface_center={table_alignment_debug['world_surface_center']} "
                     f"surface_plane={world_surface_plane_height:.4f} "
                     f"collider_plane={collider_top_plane_height:.4f} "
+                    f"visible_table_patches={table_alignment_debug.get('active_table_support_patch_count', 'n/a')} "
                     f"collider_boxes={table_alignment_debug.get('collider_box_count', 'n/a')}",
                     flush=True,
                 )
@@ -9565,7 +9596,7 @@ class InvPhyTrainerWarp:
 
             spawn_shift = self._compute_scene_spawn_shift(
                 obj_init_vertices,
-                layout.table_top_center,
+                table_surface_center_world,
             )
             spawn_shift = spawn_shift.to(device=cfg.device, dtype=torch.float32)
             obj_init_vertices = obj_init_vertices + spawn_shift
@@ -9787,10 +9818,16 @@ class InvPhyTrainerWarp:
                 context="spawn shift",
                 table_surface_center_world=table_surface_center_world,
             )
+            _, _, spawn_xy_error, spawn_z_error = self._scene_spawn_alignment_metrics(
+                self.batch_init_vertices[: self.num_all_points],
+                layout,
+                table_surface_center_world=table_surface_center_world,
+            )
             print(
                 "[quest_display] immersive spawn shift: "
                 f"shift={spawn_shift.detach().cpu().numpy().tolist()} "
-                f"support_center={spawn_support_center.detach().cpu().numpy().tolist()}",
+                f"support_center={spawn_support_center.detach().cpu().numpy().tolist()} "
+                f"xy_error={spawn_xy_error:.4f} z_error={spawn_z_error:.4f}",
                 flush=True,
             )
             live_controller_alignment = None
@@ -9924,6 +9961,11 @@ class InvPhyTrainerWarp:
                 context="settled rest state",
                 table_surface_center_world=table_surface_center_world,
             )
+            _, _, settled_xy_error, settled_z_error = self._scene_spawn_alignment_metrics(
+                x[: self.num_all_points],
+                layout,
+                table_surface_center_world=table_surface_center_world,
+            )
             settled_bounds_min = (
                 x[: self.num_all_points].min(dim=0).values.detach().cpu().numpy().tolist()
             )
@@ -9933,6 +9975,7 @@ class InvPhyTrainerWarp:
             print(
                 "[quest_display] immersive settled rest state: "
                 f"support_center={settled_support_center.detach().cpu().numpy().tolist()} "
+                f"xy_error={settled_xy_error:.4f} z_error={settled_z_error:.4f} "
                 f"bounds_min={settled_bounds_min} bounds_max={settled_bounds_max}",
                 flush=True,
             )

@@ -184,19 +184,19 @@ class InvPhyTrainerWarp:
             "scene_render_scale": 1.0,
             "scene_stereo_mode": "per_eye",
             "overlay_mode": "full",
-            "lighting_mode": "baked_texture_ambient",
+            "lighting_mode": "full",
         },
         "balanced": {
-            "scene_render_scale": 0.875,
+            "scene_render_scale": 0.75,
             "scene_stereo_mode": IMMERSIVE_BALANCED_INTERNAL_STEREO_MODE,
             "overlay_mode": "minimal",
-            "lighting_mode": "baked_texture_ambient",
+            "lighting_mode": "simple",
         },
         "performance": {
             "scene_render_scale": 0.625,
             "scene_stereo_mode": "reproject_from_center",
             "overlay_mode": "minimal",
-            "lighting_mode": "baked_texture_ambient",
+            "lighting_mode": "simple",
         },
     }
     IMMERSIVE_SCENE_RENDER_SCALE_MIN = 0.25
@@ -257,6 +257,8 @@ class InvPhyTrainerWarp:
     IMMERSIVE_BALANCED_TABLE_ROI_MIN_SIZE = 64
     IMMERSIVE_BALANCED_TABLE_ROI_SHRINK_MAX_PX = 16
     IMMERSIVE_BALANCED_TABLE_ROI_SUPERSAMPLE_SCALE = 1.25
+    IMMERSIVE_STARTUP_KEEPALIVE_INTERVAL_SECONDS = 0.25
+    IMMERSIVE_STARTUP_KEEPALIVE_RGBA = [232, 232, 232, 255]
     IMMERSIVE_GAUSSIAN_COMPOSE_ROI_PADDING = 24
     TIMING_OVERLAY_TEXT_COLOR = [255.0, 255.0, 255.0]
     TIMING_OVERLAY_BG_COLOR = [0.0, 0.0, 0.0]
@@ -886,13 +888,13 @@ class InvPhyTrainerWarp:
         )
 
         left_def = self._build_anchor_def_from_seed(
-            "left_end",
+            "endpoint_a",
             left_seed,
             object_points,
             region_node_count,
         )
         right_def = self._build_anchor_def_from_seed(
-            "right_end",
+            "endpoint_b",
             right_seed,
             object_points,
             region_node_count,
@@ -905,8 +907,29 @@ class InvPhyTrainerWarp:
         )
         if left_def is None or right_def is None or middle_def is None:
             return []
+        return [left_def, middle_def, right_def]
 
-        endpoint_defs = [left_def, right_def]
+    def _resolve_rope_endpoint_anchor_defs(self, anchor_defs, intrinsic, w2c):
+        debug = {
+            "case_name": self._interaction_anchor_case_name(),
+            "endpoint_projected_x": {},
+            "naming_valid": False,
+            "fallback_used": False,
+        }
+        if debug["case_name"] != "rope":
+            return anchor_defs, debug
+
+        endpoint_defs = []
+        other_defs = []
+        for anchor_def in anchor_defs:
+            if anchor_def["name"] in {"endpoint_a", "endpoint_b", "left_end", "right_end"}:
+                endpoint_defs.append(anchor_def)
+            else:
+                other_defs.append(anchor_def)
+        if len(endpoint_defs) != 2:
+            debug["fallback_used"] = True
+            return anchor_defs, debug
+
         endpoint_projected = []
         endpoint_valid = []
         for anchor_def in endpoint_defs:
@@ -915,18 +938,27 @@ class InvPhyTrainerWarp:
                 intrinsic,
                 w2c,
             )
-            endpoint_projected.append(screen_x)
-            endpoint_valid.append(valid)
-        if all(endpoint_valid):
-            order = sorted(
-                range(2),
-                key=lambda idx: (endpoint_projected[idx], idx),
+            debug["endpoint_projected_x"][anchor_def["name"]] = (
+                float(screen_x) if valid and screen_x is not None else None
             )
-            endpoint_defs = [endpoint_defs[idx] for idx in order]
+            endpoint_projected.append(screen_x)
+            endpoint_valid.append(bool(valid and screen_x is not None))
 
-        endpoint_defs[0]["name"] = "left_end"
-        endpoint_defs[1]["name"] = "right_end"
-        return [endpoint_defs[0], middle_def, endpoint_defs[1]]
+        if all(endpoint_valid):
+            endpoint_order = sorted(
+                range(2),
+                key=lambda idx: (float(endpoint_projected[idx]), idx),
+            )
+            debug["naming_valid"] = True
+        else:
+            endpoint_order = [0, 1]
+            debug["fallback_used"] = True
+
+        resolved_left = dict(endpoint_defs[endpoint_order[0]])
+        resolved_right = dict(endpoint_defs[endpoint_order[1]])
+        resolved_left["name"] = "left_end"
+        resolved_right["name"] = "right_end"
+        return [resolved_left, *other_defs, resolved_right], debug
 
     def _build_case_interaction_anchors(self, object_points, intrinsic, w2c):
         if self._interaction_anchor_case_name() == "rope":
@@ -1012,9 +1044,7 @@ class InvPhyTrainerWarp:
         source_in_order = left_source_x <= right_source_x
         anchor_in_order = left_anchor_x <= right_anchor_x
         debug["mapping_valid"] = True
-        if source_in_order != anchor_in_order:
-            default_anchor_names = {"left": "right_end", "right": "left_end"}
-            debug["mapping_swapped"] = True
+        debug["mapping_crossed"] = bool(source_in_order != anchor_in_order)
 
         debug["resolved_default_anchor_names"] = dict(default_anchor_names)
         return default_anchor_names, debug
@@ -1029,6 +1059,7 @@ class InvPhyTrainerWarp:
             f"default_anchor_names={mapping_debug['default_anchor_names']} "
             f"resolved_default_anchor_names={mapping_debug['resolved_default_anchor_names']} "
             f"mapping_valid={int(bool(mapping_debug['mapping_valid']))} "
+            f"crossed={int(bool(mapping_debug.get('mapping_crossed', False)))} "
             f"swap={int(bool(mapping_debug['mapping_swapped']))}",
             flush=True,
         )
@@ -4987,10 +5018,17 @@ class InvPhyTrainerWarp:
             f"right_controller({self._format_controller_pose_startup_state(sample.right)})"
         )
 
-    def _wait_for_valid_immersive_startup_sample(self, immersive_bridge, timeout=10.0):
+    def _wait_for_valid_immersive_startup_sample(
+        self,
+        immersive_bridge,
+        timeout=10.0,
+        progress_callback=None,
+    ):
         deadline = time.time() + timeout
         last_sample = None
         while time.time() < deadline:
+            if progress_callback is not None:
+                progress_callback("startup_wait_for_sample")
             sample = immersive_bridge.get_latest_sample()
             if sample is not None:
                 last_sample = sample
@@ -5014,6 +5052,136 @@ class InvPhyTrainerWarp:
             f"last_sample: {diagnostics}\n"
             + immersive_bridge.debug_summary()
         )
+
+    def _immersive_bridge_process_state(self, immersive_bridge):
+        if immersive_bridge is None:
+            return "not_started"
+        process = getattr(immersive_bridge, "process", None)
+        if process is None:
+            return "not_started"
+        exit_code = process.poll()
+        if exit_code is None:
+            return "alive"
+        return f"exited(code={exit_code})"
+
+    def _make_immersive_startup_timeline(self):
+        return {
+            "t0": time.perf_counter(),
+            "milestones": [],
+            "last_milestone": None,
+            "bridge_started_ms": None,
+            "first_publish_done_ms": None,
+        }
+
+    def _record_immersive_startup_milestone(self, startup_timeline, name, immersive_bridge=None):
+        elapsed_ms = (time.perf_counter() - startup_timeline["t0"]) * 1000.0
+        bridge_state = self._immersive_bridge_process_state(immersive_bridge)
+        milestone = {
+            "name": str(name),
+            "elapsed_ms": float(elapsed_ms),
+            "bridge_state": bridge_state,
+        }
+        startup_timeline["milestones"].append(milestone)
+        startup_timeline["last_milestone"] = str(name)
+        if name == "bridge_started":
+            startup_timeline["bridge_started_ms"] = float(elapsed_ms)
+        elif name == "first_publish_done":
+            startup_timeline["first_publish_done_ms"] = float(elapsed_ms)
+            bridge_started_ms = startup_timeline.get("bridge_started_ms")
+            if bridge_started_ms is not None:
+                startup_timeline["startup_gap_ms"] = float(elapsed_ms - bridge_started_ms)
+        print(
+            "[quest_display] immersive startup milestone: "
+            f"{name} elapsed_ms={elapsed_ms:.1f} bridge={bridge_state}",
+            flush=True,
+        )
+        return milestone
+
+    def _format_immersive_startup_timeline_failure(
+        self,
+        startup_timeline,
+        immersive_bridge=None,
+    ):
+        if startup_timeline is None:
+            return ""
+        bridge_state = self._immersive_bridge_process_state(immersive_bridge)
+        bridge_started_ms = startup_timeline.get("bridge_started_ms")
+        last_milestone = startup_timeline.get("last_milestone")
+        elapsed_ms = (time.perf_counter() - startup_timeline["t0"]) * 1000.0
+        parts = [
+            "immersive startup timeline failure: "
+            f"last_completed_milestone={last_milestone} "
+            f"elapsed_ms={elapsed_ms:.1f} "
+            f"bridge={bridge_state}"
+        ]
+        if bridge_started_ms is not None:
+            parts.append(
+                f"elapsed_since_bridge_started_ms={elapsed_ms - bridge_started_ms:.1f}"
+            )
+        return " ".join(parts)
+
+    def _make_immersive_startup_keepalive_state(self, eye_width, eye_height):
+        color = torch.tensor(
+            self.IMMERSIVE_STARTUP_KEEPALIVE_RGBA,
+            dtype=torch.uint8,
+            device=cfg.device,
+        )
+        frame = color.view(1, 1, 4).expand(eye_height, eye_width, 4).contiguous().clone()
+        return {
+            "left_frame": frame,
+            "right_frame": frame.clone(),
+            "last_publish_time": None,
+            "publish_count": 0,
+            "enabled": True,
+        }
+
+    def _maybe_publish_immersive_startup_keepalive(
+        self,
+        immersive_bridge,
+        keepalive_state,
+        *,
+        reason,
+        startup_timeline=None,
+        force=False,
+    ):
+        if keepalive_state is None or not keepalive_state.get("enabled", False):
+            return False
+        now = time.perf_counter()
+        last_publish_time = keepalive_state.get("last_publish_time")
+        if (
+            not force
+            and last_publish_time is not None
+            and (now - last_publish_time)
+            < self.IMMERSIVE_STARTUP_KEEPALIVE_INTERVAL_SECONDS
+        ):
+            return False
+        publish_ok, publish_stats = immersive_bridge.publish_stereo_frames(
+            keepalive_state["left_frame"],
+            keepalive_state["right_frame"],
+        )
+        keepalive_state["last_publish_time"] = now
+        if publish_ok:
+            keepalive_state["publish_count"] = int(keepalive_state.get("publish_count", 0)) + 1
+        bridge_state = self._immersive_bridge_process_state(immersive_bridge)
+        total_wall_ms = float(publish_stats.get("total_wall", 0.0)) * 1000.0
+        print(
+            "[quest_display] immersive startup keepalive: "
+            f"reason={reason} publish_ok={int(bool(publish_ok))} "
+            f"count={keepalive_state.get('publish_count', 0)} "
+            f"bridge={bridge_state} publish_wall_ms={total_wall_ms:.2f}",
+            flush=True,
+        )
+        if not publish_ok:
+            failure_details = self._format_immersive_startup_timeline_failure(
+                startup_timeline,
+                immersive_bridge,
+            )
+            raise RuntimeError(
+                "Quest immersive bridge stopped accepting stereo frames during startup keepalive.\n"
+                + (failure_details + "\n" if failure_details else "")
+                + immersive_bridge.debug_summary()
+            )
+        return True
 
     def _convert_live_eye_to_world_pose(self, eye_sample: EyePoseSample, head_alignment):
         if head_alignment is None or not eye_sample.pose_valid:
@@ -5244,45 +5412,9 @@ class InvPhyTrainerWarp:
         context,
         table_surface_center_world=None,
     ):
-        support_center, table_center, xy_error, z_error = (
-            self._scene_spawn_alignment_metrics(
-                object_points,
-                layout,
-                table_surface_center_world=table_surface_center_world,
-            )
-        )
-        if xy_error > self.IMMERSIVE_STARTUP_CENTER_EPS or z_error > self.IMMERSIVE_STARTUP_PLANE_EPS:
-            raise RuntimeError(
-                f"Immersive scene spawn validation failed during {context}: "
-                f"support_center={support_center.detach().cpu().numpy().tolist()} "
-                f"table_top_center={table_center.detach().cpu().numpy().tolist()} "
-                f"xy_error={xy_error:.4f} z_error={z_error:.4f}"
-            )
-        return support_center
-
-    def _scene_table_surface_center_world(self, layout):
-        active_table_bounds = getattr(layout, "active_table_bounds", None)
-        if active_table_bounds is None:
-            return np.asarray(layout.table_top_center, dtype=np.float32)
-        bounds = np.asarray(active_table_bounds, dtype=np.float32)
-        return np.array(
-            [
-                0.5 * float(bounds[0, 0] + bounds[1, 0]),
-                0.5 * float(bounds[0, 1] + bounds[1, 1]),
-                float(bounds[0, 2]),
-            ],
-            dtype=np.float32,
-        )
-
-    def _scene_spawn_alignment_metrics(
-        self,
-        object_points,
-        layout,
-        table_surface_center_world=None,
-    ):
         support_center = self._object_support_patch_center(object_points)
         target_center = (
-            self._scene_table_surface_center_world(layout)
+            layout.table_top_center
             if table_surface_center_world is None
             else table_surface_center_world
         )
@@ -5293,7 +5425,14 @@ class InvPhyTrainerWarp:
         )
         xy_error = float(torch.linalg.norm(support_center[:2] - table_center[:2]).item())
         z_error = float(torch.abs(support_center[2] - table_center[2]).item())
-        return support_center, table_center, xy_error, z_error
+        if xy_error > self.IMMERSIVE_STARTUP_CENTER_EPS or z_error > self.IMMERSIVE_STARTUP_PLANE_EPS:
+            raise RuntimeError(
+                f"Immersive scene spawn validation failed during {context}: "
+                f"support_center={support_center.detach().cpu().numpy().tolist()} "
+                f"table_top_center={table_center.detach().cpu().numpy().tolist()} "
+                f"xy_error={xy_error:.4f} z_error={z_error:.4f}"
+            )
+        return support_center
 
     def _save_immersive_startup_debug_images(self, output_dir, frames):
         if not output_dir:
@@ -5401,7 +5540,10 @@ class InvPhyTrainerWarp:
         scene_height=None,
         reproject_caches=None,
         gaussian_compose_roi_padding=None,
+        progress_callback=None,
     ):
+        if progress_callback is not None:
+            progress_callback("startup_validation_enter")
         if scene_width is None:
             scene_width = int(scene_renderer.width)
         if scene_height is None:
@@ -5575,11 +5717,15 @@ class InvPhyTrainerWarp:
                 "left": (left_scene_color, left_scene_depth),
                 "right": (right_scene_color, right_scene_depth),
             }
+            if progress_callback is not None:
+                progress_callback("startup_validation_scene_frames_ready")
 
         for eye_name, eye_sample, eye_pose_world in (
             ("left", left_eye_sample, left_eye_pose_world),
             ("right", right_eye_sample, right_eye_pose_world),
         ):
+            if progress_callback is not None:
+                progress_callback(f"startup_validation_eye_{eye_name}_begin")
             if eye_sample is None or not eye_sample.pose_valid or eye_pose_world is None:
                 continue
             startup_debug[f"{eye_name}_eye_pose_world"] = eye_pose_world.tolist()
@@ -5861,6 +6007,8 @@ class InvPhyTrainerWarp:
                 invalid_scene_depth_eyes.append(eye_name)
             if compose_metrics.get("scene_depth_suppressed", False):
                 suppressed_by_scene_depth_eyes.append(eye_name)
+            if progress_callback is not None:
+                progress_callback(f"startup_validation_eye_{eye_name}_done")
 
         startup_debug["projection_failures"] = projection_failures
         startup_debug["scene_depth_invalid_eyes"] = invalid_scene_depth_eyes
@@ -5902,6 +6050,8 @@ class InvPhyTrainerWarp:
                 debug_renders,
                 startup_debug,
             )
+        if progress_callback is not None:
+            progress_callback("startup_validation_complete")
         return startup_debug
 
     def _sources_pending_grab_start_validation(self, controller_interaction_state):
@@ -6257,10 +6407,12 @@ class InvPhyTrainerWarp:
         boxes = torch.as_tensor(boxes_np, dtype=torch.float32, device=cfg.device)
         self.simulator.set_static_collision_boxes(boxes)
 
-    def _settle_scene_rest_state(self, rest_target):
+    def _settle_scene_rest_state(self, rest_target, progress_callback=None):
         self.simulator.set_controller_interactive(rest_target, rest_target)
         last_state = None
-        for _ in range(self.IMMERSIVE_SCENE_REST_SETTLE_STEPS):
+        for step_idx in range(self.IMMERSIVE_SCENE_REST_SETTLE_STEPS):
+            if progress_callback is not None:
+                progress_callback(f"settle_step_{step_idx}")
             if self.simulator.object_collision_flag:
                 self.simulator.update_collision_graph()
             wp.capture_launch(self.simulator.forward_graph)
@@ -6274,6 +6426,8 @@ class InvPhyTrainerWarp:
                 break
         if last_state is None:
             last_state = self._capture_sim_state()
+        if progress_callback is not None:
+            progress_callback("settle_complete")
         return last_state
 
     def _snap_to_scene_rest_if_idle(self, scene_rest_state, controller_interaction_state):
@@ -9004,6 +9158,9 @@ class InvPhyTrainerWarp:
         immersive_compose_mode = "depth_aware"
         gaussian_compose_roi_padding = None
         startup_render_debug = None
+        startup_timeline = None
+        startup_keepalive_state = None
+        first_real_publish_done = False
         self._immersive_balanced_runtime_state = None
 
         diagnostic_output_path = output_dir
@@ -9136,15 +9293,76 @@ class InvPhyTrainerWarp:
         immersive_render_profile_rows = [] if render_profile else None
 
         try:
+            startup_timeline = self._make_immersive_startup_timeline()
+            self._record_immersive_startup_milestone(
+                startup_timeline,
+                "scene_renderer_construct_begin",
+                immersive_bridge,
+            )
+            scene_renderer = SimpleLabSceneRenderer(
+                scene_assets_root=scene_assets_root,
+                width=scene_width,
+                height=scene_height,
+                lighting_mode=immersive_render_options["lighting_mode"],
+                balanced_render_backend=(
+                    "pyrender"
+                    if active_scene_stereo_mode
+                    == self.IMMERSIVE_BALANCED_INTERNAL_STEREO_MODE
+                    else "auto"
+                ),
+            )
+            self._record_immersive_startup_milestone(
+                startup_timeline,
+                "scene_renderer_construct_done",
+                immersive_bridge,
+            )
+            self._record_immersive_startup_milestone(
+                startup_timeline,
+                "bridge_start_begin",
+                immersive_bridge,
+            )
             immersive_bridge = OpenXRImmersiveBridge(
                 repo_root,
                 width=eye_width,
                 height=eye_height,
             )
             immersive_bridge.start()
+            self._record_immersive_startup_milestone(
+                startup_timeline,
+                "bridge_started",
+                immersive_bridge,
+            )
+            startup_keepalive_state = self._make_immersive_startup_keepalive_state(
+                eye_width,
+                eye_height,
+            )
+            self._maybe_publish_immersive_startup_keepalive(
+                immersive_bridge,
+                startup_keepalive_state,
+                reason="bridge_started",
+                startup_timeline=startup_timeline,
+                force=True,
+            )
             initial_sample = self._wait_for_valid_immersive_startup_sample(
                 immersive_bridge,
                 timeout=10.0,
+                progress_callback=lambda reason: self._maybe_publish_immersive_startup_keepalive(
+                    immersive_bridge,
+                    startup_keepalive_state,
+                    reason=reason,
+                    startup_timeline=startup_timeline,
+                ),
+            )
+            self._record_immersive_startup_milestone(
+                startup_timeline,
+                "initial_sample_ready",
+                immersive_bridge,
+            )
+            self._maybe_publish_immersive_startup_keepalive(
+                immersive_bridge,
+                startup_keepalive_state,
+                reason="initial_sample_ready",
+                startup_timeline=startup_timeline,
             )
             last_immersive_sample = initial_sample
             print(
@@ -9274,19 +9492,23 @@ class InvPhyTrainerWarp:
                 head_forward,
                 scene_up=live_head_alignment["scene_up"],
             )
-            scene_renderer = SimpleLabSceneRenderer(
-                scene_assets_root=scene_assets_root,
-                width=scene_width,
-                height=scene_height,
-                lighting_mode=immersive_render_options["lighting_mode"],
-                balanced_render_backend=(
-                    "pyrender"
-                    if active_scene_stereo_mode
-                    == self.IMMERSIVE_BALANCED_INTERNAL_STEREO_MODE
-                    else "auto"
-                ),
+            self._record_immersive_startup_milestone(
+                startup_timeline,
+                "layout_ready",
+                immersive_bridge,
             )
             scene_renderer.set_layout(layout)
+            self._record_immersive_startup_milestone(
+                startup_timeline,
+                "scene_layout_applied",
+                immersive_bridge,
+            )
+            self._maybe_publish_immersive_startup_keepalive(
+                immersive_bridge,
+                startup_keepalive_state,
+                reason="scene_layout_applied",
+                startup_timeline=startup_timeline,
+            )
             print(
                 f"[quest_display] pyrender_readback_mode={scene_renderer.pyrender_readback_mode()}",
                 flush=True,
@@ -9303,9 +9525,8 @@ class InvPhyTrainerWarp:
                     "so scene/background/table compose stays tensor-only."
                 )
             table_alignment_debug = scene_renderer.table_alignment_debug()
-            table_surface_center_world = self._scene_table_surface_center_world(layout)
+            table_surface_center_world = layout.table_top_center
             if table_alignment_debug is not None:
-                asset_transform = table_alignment_debug["asset_transform"]
                 collider_top_plane_height = float(
                     table_alignment_debug["collider_top_plane_height"]
                 )
@@ -9325,32 +9546,14 @@ class InvPhyTrainerWarp:
                         f"{table_alignment_debug}"
                     )
                 print(
-                    "[quest_display] scene debug: "
-                    f"preset={table_alignment_debug.get('scene_preset', 'n/a')} "
-                    f"lighting_mode={table_alignment_debug.get('lighting_mode', 'n/a')} "
-                    f"requested_lighting_mode={table_alignment_debug.get('requested_lighting_mode', 'n/a')} "
-                    f"scene_scale={asset_transform.get('uniform_scene_scale', 'n/a')} "
-                    f"native_table_xy={table_alignment_debug.get('native_table_support_size_xy', 'n/a')} "
-                    f"scaled_table_xy={table_alignment_debug.get('scaled_table_support_size_xy', 'n/a')}",
-                    flush=True,
-                )
-                print(
                     "[quest_display] table alignment: "
-                    f"asset_transform={asset_transform} "
+                    f"asset_transform={table_alignment_debug['asset_transform']} "
                     f"surface_normal={table_alignment_debug['world_surface_normal']} "
                     f"normal_alignment={table_alignment_debug['surface_normal_alignment']:.4f} "
                     f"surface_center={table_alignment_debug['world_surface_center']} "
                     f"surface_plane={world_surface_plane_height:.4f} "
                     f"collider_plane={collider_top_plane_height:.4f} "
                     f"collider_boxes={table_alignment_debug.get('collider_box_count', 'n/a')}",
-                    flush=True,
-                )
-                print(
-                    "[quest_display] collider debug: "
-                    f"categories={table_alignment_debug.get('collider_category_counts', {})} "
-                    f"table_support_tiers={table_alignment_debug.get('table_support_tier_count', 'n/a')} "
-                    f"active_table_support_patches={table_alignment_debug.get('active_table_support_patch_count', 'n/a')} "
-                    f"decomposed_components={table_alignment_debug.get('decomposed_multi_box_component_count', 'n/a')}",
                     flush=True,
                 )
             print(
@@ -9362,7 +9565,7 @@ class InvPhyTrainerWarp:
 
             spawn_shift = self._compute_scene_spawn_shift(
                 obj_init_vertices,
-                table_surface_center_world,
+                layout.table_top_center,
             )
             spawn_shift = spawn_shift.to(device=cfg.device, dtype=torch.float32)
             obj_init_vertices = obj_init_vertices + spawn_shift
@@ -9375,6 +9578,17 @@ class InvPhyTrainerWarp:
                 center + spawn_shift
                 for center in original_controller_source_anchor_centers
             ]
+            self._record_immersive_startup_milestone(
+                startup_timeline,
+                "spawn_shift_done",
+                immersive_bridge,
+            )
+            self._maybe_publish_immersive_startup_keepalive(
+                immersive_bridge,
+                startup_keepalive_state,
+                reason="spawn_shift_done",
+                startup_timeline=startup_timeline,
+            )
 
             immersive_center_eye_pose_world, immersive_center_intrinsic = (
                 self._build_immersive_center_scene_view(
@@ -9387,6 +9601,21 @@ class InvPhyTrainerWarp:
             immersive_center_w2c = self._camera_pose_world_to_cv_w2c(
                 immersive_center_eye_pose_world
             )
+            controller_predefined_anchor_defs, rope_endpoint_naming_debug = (
+                self._resolve_rope_endpoint_anchor_defs(
+                    controller_predefined_anchor_defs,
+                    immersive_center_intrinsic,
+                    immersive_center_w2c,
+                )
+            )
+            if rope_endpoint_naming_debug.get("case_name") == "rope":
+                print(
+                    "[quest_display] immersive rope endpoint naming: "
+                    f"endpoint_projected_x={rope_endpoint_naming_debug['endpoint_projected_x']} "
+                    f"naming_valid={int(bool(rope_endpoint_naming_debug['naming_valid']))} "
+                    f"fallback={int(bool(rope_endpoint_naming_debug['fallback_used']))}",
+                    flush=True,
+                )
             startup_controller_source_assignment = (
                 self._assign_startup_controller_sources_by_screen_x(
                     original_controller_source_masks,
@@ -9479,6 +9708,11 @@ class InvPhyTrainerWarp:
             self.batch_controller_points = controller_runtime_base_target.unsqueeze(0).repeat(
                 self.frame_len, 1, 1
             )
+            self._record_immersive_startup_milestone(
+                startup_timeline,
+                "sim_init_begin",
+                immersive_bridge,
+            )
             self.simulator = SpringMassSystemWarp(
                 init_springs=init_springs_for_sim,
                 init_rest_lengths=init_rest_lengths_for_sim,
@@ -9513,6 +9747,17 @@ class InvPhyTrainerWarp:
             self.simulator.set_init_state(
                 self.simulator.wp_init_vertices, self.simulator.wp_init_velocities
             )
+            self._record_immersive_startup_milestone(
+                startup_timeline,
+                "sim_init_done",
+                immersive_bridge,
+            )
+            self._maybe_publish_immersive_startup_keepalive(
+                immersive_bridge,
+                startup_keepalive_state,
+                reason="sim_init_done",
+                startup_timeline=startup_timeline,
+            )
             prev_x = wp.to_torch(
                 self.simulator.wp_states[0].wp_x, requires_grad=False
             ).clone()
@@ -9542,16 +9787,10 @@ class InvPhyTrainerWarp:
                 context="spawn shift",
                 table_surface_center_world=table_surface_center_world,
             )
-            _, _, spawn_xy_error, spawn_z_error = self._scene_spawn_alignment_metrics(
-                self.batch_init_vertices[: self.num_all_points],
-                layout,
-                table_surface_center_world=table_surface_center_world,
-            )
             print(
                 "[quest_display] immersive spawn shift: "
                 f"shift={spawn_shift.detach().cpu().numpy().tolist()} "
-                f"support_center={spawn_support_center.detach().cpu().numpy().tolist()} "
-                f"xy_error={spawn_xy_error:.4f} z_error={spawn_z_error:.4f}",
+                f"support_center={spawn_support_center.detach().cpu().numpy().tolist()}",
                 flush=True,
             )
             live_controller_alignment = None
@@ -9653,7 +9892,20 @@ class InvPhyTrainerWarp:
 
             current_target = controller_runtime_base_target.clone()
             prev_target = current_target.clone()
-            scene_rest_state = self._settle_scene_rest_state(current_target.clone())
+            scene_rest_state = self._settle_scene_rest_state(
+                current_target.clone(),
+                progress_callback=lambda reason: self._maybe_publish_immersive_startup_keepalive(
+                    immersive_bridge,
+                    startup_keepalive_state,
+                    reason=reason,
+                    startup_timeline=startup_timeline,
+                ),
+            )
+            self._record_immersive_startup_milestone(
+                startup_timeline,
+                "settled_rest_done",
+                immersive_bridge,
+            )
             self._restore_sim_state(scene_rest_state)
             x = wp.to_torch(
                 self.simulator.wp_states[0].wp_x,
@@ -9672,11 +9924,6 @@ class InvPhyTrainerWarp:
                 context="settled rest state",
                 table_surface_center_world=table_surface_center_world,
             )
-            _, _, settled_xy_error, settled_z_error = self._scene_spawn_alignment_metrics(
-                x[: self.num_all_points],
-                layout,
-                table_surface_center_world=table_surface_center_world,
-            )
             settled_bounds_min = (
                 x[: self.num_all_points].min(dim=0).values.detach().cpu().numpy().tolist()
             )
@@ -9686,7 +9933,6 @@ class InvPhyTrainerWarp:
             print(
                 "[quest_display] immersive settled rest state: "
                 f"support_center={settled_support_center.detach().cpu().numpy().tolist()} "
-                f"xy_error={settled_xy_error:.4f} z_error={settled_z_error:.4f} "
                 f"bounds_min={settled_bounds_min} bounds_max={settled_bounds_max}",
                 flush=True,
             )
@@ -9795,6 +10041,11 @@ class InvPhyTrainerWarp:
                 == self.IMMERSIVE_BALANCED_INTERNAL_STEREO_MODE
                 else None
             )
+            self._record_immersive_startup_milestone(
+                startup_timeline,
+                "startup_validation_begin",
+                immersive_bridge,
+            )
             startup_render_debug = self._validate_immersive_startup_render(
                 live_head_alignment,
                 layout,
@@ -9816,6 +10067,23 @@ class InvPhyTrainerWarp:
                 scene_height=scene_height,
                 reproject_caches=shared_scene_reproject_caches,
                 gaussian_compose_roi_padding=gaussian_compose_roi_padding,
+                progress_callback=lambda reason: self._maybe_publish_immersive_startup_keepalive(
+                    immersive_bridge,
+                    startup_keepalive_state,
+                    reason=reason,
+                    startup_timeline=startup_timeline,
+                ),
+            )
+            self._record_immersive_startup_milestone(
+                startup_timeline,
+                "startup_validation_done",
+                immersive_bridge,
+            )
+            self._maybe_publish_immersive_startup_keepalive(
+                immersive_bridge,
+                startup_keepalive_state,
+                reason="startup_validation_done",
+                startup_timeline=startup_timeline,
             )
             startup_render_debug["requested_scene_stereo_mode"] = (
                 immersive_render_options["scene_stereo_mode"]
@@ -10574,6 +10842,12 @@ class InvPhyTrainerWarp:
                 if right_eye_frame.dtype != torch.uint8:
                     right_eye_frame = right_eye_frame.clamp(0.0, 255.0).to(torch.uint8)
 
+                if not first_real_publish_done:
+                    self._record_immersive_startup_milestone(
+                        startup_timeline,
+                        "first_publish_begin",
+                        immersive_bridge,
+                    )
                 publish_ok, publish_stats = immersive_bridge.publish_stereo_frames(
                     left_eye_frame,
                     right_eye_frame,
@@ -10610,10 +10884,33 @@ class InvPhyTrainerWarp:
                         publish_stats.get("fallback_copy_wall", 0.0)
                     )
                 if not publish_ok:
+                    failure_details = ""
+                    if not first_real_publish_done:
+                        failure_details = self._format_immersive_startup_timeline_failure(
+                            startup_timeline,
+                            immersive_bridge,
+                        )
                     raise RuntimeError(
                         "Quest immersive bridge stopped accepting stereo frames.\n"
+                        + (failure_details + "\n" if failure_details else "")
                         + immersive_bridge.debug_summary()
                     )
+                if not first_real_publish_done:
+                    self._record_immersive_startup_milestone(
+                        startup_timeline,
+                        "first_publish_done",
+                        immersive_bridge,
+                    )
+                    first_real_publish_done = True
+                    if startup_keepalive_state is not None:
+                        startup_keepalive_state["enabled"] = False
+                    startup_gap_ms = startup_timeline.get("startup_gap_ms")
+                    if startup_gap_ms is not None:
+                        print(
+                            "[quest_display] immersive startup first real publish: "
+                            f"startup_gap_ms={startup_gap_ms:.1f}",
+                            flush=True,
+                        )
 
                 if preview_display_active and preview_tex is not None:
                     preview_window_start = (
@@ -10726,6 +11023,23 @@ class InvPhyTrainerWarp:
                 if preview_display_active and glfw.window_should_close(window):
                     break
 
+        except RuntimeError as exc:
+            bridge_died_pre_first_publish = (
+                immersive_bridge is not None
+                and not first_real_publish_done
+                and immersive_bridge.process is not None
+                and immersive_bridge.process.poll() is not None
+            )
+            if bridge_died_pre_first_publish:
+                failure_details = self._format_immersive_startup_timeline_failure(
+                    startup_timeline,
+                    immersive_bridge,
+                )
+                message = str(exc)
+                if failure_details and failure_details not in message:
+                    message = message + "\n" + failure_details
+                raise RuntimeError(message) from exc
+            raise
         finally:
             if frame_count > 1 and component_times["total"]:
                 frames_used_for_stats = len(component_times["total"])

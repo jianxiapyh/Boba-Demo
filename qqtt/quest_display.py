@@ -72,6 +72,7 @@ class OpenXRFramePanelMirror:
         self._latest_sample: Optional[LiveControllerSample] = None
         self._latest_lock = threading.Lock()
         self._exit_logged = False
+        self._last_published_frame_id = 0
 
     def start(self) -> None:
         rebuilt_binary = self._ensure_binary()
@@ -139,6 +140,7 @@ class OpenXRFramePanelMirror:
                     self.process.wait(timeout=5.0)
             self.process = None
         self._exit_logged = False
+        self._last_published_frame_id = 0
         self._drain_pending_stage_copies(block=True)
 
         if self._shared_mmap is not None:
@@ -213,6 +215,7 @@ class OpenXRFramePanelMirror:
             timing["cpu_mmap_copy_wall"] += commit_stats["cpu_mmap_copy_wall"]
             timing["header_write_wall"] += commit_stats["header_write_wall"]
             timing["total_wall"] = time.perf_counter() - publish_start
+            self._last_published_frame_id = frame_id
             return True, timing
 
         if len(self._pending_stage_copies) >= self.STAGING_BUFFER_COUNT:
@@ -249,6 +252,7 @@ class OpenXRFramePanelMirror:
         )
         self._next_stage_index = (stage_index + 1) % self.STAGING_BUFFER_COUNT
         timing["total_wall"] = time.perf_counter() - publish_start
+        self._last_published_frame_id = frame_id
         return True, timing
 
     def _drain_pending_stage_copies(self, block: bool) -> dict[str, float]:
@@ -313,6 +317,8 @@ class OpenXRFramePanelMirror:
 
     def debug_summary(self) -> str:
         parts = []
+        if self._last_published_frame_id > 0:
+            parts.append(f"last published frame id: {self._last_published_frame_id}")
         if self._stdout_tail:
             parts.append("stdout:\n" + "".join(self._stdout_tail).strip())
         if self._stderr_tail:
@@ -532,6 +538,7 @@ class OpenXRImmersiveBridge(OpenXRFramePanelMirror):
             timing["cpu_mmap_copy_wall"] += commit_stats["cpu_mmap_copy_wall"]
             timing["header_write_wall"] += commit_stats["header_write_wall"]
             timing["total_wall"] = time.perf_counter() - publish_start
+            self._last_published_frame_id = frame_id
             return True, timing
 
         if len(self._pending_stage_copies) >= self.STAGING_BUFFER_COUNT:
@@ -568,6 +575,7 @@ class OpenXRImmersiveBridge(OpenXRFramePanelMirror):
         )
         self._next_stage_index = (stage_index + 1) % self.STAGING_BUFFER_COUNT
         timing["total_wall"] = time.perf_counter() - publish_start
+        self._last_published_frame_id = frame_id
         return True, timing
 
     def wait_for_sample(self, timeout: float = 10.0) -> LiveImmersiveSample:

@@ -34,6 +34,10 @@ COLLIDER_VERTICAL_HEIGHT_MIN = 0.32
 COLLIDER_MIN_THICKNESS = 0.035
 FLOOR_COLLIDER_THICKNESS = 0.05
 WALL_COLLIDER_THICKNESS = 0.08
+COLLIDER_SUPPORT_PATCH_MIN_SPAN = 0.10
+COLLIDER_BLOCKER_BAND_GAP_Y = 0.18
+COLLIDER_BLOCKER_AREA_MIN = 0.02
+COLLIDER_BLOCKER_SPAN_MIN = 0.05
 
 
 @dataclass
@@ -328,6 +332,102 @@ def _expand_bounds_min_thickness(
             bounds_min[axis] -= pad
             bounds_max[axis] += pad
     return bounds_min, bounds_max
+
+
+def _support_patch_is_collision_usable(
+    patch: dict[str, Any],
+    floor_y: float,
+) -> bool:
+    if float(patch["y"]) <= float(floor_y + TABLE_SUPPORT_HEIGHT_MIN):
+        return False
+    if float(patch["area"]) < float(TABLE_SUPPORT_AREA_MIN):
+        return False
+    extents = np.asarray(patch["bounds_max"] - patch["bounds_min"], dtype=np.float32)
+    return min(float(extents[0]), float(extents[2])) >= COLLIDER_SUPPORT_PATCH_MIN_SPAN
+
+
+def _build_blocker_groups(
+    mesh: trimesh.Trimesh,
+    component_face_indices: np.ndarray,
+    support_patches: list[dict[str, Any]],
+    face_centroids: np.ndarray,
+    face_areas: np.ndarray,
+    gap: float = COLLIDER_BLOCKER_BAND_GAP_Y,
+) -> list[dict[str, Any]]:
+    component_face_indices = np.asarray(component_face_indices, dtype=np.int64)
+    if component_face_indices.size == 0:
+        return []
+
+    if support_patches:
+        support_face_indices = np.unique(
+            np.concatenate(
+                [
+                    np.asarray(patch["face_indices"], dtype=np.int64)
+                    for patch in support_patches
+                    if np.asarray(patch["face_indices"], dtype=np.int64).size > 0
+                ],
+                axis=0,
+            )
+        )
+        blocker_face_indices = np.setdiff1d(
+            component_face_indices,
+            support_face_indices,
+            assume_unique=False,
+        )
+    else:
+        blocker_face_indices = component_face_indices.copy()
+
+    if blocker_face_indices.size == 0:
+        return []
+
+    face_adjacency = np.asarray(mesh.face_adjacency, dtype=np.int64)
+    height_groups = _cluster_sorted_value_groups(
+        face_centroids[blocker_face_indices, 1],
+        gap=gap,
+    )
+    blocker_groups: list[dict[str, Any]] = []
+    blocker_index = 0
+    for height_group in height_groups:
+        band_face_indices = blocker_face_indices[height_group]
+        connected_groups = _split_face_group_by_connectivity(
+            band_face_indices,
+            face_adjacency,
+        )
+        for group_face_indices in connected_groups:
+            group_areas = np.asarray(face_areas[group_face_indices], dtype=np.float32)
+            total_area = float(np.sum(group_areas))
+            if total_area <= 1e-6:
+                continue
+            group_vertices = np.asarray(
+                mesh.vertices[mesh.faces[group_face_indices].reshape(-1)],
+                dtype=np.float32,
+            )
+            bounds_min = group_vertices.min(axis=0)
+            bounds_max = group_vertices.max(axis=0)
+            extents = bounds_max - bounds_min
+            if (
+                total_area < COLLIDER_BLOCKER_AREA_MIN
+                and float(max(extents[0], extents[1], extents[2])) < COLLIDER_BLOCKER_SPAN_MIN
+            ):
+                continue
+            group_centers = np.asarray(face_centroids[group_face_indices], dtype=np.float32)
+            weights = group_areas / total_area
+            center = np.sum(group_centers * weights[:, None], axis=0)
+            blocker_groups.append(
+                {
+                    "blocker_index": int(blocker_index),
+                    "face_count": int(group_face_indices.shape[0]),
+                    "face_indices": group_face_indices.astype(np.int64),
+                    "area": total_area,
+                    "center": center.astype(np.float32),
+                    "bounds_min": bounds_min.astype(np.float32),
+                    "bounds_max": bounds_max.astype(np.float32),
+                    "y": float(np.sum(group_centers[:, 1] * weights)),
+                }
+            )
+            blocker_index += 1
+    blocker_groups.sort(key=lambda group: (group["area"], group["y"]), reverse=True)
+    return blocker_groups
 
 
 def illixr_lab_manifest_path(scene_assets_root: str | Path) -> Path:
@@ -1042,6 +1142,7 @@ class SimpleLabSceneRenderer:
         component_records: list[dict[str, Any]] = []
         for component_id in np.unique(labels):
             component_face_mask = labels == component_id
+            component_face_indices = np.nonzero(component_face_mask)[0].astype(np.int64)
             area = float(np.sum(face_areas[component_face_mask]))
             if area <= 1e-6:
                 continue
@@ -1053,6 +1154,7 @@ class SimpleLabSceneRenderer:
             horizontal_mask = component_face_mask & horizontal_face_mask
             support_patches: list[dict[str, Any]] = []
             support_levels: list[dict[str, Any]] = []
+            blocker_groups: list[dict[str, Any]] = []
             if np.any(horizontal_mask):
                 support_face_indices = np.nonzero(horizontal_mask)[0]
                 support_patches = _build_support_patches(
@@ -1083,11 +1185,19 @@ class SimpleLabSceneRenderer:
                         patch_bounds_max,
                         patch_centers,
                     )
+            blocker_groups = _build_blocker_groups(
+                mesh,
+                component_face_indices,
+                support_patches,
+                face_centroids,
+                face_areas,
+            )
             support_top_level = support_levels[0] if support_levels else None
             component_records.append(
                 {
                     "id": int(component_id),
                     "area": area,
+                    "face_indices": component_face_indices,
                     "bounds_min": bounds_min.astype(np.float32),
                     "bounds_max": bounds_max.astype(np.float32),
                     "center": (0.5 * (bounds_min + bounds_max)).astype(np.float32),
@@ -1104,6 +1214,7 @@ class SimpleLabSceneRenderer:
                     "support_patches": support_patches,
                     "support_levels": support_levels,
                     "support_top_level": support_top_level,
+                    "blocker_groups": blocker_groups,
                 }
             )
         return component_records
@@ -1438,7 +1549,7 @@ class SimpleLabSceneRenderer:
             bounds = wall_mesh.bounds.astype(np.float32)
             self._wall_world_bounds[wall_name] = (bounds[0].copy(), bounds[1].copy())
 
-        collider_boxes: list[np.ndarray] = []
+        collider_entries: list[dict[str, Any]] = []
 
         floor_bounds_min = self._floor_mesh_world.bounds[0].astype(np.float32).copy()
         floor_bounds_max = self._floor_mesh_world.bounds[1].astype(np.float32).copy()
@@ -1450,7 +1561,13 @@ class SimpleLabSceneRenderer:
             min_thickness=FLOOR_COLLIDER_THICKNESS,
             support_axis=2,
         )
-        collider_boxes.append(np.stack([floor_bounds_min, floor_bounds_max], axis=0))
+        collider_entries.append(
+            {
+                "category": "floor_slab",
+                "component_id": None,
+                "box": np.stack([floor_bounds_min, floor_bounds_max], axis=0).astype(np.float32),
+            }
+        )
 
         wall_bounds = {
             "left": _transform_bounds(
@@ -1482,27 +1599,76 @@ class SimpleLabSceneRenderer:
                 min_thickness=WALL_COLLIDER_THICKNESS,
                 support_axis=support_axis,
             )
-            collider_boxes.append(np.stack([wall_min, wall_max], axis=0))
+            collider_entries.append(
+                {
+                    "category": "boundary_wall",
+                    "component_id": None,
+                    "box": np.stack([wall_min, wall_max], axis=0).astype(np.float32),
+                }
+            )
 
         for record in self._collision_component_records:
-            bounds_min = np.asarray(record["bounds_min"], dtype=np.float32).copy()
-            bounds_max = np.asarray(record["bounds_max"], dtype=np.float32).copy()
-            support_axis = None
-            if int(record["id"]) in set(self._table_support_component_ids) and (
-                float(bounds_max[1] - bounds_min[1]) < COLLIDER_MIN_THICKNESS
-            ):
-                support_axis = 1
-            bounds_min, bounds_max = _expand_bounds_min_thickness(
-                bounds_min,
-                bounds_max,
-                min_thickness=COLLIDER_MIN_THICKNESS,
-                support_axis=support_axis,
-            )
-            world_min, world_max = _transform_bounds(bounds_min, bounds_max, world_transform)
-            collider_boxes.append(np.stack([world_min, world_max], axis=0))
+            component_id = int(record["id"])
+            for patch in record.get("support_patches", []):
+                if not _support_patch_is_collision_usable(patch, self._asset_floor_y):
+                    continue
+                bounds_min, bounds_max = _expand_bounds_min_thickness(
+                    np.asarray(patch["bounds_min"], dtype=np.float32),
+                    np.asarray(patch["bounds_max"], dtype=np.float32),
+                    min_thickness=COLLIDER_MIN_THICKNESS,
+                    support_axis=1,
+                )
+                world_min, world_max = _transform_bounds(bounds_min, bounds_max, world_transform)
+                collider_entries.append(
+                    {
+                        "category": "support_slab",
+                        "component_id": component_id,
+                        "box": np.stack([world_min, world_max], axis=0).astype(np.float32),
+                    }
+                )
+            for blocker_group in record.get("blocker_groups", []):
+                bounds_min, bounds_max = _expand_bounds_min_thickness(
+                    np.asarray(blocker_group["bounds_min"], dtype=np.float32),
+                    np.asarray(blocker_group["bounds_max"], dtype=np.float32),
+                    min_thickness=COLLIDER_MIN_THICKNESS,
+                    support_axis=None,
+                )
+                world_min, world_max = _transform_bounds(bounds_min, bounds_max, world_transform)
+                collider_entries.append(
+                    {
+                        "category": "blocker_box",
+                        "component_id": component_id,
+                        "box": np.stack([world_min, world_max], axis=0).astype(np.float32),
+                    }
+                )
 
-        self._scene_collider_boxes = np.stack(collider_boxes, axis=0).astype(np.float32)
+        self._scene_collider_boxes = np.stack(
+            [np.asarray(entry["box"], dtype=np.float32) for entry in collider_entries],
+            axis=0,
+        ).astype(np.float32)
         self.layout.static_collider_boxes = np.array(self._scene_collider_boxes, copy=True)
+        support_slab_count = int(
+            sum(1 for entry in collider_entries if entry["category"] == "support_slab")
+        )
+        blocker_box_count = int(
+            sum(1 for entry in collider_entries if entry["category"] == "blocker_box")
+        )
+        boundary_box_count = int(
+            sum(
+                1
+                for entry in collider_entries
+                if entry["category"] in {"floor_slab", "boundary_wall"}
+            )
+        )
+        component_box_counts: dict[int, int] = {}
+        for entry in collider_entries:
+            component_id = entry["component_id"]
+            if component_id is None:
+                continue
+            component_box_counts[int(component_id)] = component_box_counts.get(int(component_id), 0) + 1
+        decomposed_component_count = int(
+            sum(1 for count in component_box_counts.values() if count > 1)
+        )
 
         scene_up = np.asarray(self.layout.scene_up, dtype=np.float32)
         collider_top_center = np.array(
@@ -1546,6 +1712,10 @@ class SimpleLabSceneRenderer:
             "visible_table_world_bounds": visible_table_world_bounds.astype(np.float32).tolist(),
             "room_bounds": full_bounds.astype(np.float32).tolist(),
             "collider_box_count": int(self._scene_collider_boxes.shape[0]),
+            "support_slab_count": support_slab_count,
+            "blocker_box_count": blocker_box_count,
+            "boundary_box_count": boundary_box_count,
+            "decomposed_component_count": decomposed_component_count,
         }
 
     def _rebuild_scene_nodes(self) -> None:

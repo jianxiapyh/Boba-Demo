@@ -373,6 +373,29 @@ def build_resting_collision_pairs(
             resting_collision_pairs[i][index] = wp.bool(1)
             resting_collision_pairs[index][i] = wp.bool(1)
 
+@wp.func
+def apply_surface_collision_response(
+    velocity: wp.vec3,
+    normal: wp.vec3,
+    clamp_collide_elas: float,
+    clamp_collide_fric: float,
+):
+    v_normal = wp.dot(velocity, normal) * normal
+    v_tangent = velocity - v_normal
+    v_normal_length = wp.length(v_normal)
+    v_tangent_length = wp.max(wp.length(v_tangent), 1e-6)
+    v_normal_new = -clamp_collide_elas * v_normal
+    tangent_scale = wp.max(
+        0.0,
+        1.0
+        - clamp_collide_fric
+        * (1.0 + clamp_collide_elas)
+        * v_normal_length
+        / v_tangent_length,
+    )
+    v_tangent_new = tangent_scale * v_tangent
+    return v_normal_new + v_tangent_new
+
 @wp.kernel
 def integrate_ground_collision(
     x: wp.array(dtype=wp.vec3),
@@ -396,6 +419,7 @@ def integrate_ground_collision(
     clamp_collide_elas = wp.clamp(collide_elas[0], low=0.0, high=1.0)
     clamp_collide_fric = wp.clamp(collide_fric[0], low=0.0, high=2.0)
     normal = wp.vec3(0.0, 0.0, 1.0) * reverse_factor
+    collision_eps = float(1.0e-4)
 
     x_result = x0 + v0 * dt
     v_result = v0
@@ -405,57 +429,175 @@ def integrate_ground_collision(
         v_z = v0[2]
         next_x_z = (x_z + v_z * dt) * reverse_factor
         if next_x_z < 0.0 and v_z * reverse_factor < -1e-4:
-            v_normal = wp.dot(v0, normal) * normal
-            v_tao = v0 - v_normal
-            v_normal_length = wp.length(v_normal)
-            v_tao_length = wp.max(wp.length(v_tao), 1e-6)
-            v_normal_new = -clamp_collide_elas * v_normal
-            a = wp.max(
-                0.0,
-                1.0
-                - clamp_collide_fric
-                * (1.0 + clamp_collide_elas)
-                * v_normal_length
-                / v_tao_length,
+            v_after = apply_surface_collision_response(
+                v0,
+                normal,
+                clamp_collide_elas,
+                clamp_collide_fric,
             )
-            v_tao_new = a * v_tao
-            v_after = v_normal_new + v_tao_new
             toi = -x_z / v_z
             x_result = x0 + v0 * toi + v_after * (dt - toi)
             v_result = v_after
 
+    best_hit_t = float(2.0)
+    best_hit_normal = wp.vec3(0.0, 0.0, 0.0)
+    has_sweep_hit = int(0)
+    best_inside_depth = float(1.0e8)
+    best_inside_normal = wp.vec3(0.0, 0.0, 0.0)
+    best_inside_projected = x0
+    has_inside_hit = int(0)
+    displacement = v0 * dt
+
     for box_index in range(static_box_count):
         box_min = static_box_mins[box_index]
         box_max = static_box_maxs[box_index]
-        next_pos = x0 + v0 * dt
-        inside_xy = (
-            next_pos[0] >= box_min[0]
-            and next_pos[0] <= box_max[0]
-            and next_pos[1] >= box_min[1]
-            and next_pos[1] <= box_max[1]
+        inside_box = (
+            x0[0] >= box_min[0]
+            and x0[0] <= box_max[0]
+            and x0[1] >= box_min[1]
+            and x0[1] <= box_max[1]
+            and x0[2] >= box_min[2]
+            and x0[2] <= box_max[2]
         )
-        local_z = x0[2] - box_min[2]
-        v_z = v0[2]
-        next_local_z = (local_z + v_z * dt) * reverse_factor
-        if inside_xy and next_local_z < 0.0 and v_z * reverse_factor < -1e-4:
-            v_normal = wp.dot(v0, normal) * normal
-            v_tao = v0 - v_normal
-            v_normal_length = wp.length(v_normal)
-            v_tao_length = wp.max(wp.length(v_tao), 1e-6)
-            v_normal_new = -clamp_collide_elas * v_normal
-            a = wp.max(
-                0.0,
-                1.0
-                - clamp_collide_fric
-                * (1.0 + clamp_collide_elas)
-                * v_normal_length
-                / v_tao_length,
+        if inside_box:
+            dist_x_min = x0[0] - box_min[0]
+            dist_x_max = box_max[0] - x0[0]
+            dist_y_min = x0[1] - box_min[1]
+            dist_y_max = box_max[1] - x0[1]
+            dist_z_min = x0[2] - box_min[2]
+            dist_z_max = box_max[2] - x0[2]
+
+            nearest_dist = dist_x_min
+            inside_normal = wp.vec3(-1.0, 0.0, 0.0)
+            inside_projected = wp.vec3(box_min[0] - collision_eps, x0[1], x0[2])
+
+            if dist_x_max < nearest_dist:
+                nearest_dist = dist_x_max
+                inside_normal = wp.vec3(1.0, 0.0, 0.0)
+                inside_projected = wp.vec3(box_max[0] + collision_eps, x0[1], x0[2])
+            if dist_y_min < nearest_dist:
+                nearest_dist = dist_y_min
+                inside_normal = wp.vec3(0.0, -1.0, 0.0)
+                inside_projected = wp.vec3(x0[0], box_min[1] - collision_eps, x0[2])
+            if dist_y_max < nearest_dist:
+                nearest_dist = dist_y_max
+                inside_normal = wp.vec3(0.0, 1.0, 0.0)
+                inside_projected = wp.vec3(x0[0], box_max[1] + collision_eps, x0[2])
+            if dist_z_min < nearest_dist:
+                nearest_dist = dist_z_min
+                inside_normal = wp.vec3(0.0, 0.0, -1.0)
+                inside_projected = wp.vec3(x0[0], x0[1], box_min[2] - collision_eps)
+            if dist_z_max < nearest_dist:
+                nearest_dist = dist_z_max
+                inside_normal = wp.vec3(0.0, 0.0, 1.0)
+                inside_projected = wp.vec3(x0[0], x0[1], box_max[2] + collision_eps)
+
+            if has_inside_hit == 0 or nearest_dist < best_inside_depth:
+                best_inside_depth = nearest_dist
+                best_inside_normal = inside_normal
+                best_inside_projected = inside_projected
+                has_inside_hit = int(1)
+        else:
+            t_enter = float(0.0)
+            t_exit = float(1.0)
+            candidate_normal = wp.vec3(0.0, 0.0, 0.0)
+            valid_hit = int(1)
+
+            d0 = displacement[0]
+            if wp.abs(d0) < collision_eps:
+                if x0[0] < box_min[0] or x0[0] > box_max[0]:
+                    valid_hit = int(0)
+            else:
+                inv_d0 = 1.0 / d0
+                t0a = (box_min[0] - x0[0]) * inv_d0
+                t0b = (box_max[0] - x0[0]) * inv_d0
+                near_t0 = wp.min(t0a, t0b)
+                far_t0 = wp.max(t0a, t0b)
+                if near_t0 > t_enter:
+                    t_enter = near_t0
+                    if t0a < t0b:
+                        candidate_normal = wp.vec3(-1.0, 0.0, 0.0)
+                    else:
+                        candidate_normal = wp.vec3(1.0, 0.0, 0.0)
+                t_exit = wp.min(t_exit, far_t0)
+                if t_enter > t_exit:
+                    valid_hit = int(0)
+
+            d1 = displacement[1]
+            if valid_hit != 0:
+                if wp.abs(d1) < collision_eps:
+                    if x0[1] < box_min[1] or x0[1] > box_max[1]:
+                        valid_hit = int(0)
+                else:
+                    inv_d1 = 1.0 / d1
+                    t1a = (box_min[1] - x0[1]) * inv_d1
+                    t1b = (box_max[1] - x0[1]) * inv_d1
+                    near_t1 = wp.min(t1a, t1b)
+                    far_t1 = wp.max(t1a, t1b)
+                    if near_t1 > t_enter:
+                        t_enter = near_t1
+                        if t1a < t1b:
+                            candidate_normal = wp.vec3(0.0, -1.0, 0.0)
+                        else:
+                            candidate_normal = wp.vec3(0.0, 1.0, 0.0)
+                    t_exit = wp.min(t_exit, far_t1)
+                    if t_enter > t_exit:
+                        valid_hit = int(0)
+
+            d2 = displacement[2]
+            if valid_hit != 0:
+                if wp.abs(d2) < collision_eps:
+                    if x0[2] < box_min[2] or x0[2] > box_max[2]:
+                        valid_hit = int(0)
+                else:
+                    inv_d2 = 1.0 / d2
+                    t2a = (box_min[2] - x0[2]) * inv_d2
+                    t2b = (box_max[2] - x0[2]) * inv_d2
+                    near_t2 = wp.min(t2a, t2b)
+                    far_t2 = wp.max(t2a, t2b)
+                    if near_t2 > t_enter:
+                        t_enter = near_t2
+                        if t2a < t2b:
+                            candidate_normal = wp.vec3(0.0, 0.0, -1.0)
+                        else:
+                            candidate_normal = wp.vec3(0.0, 0.0, 1.0)
+                    t_exit = wp.min(t_exit, far_t2)
+                    if t_enter > t_exit:
+                        valid_hit = int(0)
+
+            if (
+                valid_hit != 0
+                and t_enter >= 0.0
+                and t_enter <= 1.0
+                and wp.dot(v0, candidate_normal) < -1e-4
+                and t_enter < best_hit_t
+            ):
+                best_hit_t = t_enter
+                best_hit_normal = candidate_normal
+                has_sweep_hit = int(1)
+
+    if has_inside_hit != 0:
+        v_after = v0
+        if wp.dot(v0, best_inside_normal) < -1e-4:
+            v_after = apply_surface_collision_response(
+                v0,
+                best_inside_normal,
+                clamp_collide_elas,
+                clamp_collide_fric,
             )
-            v_tao_new = a * v_tao
-            v_after = v_normal_new + v_tao_new
-            toi = -local_z / v_z
-            x_result = x0 + v0 * toi + v_after * (dt - toi)
-            v_result = v_after
+        x_result = best_inside_projected + v_after * dt
+        v_result = v_after
+    elif has_sweep_hit != 0:
+        toi = best_hit_t * dt
+        hit_point = x0 + v0 * toi + best_hit_normal * collision_eps
+        v_after = apply_surface_collision_response(
+            v0,
+            best_hit_normal,
+            clamp_collide_elas,
+            clamp_collide_fric,
+        )
+        x_result = hit_point + v_after * (dt - toi)
+        v_result = v_after
 
     x_new[tid] = x_result
     v_new[tid] = v_result

@@ -150,6 +150,7 @@ class InvPhyTrainerWarp:
     LIVE_CONTROLLER_PREDEFINED_ANCHOR_MIN_RADIUS = 0.05
     LIVE_CONTROLLER_PREVIEW_RADIUS = 3
     LIVE_CONTROLLER_PREVIEW_SELECTED_RADIUS = 5
+    LIVE_CONTROLLER_PREVIEW_OCCUPIED_COLOR = [176.0, 176.0, 176.0]
     LIVE_CONTROLLER_CANDIDATE_SQUARE_RADIUS = 6
     LIVE_CONTROLLER_TEMPLATE_RADIUS_SCALE = 0.55
     LIVE_CONTROLLER_TEMPLATE_MIN_RADIUS = 0.012
@@ -258,6 +259,8 @@ class InvPhyTrainerWarp:
     IMMERSIVE_BALANCED_TABLE_ROI_SHRINK_MAX_PX = 16
     IMMERSIVE_BALANCED_TABLE_ROI_SUPERSAMPLE_SCALE = 1.25
     IMMERSIVE_STARTUP_KEEPALIVE_INTERVAL_SECONDS = 0.25
+    IMMERSIVE_CONTROLLER_HANDNESS_CONFIRM_STREAK = 5
+    IMMERSIVE_CONTROLLER_HANDNESS_MAX_VALID_SAMPLES = 90
     IMMERSIVE_STARTUP_KEEPALIVE_RGBA = [232, 232, 232, 255]
     IMMERSIVE_GAUSSIAN_COMPOSE_ROI_PADDING = 24
     TIMING_OVERLAY_TEXT_COLOR = [255.0, 255.0, 255.0]
@@ -1215,6 +1218,63 @@ class InvPhyTrainerWarp:
     def _controller_exit_button_label(self, source):
         return "left grip" if source == "left" else "right grip"
 
+    def _other_controller_source(self, source):
+        return "right" if source == "left" else "left"
+
+    def _occupied_anchor_name_by_other_source(
+        self,
+        source,
+        controller_interaction_state,
+    ):
+        if controller_interaction_state is None:
+            return None, self._other_controller_source(source)
+        other_source = self._other_controller_source(source)
+        other_interaction_state = controller_interaction_state.get(other_source)
+        if other_interaction_state is None:
+            return None, other_source
+        return other_interaction_state.get("anchor_name"), other_source
+
+    def _anchor_is_occupied_by_other_source(
+        self,
+        source,
+        anchor_name,
+        controller_interaction_state,
+        allow_current_anchor_name=None,
+    ):
+        if anchor_name is None:
+            return False, self._other_controller_source(source)
+        if (
+            allow_current_anchor_name is not None
+            and anchor_name == allow_current_anchor_name
+        ):
+            return False, self._other_controller_source(source)
+        occupied_anchor_name, other_source = self._occupied_anchor_name_by_other_source(
+            source,
+            controller_interaction_state,
+        )
+        return occupied_anchor_name == anchor_name, other_source
+
+    def _filter_available_predefined_interaction_anchors(
+        self,
+        source,
+        anchor_states,
+        controller_interaction_state,
+        allow_current_anchor_name=None,
+    ):
+        if not anchor_states:
+            return []
+        available_anchor_states = []
+        for anchor_state in anchor_states:
+            occupied, _ = self._anchor_is_occupied_by_other_source(
+                source,
+                anchor_state.get("name"),
+                controller_interaction_state,
+                allow_current_anchor_name=allow_current_anchor_name,
+            )
+            if not occupied:
+                available_anchor_states.append(anchor_state)
+        return available_anchor_states
+
     def _update_controller_anchor_preview_state(
         self,
         source,
@@ -1224,6 +1284,7 @@ class InvPhyTrainerWarp:
         preview_state,
         cycle_edge,
         interaction_state,
+        controller_interaction_state,
     ):
         state = preview_state[source]
         if interaction_state is not None:
@@ -1245,15 +1306,31 @@ class InvPhyTrainerWarp:
         ray_origin_world, ray_direction_world = self._controller_world_ray_pose(
             controller_world
         )
-        ranked_anchors = self._rank_predefined_interaction_anchors(
+        ranked_anchors_all = self._rank_predefined_interaction_anchors(
             hit_world,
             ray_origin_world,
             ray_direction_world,
             anchor_states,
             require_selection_radius=False,
         )
-        if not ranked_anchors:
+        if not ranked_anchors_all:
             self._clear_controller_anchor_preview_candidates(state)
+            return None
+        ranked_anchors = self._filter_available_predefined_interaction_anchors(
+            source,
+            ranked_anchors_all,
+            controller_interaction_state,
+        )
+        if not ranked_anchors:
+            state["visible"] = True
+            state["cycle_locked"] = False
+            state["selected_anchor_name"] = None
+            state["selected_rank_index"] = 0
+            state["current_candidate_names"] = [
+                anchor["name"] for anchor in ranked_anchors_all
+            ]
+            state["current_selected_rank"] = None
+            state["current_candidate_count"] = len(ranked_anchors_all)
             return None
 
         candidate_count = len(ranked_anchors)
@@ -4361,6 +4438,7 @@ class InvPhyTrainerWarp:
             lateral_flip=False,
         )
         return {
+            "state": "pending",
             "resolved": False,
             "basis": head_basis_t.clone(),
             "head_basis": head_basis_t,
@@ -4377,6 +4455,14 @@ class InvPhyTrainerWarp:
             "final_right_body_x": None,
             "final_left_ray_x": None,
             "final_right_ray_x": None,
+            "candidate_flip": None,
+            "candidate_streak": 0,
+            "resolution_start_sample": None,
+            "resolution_deadline_sample": None,
+            "lock_reason": None,
+            "lock_sample_id": None,
+            "late_controller_seen_after_lock": [],
+            "locked_active_sources": [],
         }
 
     def _project_controller_world_field_to_startup_screen_x(
@@ -4533,7 +4619,10 @@ class InvPhyTrainerWarp:
         print(
             "[live_openxr_controller] immersive controller handedness validation: "
             f"sample={controller_basis_state['validation_sample_id']} "
+            f"state={controller_basis_state.get('state', 'unknown')} "
             f"mode={controller_basis_state['validation_mode']} "
+            f"candidate_streak={int(controller_basis_state.get('candidate_streak', 0))} "
+            f"lock_reason={controller_basis_state.get('lock_reason')} "
             f"screen_center_x={controller_basis_state['screen_center_x']:.2f} "
             f"live_lateral_delta_x={_fmt(controller_basis_state['live_lateral_delta_x'])} "
             f"provisional_left_body_x={_fmt(controller_basis_state['provisional_left_body_x'])} "
@@ -4549,6 +4638,97 @@ class InvPhyTrainerWarp:
             flush=True,
         )
 
+    def _controller_basis_active_sources(self, controller_runtime_state):
+        if controller_runtime_state is None:
+            return []
+        active_sources = []
+        for source in ("left", "right"):
+            if controller_runtime_state.get(f"{source}_controller") is not None:
+                active_sources.append(source)
+        return active_sources
+
+    def _controller_basis_interaction_started(
+        self,
+        controller_runtime_state,
+        controller_interaction_state,
+    ):
+        if controller_runtime_state is not None:
+            for source in ("left", "right"):
+                controller_world = controller_runtime_state.get(f"{source}_controller")
+                if controller_world is None:
+                    continue
+                if bool(controller_world.get("select_start_edge", False)):
+                    return True
+                if bool(controller_world.get("select_hold_active", False)):
+                    return True
+        if controller_interaction_state is not None:
+            for source in ("left", "right"):
+                if controller_interaction_state.get(source) is not None:
+                    return True
+        return False
+
+    def _lock_immersive_controller_basis_state(
+        self,
+        controller_basis_state,
+        sample_id,
+        lock_reason,
+        validation_mode=None,
+        basis=None,
+        lateral_flip_applied=None,
+        controller_runtime_state=None,
+    ):
+        updated_controller_basis_state = dict(controller_basis_state)
+        updated_controller_basis_state["state"] = "locked"
+        updated_controller_basis_state["resolved"] = True
+        updated_controller_basis_state["lock_reason"] = lock_reason
+        updated_controller_basis_state["lock_sample_id"] = int(sample_id)
+        updated_controller_basis_state["validation_sample_id"] = int(sample_id)
+        updated_controller_basis_state["locked_active_sources"] = (
+            self._controller_basis_active_sources(controller_runtime_state)
+        )
+        if validation_mode is not None:
+            updated_controller_basis_state["validation_mode"] = validation_mode
+        if basis is not None:
+            updated_controller_basis_state["basis"] = basis
+        if lateral_flip_applied is not None:
+            updated_controller_basis_state["lateral_flip_applied"] = bool(
+                lateral_flip_applied
+            )
+        return updated_controller_basis_state
+
+    def _maybe_note_late_controller_seen_after_lock(
+        self,
+        controller_runtime_state,
+        controller_basis_state,
+    ):
+        if (
+            controller_runtime_state is None
+            or controller_basis_state is None
+            or controller_basis_state.get("state") != "locked"
+        ):
+            return controller_basis_state
+        updated_controller_basis_state = dict(controller_basis_state)
+        seen_after_lock = list(
+            updated_controller_basis_state.get("late_controller_seen_after_lock", [])
+        )
+        locked_active_sources = set(
+            updated_controller_basis_state.get("locked_active_sources", [])
+        )
+        for source in self._controller_basis_active_sources(controller_runtime_state):
+            if source in locked_active_sources or source in seen_after_lock:
+                continue
+            seen_after_lock.append(source)
+            print(
+                "[live_openxr_controller] "
+                f"immersive late_controller_seen_after_lock source={source} "
+                "basis_reused=1",
+                flush=True,
+            )
+        updated_controller_basis_state["late_controller_seen_after_lock"] = (
+            seen_after_lock
+        )
+        return updated_controller_basis_state
+
     def _maybe_resolve_immersive_controller_handedness(
         self,
         latest_controller_sample,
@@ -4557,6 +4737,7 @@ class InvPhyTrainerWarp:
         controller_source_anchor_centers,
         intrinsic,
         w2c,
+        controller_interaction_state=None,
         alignment_pose_role="selected",
         controller_position_pose_role="selected",
         controller_ray_pose_role=None,
@@ -4565,9 +4746,40 @@ class InvPhyTrainerWarp:
             latest_controller_sample is None
             or controller_runtime_state is None
             or controller_basis_state is None
-            or controller_basis_state.get("resolved", False)
         ):
             return controller_runtime_state, controller_basis_state
+        if controller_basis_state.get("state") == "locked":
+            return (
+                controller_runtime_state,
+                self._maybe_note_late_controller_seen_after_lock(
+                    controller_runtime_state,
+                    controller_basis_state,
+                ),
+            )
+
+        sample_id = int(latest_controller_sample.sample)
+        updated_controller_basis_state = dict(controller_basis_state)
+        if updated_controller_basis_state.get("resolution_start_sample") is None:
+            updated_controller_basis_state["resolution_start_sample"] = sample_id
+            updated_controller_basis_state["resolution_deadline_sample"] = (
+                sample_id + int(self.IMMERSIVE_CONTROLLER_HANDNESS_MAX_VALID_SAMPLES)
+            )
+
+        if self._controller_basis_interaction_started(
+            controller_runtime_state,
+            controller_interaction_state,
+        ):
+            updated_controller_basis_state = self._lock_immersive_controller_basis_state(
+                updated_controller_basis_state,
+                sample_id=sample_id,
+                lock_reason="interaction_started",
+                validation_mode="interaction_started_default",
+                controller_runtime_state=controller_runtime_state,
+            )
+            self._log_immersive_controller_handedness_resolution(
+                updated_controller_basis_state
+            )
+            return controller_runtime_state, updated_controller_basis_state
 
         left_grip_position = controller_pose_position(
             latest_controller_sample.left,
@@ -4578,14 +4790,37 @@ class InvPhyTrainerWarp:
             alignment_pose_role,
         )
         if left_grip_position is None or right_grip_position is None:
-            return controller_runtime_state, controller_basis_state
+            if sample_id >= int(updated_controller_basis_state["resolution_deadline_sample"]):
+                updated_controller_basis_state = self._lock_immersive_controller_basis_state(
+                    updated_controller_basis_state,
+                    sample_id=sample_id,
+                    lock_reason="timeout_default",
+                    validation_mode="timeout_default",
+                    controller_runtime_state=controller_runtime_state,
+                )
+                self._log_immersive_controller_handedness_resolution(
+                    updated_controller_basis_state
+                )
+            return controller_runtime_state, updated_controller_basis_state
 
         live_lateral_delta_x = float(
             np.asarray(right_grip_position, dtype=np.float32)[0]
             - np.asarray(left_grip_position, dtype=np.float32)[0]
         )
         if abs(live_lateral_delta_x) < 1e-5:
-            return controller_runtime_state, controller_basis_state
+            updated_controller_basis_state["live_lateral_delta_x"] = live_lateral_delta_x
+            if sample_id >= int(updated_controller_basis_state["resolution_deadline_sample"]):
+                updated_controller_basis_state = self._lock_immersive_controller_basis_state(
+                    updated_controller_basis_state,
+                    sample_id=sample_id,
+                    lock_reason="timeout_default",
+                    validation_mode="timeout_default",
+                    controller_runtime_state=controller_runtime_state,
+                )
+                self._log_immersive_controller_handedness_resolution(
+                    updated_controller_basis_state
+                )
+            return controller_runtime_state, updated_controller_basis_state
 
         provisional_left_body_x, _, provisional_left_body_valid = (
             self._project_controller_world_field_to_startup_screen_x(
@@ -4622,38 +4857,8 @@ class InvPhyTrainerWarp:
 
         body_pair_valid = provisional_left_body_valid and provisional_right_body_valid
         ray_pair_valid = provisional_left_ray_valid and provisional_right_ray_valid
-        if not body_pair_valid and not ray_pair_valid:
-            return controller_runtime_state, controller_basis_state
-
-        body_mirrored = False
-        ray_mirrored = False
-        validation_mode = "dual_grip"
-        if body_pair_valid:
-            projected_body_delta_x = float(
-                provisional_right_body_x - provisional_left_body_x
-            )
-            body_mirrored = (live_lateral_delta_x * projected_body_delta_x) < 0.0
-            validation_mode += "_body"
-        if ray_pair_valid:
-            projected_ray_delta_x = float(
-                provisional_right_ray_x - provisional_left_ray_x
-            )
-            ray_mirrored = (live_lateral_delta_x * projected_ray_delta_x) < 0.0
-            validation_mode += "_ray"
-        lateral_flip_applied = body_mirrored or ray_mirrored
-
-        resolved_basis = self._controller_basis_with_lateral_flip(
-            controller_basis_state["head_basis"],
-            lateral_flip=lateral_flip_applied,
-        )
-        updated_controller_basis_state = dict(controller_basis_state)
         updated_controller_basis_state.update(
             {
-                "resolved": True,
-                "basis": resolved_basis,
-                "lateral_flip_applied": lateral_flip_applied,
-                "validation_mode": validation_mode,
-                "validation_sample_id": int(latest_controller_sample.sample),
                 "live_lateral_delta_x": live_lateral_delta_x,
                 "provisional_left_body_x": provisional_left_body_x,
                 "provisional_right_body_x": provisional_right_body_x,
@@ -4661,7 +4866,81 @@ class InvPhyTrainerWarp:
                 "provisional_right_ray_x": provisional_right_ray_x,
             }
         )
+        if not body_pair_valid and not ray_pair_valid:
+            if sample_id >= int(updated_controller_basis_state["resolution_deadline_sample"]):
+                updated_controller_basis_state = self._lock_immersive_controller_basis_state(
+                    updated_controller_basis_state,
+                    sample_id=sample_id,
+                    lock_reason="timeout_default",
+                    validation_mode="timeout_default",
+                    controller_runtime_state=controller_runtime_state,
+                )
+                self._log_immersive_controller_handedness_resolution(
+                    updated_controller_basis_state
+                )
+            return controller_runtime_state, updated_controller_basis_state
 
+        validation_mode = "dual_grip"
+        candidate_flip = None
+        if body_pair_valid:
+            projected_body_delta_x = float(
+                provisional_right_body_x - provisional_left_body_x
+            )
+            candidate_flip = (live_lateral_delta_x * projected_body_delta_x) < 0.0
+            validation_mode += "_body"
+        elif ray_pair_valid:
+            projected_ray_delta_x = float(
+                provisional_right_ray_x - provisional_left_ray_x
+            )
+            candidate_flip = (live_lateral_delta_x * projected_ray_delta_x) < 0.0
+            validation_mode += "_ray"
+        if candidate_flip is None:
+            if sample_id >= int(updated_controller_basis_state["resolution_deadline_sample"]):
+                updated_controller_basis_state = self._lock_immersive_controller_basis_state(
+                    updated_controller_basis_state,
+                    sample_id=sample_id,
+                    lock_reason="timeout_default",
+                    validation_mode="timeout_default",
+                    controller_runtime_state=controller_runtime_state,
+                )
+                self._log_immersive_controller_handedness_resolution(
+                    updated_controller_basis_state
+                )
+            return controller_runtime_state, updated_controller_basis_state
+
+        candidate_flip = bool(candidate_flip)
+        if updated_controller_basis_state.get("candidate_flip") == candidate_flip:
+            updated_controller_basis_state["candidate_streak"] = int(
+                updated_controller_basis_state.get("candidate_streak", 0)
+            ) + 1
+        else:
+            updated_controller_basis_state["candidate_flip"] = candidate_flip
+            updated_controller_basis_state["candidate_streak"] = 1
+        updated_controller_basis_state["validation_mode"] = f"pending_{validation_mode}"
+        updated_controller_basis_state["validation_sample_id"] = sample_id
+
+        if int(updated_controller_basis_state["candidate_streak"]) < int(
+            self.IMMERSIVE_CONTROLLER_HANDNESS_CONFIRM_STREAK
+        ):
+            if sample_id >= int(updated_controller_basis_state["resolution_deadline_sample"]):
+                updated_controller_basis_state = self._lock_immersive_controller_basis_state(
+                    updated_controller_basis_state,
+                    sample_id=sample_id,
+                    lock_reason="timeout_default",
+                    validation_mode="timeout_default",
+                    controller_runtime_state=controller_runtime_state,
+                )
+                self._log_immersive_controller_handedness_resolution(
+                    updated_controller_basis_state
+                )
+            return controller_runtime_state, updated_controller_basis_state
+
+        lateral_flip_applied = candidate_flip
+
+        resolved_basis = self._controller_basis_with_lateral_flip(
+            updated_controller_basis_state["head_basis"],
+            lateral_flip=lateral_flip_applied,
+        )
         if lateral_flip_applied:
             controller_runtime_state = self._recompute_live_controller_runtime_state_for_basis(
                 latest_controller_sample,
@@ -4702,6 +4981,15 @@ class InvPhyTrainerWarp:
         updated_controller_basis_state["final_right_body_x"] = final_right_body_x
         updated_controller_basis_state["final_left_ray_x"] = final_left_ray_x
         updated_controller_basis_state["final_right_ray_x"] = final_right_ray_x
+        updated_controller_basis_state = self._lock_immersive_controller_basis_state(
+            updated_controller_basis_state,
+            sample_id=sample_id,
+            lock_reason="dual_confirmed",
+            validation_mode=validation_mode,
+            basis=resolved_basis,
+            lateral_flip_applied=lateral_flip_applied,
+            controller_runtime_state=controller_runtime_state,
+        )
         self._log_immersive_controller_handedness_resolution(
             updated_controller_basis_state
         )
@@ -6102,6 +6390,7 @@ class InvPhyTrainerWarp:
         remap_candidate,
         hit_world,
         ray_direction,
+        controller_interaction_state=None,
         explicit_preview_selected=False,
     ):
         if interaction_state is None or remap_candidate is None:
@@ -6119,6 +6408,14 @@ class InvPhyTrainerWarp:
         selected_object_indices = remap_candidate.get("selected_object_indices")
         if selected_object_indices is None or int(selected_object_indices.numel()) <= 0:
             return "empty_patch", {}
+        anchor_name = remap_candidate.get("anchor_name")
+        anchor_occupied, occupied_other_source = self._anchor_is_occupied_by_other_source(
+            source,
+            anchor_name,
+            controller_interaction_state,
+        )
+        if anchor_occupied:
+            return f"anchor_occupied(other_source={occupied_other_source})", {}
 
         attach_anchor_world = remap_candidate["attach_anchor_world"]
         attach_radius = float(remap_candidate.get("attach_radius", 0.0))
@@ -6969,6 +7266,15 @@ class InvPhyTrainerWarp:
                     controller_predefined_anchor_states,
                     preview_anchor_name,
                 )
+                selected_preview_anchor_occupied, _ = (
+                    self._anchor_is_occupied_by_other_source(
+                        source,
+                        preview_anchor_name,
+                        controller_interaction_state,
+                    )
+                )
+                if selected_preview_anchor_occupied:
+                    selected_preview_anchor = None
                 hit_world = None if overlay is None else overlay.get("hit_world")
                 ray_origin_world, ray_direction_world = self._controller_world_ray_pose(
                     controller_world
@@ -6978,11 +7284,18 @@ class InvPhyTrainerWarp:
                 if snapped_anchor is None:
                     if not allow_implicit_fallback_start:
                         continue
+                    available_anchor_states = (
+                        self._filter_available_predefined_interaction_anchors(
+                            source,
+                            controller_predefined_anchor_states,
+                            controller_interaction_state,
+                        )
+                    )
                     ranked_anchors = self._rank_predefined_interaction_anchors(
                         hit_world,
                         ray_origin_world,
                         ray_direction_world,
-                        controller_predefined_anchor_states,
+                        available_anchor_states,
                         require_selection_radius=False,
                     )
                     snapped_anchor = None if not ranked_anchors else ranked_anchors[0]
@@ -7070,6 +7383,7 @@ class InvPhyTrainerWarp:
                     remap_candidate,
                     hit_world,
                     ray_direction_world,
+                    controller_interaction_state=controller_interaction_state,
                     explicit_preview_selected=True,
                 )
                 if rejection_reason is not None:
@@ -7225,17 +7539,22 @@ class InvPhyTrainerWarp:
                 preview_pixel = preview_entry["pixel"]
                 preview_selected = preview_entry["selected"]
                 preview_active = preview_entry["active"]
+                preview_occupied = bool(preview_entry.get("occupied", False))
                 preview_color = (
                     self.LIVE_CONTROLLER_ATTACH_ACTIVE_COLOR
                     if preview_active
-                    else color
+                    else (
+                        self.LIVE_CONTROLLER_PREVIEW_OCCUPIED_COLOR
+                        if preview_occupied
+                        else color
+                    )
                 )
                 preview_radius = (
                     self.LIVE_CONTROLLER_PREVIEW_SELECTED_RADIUS
                     if preview_selected
                     else self.LIVE_CONTROLLER_PREVIEW_RADIUS
                 )
-                preview_blend = 0.78 if preview_selected else 0.32
+                preview_blend = 0.78 if preview_selected else (0.42 if preview_occupied else 0.32)
                 self._blend_marker(
                     frame,
                     preview_pixel,
@@ -8022,6 +8341,7 @@ class InvPhyTrainerWarp:
                     "name": preview_entry["name"],
                     "selected": preview_entry["selected"],
                     "active": preview_entry["active"],
+                    "occupied": bool(preview_entry.get("occupied", False)),
                 }
             )
         return projected
@@ -8167,6 +8487,7 @@ class InvPhyTrainerWarp:
                             "name": preview_entry["name"],
                             "selected": preview_entry["selected"],
                             "active": preview_entry["active"],
+                            "occupied": bool(preview_entry.get("occupied", False)),
                         }
                     )
                 eye_entries.append(projected)
@@ -9583,7 +9904,9 @@ class InvPhyTrainerWarp:
                     f"surface_center={table_alignment_debug['world_surface_center']} "
                     f"surface_plane={world_surface_plane_height:.4f} "
                     f"collider_plane={collider_top_plane_height:.4f} "
-                    f"visible_table_patches={table_alignment_debug.get('active_table_support_patch_count', 'n/a')} "
+                    f"active_table_patches={table_alignment_debug.get('active_table_support_patch_count', 'n/a')} "
+                    f"support_slabs={table_alignment_debug.get('support_slab_count', 'n/a')} "
+                    f"blocker_boxes={table_alignment_debug.get('blocker_box_count', 'n/a')} "
                     f"collider_boxes={table_alignment_debug.get('collider_box_count', 'n/a')}",
                     flush=True,
                 )
@@ -9862,6 +10185,7 @@ class InvPhyTrainerWarp:
                 controller_source_anchor_centers,
                 intrinsic,
                 w2c,
+                controller_interaction_state=controller_interaction_state,
                 alignment_pose_role="grip",
                 controller_position_pose_role="grip",
                 controller_ray_pose_role="aim",
@@ -10256,6 +10580,7 @@ class InvPhyTrainerWarp:
                         controller_source_anchor_centers,
                         intrinsic,
                         w2c,
+                        controller_interaction_state=controller_interaction_state,
                         alignment_pose_role="grip",
                         controller_position_pose_role="grip",
                         controller_ray_pose_role="aim",
@@ -10449,6 +10774,14 @@ class InvPhyTrainerWarp:
                             controller_anchor_preview_state,
                             cycle_edge,
                             controller_interaction_state[source],
+                            controller_interaction_state,
+                        )
+                        available_anchor_states = (
+                            self._filter_available_predefined_interaction_anchors(
+                                source,
+                                controller_predefined_anchor_states,
+                                controller_interaction_state,
+                            )
                         )
                         overlay_entry["anchor_preview_entries_world"] = []
                         if (
@@ -10456,6 +10789,11 @@ class InvPhyTrainerWarp:
                             and controller_anchor_preview_state[source]["visible"]
                         ):
                             for anchor_state in controller_predefined_anchor_states:
+                                preview_occupied, _ = self._anchor_is_occupied_by_other_source(
+                                    source,
+                                    anchor_state["name"],
+                                    controller_interaction_state,
+                                )
                                 overlay_entry["anchor_preview_entries_world"].append(
                                     {
                                         "world": anchor_state["center_world"],
@@ -10473,13 +10811,14 @@ class InvPhyTrainerWarp:
                                                 "anchor_name"
                                             )
                                         ),
+                                        "occupied": preview_occupied,
                                     }
                                 )
                         nearest_anchor = None
                         if overlay_entry["hit_world"] is not None:
                             nearest_anchor = self._select_predefined_interaction_anchor(
                                 overlay_entry["hit_world"],
-                                controller_predefined_anchor_states,
+                                available_anchor_states,
                             )
                         ray_origin_world, ray_direction_world = self._controller_world_ray_pose(
                             controller_world
@@ -10492,7 +10831,7 @@ class InvPhyTrainerWarp:
                             nearest_anchor = self._select_predefined_interaction_anchor_for_ray(
                                 ray_origin_world,
                                 ray_direction_world,
-                                controller_predefined_anchor_states,
+                                available_anchor_states,
                             )
                         preview_state_entry = controller_anchor_preview_state[source]
                         if bool(preview_state_entry.get("cycle_locked", False)):

@@ -3,6 +3,9 @@
   "scene_preset": "ILLIXR_lab",
   "scene_model": "scene.obj",
   "scene_material": "scene.mtl",
+  "scene_analysis_cache": "scene_analysis_cache_v1.pkl.gz",
+  "scene_analysis_cache_schema": 1,
+  "scene_analysis_cache_inputs": "manifest_subset+scene_model_bytes+scene_material_bytes+texture_names",
   "textures": [
     "FloorBake.png",
     "WallBake.png",

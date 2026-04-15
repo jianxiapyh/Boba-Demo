@@ -9667,6 +9667,16 @@ class InvPhyTrainerWarp:
                 "scene_renderer_construct_done",
                 immersive_bridge,
             )
+            scene_analysis_cache_debug = scene_renderer.scene_analysis_cache_debug()
+            print(
+                "[quest_display] immersive scene analysis cache: "
+                f"status={scene_analysis_cache_debug.get('status')} "
+                f"reason={scene_analysis_cache_debug.get('reason')} "
+                f"schema={scene_analysis_cache_debug.get('schema')} "
+                f"input_hash={scene_analysis_cache_debug.get('input_hash')} "
+                f"path={scene_analysis_cache_debug.get('path')}",
+                flush=True,
+            )
             self._record_immersive_startup_milestone(
                 startup_timeline,
                 "bridge_start_begin",

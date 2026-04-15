@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import gzip
+import hashlib
 import json
-from dataclasses import dataclass, field
+import pickle
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +22,8 @@ from .pyrender_cuda_bridge import (
 MANIFEST_RELATIVE_PATH = Path("assets/scenes/ILLIXR_lab/manifest.json")
 ILLIXR_SCENE_NAME = "ILLIXR_lab"
 ILLIXR_BAKED_LIGHTING_MODE = "baked_texture_ambient"
+SCENE_ANALYSIS_CACHE_SCHEMA = 1
+DEFAULT_SCENE_ANALYSIS_CACHE_FILENAME = "scene_analysis_cache_v1.pkl.gz"
 
 TARGET_TABLE_SIZE_X = 0.95
 TARGET_TABLE_SIZE_Y = 0.68
@@ -563,6 +568,7 @@ class SimpleLabSceneRenderer:
         height: int,
         lighting_mode: str = "full",
         balanced_render_backend: str = "pyrender",
+        scene_analysis_cache_mode: str = "auto",
     ):
         import pyrender
 
@@ -575,6 +581,11 @@ class SimpleLabSceneRenderer:
         self.scene_root = ensure_illixr_lab_assets(scene_assets_root)
         self.manifest = load_illixr_lab_manifest(scene_assets_root)
         self.layout: SimpleLabLayout | None = None
+        self._scene_analysis_cache_mode = str(scene_analysis_cache_mode).strip().lower()
+        if self._scene_analysis_cache_mode not in {"auto", "rebuild"}:
+            raise ValueError(
+                "scene_analysis_cache_mode must be one of {'auto', 'rebuild'}"
+            )
 
         self._scene_clear_color = np.array([243, 244, 246, 255], dtype=np.uint8)
         self._table_clear_color = np.array([0, 0, 0, 0], dtype=np.uint8)
@@ -644,6 +655,93 @@ class SimpleLabSceneRenderer:
             self.manifest.get("target_table_size_m", [TARGET_TABLE_SIZE_X, TARGET_TABLE_SIZE_Y]),
             dtype=np.float32,
         )
+        self._scene_asset = None
+        self._scene_analysis_cache_path = self._resolve_scene_analysis_cache_path()
+        self._scene_analysis_cache_input_hash = self._compute_scene_analysis_cache_input_hash()
+        self._scene_analysis_cache_debug = {
+            "status": "miss",
+            "reason": "not_attempted",
+            "schema": int(SCENE_ANALYSIS_CACHE_SCHEMA),
+            "input_hash": self._scene_analysis_cache_input_hash,
+            "path": None
+            if self._scene_analysis_cache_path is None
+            else str(self._scene_analysis_cache_path),
+        }
+        cache_loaded = False
+        if self._scene_analysis_cache_mode == "auto":
+            cache_loaded = self._load_scene_analysis_cache()
+        else:
+            self._scene_analysis_cache_debug["reason"] = "forced_rebuild"
+        if not cache_loaded:
+            self._build_scene_analysis()
+            self._scene_analysis_cache_debug.update(
+                {
+                    "status": "miss",
+                    "reason": str(self._scene_analysis_cache_debug.get("reason", "rebuilt")),
+                    "schema": int(SCENE_ANALYSIS_CACHE_SCHEMA),
+                    "input_hash": self._scene_analysis_cache_input_hash,
+                }
+            )
+        self._full_scene_mesh_world: trimesh.Trimesh | None = None
+        self._background_mesh_world: trimesh.Trimesh | None = None
+        self._table_mesh_world: trimesh.Trimesh | None = None
+        self._floor_mesh_world: trimesh.Trimesh | None = None
+        self._left_wall_mesh_world: trimesh.Trimesh | None = None
+        self._right_wall_mesh_world: trimesh.Trimesh | None = None
+        self._front_back_mesh_world: trimesh.Trimesh | None = None
+
+    def _resolve_scene_analysis_cache_path(self) -> Path:
+        relative_path = self.manifest.get(
+            "scene_analysis_cache",
+            DEFAULT_SCENE_ANALYSIS_CACHE_FILENAME,
+        )
+        return self.scene_root / str(relative_path)
+
+    def _scene_analysis_cache_manifest_subset(self) -> dict[str, Any]:
+        return {
+            key: self.manifest.get(key)
+            for key in (
+                "version",
+                "scene_preset",
+                "scene_model",
+                "scene_material",
+                "textures",
+                "asset_up_axis",
+                "scene_up_axis",
+                "x_rotation_degrees",
+                "target_table_size_m",
+                "floor_materials",
+                "wall_materials",
+                "furniture_materials",
+            )
+        }
+
+    def _compute_scene_analysis_cache_input_hash(self) -> str:
+        hasher = hashlib.sha256()
+        hasher.update(
+            json.dumps(
+                self._scene_analysis_cache_manifest_subset(),
+                sort_keys=True,
+            ).encode("utf-8")
+        )
+        for manifest_key in ("scene_model", "scene_material"):
+            rel_path = self.manifest.get(manifest_key)
+            if rel_path is None:
+                continue
+            asset_path = self.scene_root / str(rel_path)
+            hasher.update(manifest_key.encode("utf-8"))
+            hasher.update(asset_path.read_bytes())
+        texture_names = [
+            str(name)
+            for name in self.manifest.get("textures", [])
+        ]
+        hasher.update(json.dumps(texture_names, sort_keys=False).encode("utf-8"))
+        return hasher.hexdigest()
+
+    def scene_analysis_cache_debug(self) -> dict[str, Any]:
+        return dict(self._scene_analysis_cache_debug)
+
+    def _build_scene_analysis(self) -> None:
         self._scene_asset = trimesh.load(
             self.scene_root / self.manifest["scene_model"],
             force="scene",
@@ -719,13 +817,200 @@ class SimpleLabSceneRenderer:
             self._furniture_component_records,
             self._table_component_ids,
         )
-        self._full_scene_mesh_world: trimesh.Trimesh | None = None
-        self._background_mesh_world: trimesh.Trimesh | None = None
-        self._table_mesh_world: trimesh.Trimesh | None = None
-        self._floor_mesh_world: trimesh.Trimesh | None = None
-        self._left_wall_mesh_world: trimesh.Trimesh | None = None
-        self._right_wall_mesh_world: trimesh.Trimesh | None = None
-        self._front_back_mesh_world: trimesh.Trimesh | None = None
+
+    def _export_scene_analysis_payload(self) -> dict[str, Any]:
+        return {
+            "floor_asset_mesh": self._floor_asset_mesh.copy(),
+            "wall_asset_mesh": self._wall_asset_mesh.copy(),
+            "furniture_asset_mesh": self._furniture_asset_mesh.copy(),
+            "asset_floor_y": float(self._asset_floor_y),
+            "asset_room_bounds": np.array(self._asset_room_bounds, copy=True),
+            "asset_room_center_xz": np.array(self._asset_room_center_xz, copy=True),
+            "wall_face_masks": {
+                key: np.array(value, copy=True)
+                for key, value in self._wall_face_masks.items()
+            },
+            "furniture_component_records": self._furniture_component_records,
+            "table_component_ids": list(self._table_component_ids),
+            "table_support_component_ids": list(self._table_support_component_ids),
+            "asset_table_scale_reference_bounds": (
+                np.array(self._asset_table_scale_reference_bounds[0], copy=True),
+                np.array(self._asset_table_scale_reference_bounds[1], copy=True),
+            ),
+            "asset_table_scale_reference_center": np.array(
+                self._asset_table_scale_reference_center,
+                copy=True,
+            ),
+            "asset_table_scale_reference_height": float(
+                self._asset_table_scale_reference_height
+            ),
+            "asset_startup_table_patch": self._asset_startup_table_patch,
+            "asset_visible_tabletop_patches": self._asset_visible_tabletop_patches,
+        }
+
+    def _apply_scene_analysis_payload(self, payload: dict[str, Any]) -> None:
+        self._scene_asset = None
+        self._floor_asset_mesh = payload["floor_asset_mesh"]
+        self._wall_asset_mesh = payload["wall_asset_mesh"]
+        self._furniture_asset_mesh = payload["furniture_asset_mesh"]
+        self._full_asset_mesh = trimesh.util.concatenate(
+            [
+                self._floor_asset_mesh.copy(),
+                self._wall_asset_mesh.copy(),
+                self._furniture_asset_mesh.copy(),
+            ]
+        )
+        self._asset_floor_y = float(payload["asset_floor_y"])
+        self._asset_room_bounds = np.asarray(
+            payload["asset_room_bounds"],
+            dtype=np.float32,
+        )
+        self._asset_room_center_xz = np.asarray(
+            payload["asset_room_center_xz"],
+            dtype=np.float32,
+        )
+        self._wall_face_masks = {
+            str(key): np.asarray(value, dtype=bool)
+            for key, value in payload["wall_face_masks"].items()
+        }
+        self._furniture_component_labels = None
+        self._furniture_component_records = payload["furniture_component_records"]
+        self._table_component_ids = [int(v) for v in payload["table_component_ids"]]
+        self._table_support_component_ids = [
+            int(v) for v in payload["table_support_component_ids"]
+        ]
+        self._asset_table_scale_reference_bounds = (
+            np.asarray(
+                payload["asset_table_scale_reference_bounds"][0],
+                dtype=np.float32,
+            ),
+            np.asarray(
+                payload["asset_table_scale_reference_bounds"][1],
+                dtype=np.float32,
+            ),
+        )
+        self._asset_table_scale_reference_center = np.asarray(
+            payload["asset_table_scale_reference_center"],
+            dtype=np.float32,
+        )
+        self._asset_table_scale_reference_height = float(
+            payload["asset_table_scale_reference_height"]
+        )
+        self._asset_startup_table_patch = payload["asset_startup_table_patch"]
+        self._asset_visible_tabletop_patches = payload["asset_visible_tabletop_patches"]
+        table_face_indices = np.concatenate(
+            [
+                np.asarray(record["face_indices"], dtype=np.int64)
+                for record in self._furniture_component_records
+                if int(record["id"]) in set(self._table_component_ids)
+            ],
+            axis=0,
+        )
+        self._table_asset_mesh = self._slice_mesh_by_face_indices(
+            self._furniture_asset_mesh,
+            table_face_indices,
+        )
+        self._startup_table_asset_mesh = self._slice_mesh_by_face_indices(
+            self._furniture_asset_mesh,
+            np.asarray(self._asset_startup_table_patch["face_indices"], dtype=np.int64),
+        )
+        self._visible_tabletop_asset_mesh = self._slice_mesh_by_face_indices(
+            self._furniture_asset_mesh,
+            np.concatenate(
+                [
+                    np.asarray(patch["face_indices"], dtype=np.int64)
+                    for patch in self._asset_visible_tabletop_patches
+                ],
+                axis=0,
+            ),
+        )
+        self._left_wall_asset_mesh = self._slice_mesh_by_face_mask(
+            self._wall_asset_mesh,
+            self._wall_face_masks["left"],
+        )
+        self._right_wall_asset_mesh = self._slice_mesh_by_face_mask(
+            self._wall_asset_mesh,
+            self._wall_face_masks["right"],
+        )
+        self._front_back_asset_mesh = self._slice_mesh_by_face_mask(
+            self._wall_asset_mesh,
+            self._wall_face_masks["front"] | self._wall_face_masks["back"],
+        )
+        self._collision_component_records = self._select_collision_component_records(
+            self._furniture_component_records,
+            self._table_component_ids,
+        )
+
+    def _load_scene_analysis_cache(self) -> bool:
+        cache_path = self._scene_analysis_cache_path
+        expected_manifest_schema = int(
+            self.manifest.get(
+                "scene_analysis_cache_schema",
+                SCENE_ANALYSIS_CACHE_SCHEMA,
+            )
+        )
+        if expected_manifest_schema != int(SCENE_ANALYSIS_CACHE_SCHEMA):
+            self._scene_analysis_cache_debug["reason"] = "manifest_cache_schema_mismatch"
+            return False
+        if cache_path is None:
+            self._scene_analysis_cache_debug["reason"] = "cache_path_unavailable"
+            return False
+        if not cache_path.exists():
+            self._scene_analysis_cache_debug["reason"] = "cache_file_missing"
+            return False
+        try:
+            with gzip.open(cache_path, "rb") as handle:
+                payload = pickle.load(handle)
+        except Exception as exc:
+            self._scene_analysis_cache_debug["reason"] = (
+                f"cache_load_error:{exc.__class__.__name__}"
+            )
+            return False
+        if int(payload.get("schema", -1)) != int(SCENE_ANALYSIS_CACHE_SCHEMA):
+            self._scene_analysis_cache_debug["reason"] = "cache_schema_mismatch"
+            return False
+        if str(payload.get("input_hash", "")) != self._scene_analysis_cache_input_hash:
+            self._scene_analysis_cache_debug["reason"] = "cache_input_hash_mismatch"
+            return False
+        if int(payload.get("manifest_version", -1)) != int(self.manifest.get("version", -1)):
+            self._scene_analysis_cache_debug["reason"] = "cache_manifest_version_mismatch"
+            return False
+        analysis = payload.get("analysis")
+        if not isinstance(analysis, dict):
+            self._scene_analysis_cache_debug["reason"] = "cache_payload_invalid"
+            return False
+        self._apply_scene_analysis_payload(analysis)
+        self._scene_analysis_cache_debug.update(
+            {
+                "status": "hit",
+                "reason": "cache_loaded",
+                "schema": int(payload.get("schema", SCENE_ANALYSIS_CACHE_SCHEMA)),
+                "input_hash": str(payload.get("input_hash", "")),
+            }
+        )
+        return True
+
+    def write_scene_analysis_cache(
+        self,
+        output_path: str | Path | None = None,
+    ) -> Path:
+        cache_path = (
+            Path(output_path)
+            if output_path is not None
+            else self._scene_analysis_cache_path
+        )
+        if cache_path is None:
+            raise RuntimeError("Scene analysis cache path is unavailable.")
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "schema": int(SCENE_ANALYSIS_CACHE_SCHEMA),
+            "manifest_version": int(self.manifest.get("version", -1)),
+            "input_hash": self._scene_analysis_cache_input_hash,
+            "analysis": self._export_scene_analysis_payload(),
+        }
+        with gzip.open(cache_path, "wb") as handle:
+            pickle.dump(payload, handle, protocol=pickle.HIGHEST_PROTOCOL)
+        return cache_path
 
     def _concat_geometries(self, names: list[str]) -> trimesh.Trimesh:
         geometries: list[trimesh.Trimesh] = []
@@ -1877,6 +2162,28 @@ class SimpleLabSceneRenderer:
         if return_render_info:
             return render_color, render_depth, render_info
         return render_color, render_depth
+
+
+def build_illixr_scene_analysis_cache(
+    scene_assets_root: str | Path,
+    output_path: str | Path | None = None,
+    width: int = 64,
+    height: int = 64,
+) -> tuple[Path, dict[str, Any]]:
+    renderer = SimpleLabSceneRenderer(
+        scene_assets_root=scene_assets_root,
+        width=width,
+        height=height,
+        lighting_mode=ILLIXR_BAKED_LIGHTING_MODE,
+        balanced_render_backend="pyrender",
+        scene_analysis_cache_mode="rebuild",
+    )
+    try:
+        cache_path = renderer.write_scene_analysis_cache(output_path)
+        debug = renderer.scene_analysis_cache_debug()
+    finally:
+        renderer.delete()
+    return cache_path, debug
 
 
 ImmersiveSceneRenderer = SimpleLabSceneRenderer

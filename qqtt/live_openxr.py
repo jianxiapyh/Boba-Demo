@@ -137,6 +137,7 @@ class LiveImmersiveSample:
     right: ControllerPoseSample
     left_eye: EyePoseSample
     right_eye: EyePoseSample
+    received_monotonic_s: float | None = None
 
 
 def hand_anchor(hand: HandJointSample) -> Optional[np.ndarray]:

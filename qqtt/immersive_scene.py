@@ -61,6 +61,7 @@ class SimpleLabLayout:
     scene_up: np.ndarray
     room_center_xy: np.ndarray | None = None
     static_collider_boxes: np.ndarray | None = None
+    support_surface_boxes: np.ndarray | None = None
     active_table_bounds: np.ndarray | None = None
     active_table_surface_center: np.ndarray | None = None
 
@@ -787,6 +788,22 @@ class SimpleLabSceneRenderer:
             self._furniture_component_labels,
             self._table_component_ids,
         )
+        self._background_furniture_asset_mesh = (
+            self._slice_furniture_mesh_excluding_component_ids(
+                self._furniture_component_records,
+                self._table_component_ids,
+            )
+        )
+        background_asset_meshes = [
+            mesh.copy()
+            for mesh in (
+                self._floor_asset_mesh,
+                self._wall_asset_mesh,
+                self._background_furniture_asset_mesh,
+            )
+            if mesh.faces.shape[0] > 0
+        ]
+        self._background_asset_mesh = trimesh.util.concatenate(background_asset_meshes)
         self._startup_table_asset_mesh = self._slice_mesh_by_face_indices(
             self._furniture_asset_mesh,
             np.asarray(self._asset_startup_table_patch["face_indices"], dtype=np.int64),
@@ -910,6 +927,22 @@ class SimpleLabSceneRenderer:
             self._furniture_asset_mesh,
             table_face_indices,
         )
+        self._background_furniture_asset_mesh = (
+            self._slice_furniture_mesh_excluding_component_ids(
+                self._furniture_component_records,
+                self._table_component_ids,
+            )
+        )
+        background_asset_meshes = [
+            mesh.copy()
+            for mesh in (
+                self._floor_asset_mesh,
+                self._wall_asset_mesh,
+                self._background_furniture_asset_mesh,
+            )
+            if mesh.faces.shape[0] > 0
+        ]
+        self._background_asset_mesh = trimesh.util.concatenate(background_asset_meshes)
         self._startup_table_asset_mesh = self._slice_mesh_by_face_indices(
             self._furniture_asset_mesh,
             np.asarray(self._asset_startup_table_patch["face_indices"], dtype=np.int64),
@@ -1399,6 +1432,28 @@ class SimpleLabSceneRenderer:
         face_mask[face_indices] = True
         return self._slice_mesh_by_face_mask(mesh, face_mask)
 
+    def _slice_furniture_mesh_excluding_component_ids(
+        self,
+        component_records: list[dict[str, Any]],
+        excluded_component_ids: list[int],
+    ) -> trimesh.Trimesh:
+        excluded_component_id_set = {int(v) for v in excluded_component_ids}
+        face_index_groups = [
+            np.asarray(record["face_indices"], dtype=np.int64)
+            for record in component_records
+            if int(record["id"]) not in excluded_component_id_set
+        ]
+        if not face_index_groups:
+            return trimesh.Trimesh(
+                vertices=np.zeros((0, 3)),
+                faces=np.zeros((0, 3), dtype=np.int64),
+                process=False,
+            )
+        return self._slice_mesh_by_face_indices(
+            self._furniture_asset_mesh,
+            np.concatenate(face_index_groups, axis=0),
+        )
+
     def _split_wall_faces(self, mesh: trimesh.Trimesh) -> dict[str, np.ndarray]:
         face_centroids = np.asarray(mesh.triangles_center, dtype=np.float32)
         bounds = mesh.bounds.astype(np.float32)
@@ -1752,9 +1807,10 @@ class SimpleLabSceneRenderer:
 
         self._full_scene_mesh_world = self._full_asset_mesh.copy()
         self._full_scene_mesh_world.apply_transform(world_transform)
-        self._background_mesh_world = self._full_scene_mesh_world.copy()
+        self._background_mesh_world = self._background_asset_mesh.copy()
+        self._background_mesh_world.apply_transform(world_transform)
 
-        self._table_mesh_world = self._visible_tabletop_asset_mesh.copy()
+        self._table_mesh_world = self._table_asset_mesh.copy()
         self._table_mesh_world.apply_transform(world_transform)
 
         self._floor_mesh_world = self._floor_asset_mesh.copy()
@@ -1810,16 +1866,33 @@ class SimpleLabSceneRenderer:
         self.layout.floor_z = floor_z
         self.layout.wall_height = float(max(floor_z - float(full_bounds[0, 2]), 0.1))
 
-        visible_table_world_bounds = self._table_mesh_world.bounds.astype(np.float32)
+        visible_tabletop_mesh_world = self._visible_tabletop_asset_mesh.copy()
+        visible_tabletop_mesh_world.apply_transform(world_transform)
+        visible_tabletop_world_bounds = visible_tabletop_mesh_world.bounds.astype(
+            np.float32
+        )
+        table_render_world_bounds = self._table_mesh_world.bounds.astype(np.float32)
         self._table_world_bounds = (
-            visible_table_world_bounds[0].copy(),
-            visible_table_world_bounds[1].copy(),
+            table_render_world_bounds[0].copy(),
+            table_render_world_bounds[1].copy(),
         )
         self.layout.table_size = np.array(
             [
-                float(visible_table_world_bounds[1, 0] - visible_table_world_bounds[0, 0]),
-                float(visible_table_world_bounds[1, 1] - visible_table_world_bounds[0, 1]),
-                float(max(visible_table_world_bounds[1, 2] - visible_table_world_bounds[0, 2], 0.12)),
+                float(
+                    table_render_world_bounds[1, 0]
+                    - table_render_world_bounds[0, 0]
+                ),
+                float(
+                    table_render_world_bounds[1, 1]
+                    - table_render_world_bounds[0, 1]
+                ),
+                float(
+                    max(
+                        table_render_world_bounds[1, 2]
+                        - table_render_world_bounds[0, 2],
+                        0.12,
+                    )
+                ),
             ],
             dtype=np.float32,
         )
@@ -1931,6 +2004,21 @@ class SimpleLabSceneRenderer:
             [np.asarray(entry["box"], dtype=np.float32) for entry in collider_entries],
             axis=0,
         ).astype(np.float32)
+        support_surface_entries = [
+            entry
+            for entry in collider_entries
+            if entry["category"] in {"floor_slab", "support_slab"}
+        ]
+        if support_surface_entries:
+            self.layout.support_surface_boxes = np.stack(
+                [
+                    np.asarray(entry["box"], dtype=np.float32)
+                    for entry in support_surface_entries
+                ],
+                axis=0,
+            ).astype(np.float32)
+        else:
+            self.layout.support_surface_boxes = None
         self.layout.static_collider_boxes = np.array(self._scene_collider_boxes, copy=True)
         support_slab_count = int(
             sum(1 for entry in collider_entries if entry["category"] == "support_slab")
@@ -1994,13 +2082,21 @@ class SimpleLabSceneRenderer:
             "native_table_support_size_xy": scale_reference_extent_xy.astype(np.float32).tolist(),
             "scaled_table_support_size_xy": self.layout.table_size[:2].astype(np.float32).tolist(),
             "active_table_world_bounds": active_table_world_bounds.astype(np.float32).tolist(),
-            "visible_table_world_bounds": visible_table_world_bounds.astype(np.float32).tolist(),
+            "visible_tabletop_world_bounds": visible_tabletop_world_bounds.astype(
+                np.float32
+            ).tolist(),
+            "table_render_world_bounds": table_render_world_bounds.astype(
+                np.float32
+            ).tolist(),
             "room_bounds": full_bounds.astype(np.float32).tolist(),
             "collider_box_count": int(self._scene_collider_boxes.shape[0]),
             "support_slab_count": support_slab_count,
             "blocker_box_count": blocker_box_count,
             "boundary_box_count": boundary_box_count,
             "decomposed_component_count": decomposed_component_count,
+            "table_render_component_ids": [int(v) for v in self._table_component_ids],
+            "background_excludes_active_table": True,
+            "table_render_bounds_source": "full_active_table_mesh",
         }
 
     def _rebuild_scene_nodes(self) -> None:

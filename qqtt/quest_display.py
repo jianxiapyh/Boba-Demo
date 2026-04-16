@@ -396,6 +396,8 @@ class OpenXRFramePanelMirror:
             except Exception as exc:
                 self._parse_errors.append(f"{exc}: {stripped}")
                 continue
+            if hasattr(sample, "received_monotonic_s"):
+                sample.received_monotonic_s = time.monotonic()
             with self._latest_lock:
                 self._latest_sample = sample
 

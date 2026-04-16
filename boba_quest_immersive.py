@@ -222,6 +222,26 @@ def build_parser() -> ArgumentParser:
         default=30,
         help="print one detailed render profile line every N profiled frames",
     )
+    parser.add_argument(
+        "--immersive_timewarp",
+        choices=("off", "scene_depth_reproject"),
+        default="off",
+        help=(
+            "late-warp mode for immersive Quest output: "
+            "'off' keeps the current shipped path, "
+            "'scene_depth_reproject' late-warps the fully composed scene via depth reprojection"
+        ),
+    )
+    parser.add_argument(
+        "--immersive_static_scene_overlap",
+        choices=("off", "on"),
+        default="off",
+        help=(
+            "static scene overlap mode for immersive Quest output: "
+            "'off' keeps the serial reference path, "
+            "'on' overlaps balanced room/table rendering with simulation+LBS without enabling time warp"
+        ),
+    )
     return parser
 
 
@@ -248,6 +268,12 @@ def main(argv: list[str] | None = None):
     print("[quest_display] mode=immersive", flush=True)
     print("[quest_display] scene_preset=ILLIXR_lab", flush=True)
     print("[quest_display] immersive_render_preset=balanced", flush=True)
+    print(f"[quest_display] immersive_timewarp={args.immersive_timewarp}", flush=True)
+    print(
+        "[quest_display] immersive_static_scene_overlap="
+        f"{args.immersive_static_scene_overlap}",
+        flush=True,
+    )
     print(
         f"[quest_display] interactive_window_mode={args.interactive_window_mode}",
         flush=True,
@@ -327,6 +353,8 @@ def main(argv: list[str] | None = None):
             scene_assets_root=args.scene_assets_root,
             render_profile=args.render_profile,
             render_profile_every=args.render_profile_every,
+            immersive_timewarp=args.immersive_timewarp,
+            immersive_static_scene_overlap=args.immersive_static_scene_overlap,
         )
     finally:
         import glfw

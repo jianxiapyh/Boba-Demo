@@ -5,8 +5,10 @@ This repo contains the shipped Quest immersive Boba demo path: live OpenXR contr
 The public packaged demo cases in this branch are:
 - `sloth`
 - `rope`
-- `hq_rope_0`
-- `hq_rope_1`
+- `hq_rope`
+
+Compatibility alias:
+- `hq_rope_0 -> hq_rope`
 
 Each case resolves entirely from `assets/<case>/`, and the shipped room assets live under `assets/scenes/ILLIXR_lab/`.
 
@@ -21,14 +23,12 @@ The immersive demo no longer depends on runtime assets from:
 The packaged runtime bundles live under:
 - `assets/sloth/`
 - `assets/rope/`
-- `assets/hq_rope_0/`
-- `assets/hq_rope_1/`
+- `assets/hq_rope/`
 
 For the shipped runtime Gaussian PLYs:
 - `assets/sloth/sloth.ply` is copied from `Boba/gaussian_output/double_stretch_sloth/.../iteration_10000/point_cloud.ply`
 - `assets/rope/rope.ply` is copied from `Boba/gaussian_output/single_lift_rope/.../iteration_10000/point_cloud.ply`
-- `assets/hq_rope_0/hq_rope_0.ply` is copied from `feng_rope/data/different_types/feng_rope_v8_0000/shape/object.ply`
-- `assets/hq_rope_1/hq_rope_1.ply` is copied from `feng_rope/data/different_types/feng_rope_v8_0005/shape/object.ply`
+- `assets/hq_rope/hq_rope.ply` is rebaked from `feng_rope/data/different_types/feng_rope_v8_0000/shape/object.ply`
 
 The packaged runtime no longer requires `multi_ctrls.pkl`; controller traces come from `final_data.pkl` for every shipped case.
 
@@ -70,12 +70,7 @@ Additional rope-family packaged cases:
 
 ```bash
 conda run -n phystwin env PYTHONNOUSERSITE=1 python boba_quest_immersive.py \
-  --case_name hq_rope_0 \
-  --n_dup 0 \
-  --interactive_window_mode hidden
-
-conda run -n phystwin env PYTHONNOUSERSITE=1 python boba_quest_immersive.py \
-  --case_name hq_rope_1 \
+  --case_name hq_rope \
   --n_dup 0 \
   --interactive_window_mode hidden
 ```

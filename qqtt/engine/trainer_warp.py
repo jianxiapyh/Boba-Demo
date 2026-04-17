@@ -948,49 +948,11 @@ class InvPhyTrainerWarp:
             bounds = points.max(dim=0).values - points.min(dim=0).values
             return float(torch.linalg.norm(bounds).item())
 
-    def _apply_uniform_gaussian_scale_about_pivot(
-        self,
-        gaussians,
-        scale,
-        *,
-        pivot,
-    ):
-        scale = float(scale)
-        pivot = torch.as_tensor(
-            pivot,
-            dtype=gaussians._xyz.dtype,
-            device=gaussians._xyz.device,
-        ).reshape(1, 3)
-        span_before = self._principal_axis_span_torch(gaussians._xyz.detach())
-        support_center_before = self._object_support_patch_center(
-            gaussians._xyz.detach()
-        )
-        gaussians._xyz = (pivot + (gaussians._xyz - pivot) * scale).contiguous()
-        gaussians._scaling = (
-            gaussians._scaling + float(np.log(scale))
-        ).contiguous()
-        span_after = self._principal_axis_span_torch(gaussians._xyz.detach())
-        support_center_after = self._object_support_patch_center(
-            gaussians._xyz.detach()
-        )
-        return {
-            "scale": scale,
-            "pivot": pivot.reshape(3).detach().cpu().numpy().tolist(),
-            "span_before": span_before,
-            "span_after": span_after,
-            "support_center_before": (
-                support_center_before.detach().cpu().numpy().tolist()
-            ),
-            "support_center_after": (
-                support_center_after.detach().cpu().numpy().tolist()
-            ),
-        }
-
     def _is_rope_family_case(self, case_name=None):
         if case_name is None:
             case_name = self._interaction_anchor_case_name()
         case_name = str(case_name).strip().lower()
-        return case_name in {"rope", "hq_rope_0", "hq_rope_1"}
+        return case_name in {"rope", "hq_rope"}
 
     def _live_controller_case_profile(self, case_name=None):
         if case_name is None:
@@ -6827,24 +6789,6 @@ class InvPhyTrainerWarp:
             "rotated_support_center": rotated_support_center,
         }
 
-    def _apply_rigid_gaussian_visual_spawn_shift(
-        self,
-        gaussians,
-        table_top_center_world,
-    ):
-        support_center_before = self._object_support_patch_center(gaussians._xyz)
-        visual_spawn_shift = self._compute_scene_spawn_shift(
-            gaussians._xyz,
-            table_top_center_world,
-        ).to(device=gaussians._xyz.device, dtype=gaussians._xyz.dtype)
-        gaussians._xyz = gaussians._xyz + visual_spawn_shift
-        support_center_after = self._object_support_patch_center(gaussians._xyz)
-        return {
-            "support_center_before": support_center_before,
-            "support_center_after": support_center_after,
-            "visual_spawn_shift": visual_spawn_shift,
-        }
-
     def _resolve_immersive_startup_yaw_angle(self, object_vertices):
         case_name = self._interaction_anchor_case_name()
         default_yaw = float(self.IMMERSIVE_STARTUP_YAW_RADIANS)
@@ -10586,36 +10530,16 @@ class InvPhyTrainerWarp:
             for mask in original_controller_source_masks
         ]
         case_name = self._interaction_anchor_case_name()
-        native_gaussian_inspect_mode = case_name == "hq_rope_0"
-        active_gs_path = gs_path
-        if native_gaussian_inspect_mode:
-            native_gs_path = Path(gs_path).with_name("native_object.ply")
-            if not native_gs_path.exists():
-                raise FileNotFoundError(
-                    "hq_rope_0 native gaussian inspect mode expects "
-                    f"{native_gs_path} to exist."
-                )
-            active_gs_path = str(native_gs_path.resolve())
         gaussians = GaussianModel(sh_degree=3)
-        gaussians.load_ply(active_gs_path)
+        gaussians.load_ply(gs_path)
         raw_gaussian_count = int(gaussians._xyz.shape[0])
+        disable_opacity_pruning = case_name == "hq_rope"
         kept_gaussian_count = raw_gaussian_count
-        gaussian_case_scale_debug = None
-        case_world_scale = self._demo_case_world_scale(case_name)
-        if native_gaussian_inspect_mode and abs(case_world_scale - 1.0) > 1e-8:
-            gaussian_scale_pivot = self._object_support_patch_center(
-                gaussians._xyz.detach()
-            )
-            gaussian_case_scale_debug = self._apply_uniform_gaussian_scale_about_pivot(
-                gaussians,
-                case_world_scale,
-                pivot=gaussian_scale_pivot,
-            )
-        if not native_gaussian_inspect_mode:
+        if not disable_opacity_pruning:
             gaussians = remove_gaussians_with_low_opacity(gaussians, 0.1)
             kept_gaussian_count = int(gaussians._xyz.shape[0])
-            gaussians.isotropic = True
-        if native_gaussian_inspect_mode:
+        gaussians.isotropic = True
+        if case_name == "hq_rope":
             gaussian_bounds_min = (
                 gaussians._xyz.min(dim=0).values.detach().cpu().numpy().tolist()
             )
@@ -10630,12 +10554,12 @@ class InvPhyTrainerWarp:
             )
             scaled_object_span = self._principal_axis_span_torch(obj_init_vertices.detach())
             print(
-                "[quest_display] hq rope native gaussian inspect: "
-                f"case={case_name} native_gaussian_inspect=1 "
-                f"gaussian_source={active_gs_path} "
+                "[quest_display] hq rope gaussian import: "
+                f"case={case_name} "
+                f"gaussian_source={gs_path} "
                 f"total_gaussians={raw_gaussian_count} "
+                f"kept_gaussians={kept_gaussian_count} "
                 "opacity_pruning=disabled "
-                f"case_scale={case_world_scale:.8f} "
                 f"gaussian_bounds_min={gaussian_bounds_min} "
                 f"gaussian_bounds_max={gaussian_bounds_max} "
                 f"frame0_object_bounds_min={object_bounds_min} "
@@ -10643,66 +10567,8 @@ class InvPhyTrainerWarp:
                 f"frame0_object_span_after_scale={scaled_object_span:.8f}",
                 flush=True,
             )
-            if gaussian_case_scale_debug is not None:
-                dataset_scale_debug = getattr(self.dataset, "demo_case_scale_debug", None)
-                object_span_before = (
-                    scaled_object_span / max(case_world_scale, 1e-8)
-                    if dataset_scale_debug is None
-                    else dataset_scale_debug.get("object_span_before")
-                )
-                object_span_after = (
-                    scaled_object_span
-                    if dataset_scale_debug is None
-                    else dataset_scale_debug.get("object_span_after", scaled_object_span)
-                )
-                print(
-                    "[quest_display] hq rope native gaussian inspect scale: "
-                    f"case={case_name} "
-                    f"scale={gaussian_case_scale_debug['scale']:.8f} "
-                    f"gaussian_span_before={gaussian_case_scale_debug['span_before']:.8f} "
-                    f"gaussian_span_after={gaussian_case_scale_debug['span_after']:.8f} "
-                    f"frame0_object_span_before={float(object_span_before):.8f} "
-                    f"frame0_object_span_after={float(object_span_after):.8f} "
-                    f"gaussian_scale_pivot={gaussian_case_scale_debug['pivot']} "
-                    "support_center_before="
-                    f"{gaussian_case_scale_debug['support_center_before']} "
-                    "support_center_after="
-                    f"{gaussian_case_scale_debug['support_center_after']}",
-                    flush=True,
-                )
-        elif case_name in {"hq_rope_0", "hq_rope_1"}:
-            gaussian_bounds_min = (
-                gaussians._xyz.min(dim=0).values.detach().cpu().numpy().tolist()
-            )
-            gaussian_bounds_max = (
-                gaussians._xyz.max(dim=0).values.detach().cpu().numpy().tolist()
-            )
-            object_bounds_min = (
-                obj_init_vertices.min(dim=0).values.detach().cpu().numpy().tolist()
-            )
-            object_bounds_max = (
-                obj_init_vertices.max(dim=0).values.detach().cpu().numpy().tolist()
-            )
-            print(
-                "[quest_display] hq rope gaussian import: "
-                f"case={case_name} "
-                f"total_gaussians={raw_gaussian_count} "
-                f"kept_gaussians={kept_gaussian_count} "
-                f"gaussian_bounds_min={gaussian_bounds_min} "
-                f"gaussian_bounds_max={gaussian_bounds_max} "
-                f"frame0_object_bounds_min={object_bounds_min} "
-                f"frame0_object_bounds_max={object_bounds_max}",
-                flush=True,
-            )
 
         startup_yaw_angle = self._resolve_immersive_startup_yaw_angle(obj_init_vertices)
-        gaussian_support_center_before_yaw = None
-        gaussian_yaw_pivot = None
-        if native_gaussian_inspect_mode:
-            gaussian_yaw_pivot = self._object_support_patch_center(gaussians._xyz.detach())
-            gaussian_support_center_before_yaw = (
-                gaussian_yaw_pivot.detach().cpu().numpy().tolist()
-            )
         startup_yaw_debug = self._apply_immersive_startup_yaw(
             obj_init_vertices,
             None,
@@ -10711,7 +10577,6 @@ class InvPhyTrainerWarp:
             recorded_anchor_centers,
             original_controller_source_anchor_centers,
             yaw_angle=startup_yaw_angle,
-            gaussian_yaw_pivot=gaussian_yaw_pivot,
         )
         obj_init_vertices = startup_yaw_debug["object_vertices"]
         recorded_base_target = startup_yaw_debug["recorded_base_target"]
@@ -10729,21 +10594,6 @@ class InvPhyTrainerWarp:
             "controller_runtime_rotated=1",
             flush=True,
         )
-        if native_gaussian_inspect_mode:
-            gaussian_support_center_after_yaw = (
-                self._object_support_patch_center(gaussians._xyz.detach())
-                .detach()
-                .cpu()
-                .numpy()
-                .tolist()
-            )
-            print(
-                "[quest_display] hq rope native gaussian inspect yaw: "
-                f"case={case_name} "
-                f"support_center_before={gaussian_support_center_before_yaw} "
-                f"support_center_after={gaussian_support_center_after_yaw}",
-                flush=True,
-            )
         controller_predefined_anchor_defs = self._build_case_interaction_anchors(
             obj_init_vertices,
             intrinsic_torch,
@@ -10756,7 +10606,6 @@ class InvPhyTrainerWarp:
         controller_attachment_metadata = None
         controller_anchor_templates = {"left": {}, "right": {}}
         rotation_cache = None
-        rigid_gaussian_state = None
 
         background_black = torch.tensor(
             [0.0, 0.0, 0.0], dtype=torch.float32, device="cuda"
@@ -11323,8 +11172,7 @@ class InvPhyTrainerWarp:
             spawn_shift = spawn_shift.to(device=cfg.device, dtype=torch.float32)
             obj_init_vertices = obj_init_vertices + spawn_shift
             recorded_base_target = recorded_base_target + spawn_shift
-            if not native_gaussian_inspect_mode:
-                gaussians._xyz = gaussians._xyz + spawn_shift
+            gaussians._xyz = gaussians._xyz + spawn_shift
             recorded_anchor_centers = [
                 center + spawn_shift for center in recorded_anchor_centers
             ]
@@ -11332,28 +11180,6 @@ class InvPhyTrainerWarp:
                 center + spawn_shift
                 for center in original_controller_source_anchor_centers
             ]
-            if native_gaussian_inspect_mode:
-                gaussian_visual_spawn_debug = self._apply_rigid_gaussian_visual_spawn_shift(
-                    gaussians,
-                    table_surface_center_world,
-                )
-                rigid_gaussian_state = self._capture_gaussian_runtime_state(gaussians)
-                print(
-                    "[quest_display] hq rope native gaussian inspect placement: "
-                    f"case={case_name} "
-                    f"support_center_before="
-                    f"{gaussian_visual_spawn_debug['support_center_before'].detach().cpu().numpy().tolist()} "
-                    f"support_center_after="
-                    f"{gaussian_visual_spawn_debug['support_center_after'].detach().cpu().numpy().tolist()} "
-                    f"visual_spawn_shift="
-                    f"{gaussian_visual_spawn_debug['visual_spawn_shift'].detach().cpu().numpy().tolist()}",
-                    flush=True,
-                )
-                print(
-                    "[quest_display] hq rope native gaussian inspect: "
-                    "gaussian_skinning_bypassed=1",
-                    flush=True,
-                )
             self._record_immersive_startup_milestone(
                 startup_timeline,
                 "spawn_shift_done",
@@ -11539,25 +11365,24 @@ class InvPhyTrainerWarp:
             ).clone()
             current_pos = gaussians.get_xyz
             current_rot = gaussians.get_rotation
-            if not native_gaussian_inspect_mode:
-                relations_single = get_topk_indices(prev_x, K=4)
-                weights_single, weights_indices_single = knn_weights_sparse(
-                    prev_x,
-                    current_pos,
-                    K=4,
-                )
-                rotation_cache = build_rotation_reuse_cache(
-                    weights_indices=weights_indices_single,
-                    weights=weights_single,
-                    relations=relations_single,
-                    mass_nodes_rest=prev_x,
-                    gaussians_xyz_rest=current_pos,
-                    gaussians_quat_rest=current_rot,
-                    device=cfg.device,
-                    mass_node_per_instance=n_vert_single_obj,
-                    gaussians_per_instance=current_pos.shape[0],
-                    number_of_instance=1,
-                )
+            relations_single = get_topk_indices(prev_x, K=4)
+            weights_single, weights_indices_single = knn_weights_sparse(
+                prev_x,
+                current_pos,
+                K=4,
+            )
+            rotation_cache = build_rotation_reuse_cache(
+                weights_indices=weights_indices_single,
+                weights=weights_single,
+                relations=relations_single,
+                mass_nodes_rest=prev_x,
+                gaussians_xyz_rest=current_pos,
+                gaussians_quat_rest=current_rot,
+                device=cfg.device,
+                mass_node_per_instance=n_vert_single_obj,
+                gaussians_per_instance=current_pos.shape[0],
+                number_of_instance=1,
+            )
             spawn_support_center = self._validate_scene_spawn_alignment(
                 self.batch_init_vertices[: self.num_all_points],
                 layout,
@@ -11796,21 +11621,12 @@ class InvPhyTrainerWarp:
                 self.simulator.wp_states[0].wp_x,
                 requires_grad=False,
             ).clone()
-            if native_gaussian_inspect_mode:
-                if rigid_gaussian_state is None:
-                    raise RuntimeError(
-                        "hq_rope_0 native gaussian inspect mode requires a rigid startup gaussian state."
-                    )
-                self._restore_gaussian_runtime_state(gaussians, rigid_gaussian_state)
-                current_pos = gaussians.get_xyz
-                current_rot = gaussians.get_rotation
-            else:
-                current_pos, current_rot = lbs_with_rotation_reuse(
-                    current_mass_nodes=x,
-                    cache=rotation_cache,
-                )
-                gaussians._xyz = current_pos
-                gaussians._rotation = current_rot
+            current_pos, current_rot = lbs_with_rotation_reuse(
+                current_mass_nodes=x,
+                cache=rotation_cache,
+            )
+            gaussians._xyz = current_pos
+            gaussians._rotation = current_rot
             prev_x = x.clone()
             settled_support_center = self._validate_scene_spawn_alignment(
                 x[: self.num_all_points],
@@ -12363,21 +12179,12 @@ class InvPhyTrainerWarp:
                     component_times["simulator"].append(sim_time)
 
                 interp_timer.start()
-                if native_gaussian_inspect_mode:
-                    if rigid_gaussian_state is None:
-                        raise RuntimeError(
-                            "hq_rope_0 native gaussian inspect mode requires a rigid startup gaussian state."
-                        )
-                    self._restore_gaussian_runtime_state(gaussians, rigid_gaussian_state)
-                    current_pos = gaussians.get_xyz
-                    current_rot = gaussians.get_rotation
-                else:
-                    current_pos, current_rot = lbs_with_rotation_reuse(
-                        current_mass_nodes=x,
-                        cache=rotation_cache,
-                    )
-                    gaussians._xyz = current_pos
-                    gaussians._rotation = current_rot
+                current_pos, current_rot = lbs_with_rotation_reuse(
+                    current_mass_nodes=x,
+                    cache=rotation_cache,
+                )
+                gaussians._xyz = current_pos
+                gaussians._rotation = current_rot
                 interp_time = interp_timer.stop()
                 if frame_count > 1:
                     component_times["full_motion_interpolation"].append(interp_time)

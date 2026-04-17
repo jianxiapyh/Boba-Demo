@@ -28,6 +28,36 @@ def _normalize(vector: np.ndarray, eps: float = 1e-12) -> np.ndarray:
     return vector / norm
 
 
+def _object_support_patch_center(points: np.ndarray, reverse_z: bool = True) -> np.ndarray:
+    points = np.asarray(points, dtype=np.float64)
+    scene_down = np.array(
+        [0.0, 0.0, 1.0 if reverse_z else -1.0],
+        dtype=np.float64,
+    )
+    support_depth = points @ scene_down
+    support_depth_max = float(np.max(support_depth))
+    support_mask = support_depth >= (support_depth_max - 0.012)
+    support_points = points[support_mask]
+    if support_points.size == 0:
+        support_points = points
+    support_center = support_points.mean(axis=0)
+    support_center = support_center.astype(np.float64, copy=True)
+    support_center[2] = (
+        float(np.max(points[:, 2])) if reverse_z else float(np.min(points[:, 2]))
+    )
+    return support_center
+
+
+def _scale_points_about_pivot(
+    points: np.ndarray,
+    pivot: np.ndarray,
+    scale: float,
+) -> np.ndarray:
+    points = np.asarray(points, dtype=np.float64)
+    pivot = np.asarray(pivot, dtype=np.float64).reshape(1, 3)
+    return pivot + (points - pivot) * float(scale)
+
+
 def _principal_axis(points: np.ndarray) -> np.ndarray:
     centered = points - points.mean(axis=0, keepdims=True)
     covariance = centered.T @ centered / max(points.shape[0], 1)
@@ -297,13 +327,30 @@ def build_parser() -> ArgumentParser:
         default=0.1,
         help="sigmoid(opacity) threshold used only for the rope similarity fit subset",
     )
+    parser.add_argument(
+        "--target-case-scale",
+        type=float,
+        default=1.0,
+        help="optional uniform scale applied to the frame-0 target points before fitting",
+    )
     return parser
 
 
 def main() -> None:
     args = build_parser().parse_args()
 
-    target_points = _load_target_frame0_points(args.final_data)
+    target_points_unscaled = _load_target_frame0_points(args.final_data)
+    target_case_scale = float(args.target_case_scale)
+    target_scale_pivot = None
+    if abs(target_case_scale - 1.0) > 1e-8:
+        target_scale_pivot = _object_support_patch_center(target_points_unscaled)
+        target_points = _scale_points_about_pivot(
+            target_points_unscaled,
+            target_scale_pivot,
+            target_case_scale,
+        )
+    else:
+        target_points = np.array(target_points_unscaled, copy=True)
     ply, vertex_data = _load_vertex_data(args.input_ply)
     xyz = _extract_xyz(vertex_data)
     quaternions, rotation_names = _extract_rotations(vertex_data)
@@ -380,6 +427,7 @@ def main() -> None:
         "input_ply": str(args.input_ply.resolve()),
         "output_ply": str(args.output_ply.resolve()),
         "fit_opacity_threshold": float(args.fit_opacity_threshold),
+        "target_case_scale": target_case_scale,
         "support_band_quantile": SUPPORT_BAND_QUANTILE,
         "support_plane_tolerance": SUPPORT_PLANE_TOLERANCE,
         "span_alignment_tolerance": SPAN_ALIGNMENT_TOLERANCE,
@@ -394,6 +442,10 @@ def main() -> None:
         "target_midpoint": fit["target_midpoint"].tolist(),
         "source_endpoints": fit["source_endpoints"].tolist(),
         "target_endpoints": fit["target_endpoints"].tolist(),
+        "target_frame0_unscaled_bounds": np.stack(
+            [target_points_unscaled.min(axis=0), target_points_unscaled.max(axis=0)],
+            axis=0,
+        ).tolist(),
         "target_frame0_bounds": np.stack(
             [target_points.min(axis=0), target_points.max(axis=0)],
             axis=0,
@@ -411,6 +463,8 @@ def main() -> None:
         "final_support_height": float(final_support_height),
         "residual_z_shift": float(residual_z_shift),
     }
+    if target_scale_pivot is not None:
+        summary["target_scale_pivot"] = target_scale_pivot.tolist()
     summary.update(_compute_alignment_summary(transformed_fit_points, target_points, fit))
 
     span_error = abs(summary["source_span"] * fit["scale"] - summary["target_span"])
@@ -422,7 +476,7 @@ def main() -> None:
 
     support_plane_delta = final_support_height - target_support_height
     summary["support_plane_delta"] = float(support_plane_delta)
-    if support_plane_delta > SUPPORT_PLANE_TOLERANCE:
+    if support_plane_delta < -SUPPORT_PLANE_TOLERANCE:
         raise ValueError(
             "Aligned rope still sits below the target support plane: "
             f"support_plane_delta={support_plane_delta:.6f} "
@@ -438,6 +492,7 @@ def main() -> None:
         "[hq_rope_align] "
         f"input={args.input_ply} output={args.output_ply} "
         f"fit_gaussians={int(fit_mask.sum())}/{int(xyz.shape[0])} "
+        f"target_case_scale={target_case_scale:.6f} "
         f"uniform_scale={fit['scale']:.6f} "
         f"source_span={summary['source_span']:.6f} "
         f"target_span={summary['target_span']:.6f} "

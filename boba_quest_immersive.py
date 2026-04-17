@@ -16,9 +16,13 @@ np = None
 torch = None
 REPO_ROOT = Path(__file__).resolve().parent
 DEFAULT_SCENE_ASSETS_ROOT = REPO_ROOT / "assets" / "scenes"
-PUBLIC_DEMO_CASES = ("sloth", "rope", "hq_rope_0", "hq_rope_1")
+PUBLIC_DEMO_CASES = ("sloth", "rope", "hq_rope")
+COMPAT_DEMO_CASE_ALIASES = {
+    "hq_rope_0": "hq_rope",
+}
+SUPPORTED_DEMO_CASE_ARGUMENTS = PUBLIC_DEMO_CASES + tuple(COMPAT_DEMO_CASE_ALIASES.keys())
 DEMO_CASE_WORLD_SCALE = {
-    "hq_rope_0": 0.3932700391790796,
+    "hq_rope": 0.3932700391790796,
 }
 DEMO_CASE_LENGTH_LIKE_CFG_KEYS = (
     "object_radius",
@@ -27,8 +31,13 @@ DEMO_CASE_LENGTH_LIKE_CFG_KEYS = (
 )
 
 
+def canonical_demo_case_name(case_name: str) -> str:
+    case_key = str(case_name).strip().lower()
+    return str(COMPAT_DEMO_CASE_ALIASES.get(case_key, case_key))
+
+
 def resolve_demo_case_manifest(case_name: str) -> tuple[str, Path, dict]:
-    canonical_case = case_name
+    canonical_case = canonical_demo_case_name(case_name)
     manifest_path = REPO_ROOT / "assets" / canonical_case / "manifest.json"
     if not manifest_path.exists():
         raise FileNotFoundError(
@@ -49,7 +58,7 @@ def manifest_file_path(manifest_dir: Path, manifest: dict, key: str) -> str:
 
 
 def demo_case_world_scale(case_name: str) -> float:
-    case_key = str(case_name).strip().lower()
+    case_key = canonical_demo_case_name(case_name)
     return float(DEMO_CASE_WORLD_SCALE.get(case_key, 1.0))
 
 
@@ -219,7 +228,7 @@ def build_parser() -> ArgumentParser:
     parser.add_argument(
         "--case_name",
         type=str,
-        choices=PUBLIC_DEMO_CASES,
+        choices=SUPPORTED_DEMO_CASE_ARGUMENTS,
         default="sloth",
         help="public packaged demo case",
     )
@@ -329,6 +338,12 @@ def main(argv: list[str] | None = None):
 
     case_name = args.case_name
     canonical_case_name, manifest_dir, case_manifest = resolve_demo_case_manifest(case_name)
+    if canonical_case_name != case_name:
+        print(
+            "[quest_display] demo case alias resolved: "
+            f"requested={case_name} canonical={canonical_case_name}",
+            flush=True,
+        )
 
     cfg.load_from_yaml(case_manifest.get("config", "configs/real.yaml"))
     cfg.demo_case_name = canonical_case_name

@@ -8,7 +8,7 @@ export BOBA_GSPLAT_SOURCE_ROOT="${BOBA_GSPLAT_SOURCE_ROOT:-${SCRIPT_DIR}/../Boba
 
 # Default Quest immersive run: live OpenXR controllers, immersive display,
 # ILLIXR_lab scene, balanced preset. Public demo cases are sloth, rope,
-# hq_rope_0, and hq_rope_1.
+# and hq_rope.
 python boba_quest_immersive.py \
   --case_name sloth \
   --n_dup 0 \
@@ -20,12 +20,7 @@ python boba_quest_immersive.py \
   --interactive_window_mode hidden
 
 python boba_quest_immersive.py \
-  --case_name hq_rope_0 \
-  --n_dup 0 \
-  --interactive_window_mode hidden
-
-python boba_quest_immersive.py \
-  --case_name hq_rope_1 \
+  --case_name hq_rope \
   --n_dup 0 \
   --interactive_window_mode hidden
 

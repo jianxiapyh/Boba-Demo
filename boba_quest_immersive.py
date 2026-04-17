@@ -287,6 +287,17 @@ def build_parser() -> ArgumentParser:
             "'adaptive' reuses only when head motion stays within conservative guardrails"
         ),
     )
+    parser.add_argument(
+        "--immersive_gaussian_render",
+        choices=("serial", "stereo_parallel"),
+        default="serial",
+        help=(
+            "Gaussian render scheduling mode for immersive Quest output: "
+            "'serial' renders left/right Gaussian eyes sequentially, "
+            "'stereo_parallel' experimentally renders both eyes concurrently on separate CUDA streams "
+            "(currently only supported with overlap=off and timewarp=off)"
+        ),
+    )
     return parser
 
 
@@ -321,6 +332,10 @@ def main(argv: list[str] | None = None):
     )
     print(
         f"[quest_display] immersive_framegen={args.immersive_framegen}",
+        flush=True,
+    )
+    print(
+        f"[quest_display] immersive_gaussian_render={args.immersive_gaussian_render}",
         flush=True,
     )
     print(
@@ -421,6 +436,7 @@ def main(argv: list[str] | None = None):
             immersive_timewarp=args.immersive_timewarp,
             immersive_static_scene_overlap=args.immersive_static_scene_overlap,
             immersive_framegen=args.immersive_framegen,
+            immersive_gaussian_render=args.immersive_gaussian_render,
         )
     finally:
         import glfw

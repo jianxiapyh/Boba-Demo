@@ -4058,7 +4058,8 @@ class InvPhyTrainerWarp:
         if key.endswith("_gib"):
             return "memory"
         if (
-            key.endswith("_scale")
+            key.endswith("_fps")
+            or key.endswith("_scale")
             or key.endswith("_used")
             or key.endswith("_sample_id")
             or key.endswith("_applied")
@@ -4079,6 +4080,8 @@ class InvPhyTrainerWarp:
         if metric_group == "ratio":
             return f"{value * 100.0:.1f}%"
         if metric_group == "scalar":
+            if key.endswith("_fps"):
+                return f"{value:.2f} fps"
             if key.endswith("_scale"):
                 return f"{value:.2f}x"
             if key.endswith("_deg"):
@@ -4114,6 +4117,40 @@ class InvPhyTrainerWarp:
         ]
         for label, avg_time, share in formatted_rows:
             lines.append(f"{label:<{label_width}}  {avg_time:>{time_width}}  {share:>{share_width}}")
+        return lines
+
+    def _format_immersive_render_stage_breakdown_lines(
+        self,
+        average_frame_time,
+        stage_rows,
+    ):
+        if not stage_rows:
+            return []
+        formatted_rows = []
+        for label, average_stage_time in stage_rows:
+            time_share_percentage = (
+                (average_stage_time / average_frame_time) * 100.0
+                if average_frame_time > 0.0
+                else 0.0
+            )
+            formatted_rows.append(
+                (
+                    label,
+                    f"{average_stage_time * 1000.0:.2f} ms",
+                    f"{time_share_percentage:.1f}%",
+                )
+            )
+        label_width = max(len("Render Stage"), *(len(row[0]) for row in formatted_rows))
+        time_width = max(len("Avg Time"), *(len(row[1]) for row in formatted_rows))
+        share_width = max(len("Share"), *(len(row[2]) for row in formatted_rows))
+        lines = [
+            "Render Stage Breakdown:",
+            f"{'Render Stage':<{label_width}}  {'Avg Time':>{time_width}}  {'Share':>{share_width}}",
+        ]
+        for label, avg_time, share in formatted_rows:
+            lines.append(
+                f"{label:<{label_width}}  {avg_time:>{time_width}}  {share:>{share_width}}"
+            )
         return lines
 
     def _render_profile_summary_lines(self, mode, render_profile_series, ordered_keys):
@@ -9400,6 +9437,240 @@ class InvPhyTrainerWarp:
         rgba = torch.cat([rgb, alpha], dim=0)
         return rgba, black_depth
 
+    def _get_immersive_gaussian_render_streams(self):
+        stream_store = getattr(self, "_immersive_gaussian_render_streams", None)
+        if stream_store is None:
+            stream_store = {
+                "left": torch.cuda.Stream(),
+                "right": torch.cuda.Stream(),
+            }
+            self._immersive_gaussian_render_streams = stream_store
+        return stream_store
+
+    @torch.no_grad()
+    def _render_immersive_stereo_gaussians(
+        self,
+        left_eye_render_state,
+        right_eye_render_state,
+        gaussians,
+        render_pipe,
+        background_black,
+        background_white,
+        render_profile_frame=None,
+        mode="serial",
+    ):
+        render_mode = str(mode).strip().lower()
+        if render_mode not in {"serial", "stereo_parallel"}:
+            raise ValueError(
+                "immersive_gaussian_render must be one of {'serial', 'stereo_parallel'}"
+            )
+
+        if render_mode == "serial":
+            gaussian_render_start = time.perf_counter()
+            left_gaussian_span = self._render_profile_begin_cuda_span(
+                render_profile_frame,
+                "gaussian_render_left_cuda",
+            )
+            left_gaussian_rgba, left_gaussian_depth = self._render_gaussian_rgba(
+                left_eye_render_state["view"],
+                gaussians,
+                render_pipe,
+                background_black,
+                background_white,
+                use_gsplat=True,
+            )
+            self._render_profile_end_cuda_span(
+                render_profile_frame,
+                left_gaussian_span,
+            )
+            right_gaussian_span = self._render_profile_begin_cuda_span(
+                render_profile_frame,
+                "gaussian_render_right_cuda",
+            )
+            right_gaussian_rgba, right_gaussian_depth = self._render_gaussian_rgba(
+                right_eye_render_state["view"],
+                gaussians,
+                render_pipe,
+                background_black,
+                background_white,
+                use_gsplat=True,
+            )
+            self._render_profile_end_cuda_span(
+                render_profile_frame,
+                right_gaussian_span,
+            )
+            return (
+                left_gaussian_rgba,
+                left_gaussian_depth,
+                right_gaussian_rgba,
+                right_gaussian_depth,
+                time.perf_counter() - gaussian_render_start,
+            )
+
+        render_streams = self._get_immersive_gaussian_render_streams()
+        left_stream = render_streams["left"]
+        right_stream = render_streams["right"]
+        current_stream = torch.cuda.current_stream()
+        gaussian_render_start = time.perf_counter()
+
+        with torch.cuda.stream(left_stream):
+            left_gaussian_span = self._render_profile_begin_cuda_span(
+                render_profile_frame,
+                "gaussian_render_left_cuda",
+            )
+            left_gaussian_rgba, left_gaussian_depth = self._render_gaussian_rgba(
+                left_eye_render_state["view"],
+                gaussians,
+                render_pipe,
+                background_black,
+                background_white,
+                use_gsplat=True,
+            )
+            self._render_profile_end_cuda_span(
+                render_profile_frame,
+                left_gaussian_span,
+            )
+
+        with torch.cuda.stream(right_stream):
+            right_gaussian_span = self._render_profile_begin_cuda_span(
+                render_profile_frame,
+                "gaussian_render_right_cuda",
+            )
+            right_gaussian_rgba, right_gaussian_depth = self._render_gaussian_rgba(
+                right_eye_render_state["view"],
+                gaussians,
+                render_pipe,
+                background_black,
+                background_white,
+                use_gsplat=True,
+            )
+            self._render_profile_end_cuda_span(
+                render_profile_frame,
+                right_gaussian_span,
+            )
+
+        current_stream.wait_stream(left_stream)
+        current_stream.wait_stream(right_stream)
+        left_stream.synchronize()
+        right_stream.synchronize()
+        return (
+            left_gaussian_rgba,
+            left_gaussian_depth,
+            right_gaussian_rgba,
+            right_gaussian_depth,
+            time.perf_counter() - gaussian_render_start,
+        )
+
+    @torch.no_grad()
+    def _compose_immersive_stereo_eye_frames(
+        self,
+        left_scene_color,
+        left_scene_depth,
+        right_scene_color,
+        right_scene_depth,
+        left_gaussian_rgba,
+        left_gaussian_depth,
+        right_gaussian_rgba,
+        right_gaussian_depth,
+        eye_height,
+        eye_width,
+        compose_mode,
+        compose_roi_padding,
+        render_profile_frame=None,
+        output_dtype=torch.float32,
+    ):
+        left_compose_span = self._render_profile_begin_cuda_span(
+            render_profile_frame,
+            "compose_left_cuda",
+        )
+        if render_profile_frame is not None:
+            (
+                left_eye_frame,
+                left_eye_frame_depth,
+                left_compose_metrics,
+                _,
+            ) = self._compose_immersive_eye_frame(
+                left_scene_color,
+                left_scene_depth,
+                left_gaussian_rgba,
+                left_gaussian_depth,
+                target_height=eye_height,
+                target_width=eye_width,
+                compose_mode=compose_mode,
+                compose_roi_padding=compose_roi_padding,
+                collect_debug=True,
+                output_dtype=output_dtype,
+                return_depth=True,
+            )
+        else:
+            left_eye_frame, left_eye_frame_depth = self._compose_immersive_eye_frame(
+                left_scene_color,
+                left_scene_depth,
+                left_gaussian_rgba,
+                left_gaussian_depth,
+                target_height=eye_height,
+                target_width=eye_width,
+                compose_mode=compose_mode,
+                compose_roi_padding=compose_roi_padding,
+                output_dtype=output_dtype,
+                return_depth=True,
+            )
+            left_compose_metrics = None
+        self._render_profile_end_cuda_span(
+            render_profile_frame,
+            left_compose_span,
+        )
+
+        right_compose_span = self._render_profile_begin_cuda_span(
+            render_profile_frame,
+            "compose_right_cuda",
+        )
+        if render_profile_frame is not None:
+            (
+                right_eye_frame,
+                right_eye_frame_depth,
+                right_compose_metrics,
+                _,
+            ) = self._compose_immersive_eye_frame(
+                right_scene_color,
+                right_scene_depth,
+                right_gaussian_rgba,
+                right_gaussian_depth,
+                target_height=eye_height,
+                target_width=eye_width,
+                compose_mode=compose_mode,
+                compose_roi_padding=compose_roi_padding,
+                collect_debug=True,
+                output_dtype=output_dtype,
+                return_depth=True,
+            )
+        else:
+            right_eye_frame, right_eye_frame_depth = self._compose_immersive_eye_frame(
+                right_scene_color,
+                right_scene_depth,
+                right_gaussian_rgba,
+                right_gaussian_depth,
+                target_height=eye_height,
+                target_width=eye_width,
+                compose_mode=compose_mode,
+                compose_roi_padding=compose_roi_padding,
+                output_dtype=output_dtype,
+                return_depth=True,
+            )
+            right_compose_metrics = None
+        self._render_profile_end_cuda_span(
+            render_profile_frame,
+            right_compose_span,
+        )
+        return (
+            left_eye_frame,
+            left_eye_frame_depth,
+            left_compose_metrics,
+            right_eye_frame,
+            right_eye_frame_depth,
+            right_compose_metrics,
+        )
+
     @torch.no_grad()
     def _render_immersive_eye_frame(
         self,
@@ -9422,6 +9693,7 @@ class InvPhyTrainerWarp:
         collect_debug_maps=False,
         eye_render_state=None,
         output_dtype=torch.uint8,
+        timing_out=None,
     ):
         view_setup_start = (
             time.perf_counter()
@@ -9447,6 +9719,7 @@ class InvPhyTrainerWarp:
             render_profile_frame,
             f"gaussian_render_{eye_label}_cuda",
         )
+        gaussian_wall_start = time.perf_counter() if timing_out is not None else None
         gaussian_rgba, gaussian_depth = self._render_gaussian_rgba(
             eye_view,
             gaussians,
@@ -9455,11 +9728,17 @@ class InvPhyTrainerWarp:
             background_white,
             use_gsplat=True,
         )
+        if gaussian_wall_start is not None:
+            timing_out["gaussian_render_wall"] = (
+                time.perf_counter() - gaussian_wall_start
+            )
+            timing_out["gaussian_ready_monotonic"] = time.perf_counter()
         self._render_profile_end_cuda_span(render_profile_frame, gaussian_span)
         compose_span = self._render_profile_begin_cuda_span(
             render_profile_frame,
             f"compose_{eye_label}_cuda",
         )
+        compose_wall_start = time.perf_counter() if timing_out is not None else None
         compose_metrics = None
         compose_debug_maps = None
         if collect_compose_debug or collect_debug_maps:
@@ -9493,6 +9772,8 @@ class InvPhyTrainerWarp:
                 output_dtype=output_dtype,
             )
         self._render_profile_end_cuda_span(render_profile_frame, compose_span)
+        if compose_wall_start is not None:
+            timing_out["compose_wall"] = time.perf_counter() - compose_wall_start
         return (
             composed,
             gaussian_rgba,
@@ -10658,6 +10939,7 @@ class InvPhyTrainerWarp:
         immersive_timewarp="off",
         immersive_static_scene_overlap="off",
         immersive_framegen="off",
+        immersive_gaussian_render="serial",
     ):
         logger.info(f"Load model from {model_path}")
         checkpoint = torch.load(model_path, map_location=cfg.device)
@@ -10882,6 +11164,12 @@ class InvPhyTrainerWarp:
                 "immersive_framegen must be one of "
                 "{'off', 'static', 'adaptive'}"
             )
+        immersive_gaussian_render_mode = str(immersive_gaussian_render).strip().lower()
+        if immersive_gaussian_render_mode not in {"serial", "stereo_parallel"}:
+            raise ValueError(
+                "immersive_gaussian_render must be one of "
+                "{'serial', 'stereo_parallel'}"
+            )
         scene_depth_reproject_requested = (
             immersive_timewarp_mode == "scene_depth_reproject"
         )
@@ -10906,9 +11194,18 @@ class InvPhyTrainerWarp:
                 "immersive_framegen static|adaptive requires "
                 "--immersive_timewarp off"
             )
+        if immersive_gaussian_render_mode == "stereo_parallel" and (
+            immersive_static_scene_overlap_mode != "off"
+            or immersive_timewarp_mode != "off"
+        ):
+            raise ValueError(
+                "immersive_gaussian_render stereo_parallel requires "
+                "--immersive_static_scene_overlap off and --immersive_timewarp off"
+            )
         scene_depth_reproject_enabled = scene_depth_reproject_requested
         static_scene_overlap_enabled = False
         static_scene_overlap_failure_logged = False
+        gaussian_render_failure_logged = False
         static_scene_framegen_cache = None
         scene_pose_staleness_ms_samples = []
         static_scene_reuse_applied_samples = []
@@ -10931,6 +11228,15 @@ class InvPhyTrainerWarp:
             "full_motion_interpolation": [],
             "rendering": [],
             "total": [],
+        }
+        render_stage_times = {
+            "simulation_lbs_wall_ms": [],
+            "static_scene_render_ms": [],
+            "gaussian_render_wall_ms": [],
+            "branch_b_ready_ms": [],
+            "pre_compose_ready_ms": [],
+            "compositing_ms": [],
+            "overlay_publish_ms": [],
         }
         immersive_render_profile_keys = [
             "rendering",
@@ -11033,6 +11339,12 @@ class InvPhyTrainerWarp:
             "static_scene_worker_wall_ms",
             "simulation_lbs_wall_ms",
             "overlap_wait_wall_ms",
+            "static_scene_render_ms",
+            "gaussian_render_wall_ms",
+            "branch_b_ready_ms",
+            "pre_compose_ready_ms",
+            "compositing_ms",
+            "overlay_publish_ms",
             "static_scene_reuse_applied",
             "static_scene_reuse_age_frames",
             "static_scene_framegen_forced_render",
@@ -11780,6 +12092,11 @@ class InvPhyTrainerWarp:
                             f"{type(exc).__name__}: {exc}",
                             flush=True,
                         )
+            print(
+                "[quest_display] immersive gaussian render: "
+                f"mode={immersive_gaussian_render_mode}",
+                flush=True,
+            )
 
             self._set_scene_collider_boxes(layout)
             support_surface_boxes_np = None
@@ -12615,6 +12932,14 @@ class InvPhyTrainerWarp:
                 simulation_lbs_wall_s = float(sim_time + interp_time)
                 overlap_wait_wall_s = 0.0
                 static_scene_worker_wall_s = 0.0
+                static_scene_render_wall_s = 0.0
+                gaussian_render_wall_s = 0.0
+                branch_b_ready_wall_s = 0.0
+                pre_compose_ready_wall_s = 0.0
+                compositing_wall_s = 0.0
+                overlay_publish_wall_s = 0.0
+                overlay_draw_wall_s = 0.0
+                publish_stage_wall_s = 0.0
                 if render_profile_frame is not None:
                     render_profile_frame["render_sample_id"] = float(render_sample_id)
                     render_profile_frame["simulation_lbs_wall_ms"] = (
@@ -12647,48 +12972,19 @@ class InvPhyTrainerWarp:
                 right_overlay_eye_render_state = right_eye_render_state
                 left_compose_metrics = None
                 right_compose_metrics = None
-                worker_result_ready = False
-                overlap_left_gaussian_rgba = None
-                overlap_left_gaussian_depth = None
-                overlap_right_gaussian_rgba = None
-                overlap_right_gaussian_depth = None
+                left_scene_color = None
+                left_scene_depth = None
+                right_scene_color = None
+                right_scene_depth = None
+                left_gaussian_rgba = None
+                left_gaussian_depth = None
+                right_gaussian_rgba = None
+                right_gaussian_depth = None
+                scene_layers_ready = False
                 if (
                     framegen_reuse_applied
                     and static_scene_framegen_cache is not None
                 ):
-                    left_gaussian_span = self._render_profile_begin_cuda_span(
-                        render_profile_frame,
-                        "gaussian_render_left_cuda",
-                    )
-                    left_gaussian_rgba, left_gaussian_depth = self._render_gaussian_rgba(
-                        left_eye_render_state["view"],
-                        gaussians,
-                        render_pipe,
-                        background_black,
-                        background_white,
-                        use_gsplat=True,
-                    )
-                    self._render_profile_end_cuda_span(
-                        render_profile_frame,
-                        left_gaussian_span,
-                    )
-                    right_gaussian_span = self._render_profile_begin_cuda_span(
-                        render_profile_frame,
-                        "gaussian_render_right_cuda",
-                    )
-                    right_gaussian_rgba, right_gaussian_depth = self._render_gaussian_rgba(
-                        right_eye_render_state["view"],
-                        gaussians,
-                        render_pipe,
-                        background_black,
-                        background_white,
-                        use_gsplat=True,
-                    )
-                    self._render_profile_end_cuda_span(
-                        render_profile_frame,
-                        right_gaussian_span,
-                    )
-
                     left_scene_color = static_scene_framegen_cache["left_scene_color"]
                     left_scene_depth = static_scene_framegen_cache["left_scene_depth"]
                     right_scene_color = static_scene_framegen_cache["right_scene_color"]
@@ -12696,141 +12992,53 @@ class InvPhyTrainerWarp:
                     static_scene_framegen_cache["age_displayed_frames"] = int(
                         framegen_reuse_age_frames
                     )
-
-                    left_compose_span = self._render_profile_begin_cuda_span(
-                        render_profile_frame,
-                        "compose_left_cuda",
-                    )
-                    if render_profile_frame is not None:
-                        (
-                            left_eye_frame,
-                            left_eye_frame_depth,
-                            left_compose_metrics,
-                            _,
-                        ) = self._compose_immersive_eye_frame(
-                            left_scene_color,
-                            left_scene_depth,
-                            left_gaussian_rgba,
-                            left_gaussian_depth,
-                            target_height=eye_height,
-                            target_width=eye_width,
-                            compose_mode=immersive_compose_mode,
-                            compose_roi_padding=gaussian_compose_roi_padding,
-                            collect_debug=True,
-                            output_dtype=eye_frame_output_dtype,
-                            return_depth=True,
-                        )
-                    else:
-                        left_eye_frame, left_eye_frame_depth = self._compose_immersive_eye_frame(
-                            left_scene_color,
-                            left_scene_depth,
-                            left_gaussian_rgba,
-                            left_gaussian_depth,
-                            target_height=eye_height,
-                            target_width=eye_width,
-                            compose_mode=immersive_compose_mode,
-                            compose_roi_padding=gaussian_compose_roi_padding,
-                            output_dtype=eye_frame_output_dtype,
-                            return_depth=True,
-                        )
-                    self._render_profile_end_cuda_span(
-                        render_profile_frame,
-                        left_compose_span,
-                    )
-
-                    right_compose_span = self._render_profile_begin_cuda_span(
-                        render_profile_frame,
-                        "compose_right_cuda",
-                    )
-                    if render_profile_frame is not None:
-                        (
-                            right_eye_frame,
-                            right_eye_frame_depth,
-                            right_compose_metrics,
-                            _,
-                        ) = self._compose_immersive_eye_frame(
-                            right_scene_color,
-                            right_scene_depth,
-                            right_gaussian_rgba,
-                            right_gaussian_depth,
-                            target_height=eye_height,
-                            target_width=eye_width,
-                            compose_mode=immersive_compose_mode,
-                            compose_roi_padding=gaussian_compose_roi_padding,
-                            collect_debug=True,
-                            output_dtype=eye_frame_output_dtype,
-                            return_depth=True,
-                        )
-                    else:
-                        right_eye_frame, right_eye_frame_depth = self._compose_immersive_eye_frame(
-                            right_scene_color,
-                            right_scene_depth,
-                            right_gaussian_rgba,
-                            right_gaussian_depth,
-                            target_height=eye_height,
-                            target_width=eye_width,
-                            compose_mode=immersive_compose_mode,
-                            compose_roi_padding=gaussian_compose_roi_padding,
-                            output_dtype=eye_frame_output_dtype,
-                            return_depth=True,
-                        )
-                    self._render_profile_end_cuda_span(
-                        render_profile_frame,
-                        right_compose_span,
-                    )
-                elif static_scene_request_submitted:
-                    left_gaussian_span = self._render_profile_begin_cuda_span(
-                        render_profile_frame,
-                        "gaussian_render_left_cuda",
-                    )
-                    (
-                        overlap_left_gaussian_rgba,
-                        overlap_left_gaussian_depth,
-                    ) = self._render_gaussian_rgba(
-                        left_eye_render_state["view"],
-                        gaussians,
-                        render_pipe,
-                        background_black,
-                        background_white,
-                        use_gsplat=True,
-                    )
-                    self._render_profile_end_cuda_span(
-                        render_profile_frame,
-                        left_gaussian_span,
-                    )
-                    right_gaussian_span = self._render_profile_begin_cuda_span(
-                        render_profile_frame,
-                        "gaussian_render_right_cuda",
-                    )
-                    (
-                        overlap_right_gaussian_rgba,
-                        overlap_right_gaussian_depth,
-                    ) = self._render_gaussian_rgba(
-                        right_eye_render_state["view"],
-                        gaussians,
-                        render_pipe,
-                        background_black,
-                        background_white,
-                        use_gsplat=True,
-                    )
-                    self._render_profile_end_cuda_span(
-                        render_profile_frame,
-                        right_gaussian_span,
-                    )
+                    scene_layers_ready = True
                 if static_scene_request_submitted:
-                    overlap_wait_start = (
-                        time.perf_counter() if static_scene_request_submitted else None
+                    gaussian_render_mode_for_frame = immersive_gaussian_render_mode
+                    while True:
+                        try:
+                            (
+                                left_gaussian_rgba,
+                                left_gaussian_depth,
+                                right_gaussian_rgba,
+                                right_gaussian_depth,
+                                gaussian_render_wall_s,
+                            ) = self._render_immersive_stereo_gaussians(
+                                left_eye_render_state,
+                                right_eye_render_state,
+                                gaussians,
+                                render_pipe,
+                                background_black,
+                                background_white,
+                                mode=gaussian_render_mode_for_frame,
+                                render_profile_frame=render_profile_frame,
+                            )
+                            break
+                        except Exception as exc:
+                            if gaussian_render_mode_for_frame != "stereo_parallel":
+                                raise
+                            if not gaussian_render_failure_logged:
+                                print(
+                                    "[quest_display] immersive stereo-parallel gaussian "
+                                    "render failed mid-run; degrading to serial gaussian "
+                                    f"render: {type(exc).__name__}: {exc}",
+                                    flush=True,
+                                )
+                                gaussian_render_failure_logged = True
+                            immersive_gaussian_render_mode = "serial"
+                            gaussian_render_mode_for_frame = "serial"
+                    branch_b_ready_wall_s = (
+                        float(simulation_lbs_wall_s) + float(gaussian_render_wall_s)
                     )
+                    overlap_wait_start = time.perf_counter()
                     try:
                         static_scene_result = static_scene_worker.get_result(timeout=60.0)
-                        if overlap_wait_start is not None:
-                            overlap_wait_wall_s = (
-                                time.perf_counter() - overlap_wait_start
-                            )
+                        overlap_wait_wall_s = time.perf_counter() - overlap_wait_start
                         static_scene_worker_wall_s = (
                             float(static_scene_result.get("worker_wall_ms", 0.0))
                             / 1000.0
                         )
+                        static_scene_render_wall_s = static_scene_worker_wall_s
                         if render_profile_frame is not None:
                             render_profile_frame["static_scene_worker_wall_ms"] = (
                                 static_scene_worker_wall_s
@@ -12838,28 +13046,6 @@ class InvPhyTrainerWarp:
                             render_profile_frame["overlap_wait_wall_ms"] = (
                                 overlap_wait_wall_s
                             )
-                        worker_result_ready = True
-                    except Exception as exc:
-                        if not static_scene_overlap_failure_logged:
-                            print(
-                                "[quest_display] immersive static-scene overlap failed "
-                                "mid-run; falling back to serial room render: "
-                                f"{type(exc).__name__}: {exc}",
-                                flush=True,
-                            )
-                            static_scene_overlap_failure_logged = True
-                        if static_scene_worker is not None:
-                            try:
-                                static_scene_worker.stop()
-                            except Exception:
-                                pass
-                        static_scene_worker = None
-                        static_scene_overlap_enabled = False
-                        scene_depth_reproject_enabled = False
-                        static_scene_framegen_cache = None
-                        immersive_framegen_mode = "off"
-
-                    if worker_result_ready:
                         (
                             left_scene_color,
                             left_scene_depth,
@@ -12891,247 +13077,42 @@ class InvPhyTrainerWarp:
                                     right_scene_depth=right_scene_depth,
                                 )
                             )
-
-                        left_gaussian_rgba = overlap_left_gaussian_rgba
-                        left_gaussian_depth = overlap_left_gaussian_depth
-                        right_gaussian_rgba = overlap_right_gaussian_rgba
-                        right_gaussian_depth = overlap_right_gaussian_depth
-
-                    if worker_result_ready:
-                        left_compose_span = self._render_profile_begin_cuda_span(
-                            render_profile_frame,
-                            "compose_left_cuda",
-                        )
-                        if render_profile_frame is not None:
-                            (
-                                left_eye_frame,
-                                left_eye_frame_depth,
-                                left_compose_metrics,
-                                _,
-                            ) = self._compose_immersive_eye_frame(
-                                left_scene_color,
-                                left_scene_depth,
-                                left_gaussian_rgba,
-                                left_gaussian_depth,
-                                target_height=eye_height,
-                                target_width=eye_width,
-                                compose_mode=immersive_compose_mode,
-                                compose_roi_padding=gaussian_compose_roi_padding,
-                                collect_debug=True,
-                                output_dtype=eye_frame_output_dtype,
-                                return_depth=True,
+                        scene_layers_ready = True
+                    except Exception as exc:
+                        if not static_scene_overlap_failure_logged:
+                            print(
+                                "[quest_display] immersive static-scene overlap failed "
+                                "mid-run; falling back to serial room render: "
+                                f"{type(exc).__name__}: {exc}",
+                                flush=True,
                             )
-                        else:
-                            left_eye_frame, left_eye_frame_depth = self._compose_immersive_eye_frame(
-                                left_scene_color,
-                                left_scene_depth,
-                                left_gaussian_rgba,
-                                left_gaussian_depth,
-                                target_height=eye_height,
-                                target_width=eye_width,
-                                compose_mode=immersive_compose_mode,
-                                compose_roi_padding=gaussian_compose_roi_padding,
-                                output_dtype=eye_frame_output_dtype,
-                                return_depth=True,
-                            )
-                            left_compose_metrics = None
-                        self._render_profile_end_cuda_span(
-                            render_profile_frame,
-                            left_compose_span,
-                        )
-
-                        right_compose_span = self._render_profile_begin_cuda_span(
-                            render_profile_frame,
-                            "compose_right_cuda",
-                        )
-                        if render_profile_frame is not None:
-                            (
-                                right_eye_frame,
-                                right_eye_frame_depth,
-                                right_compose_metrics,
-                                _,
-                            ) = self._compose_immersive_eye_frame(
-                                right_scene_color,
-                                right_scene_depth,
-                                right_gaussian_rgba,
-                                right_gaussian_depth,
-                                target_height=eye_height,
-                                target_width=eye_width,
-                                compose_mode=immersive_compose_mode,
-                                compose_roi_padding=gaussian_compose_roi_padding,
-                                collect_debug=True,
-                                output_dtype=eye_frame_output_dtype,
-                                return_depth=True,
-                            )
-                        else:
-                            right_eye_frame, right_eye_frame_depth = self._compose_immersive_eye_frame(
-                                right_scene_color,
-                                right_scene_depth,
-                                right_gaussian_rgba,
-                                right_gaussian_depth,
-                                target_height=eye_height,
-                                target_width=eye_width,
-                                compose_mode=immersive_compose_mode,
-                                compose_roi_padding=gaussian_compose_roi_padding,
-                                output_dtype=eye_frame_output_dtype,
-                                return_depth=True,
-                            )
-                            right_compose_metrics = None
-                        self._render_profile_end_cuda_span(
-                            render_profile_frame,
-                            right_compose_span,
-                        )
-
-                        publish_sample = immersive_bridge.get_latest_sample()
-                        publish_left_eye_pose_world = last_left_eye_pose_world
-                        publish_right_eye_pose_world = last_right_eye_pose_world
-                        publish_left_intrinsic = left_intrinsic
-                        publish_right_intrinsic = right_intrinsic
-                        if (
-                            scene_depth_reproject_enabled
-                            and publish_sample is not None
-                            and self._immersive_sample_has_valid_eye_pose(publish_sample)
-                            and int(publish_sample.sample) > render_sample_id
-                        ):
-                            (
-                                predicted_left_eye_pose_world,
-                                predicted_right_eye_pose_world,
-                            ) = self._predict_immersive_eye_poses_for_sample(
-                                publish_sample,
-                                live_head_alignment,
-                                head_pose_state,
-                                frame_count,
-                            )
-                            if predicted_left_eye_pose_world is not None:
-                                publish_left_eye_pose_world = predicted_left_eye_pose_world
-                            if predicted_right_eye_pose_world is not None:
-                                publish_right_eye_pose_world = predicted_right_eye_pose_world
-                            if (
-                                publish_sample.left_eye is not None
-                                and publish_sample.left_eye.pose_valid
-                            ):
-                                publish_left_intrinsic = self._eye_sample_intrinsic(
-                                    publish_sample.left_eye,
-                                    eye_width,
-                                    eye_height,
-                                )
-                            if (
-                                publish_sample.right_eye is not None
-                                and publish_sample.right_eye.pose_valid
-                            ):
-                                publish_right_intrinsic = self._eye_sample_intrinsic(
-                                    publish_sample.right_eye,
-                                    eye_width,
-                                    eye_height,
-                                )
-                            latewarp_span = self._render_profile_begin_cuda_span(
-                                render_profile_frame,
-                                "scene_timewarp_gpu_ms",
-                            )
+                            static_scene_overlap_failure_logged = True
+                        if static_scene_worker is not None:
                             try:
-                                (
-                                    warped_left_eye_frame,
-                                    warped_left_eye_depth,
-                                    _,
-                                ) = self._latewarp_immersive_scene_eye(
-                                    left_eye_frame,
-                                    left_eye_frame_depth,
-                                    last_left_eye_pose_world,
-                                    publish_left_eye_pose_world,
-                                    left_intrinsic,
-                                    publish_left_intrinsic,
-                                    eye_height,
-                                    eye_width,
-                                    "left",
-                                    reproject_caches=shared_scene_reproject_caches,
-                                    render_profile_frame=render_profile_frame,
-                                )
-                                if (
-                                    torch.is_tensor(warped_left_eye_frame)
-                                    and torch.is_tensor(warped_left_eye_depth)
-                                    and tuple(warped_left_eye_frame.shape)
-                                    == (eye_height, eye_width, 4)
-                                    and tuple(warped_left_eye_depth.shape)
-                                    == (eye_height, eye_width)
-                                    and self._is_finite_tensor(warped_left_eye_frame)
-                                    and self._is_finite_tensor(warped_left_eye_depth)
-                                ):
-                                    left_eye_frame = warped_left_eye_frame
-                                    left_eye_frame_depth = warped_left_eye_depth
-                                else:
-                                    scene_timewarp_fallback_left_used = 1.0
+                                static_scene_worker.stop()
                             except Exception:
-                                scene_timewarp_fallback_left_used = 1.0
-                            try:
-                                (
-                                    warped_right_eye_frame,
-                                    warped_right_eye_depth,
-                                    _,
-                                ) = self._latewarp_immersive_scene_eye(
-                                    right_eye_frame,
-                                    right_eye_frame_depth,
-                                    last_right_eye_pose_world,
-                                    publish_right_eye_pose_world,
-                                    right_intrinsic,
-                                    publish_right_intrinsic,
-                                    eye_height,
-                                    eye_width,
-                                    "right",
-                                    reproject_caches=shared_scene_reproject_caches,
-                                    render_profile_frame=render_profile_frame,
-                                )
-                                if (
-                                    torch.is_tensor(warped_right_eye_frame)
-                                    and torch.is_tensor(warped_right_eye_depth)
-                                    and tuple(warped_right_eye_frame.shape)
-                                    == (eye_height, eye_width, 4)
-                                    and tuple(warped_right_eye_depth.shape)
-                                    == (eye_height, eye_width)
-                                    and self._is_finite_tensor(warped_right_eye_frame)
-                                    and self._is_finite_tensor(warped_right_eye_depth)
-                                ):
-                                    right_eye_frame = warped_right_eye_frame
-                                    right_eye_frame_depth = warped_right_eye_depth
-                                else:
-                                    scene_timewarp_fallback_right_used = 1.0
-                            except Exception:
-                                scene_timewarp_fallback_right_used = 1.0
-                            self._render_profile_end_cuda_span(
-                                render_profile_frame,
-                                latewarp_span,
-                            )
-                            scene_timewarp_applied = 1.0
-                            scene_pose_sample = publish_sample
-                            publish_sample_id = int(publish_sample.sample)
-                            left_overlay_eye_render_state = (
-                                self._prepare_immersive_eye_render_state(
-                                    publish_left_eye_pose_world,
-                                    publish_left_intrinsic,
-                                    eye_height,
-                                    eye_width,
-                                    eye_label="left_publish",
-                                )
-                            )
-                            right_overlay_eye_render_state = (
-                                self._prepare_immersive_eye_render_state(
-                                    publish_right_eye_pose_world,
-                                    publish_right_intrinsic,
-                                    eye_height,
-                                    eye_width,
-                                    eye_label="right_publish",
-                                )
-                            )
-                if not framegen_reuse_applied and not worker_result_ready:
+                                pass
+                        static_scene_worker = None
+                        static_scene_overlap_enabled = False
+                        scene_depth_reproject_enabled = False
+                        static_scene_framegen_cache = None
+                        immersive_framegen_mode = "off"
+
+                if not scene_layers_ready:
                     if (
                         active_scene_stereo_mode
                         == self.IMMERSIVE_BALANCED_INTERNAL_STEREO_MODE
                         and balanced_scene_render_plan is not None
                     ):
+                        static_scene_render_start = time.perf_counter()
                         serial_scene_outputs = (
                             _execute_immersive_balanced_scene_render_plan(
                                 scene_renderer,
                                 balanced_scene_render_plan,
                             )
+                        )
+                        static_scene_render_wall_s = (
+                            time.perf_counter() - static_scene_render_start
                         )
                         (
                             left_scene_color,
@@ -13149,6 +13130,7 @@ class InvPhyTrainerWarp:
                             render_profile_frame=render_profile_frame,
                         )
                     else:
+                        static_scene_render_start = time.perf_counter()
                         (
                             left_scene_color,
                             left_scene_depth,
@@ -13173,60 +13155,218 @@ class InvPhyTrainerWarp:
                             reproject_caches=shared_scene_reproject_caches,
                             render_profile_frame=render_profile_frame,
                         )
+                        static_scene_render_wall_s = (
+                            time.perf_counter() - static_scene_render_start
+                        )
+
+                if left_gaussian_rgba is None:
+                    gaussian_render_mode_for_frame = immersive_gaussian_render_mode
+                    while True:
+                        try:
+                            (
+                                left_gaussian_rgba,
+                                left_gaussian_depth,
+                                right_gaussian_rgba,
+                                right_gaussian_depth,
+                                gaussian_render_wall_s,
+                            ) = self._render_immersive_stereo_gaussians(
+                                left_eye_render_state,
+                                right_eye_render_state,
+                                gaussians,
+                                render_pipe,
+                                background_black,
+                                background_white,
+                                mode=gaussian_render_mode_for_frame,
+                                render_profile_frame=render_profile_frame,
+                            )
+                            break
+                        except Exception as exc:
+                            if gaussian_render_mode_for_frame != "stereo_parallel":
+                                raise
+                            if not gaussian_render_failure_logged:
+                                print(
+                                    "[quest_display] immersive stereo-parallel gaussian "
+                                    "render failed mid-run; degrading to serial gaussian "
+                                    f"render: {type(exc).__name__}: {exc}",
+                                    flush=True,
+                                )
+                                gaussian_render_failure_logged = True
+                            immersive_gaussian_render_mode = "serial"
+                            gaussian_render_mode_for_frame = "serial"
+                    branch_b_ready_wall_s = (
+                        float(simulation_lbs_wall_s) + float(gaussian_render_wall_s)
+                    )
+
+                pre_compose_ready_wall_s = max(
+                    float(static_scene_render_wall_s),
+                    float(branch_b_ready_wall_s),
+                )
+
+                compositing_stage_start = time.perf_counter()
+                (
+                    left_eye_frame,
+                    left_eye_frame_depth,
+                    left_compose_metrics,
+                    right_eye_frame,
+                    right_eye_frame_depth,
+                    right_compose_metrics,
+                ) = self._compose_immersive_stereo_eye_frames(
+                    left_scene_color,
+                    left_scene_depth,
+                    right_scene_color,
+                    right_scene_depth,
+                    left_gaussian_rgba,
+                    left_gaussian_depth,
+                    right_gaussian_rgba,
+                    right_gaussian_depth,
+                    eye_height,
+                    eye_width,
+                    immersive_compose_mode,
+                    gaussian_compose_roi_padding,
+                    render_profile_frame=render_profile_frame,
+                    output_dtype=eye_frame_output_dtype,
+                )
+
+                publish_sample = immersive_bridge.get_latest_sample()
+                publish_left_eye_pose_world = last_left_eye_pose_world
+                publish_right_eye_pose_world = last_right_eye_pose_world
+                publish_left_intrinsic = left_intrinsic
+                publish_right_intrinsic = right_intrinsic
+                if (
+                    scene_depth_reproject_enabled
+                    and publish_sample is not None
+                    and self._immersive_sample_has_valid_eye_pose(publish_sample)
+                    and int(publish_sample.sample) > render_sample_id
+                ):
                     (
-                        left_eye_frame,
-                        left_gaussian_rgba,
-                        left_gaussian_depth,
-                        left_compose_metrics,
-                        _,
-                    ) = (
-                        self._render_immersive_eye_frame(
+                        predicted_left_eye_pose_world,
+                        predicted_right_eye_pose_world,
+                    ) = self._predict_immersive_eye_poses_for_sample(
+                        publish_sample,
+                        live_head_alignment,
+                        head_pose_state,
+                        frame_count,
+                    )
+                    if predicted_left_eye_pose_world is not None:
+                        publish_left_eye_pose_world = predicted_left_eye_pose_world
+                    if predicted_right_eye_pose_world is not None:
+                        publish_right_eye_pose_world = predicted_right_eye_pose_world
+                    if (
+                        publish_sample.left_eye is not None
+                        and publish_sample.left_eye.pose_valid
+                    ):
+                        publish_left_intrinsic = self._eye_sample_intrinsic(
+                            publish_sample.left_eye,
+                            eye_width,
+                            eye_height,
+                        )
+                    if (
+                        publish_sample.right_eye is not None
+                        and publish_sample.right_eye.pose_valid
+                    ):
+                        publish_right_intrinsic = self._eye_sample_intrinsic(
+                            publish_sample.right_eye,
+                            eye_width,
+                            eye_height,
+                        )
+                    latewarp_span = self._render_profile_begin_cuda_span(
+                        render_profile_frame,
+                        "scene_timewarp_gpu_ms",
+                    )
+                    try:
+                        (
+                            warped_left_eye_frame,
+                            warped_left_eye_depth,
+                            _,
+                        ) = self._latewarp_immersive_scene_eye(
+                            left_eye_frame,
+                            left_eye_frame_depth,
                             last_left_eye_pose_world,
+                            publish_left_eye_pose_world,
                             left_intrinsic,
+                            publish_left_intrinsic,
                             eye_height,
                             eye_width,
-                            left_scene_color,
-                            left_scene_depth,
-                            gaussians,
-                            render_pipe,
-                            background_black,
-                            background_white,
+                            "left",
+                            reproject_caches=shared_scene_reproject_caches,
                             render_profile_frame=render_profile_frame,
-                            eye_label="left",
-                            compose_mode=immersive_compose_mode,
-                            compose_roi_padding=gaussian_compose_roi_padding,
-                            collect_compose_debug=render_profile_frame is not None,
-                            eye_render_state=left_eye_render_state,
-                            output_dtype=eye_frame_output_dtype,
                         )
-                    )
-                    (
-                        right_eye_frame,
-                        right_gaussian_rgba,
-                        right_gaussian_depth,
-                        right_compose_metrics,
-                        _,
-                    ) = (
-                        self._render_immersive_eye_frame(
+                        if (
+                            torch.is_tensor(warped_left_eye_frame)
+                            and torch.is_tensor(warped_left_eye_depth)
+                            and tuple(warped_left_eye_frame.shape)
+                            == (eye_height, eye_width, 4)
+                            and tuple(warped_left_eye_depth.shape)
+                            == (eye_height, eye_width)
+                            and self._is_finite_tensor(warped_left_eye_frame)
+                            and self._is_finite_tensor(warped_left_eye_depth)
+                        ):
+                            left_eye_frame = warped_left_eye_frame
+                            left_eye_frame_depth = warped_left_eye_depth
+                        else:
+                            scene_timewarp_fallback_left_used = 1.0
+                    except Exception:
+                        scene_timewarp_fallback_left_used = 1.0
+                    try:
+                        (
+                            warped_right_eye_frame,
+                            warped_right_eye_depth,
+                            _,
+                        ) = self._latewarp_immersive_scene_eye(
+                            right_eye_frame,
+                            right_eye_frame_depth,
                             last_right_eye_pose_world,
+                            publish_right_eye_pose_world,
                             right_intrinsic,
+                            publish_right_intrinsic,
                             eye_height,
                             eye_width,
-                            right_scene_color,
-                            right_scene_depth,
-                            gaussians,
-                            render_pipe,
-                            background_black,
-                            background_white,
+                            "right",
+                            reproject_caches=shared_scene_reproject_caches,
                             render_profile_frame=render_profile_frame,
-                            eye_label="right",
-                            compose_mode=immersive_compose_mode,
-                            compose_roi_padding=gaussian_compose_roi_padding,
-                            collect_compose_debug=render_profile_frame is not None,
-                            eye_render_state=right_eye_render_state,
-                            output_dtype=eye_frame_output_dtype,
+                        )
+                        if (
+                            torch.is_tensor(warped_right_eye_frame)
+                            and torch.is_tensor(warped_right_eye_depth)
+                            and tuple(warped_right_eye_frame.shape)
+                            == (eye_height, eye_width, 4)
+                            and tuple(warped_right_eye_depth.shape)
+                            == (eye_height, eye_width)
+                            and self._is_finite_tensor(warped_right_eye_frame)
+                            and self._is_finite_tensor(warped_right_eye_depth)
+                        ):
+                            right_eye_frame = warped_right_eye_frame
+                            right_eye_frame_depth = warped_right_eye_depth
+                        else:
+                            scene_timewarp_fallback_right_used = 1.0
+                    except Exception:
+                        scene_timewarp_fallback_right_used = 1.0
+                    self._render_profile_end_cuda_span(
+                        render_profile_frame,
+                        latewarp_span,
+                    )
+                    scene_timewarp_applied = 1.0
+                    scene_pose_sample = publish_sample
+                    publish_sample_id = int(publish_sample.sample)
+                    left_overlay_eye_render_state = (
+                        self._prepare_immersive_eye_render_state(
+                            publish_left_eye_pose_world,
+                            publish_left_intrinsic,
+                            eye_height,
+                            eye_width,
+                            eye_label="left_publish",
                         )
                     )
+                    right_overlay_eye_render_state = (
+                        self._prepare_immersive_eye_render_state(
+                            publish_right_eye_pose_world,
+                            publish_right_intrinsic,
+                            eye_height,
+                            eye_width,
+                            eye_label="right_publish",
+                        )
+                    )
+                compositing_wall_s = time.perf_counter() - compositing_stage_start
 
                 if render_profile_frame is not None:
                     render_profile_frame["publish_sample_id"] = float(
@@ -13252,6 +13392,7 @@ class InvPhyTrainerWarp:
                         right_compose_metrics,
                     )
 
+                overlay_stage_start = time.perf_counter()
                 overlay_projection_start = (
                     time.perf_counter() if render_profile_frame is not None else None
                 )
@@ -13302,6 +13443,7 @@ class InvPhyTrainerWarp:
                             "overlay_draw_right_wall",
                             time.perf_counter() - overlay_draw_right_start,
                         )
+                overlay_draw_wall_s = time.perf_counter() - overlay_stage_start
 
                 if left_eye_frame.dtype != torch.uint8:
                     left_eye_frame = left_eye_frame.clamp(0.0, 255.0).to(torch.uint8)
@@ -13515,10 +13657,13 @@ class InvPhyTrainerWarp:
                         "first_publish_begin",
                         immersive_bridge,
                     )
+                publish_stage_start = time.perf_counter()
                 publish_ok, publish_stats = immersive_bridge.publish_stereo_frames(
                     left_eye_frame,
                     right_eye_frame,
                 )
+                publish_stage_wall_s = time.perf_counter() - publish_stage_start
+                overlay_publish_wall_s = overlay_draw_wall_s + publish_stage_wall_s
                 if render_profile_frame is not None:
                     render_profile_frame["publish_total_wall"] = float(
                         publish_stats.get("total_wall", 0.0)
@@ -13620,8 +13765,50 @@ class InvPhyTrainerWarp:
                 render_time = render_timer.stop()
                 if frame_count > 1:
                     component_times["rendering"].append(render_time)
+                    render_stage_times["static_scene_render_ms"].append(
+                        float(static_scene_render_wall_s)
+                    )
+                    render_stage_times["simulation_lbs_wall_ms"].append(
+                        float(simulation_lbs_wall_s)
+                    )
+                    render_stage_times["gaussian_render_wall_ms"].append(
+                        float(gaussian_render_wall_s)
+                    )
+                    render_stage_times["branch_b_ready_ms"].append(
+                        float(branch_b_ready_wall_s)
+                    )
+                    render_stage_times["pre_compose_ready_ms"].append(
+                        float(pre_compose_ready_wall_s)
+                    )
+                    render_stage_times["compositing_ms"].append(
+                        float(compositing_wall_s)
+                    )
+                    render_stage_times["overlay_publish_ms"].append(
+                        float(overlay_publish_wall_s)
+                    )
                 if render_profile_frame is not None:
                     render_profile_frame["rendering"] = float(render_time)
+                    render_profile_frame["static_scene_render_ms"] = float(
+                        static_scene_render_wall_s
+                    )
+                    render_profile_frame["simulation_lbs_wall_ms"] = float(
+                        simulation_lbs_wall_s
+                    )
+                    render_profile_frame["gaussian_render_wall_ms"] = float(
+                        gaussian_render_wall_s
+                    )
+                    render_profile_frame["branch_b_ready_ms"] = float(
+                        branch_b_ready_wall_s
+                    )
+                    render_profile_frame["pre_compose_ready_ms"] = float(
+                        pre_compose_ready_wall_s
+                    )
+                    render_profile_frame["compositing_ms"] = float(
+                        compositing_wall_s
+                    )
+                    render_profile_frame["overlay_publish_ms"] = float(
+                        overlay_publish_wall_s
+                    )
                     render_profile_frame = self._render_profile_finalize_frame(
                         render_profile_frame
                     )
@@ -13721,14 +13908,15 @@ class InvPhyTrainerWarp:
                 log_lines = [summary_header.lstrip("\n")]
                 total_frame_times = component_times["total"]
                 total_time_seconds = sum(total_frame_times)
-                average_fps = frames_used_for_stats / total_time_seconds
+                published_fps = frames_used_for_stats / total_time_seconds
                 average_frame_time = np.mean(total_frame_times)
-                print(f"Average FPS: {average_fps:.2f}")
+                print(f"Published FPS: {published_fps:.2f}")
                 print(f"Average Total Frame Time: {average_frame_time * 1000:.2f} ms")
-                log_lines.append(f"Average FPS: {average_fps:.2f}")
+                log_lines.append(f"Published FPS: {published_fps:.2f}")
                 log_lines.append(
                     f"Average Total Frame Time: {average_frame_time * 1000:.2f} ms"
                 )
+                average_static_scene_reuse_ratio = 0.0
                 if scene_pose_staleness_ms_samples:
                     average_scene_pose_staleness_ms = float(
                         np.mean(
@@ -13759,6 +13947,32 @@ class InvPhyTrainerWarp:
                     )
                     print(static_scene_reuse_line)
                     log_lines.append(static_scene_reuse_line)
+                fresh_static_scene_render_fps = published_fps * (
+                    1.0 - average_static_scene_reuse_ratio
+                )
+                fresh_static_scene_render_fps_line = (
+                    "Fresh Static Scene Render FPS: "
+                    f"{fresh_static_scene_render_fps:.2f}"
+                )
+                print(fresh_static_scene_render_fps_line)
+                log_lines.append(fresh_static_scene_render_fps_line)
+                viewer_consumed_source_fps = None
+                if immersive_bridge is not None:
+                    viewer_consumed_stats = immersive_bridge.viewer_consumed_source_stats()
+                    viewer_consumed_source_fps = float(
+                        viewer_consumed_stats.get("average_fps", 0.0)
+                    )
+                    if viewer_consumed_source_fps <= 0.0:
+                        viewer_consumed_source_fps = float(
+                            viewer_consumed_stats.get("recent_fps", 0.0)
+                        )
+                if viewer_consumed_source_fps is not None and viewer_consumed_source_fps > 0.0:
+                    viewer_consumed_line = (
+                        "Viewer-Consumed Source FPS: "
+                        f"{viewer_consumed_source_fps:.2f}"
+                    )
+                    print(viewer_consumed_line)
+                    log_lines.append(viewer_consumed_line)
                 if startup_render_debug is not None:
                     startup_compose_line = (
                         "Startup compose mode: "
@@ -13772,6 +13986,11 @@ class InvPhyTrainerWarp:
                     print(startup_compose_line)
                     log_lines.append(startup_compose_line)
                 component_summary_rows = []
+                component_name_labels = {
+                    "simulator": "Spring-mass simulation",
+                    "full_motion_interpolation": "LBS",
+                    "rendering": "Rendering stage",
+                }
                 for component_name in (
                     "simulator",
                     "full_motion_interpolation",
@@ -13781,13 +14000,43 @@ class InvPhyTrainerWarp:
                     if component_times_list:
                         component_summary_rows.append(
                             (
-                                component_name.replace("_", " ").capitalize(),
+                                component_name_labels.get(component_name, component_name),
                                 float(np.mean(component_times_list)),
                             )
                         )
                 for line in self._format_component_summary_lines(
                     average_frame_time,
                     component_summary_rows,
+                ):
+                    print(line)
+                    log_lines.append(line)
+                render_stage_rows = []
+                for stage_key, stage_label in (
+                    ("static_scene_render_ms", "Parallel branch A: Static scene render"),
+                    (
+                        "branch_b_ready_ms",
+                        "Parallel branch B: Spring-mass simulation + LBS + Gaussian render",
+                    ),
+                    (
+                        "pre_compose_ready_ms",
+                        "Join at compose: Pre-compose ready time",
+                    ),
+                    ("simulation_lbs_wall_ms", "Spring-mass simulation + LBS"),
+                    ("gaussian_render_wall_ms", "Gaussian render"),
+                    ("compositing_ms", "Compositing"),
+                    ("overlay_publish_ms", "Overlay + publish"),
+                ):
+                    stage_samples = render_stage_times.get(stage_key, [])
+                    if stage_samples:
+                        render_stage_rows.append(
+                            (
+                                stage_label,
+                                float(np.mean(np.asarray(stage_samples, dtype=np.float64))),
+                            )
+                        )
+                for line in self._format_immersive_render_stage_breakdown_lines(
+                    average_frame_time,
+                    render_stage_rows,
                 ):
                     print(line)
                     log_lines.append(line)
@@ -13849,6 +14098,7 @@ class InvPhyTrainerWarp:
         immersive_timewarp="off",
         immersive_static_scene_overlap="off",
         immersive_framegen="off",
+        immersive_gaussian_render="serial",
     ):
         if n_dup != 0:
             raise ValueError(
@@ -13867,6 +14117,7 @@ class InvPhyTrainerWarp:
             immersive_timewarp=immersive_timewarp,
             immersive_static_scene_overlap=immersive_static_scene_overlap,
             immersive_framegen=immersive_framegen,
+            immersive_gaussian_render=immersive_gaussian_render,
         )
 
     def _create_gs_view(
@@ -16727,6 +16978,12 @@ class InvPhyTrainerWarp:
             "static_scene_worker_wall_ms",
             "simulation_lbs_wall_ms",
             "overlap_wait_wall_ms",
+            "static_scene_render_ms",
+            "gaussian_render_wall_ms",
+            "branch_b_ready_ms",
+            "pre_compose_ready_ms",
+            "compositing_ms",
+            "overlay_publish_ms",
             "scene_pose_staleness_ms_at_publish",
             "scene_pose_staleness_savings_ms",
             "render_sample_id",

@@ -103,7 +103,10 @@ class GaussianModel:
     @property
     def get_scaling(self):
         if self.isotropic:
-            return self.scaling_activation(self._scaling).repeat(1, 3)
+            scaling = self.scaling_activation(self._scaling)
+            if scaling.shape[1] == 1:
+                return scaling.repeat(1, 3)
+            return scaling
         else:
             return self.scaling_activation(self._scaling)
     
@@ -302,8 +305,13 @@ class GaussianModel:
 
         extra_f_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("f_rest_")]
         extra_f_names = sorted(extra_f_names, key = lambda x: int(x.split('_')[-1]))
-        assert len(extra_f_names)==3*(self.max_sh_degree + 1) ** 2 - 3
-        features_extra = np.zeros((xyz.shape[0], len(extra_f_names)))
+        expected_extra_count = 3 * (self.max_sh_degree + 1) ** 2 - 3
+        if len(extra_f_names) not in {0, expected_extra_count}:
+            raise ValueError(
+                f"Unexpected SH feature count in {path}: "
+                f"found {len(extra_f_names)} f_rest entries, expected 0 or {expected_extra_count}."
+            )
+        features_extra = np.zeros((xyz.shape[0], expected_extra_count), dtype=np.float32)
         for idx, attr_name in enumerate(extra_f_names):
             features_extra[:, idx] = np.asarray(plydata.elements[0][attr_name])
         # Reshape (P,F*SH_coeffs) to (P, F, SH_coeffs except DC)

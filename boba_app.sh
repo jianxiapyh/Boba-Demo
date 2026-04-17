@@ -7,7 +7,8 @@ export PYTHONNOUSERSITE="${PYTHONNOUSERSITE:-1}"
 export BOBA_GSPLAT_SOURCE_ROOT="${BOBA_GSPLAT_SOURCE_ROOT:-${SCRIPT_DIR}/../Boba_OpenSource/gaussian_splatting/submodules/gsplat}"
 
 # Default Quest immersive run: live OpenXR controllers, immersive display,
-# ILLIXR_lab scene, balanced preset. Public demo cases are sloth and rope.
+# ILLIXR_lab scene, balanced preset. Public demo cases are sloth, rope,
+# hq_rope_0, and hq_rope_1.
 python boba_quest_immersive.py \
   --case_name sloth \
   --n_dup 0 \
@@ -15,6 +16,16 @@ python boba_quest_immersive.py \
 
 python boba_quest_immersive.py \
   --case_name rope \
+  --n_dup 0 \
+  --interactive_window_mode hidden
+
+python boba_quest_immersive.py \
+  --case_name hq_rope_0 \
+  --n_dup 0 \
+  --interactive_window_mode hidden
+
+python boba_quest_immersive.py \
+  --case_name hq_rope_1 \
   --n_dup 0 \
   --interactive_window_mode hidden
 

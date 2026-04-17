@@ -16,7 +16,15 @@ np = None
 torch = None
 REPO_ROOT = Path(__file__).resolve().parent
 DEFAULT_SCENE_ASSETS_ROOT = REPO_ROOT / "assets" / "scenes"
-PUBLIC_DEMO_CASES = ("sloth", "rope")
+PUBLIC_DEMO_CASES = ("sloth", "rope", "hq_rope_0", "hq_rope_1")
+DEMO_CASE_WORLD_SCALE = {
+    "hq_rope_0": 0.3932700391790796,
+}
+DEMO_CASE_LENGTH_LIKE_CFG_KEYS = (
+    "object_radius",
+    "controller_radius",
+    "collision_dist",
+)
 
 
 def resolve_demo_case_manifest(case_name: str) -> tuple[str, Path, dict]:
@@ -38,6 +46,23 @@ def manifest_file_path(manifest_dir: Path, manifest: dict, key: str) -> str:
     if relative_path is None:
         raise KeyError(f"Manifest is missing required key: {key}")
     return str((manifest_dir / relative_path).resolve())
+
+
+def demo_case_world_scale(case_name: str) -> float:
+    case_key = str(case_name).strip().lower()
+    return float(DEMO_CASE_WORLD_SCALE.get(case_key, 1.0))
+
+
+def apply_demo_case_world_scale_to_cfg(cfg, case_name: str) -> float:
+    scale = demo_case_world_scale(case_name)
+    cfg.demo_case_world_scale = scale
+    if abs(scale - 1.0) <= 1e-8:
+        return scale
+    for attr_name in DEMO_CASE_LENGTH_LIKE_CFG_KEYS:
+        if not hasattr(cfg, attr_name):
+            continue
+        setattr(cfg, attr_name, float(getattr(cfg, attr_name)) * scale)
+    return scale
 
 
 def set_all_seeds(seed: int):
@@ -196,7 +221,7 @@ def build_parser() -> ArgumentParser:
         type=str,
         choices=PUBLIC_DEMO_CASES,
         default="sloth",
-        help="public packaged demo case: sloth or rope",
+        help="public packaged demo case",
     )
     parser.add_argument("--n_dup", type=int, default=0, help="must remain 0 for the shipped Quest demo")
     parser.add_argument(
@@ -314,6 +339,16 @@ def main(argv: list[str] | None = None):
     with open(optimal_path, "rb") as f:
         optimal_params = pickle.load(f)
     cfg.set_optimal_params(optimal_params)
+    demo_case_scale = apply_demo_case_world_scale_to_cfg(cfg, canonical_case_name)
+    if abs(demo_case_scale - 1.0) > 1e-8:
+        print(
+            "[quest_display] demo case world scale: "
+            f"case={canonical_case_name} scale={demo_case_scale:.8f} "
+            f"object_radius={float(cfg.object_radius):.8f} "
+            f"controller_radius={float(cfg.controller_radius):.8f} "
+            f"collision_dist={float(cfg.collision_dist):.8f}",
+            flush=True,
+        )
 
     with open(manifest_file_path(manifest_dir, case_manifest, "calibrate"), "rb") as f:
         c2ws = pickle.load(f)

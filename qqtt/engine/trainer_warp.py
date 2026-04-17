@@ -12389,6 +12389,49 @@ class InvPhyTrainerWarp:
                 left_overlay_eye_render_state = left_eye_render_state
                 right_overlay_eye_render_state = right_eye_render_state
                 worker_result_ready = False
+                overlap_left_gaussian_rgba = None
+                overlap_left_gaussian_depth = None
+                overlap_right_gaussian_rgba = None
+                overlap_right_gaussian_depth = None
+                if static_scene_request_submitted:
+                    left_gaussian_span = self._render_profile_begin_cuda_span(
+                        render_profile_frame,
+                        "gaussian_render_left_cuda",
+                    )
+                    (
+                        overlap_left_gaussian_rgba,
+                        overlap_left_gaussian_depth,
+                    ) = self._render_gaussian_rgba(
+                        left_eye_render_state["view"],
+                        gaussians,
+                        render_pipe,
+                        background_black,
+                        background_white,
+                        use_gsplat=True,
+                    )
+                    self._render_profile_end_cuda_span(
+                        render_profile_frame,
+                        left_gaussian_span,
+                    )
+                    right_gaussian_span = self._render_profile_begin_cuda_span(
+                        render_profile_frame,
+                        "gaussian_render_right_cuda",
+                    )
+                    (
+                        overlap_right_gaussian_rgba,
+                        overlap_right_gaussian_depth,
+                    ) = self._render_gaussian_rgba(
+                        right_eye_render_state["view"],
+                        gaussians,
+                        render_pipe,
+                        background_black,
+                        background_white,
+                        use_gsplat=True,
+                    )
+                    self._render_profile_end_cuda_span(
+                        render_profile_frame,
+                        right_gaussian_span,
+                    )
                 if static_scene_request_submitted:
                     overlap_wait_start = (
                         time.perf_counter() if static_scene_request_submitted else None
@@ -12446,38 +12489,10 @@ class InvPhyTrainerWarp:
                             render_profile_frame=render_profile_frame,
                         )
 
-                        left_gaussian_span = self._render_profile_begin_cuda_span(
-                            render_profile_frame,
-                            "gaussian_render_left_cuda",
-                        )
-                        left_gaussian_rgba, left_gaussian_depth = self._render_gaussian_rgba(
-                            left_eye_render_state["view"],
-                            gaussians,
-                            render_pipe,
-                            background_black,
-                            background_white,
-                            use_gsplat=True,
-                        )
-                        self._render_profile_end_cuda_span(
-                            render_profile_frame,
-                            left_gaussian_span,
-                        )
-                        right_gaussian_span = self._render_profile_begin_cuda_span(
-                            render_profile_frame,
-                            "gaussian_render_right_cuda",
-                        )
-                        right_gaussian_rgba, right_gaussian_depth = self._render_gaussian_rgba(
-                            right_eye_render_state["view"],
-                            gaussians,
-                            render_pipe,
-                            background_black,
-                            background_white,
-                            use_gsplat=True,
-                        )
-                        self._render_profile_end_cuda_span(
-                            render_profile_frame,
-                            right_gaussian_span,
-                        )
+                        left_gaussian_rgba = overlap_left_gaussian_rgba
+                        left_gaussian_depth = overlap_left_gaussian_depth
+                        right_gaussian_rgba = overlap_right_gaussian_rgba
+                        right_gaussian_depth = overlap_right_gaussian_depth
 
                     left_compose_span = self._render_profile_begin_cuda_span(
                         render_profile_frame,

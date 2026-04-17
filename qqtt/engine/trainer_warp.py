@@ -21,6 +21,7 @@ import threading
 import torchvision
 from gaussian_splatting.scene.gaussian_model import GaussianModel
 from gaussian_splatting.gaussian_renderer import render as render_gaussian
+from gaussian_splatting.gaussian_renderer import render_batch as render_gaussian_batch
 from gaussian_splatting.dynamic_utils import (
     lbs_with_rotation_reuse,
     build_rotation_reuse_cache,
@@ -4293,7 +4294,8 @@ class InvPhyTrainerWarp:
             f"table_ff=L{frame_profile.get('scene_table_fullframe_fallback_left_ratio', 0.0) * 100.0:.0f}/"
             f"R{frame_profile.get('scene_table_fullframe_fallback_right_ratio', 0.0) * 100.0:.0f}% "
             f"gaussian=L{frame_profile.get('gaussian_render_left_cuda', 0.0) * 1000.0:.2f}/"
-            f"R{frame_profile.get('gaussian_render_right_cuda', 0.0) * 1000.0:.2f}ms "
+            f"R{frame_profile.get('gaussian_render_right_cuda', 0.0) * 1000.0:.2f}/"
+            f"B{frame_profile.get('gaussian_render_stereo_batched_cuda', 0.0) * 1000.0:.2f}ms "
             f"compose=L{frame_profile.get('compose_left_cuda', 0.0) * 1000.0:.2f}/"
             f"R{frame_profile.get('compose_right_cuda', 0.0) * 1000.0:.2f}ms "
             f"gaussian_roi=L{frame_profile.get('gaussian_compose_roi_left_ratio', 0.0) * 100.0:.1f}/"
@@ -9437,6 +9439,69 @@ class InvPhyTrainerWarp:
         rgba = torch.cat([rgb, alpha], dim=0)
         return rgba, black_depth
 
+    @torch.no_grad()
+    def _render_gaussian_rgba_batch(
+        self,
+        views,
+        gaussians,
+        render_pipe,
+        background_black,
+        background_white,
+        use_gsplat=False,
+    ):
+        black_results = render_gaussian_batch(
+            views,
+            gaussians,
+            render_pipe,
+            background_black,
+            use_gsplat=use_gsplat,
+        )
+        black_renderings = [
+            result["render"].detach().clamp(0.0, 1.0)
+            for result in black_results
+        ]
+        black_depths = []
+        for result in black_results:
+            black_depth = result.get("depth")
+            if torch.is_tensor(black_depth):
+                black_depth = black_depth.detach()
+            black_depths.append(black_depth)
+
+        if black_renderings and black_renderings[0].shape[0] == 4:
+            return list(zip(black_renderings, black_depths))
+
+        white_results = render_gaussian_batch(
+            views,
+            gaussians,
+            render_pipe,
+            background_white,
+            use_gsplat=use_gsplat,
+        )
+        white_renderings = [
+            result["render"].detach().clamp(0.0, 1.0)
+            for result in white_results
+        ]
+
+        outputs = []
+        for black_rendering, white_rendering, black_depth in zip(
+            black_renderings,
+            white_renderings,
+            black_depths,
+        ):
+            rgb_black = black_rendering[:3]
+            rgb_white = white_rendering[:3]
+            alpha = (1.0 - (rgb_white - rgb_black).mean(dim=0, keepdim=True)).clamp(
+                0.0, 1.0
+            )
+            safe_alpha = alpha > (1.0 / 255.0)
+            rgb = torch.where(
+                safe_alpha,
+                rgb_black / alpha.clamp_min(1e-6),
+                torch.zeros_like(rgb_black),
+            ).clamp(0.0, 1.0)
+            outputs.append((torch.cat([rgb, alpha], dim=0), black_depth))
+        return outputs
+
     def _get_immersive_gaussian_render_streams(self):
         stream_store = getattr(self, "_immersive_gaussian_render_streams", None)
         if stream_store is None:
@@ -9460,9 +9525,10 @@ class InvPhyTrainerWarp:
         mode="serial",
     ):
         render_mode = str(mode).strip().lower()
-        if render_mode not in {"serial", "stereo_parallel"}:
+        if render_mode not in {"serial", "stereo_parallel", "stereo_batched"}:
             raise ValueError(
-                "immersive_gaussian_render must be one of {'serial', 'stereo_parallel'}"
+                "immersive_gaussian_render must be one of "
+                "{'serial', 'stereo_parallel', 'stereo_batched'}"
             )
 
         if render_mode == "serial":
@@ -9499,6 +9565,39 @@ class InvPhyTrainerWarp:
                 render_profile_frame,
                 right_gaussian_span,
             )
+            return (
+                left_gaussian_rgba,
+                left_gaussian_depth,
+                right_gaussian_rgba,
+                right_gaussian_depth,
+                time.perf_counter() - gaussian_render_start,
+            )
+
+        if render_mode == "stereo_batched":
+            gaussian_render_start = time.perf_counter()
+            batched_span = self._render_profile_begin_cuda_span(
+                render_profile_frame,
+                "gaussian_render_stereo_batched_cuda",
+            )
+            batched_outputs = self._render_gaussian_rgba_batch(
+                [
+                    left_eye_render_state["view"],
+                    right_eye_render_state["view"],
+                ],
+                gaussians,
+                render_pipe,
+                background_black,
+                background_white,
+                use_gsplat=True,
+            )
+            self._render_profile_end_cuda_span(
+                render_profile_frame,
+                batched_span,
+            )
+            (
+                (left_gaussian_rgba, left_gaussian_depth),
+                (right_gaussian_rgba, right_gaussian_depth),
+            ) = batched_outputs
             return (
                 left_gaussian_rgba,
                 left_gaussian_depth,
@@ -11165,10 +11264,14 @@ class InvPhyTrainerWarp:
                 "{'off', 'static', 'adaptive'}"
             )
         immersive_gaussian_render_mode = str(immersive_gaussian_render).strip().lower()
-        if immersive_gaussian_render_mode not in {"serial", "stereo_parallel"}:
+        if immersive_gaussian_render_mode not in {
+            "serial",
+            "stereo_parallel",
+            "stereo_batched",
+        }:
             raise ValueError(
                 "immersive_gaussian_render must be one of "
-                "{'serial', 'stereo_parallel'}"
+                "{'serial', 'stereo_parallel', 'stereo_batched'}"
             )
         scene_depth_reproject_requested = (
             immersive_timewarp_mode == "scene_depth_reproject"
@@ -11194,12 +11297,12 @@ class InvPhyTrainerWarp:
                 "immersive_framegen static|adaptive requires "
                 "--immersive_timewarp off"
             )
-        if immersive_gaussian_render_mode == "stereo_parallel" and (
+        if immersive_gaussian_render_mode in {"stereo_parallel", "stereo_batched"} and (
             immersive_static_scene_overlap_mode != "off"
             or immersive_timewarp_mode != "off"
         ):
             raise ValueError(
-                "immersive_gaussian_render stereo_parallel requires "
+                f"immersive_gaussian_render {immersive_gaussian_render_mode} requires "
                 "--immersive_static_scene_overlap off and --immersive_timewarp off"
             )
         scene_depth_reproject_enabled = scene_depth_reproject_requested
@@ -11312,6 +11415,7 @@ class InvPhyTrainerWarp:
             "scene_compose_side_right_cuda",
             "gaussian_render_left_cuda",
             "gaussian_render_right_cuda",
+            "gaussian_render_stereo_batched_cuda",
             "scene_compose_table_left_cuda",
             "scene_compose_table_right_cuda",
             "compose_left_cuda",
@@ -13015,11 +13119,11 @@ class InvPhyTrainerWarp:
                             )
                             break
                         except Exception as exc:
-                            if gaussian_render_mode_for_frame != "stereo_parallel":
+                            if gaussian_render_mode_for_frame == "serial":
                                 raise
                             if not gaussian_render_failure_logged:
                                 print(
-                                    "[quest_display] immersive stereo-parallel gaussian "
+                                    "[quest_display] immersive experimental gaussian "
                                     "render failed mid-run; degrading to serial gaussian "
                                     f"render: {type(exc).__name__}: {exc}",
                                     flush=True,
@@ -13181,11 +13285,11 @@ class InvPhyTrainerWarp:
                             )
                             break
                         except Exception as exc:
-                            if gaussian_render_mode_for_frame != "stereo_parallel":
+                            if gaussian_render_mode_for_frame == "serial":
                                 raise
                             if not gaussian_render_failure_logged:
                                 print(
-                                    "[quest_display] immersive stereo-parallel gaussian "
+                                    "[quest_display] immersive experimental gaussian "
                                     "render failed mid-run; degrading to serial gaussian "
                                     f"render: {type(exc).__name__}: {exc}",
                                     flush=True,
@@ -16967,6 +17071,7 @@ class InvPhyTrainerWarp:
             "scene_warp_far_right_cuda",
             "scene_warp_near_left_cuda",
             "scene_warp_near_right_cuda",
+            "gaussian_render_stereo_batched_cuda",
             "scene_side_warp_left_used",
             "scene_side_warp_right_used",
             "scene_side_render_fallback_left_used",

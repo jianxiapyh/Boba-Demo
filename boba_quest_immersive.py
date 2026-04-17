@@ -289,12 +289,14 @@ def build_parser() -> ArgumentParser:
     )
     parser.add_argument(
         "--immersive_gaussian_render",
-        choices=("serial", "stereo_parallel"),
+        choices=("serial", "stereo_parallel", "stereo_batched"),
         default="serial",
         help=(
             "Gaussian render scheduling mode for immersive Quest output: "
             "'serial' renders left/right Gaussian eyes sequentially, "
             "'stereo_parallel' experimentally renders both eyes concurrently on separate CUDA streams "
+            "(currently only supported with overlap=off and timewarp=off), "
+            "'stereo_batched' experimentally renders both eyes in one batched gsplat call "
             "(currently only supported with overlap=off and timewarp=off)"
         ),
     )

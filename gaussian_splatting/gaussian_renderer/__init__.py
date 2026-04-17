@@ -25,6 +25,43 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         return render_3dgs(viewpoint_camera, pc, pipe, bg_color, scaling_modifier, separate_sh, override_color, use_trained_exp)
 
 
+def render_batch(viewpoint_cameras, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, use_gsplat=True, antialiased=False):
+    if use_gsplat:
+        return render_gsplat_batch(
+            viewpoint_cameras,
+            pc,
+            pipe,
+            bg_color,
+            scaling_modifier,
+            override_color,
+            antialiased,
+        )
+    raise NotImplementedError(
+        "Batched gaussian rendering currently supports only gsplat."
+    )
+
+
+def _camera_intrinsic_matrix(viewpoint_camera, pc : GaussianModel):
+    if viewpoint_camera.K is not None:
+        return torch.as_tensor(
+            viewpoint_camera.K,
+            dtype=pc.get_xyz.dtype,
+            device=pc.get_xyz.device,
+        ).reshape(3, 3)
+
+    tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
+    tanfovy = math.tan(viewpoint_camera.FoVy * 0.5)
+    focal_length_x = viewpoint_camera.image_width / (2 * tanfovx)
+    focal_length_y = viewpoint_camera.image_height / (2 * tanfovy)
+    return torch.tensor(
+        [
+            [focal_length_x, 0, viewpoint_camera.image_width / 2.0],
+            [0, focal_length_y, viewpoint_camera.image_height / 2.0],
+            [0, 0, 1],
+        ]
+    ).to(pc.get_xyz)
+
+
 # This is code is adapted from ChatSim background gaussians model: 
 # https://github.com/yifanlu0227/ChatSim/blob/main/chatsim/background/gaussian-splatting/gaussian_renderer/gsplat_renderer.py
 def render_gsplat(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, antialiased = True, render_normals = False):
@@ -34,24 +71,7 @@ def render_gsplat(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.T
     Background tensor (bg_color) must be on GPU!
     """
     # Set up rasterization configuration
-    if viewpoint_camera.K is not None:
-        K = torch.as_tensor(
-            viewpoint_camera.K,
-            dtype=pc.get_xyz.dtype,
-            device=pc.get_xyz.device,
-        ).reshape(3, 3)
-    else:
-        tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
-        tanfovy = math.tan(viewpoint_camera.FoVy * 0.5)
-        focal_length_x = viewpoint_camera.image_width / (2 * tanfovx)
-        focal_length_y = viewpoint_camera.image_height / (2 * tanfovy)
-        K = torch.tensor(
-            [
-                [focal_length_x, 0, viewpoint_camera.image_width / 2.0],
-                [0, focal_length_y, viewpoint_camera.image_height / 2.0],
-                [0, 0, 1],
-            ]
-        ).to(pc.get_xyz)
+    K = _camera_intrinsic_matrix(viewpoint_camera, pc)
 
     means3D = pc.get_xyz
     opacity = pc.get_opacity
@@ -163,6 +183,128 @@ def render_gsplat(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.T
     }
 
     return return_pkg
+
+
+def render_gsplat_batch(viewpoint_cameras, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, antialiased = True):
+    """
+    Render multiple views of the same Gaussian model in one gsplat call.
+
+    Background tensor (bg_color) must be on GPU.
+    """
+    if viewpoint_cameras is None or len(viewpoint_cameras) == 0:
+        return []
+
+    reference_camera = viewpoint_cameras[0]
+    image_width = int(reference_camera.image_width)
+    image_height = int(reference_camera.image_height)
+    for viewpoint_camera in viewpoint_cameras[1:]:
+        if (
+            int(viewpoint_camera.image_width) != image_width
+            or int(viewpoint_camera.image_height) != image_height
+        ):
+            raise ValueError(
+                "Batched gsplat rendering requires all views to share the same resolution."
+            )
+
+    means3D = pc.get_xyz
+    opacity = pc.get_opacity
+    scales = pc.get_scaling * scaling_modifier
+    rotations = pc.get_rotation
+
+    if override_color is not None:
+        colors = override_color
+        sh_degree = None
+    else:
+        colors = pc.get_features
+        sh_degree = pc.active_sh_degree
+
+    viewmats = torch.stack(
+        [
+            viewpoint_camera.world_view_transform.transpose(0, 1).to(
+                device=pc.get_xyz.device,
+                dtype=pc.get_xyz.dtype,
+            )
+            for viewpoint_camera in viewpoint_cameras
+        ],
+        dim=0,
+    )
+    Ks = torch.stack(
+        [
+            _camera_intrinsic_matrix(viewpoint_camera, pc)
+            for viewpoint_camera in viewpoint_cameras
+        ],
+        dim=0,
+    )
+
+    if isinstance(bg_color, torch.Tensor):
+        backgrounds = bg_color.to(device=pc.get_xyz.device, dtype=pc.get_xyz.dtype)
+        if backgrounds.ndim == 1:
+            backgrounds = backgrounds.unsqueeze(0).expand(len(viewpoint_cameras), -1)
+        elif backgrounds.ndim != 2 or backgrounds.shape[0] != len(viewpoint_cameras):
+            raise ValueError(
+                "Batched gsplat background tensor must have shape (3,) or (B, 3)."
+            )
+    else:
+        backgrounds = torch.as_tensor(
+            bg_color,
+            device=pc.get_xyz.device,
+            dtype=pc.get_xyz.dtype,
+        )
+        if backgrounds.ndim == 1:
+            backgrounds = backgrounds.unsqueeze(0).expand(len(viewpoint_cameras), -1)
+
+    rasterize_mode = "classic" if not antialiased else "antialiased"
+    render_colors, render_alphas, info = rasterization(
+        means=means3D,
+        quats=rotations,
+        scales=scales,
+        opacities=opacity.squeeze(-1),
+        colors=colors,
+        viewmats=viewmats,
+        Ks=Ks,
+        backgrounds=backgrounds,
+        width=image_width,
+        height=image_height,
+        packed=False,
+        sh_degree=sh_degree,
+        render_mode="RGB+ED",
+        rasterize_mode=rasterize_mode,
+        absgrad=True,
+    )
+
+    try:
+        info["means2d"].retain_grad()
+    except:
+        pass
+
+    packages = []
+    batched_radii = info["radii"]
+    batched_means2d = info["means2d"]
+    for batch_index in range(len(viewpoint_cameras)):
+        rendered_image = render_colors[batch_index].permute(2, 0, 1)[:3]
+        rendered_depth = render_colors[batch_index].permute(2, 0, 1)[3:]
+        rendered_alphas = render_alphas[batch_index].permute(2, 0, 1)
+        depth_image = rendered_depth.squeeze(0)
+        if torch.is_tensor(batched_radii) and batched_radii.ndim > 1:
+            radii = batched_radii[batch_index]
+        else:
+            radii = batched_radii.squeeze(0)
+        if torch.is_tensor(batched_means2d) and batched_means2d.ndim >= 3:
+            screenspace_points = batched_means2d[batch_index : batch_index + 1]
+        else:
+            screenspace_points = batched_means2d
+        packages.append(
+            {
+                "render": torch.cat((rendered_image, rendered_alphas), dim=0),
+                "depth": depth_image,
+                "normal": None,
+                "viewspace_points": screenspace_points,
+                "visibility_filter": radii > 0,
+                "radii": radii,
+            }
+        )
+
+    return packages
 
 
 def render_3dgs(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, separate_sh = False, override_color = None, use_trained_exp=False):

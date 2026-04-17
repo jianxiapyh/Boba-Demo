@@ -276,6 +276,17 @@ def build_parser() -> ArgumentParser:
             "'on' overlaps balanced room/table rendering with simulation+LBS without enabling time warp"
         ),
     )
+    parser.add_argument(
+        "--immersive_framegen",
+        choices=("off", "static", "adaptive"),
+        default="off",
+        help=(
+            "static-scene frame generation mode for immersive Quest output: "
+            "'off' renders the static room/table every frame, "
+            "'static' reuses the last static scene every other frame, "
+            "'adaptive' reuses only when head motion stays within conservative guardrails"
+        ),
+    )
     return parser
 
 
@@ -306,6 +317,10 @@ def main(argv: list[str] | None = None):
     print(
         "[quest_display] immersive_static_scene_overlap="
         f"{args.immersive_static_scene_overlap}",
+        flush=True,
+    )
+    print(
+        f"[quest_display] immersive_framegen={args.immersive_framegen}",
         flush=True,
     )
     print(
@@ -405,6 +420,7 @@ def main(argv: list[str] | None = None):
             render_profile_every=args.render_profile_every,
             immersive_timewarp=args.immersive_timewarp,
             immersive_static_scene_overlap=args.immersive_static_scene_overlap,
+            immersive_framegen=args.immersive_framegen,
         )
     finally:
         import glfw

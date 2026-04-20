@@ -22,8 +22,8 @@ from .pyrender_cuda_bridge import (
 MANIFEST_RELATIVE_PATH = Path("assets/scenes/ILLIXR_lab/manifest.json")
 ILLIXR_SCENE_NAME = "ILLIXR_lab"
 ILLIXR_BAKED_LIGHTING_MODE = "baked_texture_ambient"
-SCENE_ANALYSIS_CACHE_SCHEMA = 1
-DEFAULT_SCENE_ANALYSIS_CACHE_FILENAME = "scene_analysis_cache_v1.pkl.gz"
+SCENE_ANALYSIS_CACHE_SCHEMA = 3
+DEFAULT_SCENE_ANALYSIS_CACHE_FILENAME = "scene_analysis_cache_v3.pkl.gz"
 
 TARGET_TABLE_SIZE_X = 0.95
 TARGET_TABLE_SIZE_Y = 0.68
@@ -43,6 +43,14 @@ COLLIDER_SUPPORT_PATCH_MIN_SPAN = 0.10
 COLLIDER_BLOCKER_BAND_GAP_Y = 0.18
 COLLIDER_BLOCKER_AREA_MIN = 0.02
 COLLIDER_BLOCKER_SPAN_MIN = 0.05
+FOCUS_RENDER_CHUNK_EDGE_MIN = 0.8
+FOCUS_RENDER_CHUNK_FACE_MIN = 5000
+FOCUS_RENDER_PLANAR_TILE_SIZE = 0.75
+FOCUS_RENDER_VOLUME_CHUNK_SIZE = 0.5
+FOCUS_RENDER_MAX_CHUNKS_PER_PARENT = 32
+FOCUS_RENDER_PLANAR_MAX_THICKNESS = 0.15
+FOCUS_RENDER_PLANAR_THICKNESS_RATIO = 0.18
+FOCUS_RENDER_BVH_LEAF_SIZE = 8
 
 
 @dataclass
@@ -193,6 +201,188 @@ def _cluster_support_levels(
             start = idx
     levels.sort(key=lambda level: (level["area"], level["y"]), reverse=True)
     return levels
+
+
+def _component_bounds_for_face_indices(
+    mesh: trimesh.Trimesh,
+    face_indices: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    face_indices = np.asarray(face_indices, dtype=np.int64)
+    if face_indices.size == 0:
+        zero = np.zeros((3,), dtype=np.float32)
+        return zero.copy(), zero.copy()
+    component_faces = np.asarray(mesh.faces[face_indices], dtype=np.int64)
+    vertex_ids = np.unique(component_faces.reshape(-1))
+    component_vertices = np.asarray(mesh.vertices[vertex_ids], dtype=np.float32)
+    return (
+        component_vertices.min(axis=0).astype(np.float32),
+        component_vertices.max(axis=0).astype(np.float32),
+    )
+
+
+def _union_bounds_from_arrays(
+    bounds_mins: np.ndarray,
+    bounds_maxs: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    return (
+        np.min(np.asarray(bounds_mins, dtype=np.float32), axis=0).astype(np.float32),
+        np.max(np.asarray(bounds_maxs, dtype=np.float32), axis=0).astype(np.float32),
+    )
+
+
+def _build_focus_render_bvh(
+    catalog_entries: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    if not catalog_entries:
+        return []
+    entry_bounds_min = np.asarray(
+        [np.asarray(entry["bounds_min"], dtype=np.float32) for entry in catalog_entries],
+        dtype=np.float32,
+    )
+    entry_bounds_max = np.asarray(
+        [np.asarray(entry["bounds_max"], dtype=np.float32) for entry in catalog_entries],
+        dtype=np.float32,
+    )
+    entry_centers = 0.5 * (entry_bounds_min + entry_bounds_max)
+    entry_face_counts = np.asarray(
+        [int(entry["face_count"]) for entry in catalog_entries],
+        dtype=np.int64,
+    )
+    entry_ids = [int(entry["entry_id"]) for entry in catalog_entries]
+    nodes: list[dict[str, Any] | None] = []
+
+    def _build_node(entry_indices: list[int]) -> int:
+        node_index = len(nodes)
+        nodes.append(None)
+        node_bounds_min, node_bounds_max = _union_bounds_from_arrays(
+            entry_bounds_min[entry_indices],
+            entry_bounds_max[entry_indices],
+        )
+        subtree_leaf_count = int(len(entry_indices))
+        subtree_face_count = int(np.sum(entry_face_counts[entry_indices]))
+        if subtree_leaf_count <= int(FOCUS_RENDER_BVH_LEAF_SIZE):
+            nodes[node_index] = {
+                "bounds_min": node_bounds_min,
+                "bounds_max": node_bounds_max,
+                "left_child": -1,
+                "right_child": -1,
+                "leaf_entry_ids": [int(entry_ids[idx]) for idx in entry_indices],
+                "subtree_face_count": subtree_face_count,
+                "subtree_leaf_count": subtree_leaf_count,
+                "is_leaf": True,
+            }
+            return int(node_index)
+
+        centroid_subset = entry_centers[entry_indices]
+        axis_spans = np.max(centroid_subset, axis=0) - np.min(centroid_subset, axis=0)
+        split_axis = int(np.argmax(axis_spans))
+        ordered_indices = sorted(
+            entry_indices,
+            key=lambda idx: (
+                float(entry_centers[idx][split_axis]),
+                int(entry_ids[idx]),
+            ),
+        )
+        split_mid = len(ordered_indices) // 2
+        left_indices = ordered_indices[:split_mid]
+        right_indices = ordered_indices[split_mid:]
+        if not left_indices or not right_indices:
+            half = max(len(entry_indices) // 2, 1)
+            left_indices = ordered_indices[:half]
+            right_indices = ordered_indices[half:]
+        left_child = _build_node(left_indices)
+        right_child = _build_node(right_indices)
+        nodes[node_index] = {
+            "bounds_min": node_bounds_min,
+            "bounds_max": node_bounds_max,
+            "left_child": int(left_child),
+            "right_child": int(right_child),
+            "leaf_entry_ids": [],
+            "subtree_face_count": subtree_face_count,
+            "subtree_leaf_count": subtree_leaf_count,
+            "is_leaf": False,
+        }
+        return int(node_index)
+
+    _build_node(list(range(len(catalog_entries))))
+    return [dict(node) for node in nodes if node is not None]
+
+
+def _split_focus_catalog_face_indices(
+    mesh: trimesh.Trimesh,
+    face_indices: np.ndarray,
+    *,
+    role: str,
+    planar_tile_size: float = FOCUS_RENDER_PLANAR_TILE_SIZE,
+    volume_chunk_size: float = FOCUS_RENDER_VOLUME_CHUNK_SIZE,
+    max_chunks: int = FOCUS_RENDER_MAX_CHUNKS_PER_PARENT,
+) -> tuple[list[np.ndarray], str]:
+    face_indices = np.asarray(face_indices, dtype=np.int64)
+    if face_indices.size == 0:
+        return [], "whole"
+
+    bounds_min, bounds_max = _component_bounds_for_face_indices(mesh, face_indices)
+    extents = np.asarray(bounds_max - bounds_min, dtype=np.float32)
+    longest_edge = float(np.max(extents))
+    if (
+        longest_edge < float(FOCUS_RENDER_CHUNK_EDGE_MIN)
+        and face_indices.size < int(FOCUS_RENDER_CHUNK_FACE_MIN)
+    ):
+        return [face_indices.copy()], "whole"
+
+    sort_axes = np.argsort(extents)
+    min_extent = float(extents[int(sort_axes[0])])
+    planar_role = role in {"floor", "left_wall", "right_wall", "front_back_walls"}
+    planar_chunking = planar_role or (
+        longest_edge > 1e-6
+        and min_extent
+        <= min(
+            float(FOCUS_RENDER_PLANAR_MAX_THICKNESS),
+            float(FOCUS_RENDER_PLANAR_THICKNESS_RATIO) * longest_edge,
+        )
+    )
+    if planar_chunking:
+        chunk_kind = "planar"
+        axis_indices = tuple(int(axis) for axis in sort_axes[1:])
+        chunk_size = max(float(planar_tile_size), 1.0e-3)
+    else:
+        chunk_kind = "volumetric"
+        axis_indices = (0, 1, 2)
+        chunk_size = max(float(volume_chunk_size), 1.0e-3)
+
+    face_centroids = np.asarray(mesh.triangles_center, dtype=np.float32)
+    current_chunk_size = float(chunk_size)
+    grouped_faces: list[np.ndarray] | None = None
+    for _ in range(8):
+        groups: dict[tuple[int, ...], list[int]] = {}
+        for face_id in face_indices.tolist():
+            centroid = face_centroids[int(face_id)]
+            key = tuple(
+                int(
+                    np.floor(
+                        float(centroid[int(axis)] - bounds_min[int(axis)])
+                        / max(current_chunk_size, 1.0e-6)
+                    )
+                )
+                for axis in axis_indices
+            )
+            groups.setdefault(key, []).append(int(face_id))
+        grouped_faces = [
+            np.asarray(groups[key], dtype=np.int64)
+            for key in sorted(groups.keys())
+        ]
+        if len(grouped_faces) <= 1:
+            return [face_indices.copy()], "whole"
+        if len(grouped_faces) <= int(max_chunks):
+            break
+        scale = (len(grouped_faces) / max(float(max_chunks), 1.0)) ** (
+            1.0 / max(len(axis_indices), 1)
+        )
+        current_chunk_size *= max(1.25, scale * 1.05)
+    assert grouped_faces is not None
+    if len(grouped_faces) > int(max_chunks):
+        return [face_indices.copy()], "whole"
+    return grouped_faces, chunk_kind
 
 
 def _split_face_group_by_connectivity(
@@ -573,6 +763,7 @@ class SimpleLabSceneRenderer:
     ):
         import pyrender
 
+        self.scene_assets_root = Path(scene_assets_root).resolve()
         self.width = int(width)
         self.height = int(height)
         self.requested_lighting_mode = str(lighting_mode)
@@ -628,7 +819,15 @@ class SimpleLabSceneRenderer:
                 "background_role": "floor",
             },
         }
-        self._eager_layer_names = {"background", "table"}
+        self._eager_layer_names = {
+            "full",
+            "background",
+            "table",
+            "balanced_far_front_back_walls",
+            "balanced_left_wall",
+            "balanced_right_wall",
+            "balanced_near_floor",
+        }
         self._layer_entries: dict[str, dict[str, Any]] = {}
         self._table_alignment_debug: dict[str, Any] | None = None
         self._table_world_bounds: tuple[np.ndarray, np.ndarray] | None = None
@@ -668,6 +867,17 @@ class SimpleLabSceneRenderer:
             if self._scene_analysis_cache_path is None
             else str(self._scene_analysis_cache_path),
         }
+        self._focus_render_catalog: list[dict[str, Any]] = []
+        self._focus_render_catalog_total_faces = 0
+        self._focus_render_bvh: list[dict[str, Any]] = []
+        self._focus_render_catalog_world: list[dict[str, Any]] = []
+        self._focus_render_catalog_world_by_id: dict[int, dict[str, Any]] = {}
+        self._focus_render_bvh_world: list[dict[str, Any]] = []
+        self._focus_render_active_table_entry_ids: set[int] = set()
+        self._support_surface_entries_world: list[dict[str, Any]] = []
+        self._support_surface_entries_world_by_id: dict[int, dict[str, Any]] = {}
+        self._focus_render_world_transform: np.ndarray | None = None
+        self._focus_scene_entry: dict[str, Any] | None = None
         cache_loaded = False
         if self._scene_analysis_cache_mode == "auto":
             cache_loaded = self._load_scene_analysis_cache()
@@ -834,6 +1044,7 @@ class SimpleLabSceneRenderer:
             self._furniture_component_records,
             self._table_component_ids,
         )
+        self._build_focus_render_catalog()
 
     def _export_scene_analysis_payload(self) -> dict[str, Any]:
         return {
@@ -863,6 +1074,11 @@ class SimpleLabSceneRenderer:
             ),
             "asset_startup_table_patch": self._asset_startup_table_patch,
             "asset_visible_tabletop_patches": self._asset_visible_tabletop_patches,
+            "focus_render_catalog": self._focus_render_catalog,
+            "focus_render_catalog_total_faces": int(
+                self._focus_render_catalog_total_faces
+            ),
+            "focus_render_bvh": self._focus_render_bvh,
         }
 
     def _apply_scene_analysis_payload(self, payload: dict[str, Any]) -> None:
@@ -973,6 +1189,17 @@ class SimpleLabSceneRenderer:
             self._furniture_component_records,
             self._table_component_ids,
         )
+        self._focus_render_catalog = list(payload.get("focus_render_catalog", []))
+        self._focus_render_catalog_total_faces = int(
+            payload.get("focus_render_catalog_total_faces", 0)
+        )
+        if not self._focus_render_catalog:
+            self._build_focus_render_catalog()
+        self._focus_render_bvh = list(payload.get("focus_render_bvh", []))
+        if not self._focus_render_bvh:
+            self._focus_render_bvh = _build_focus_render_bvh(
+                self._focus_render_catalog
+            )
 
     def _load_scene_analysis_cache(self) -> bool:
         cache_path = self._scene_analysis_cache_path
@@ -1107,7 +1334,15 @@ class SimpleLabSceneRenderer:
         self._layer_entries[layer_name] = entry
         if self.layout is not None:
             self._rebuild_scene_nodes()
+            if layer_name in self._eager_layer_names:
+                self._get_layer_renderer(layer_name, self.width, self.height)
         return entry
+
+    def _initialize_eager_layer_renderers(self) -> None:
+        if self.layout is None:
+            return
+        for layer_name in self._eager_layer_names:
+            self._get_layer_renderer(layer_name, self.width, self.height)
 
     def delete(self) -> None:
         for entry in self._layer_entries.values():
@@ -1115,6 +1350,11 @@ class SimpleLabSceneRenderer:
             if renderer is not None:
                 renderer.delete()
                 entry["renderer"] = None
+        if self._focus_scene_entry is not None:
+            renderer = self._focus_scene_entry.get("renderer")
+            if renderer is not None:
+                renderer.delete()
+                self._focus_scene_entry["renderer"] = None
 
     def pyrender_readback_mode(self) -> str:
         return str(self._pyrender_readback_mode)
@@ -1158,9 +1398,199 @@ class SimpleLabSceneRenderer:
             return None
         return np.array(self._scene_collider_boxes, copy=True)
 
+    def support_surface_entries(self) -> list[dict[str, Any]]:
+        return [
+            {
+                "support_id": int(entry["support_id"]),
+                "component_id": (
+                    None
+                    if entry["component_id"] is None
+                    else int(entry["component_id"])
+                ),
+                "kind": str(entry["kind"]),
+                "bounds_min": np.asarray(entry["bounds_min"], dtype=np.float32).copy(),
+                "bounds_max": np.asarray(entry["bounds_max"], dtype=np.float32).copy(),
+                "render_bounds_min": np.asarray(
+                    entry.get("render_bounds_min", entry["bounds_min"]),
+                    dtype=np.float32,
+                ).copy(),
+                "render_bounds_max": np.asarray(
+                    entry.get("render_bounds_max", entry["bounds_max"]),
+                    dtype=np.float32,
+                ).copy(),
+                "center": np.asarray(entry["center"], dtype=np.float32).copy(),
+                "support_area": float(entry["support_area"]),
+            }
+            for entry in self._support_surface_entries_world
+        ]
+
+    def support_surface_entries_ref(self) -> list[dict[str, Any]]:
+        return self._support_surface_entries_world
+
+    def support_surface_entries_by_id_ref(self) -> dict[int, dict[str, Any]]:
+        return self._support_surface_entries_world_by_id
+
     def set_layout(self, layout: SimpleLabLayout) -> None:
         self.layout = layout
         self._rebuild_scene_nodes()
+        self._initialize_eager_layer_renderers()
+
+    @staticmethod
+    def _default_warmup_roi_bounds(
+        width: int,
+        height: int,
+        *,
+        width_ratio: float = 0.28,
+        height_ratio: float = 0.28,
+        min_size: int = 96,
+    ) -> tuple[int, int, int, int] | None:
+        width = int(width)
+        height = int(height)
+        if width <= 0 or height <= 0:
+            return None
+        roi_width = min(
+            width,
+            max(int(round(float(width) * float(width_ratio))), int(min_size)),
+        )
+        roi_height = min(
+            height,
+            max(int(round(float(height) * float(height_ratio))), int(min_size)),
+        )
+        x0 = max(0, (width - roi_width) // 2)
+        y0 = max(0, (height - roi_height) // 2)
+        x1 = min(width, x0 + roi_width)
+        y1 = min(height, y0 + roi_height)
+        if x1 <= x0 or y1 <= y0:
+            return None
+        return (int(x0), int(y0), int(x1), int(y1))
+
+    def warmup_balanced_runtime_paths(
+        self,
+        *,
+        left_eye_pose_world: np.ndarray,
+        right_eye_pose_world: np.ndarray,
+        left_eye_intrinsic: np.ndarray,
+        right_eye_intrinsic: np.ndarray,
+        left_base_intrinsic: np.ndarray,
+        right_base_intrinsic: np.ndarray,
+        eye_width: int,
+        eye_height: int,
+        scene_width: int,
+        scene_height: int,
+        table_roi_bounds_by_eye: dict[str, tuple[int, int, int, int] | None] | None = None,
+        focus_roi_bounds_by_eye: dict[str, tuple[int, int, int, int] | None] | None = None,
+        table_roi_render_scale: float = 1.0,
+        focus_roi_render_scale: float = 1.0,
+    ) -> list[str]:
+        if self.layout is None:
+            raise RuntimeError("Immersive scene layout has not been configured.")
+
+        touched_paths: set[str] = set()
+        default_roi = self._default_warmup_roi_bounds(eye_width, eye_height)
+        table_roi_bounds_by_eye = dict(table_roi_bounds_by_eye or {})
+        focus_roi_bounds_by_eye = dict(focus_roi_bounds_by_eye or {})
+
+        eye_specs = {
+            "left": {
+                "pose_world": np.asarray(left_eye_pose_world, dtype=np.float32),
+                "eye_intrinsic": np.asarray(left_eye_intrinsic, dtype=np.float32),
+                "base_intrinsic": np.asarray(left_base_intrinsic, dtype=np.float32),
+            },
+            "right": {
+                "pose_world": np.asarray(right_eye_pose_world, dtype=np.float32),
+                "eye_intrinsic": np.asarray(right_eye_intrinsic, dtype=np.float32),
+                "base_intrinsic": np.asarray(right_base_intrinsic, dtype=np.float32),
+            },
+        }
+
+        for eye_label, eye_spec in eye_specs.items():
+            pose_world = eye_spec["pose_world"]
+            eye_intrinsic = eye_spec["eye_intrinsic"]
+            base_intrinsic = eye_spec["base_intrinsic"]
+            table_roi_bounds = table_roi_bounds_by_eye.get(eye_label)
+            if table_roi_bounds is not None:
+                table_roi_bounds = tuple(int(v) for v in table_roi_bounds)
+            focus_roi_bounds = focus_roi_bounds_by_eye.get(eye_label)
+            if focus_roi_bounds is not None:
+                focus_roi_bounds = tuple(int(v) for v in focus_roi_bounds)
+            if table_roi_bounds is None:
+                table_roi_bounds = default_roi
+            if focus_roi_bounds is None:
+                focus_roi_bounds = default_roi
+            background_roi_bounds = (
+                focus_roi_bounds
+                if focus_roi_bounds is not None
+                else table_roi_bounds
+            )
+
+            self.render_background_eye(
+                pose_world,
+                base_intrinsic,
+                width=int(scene_width),
+                height=int(scene_height),
+            )
+            touched_paths.add("background_base")
+            self.render_eye(
+                pose_world,
+                base_intrinsic,
+                width=int(scene_width),
+                height=int(scene_height),
+            )
+            touched_paths.add("full_base")
+            self.render_background_eye(
+                pose_world,
+                eye_intrinsic,
+                width=int(eye_width),
+                height=int(eye_height),
+            )
+            touched_paths.add("background_full")
+            self.render_eye(
+                pose_world,
+                eye_intrinsic,
+                width=int(eye_width),
+                height=int(eye_height),
+            )
+            touched_paths.add("full_full")
+            self.render_table_eye(
+                pose_world,
+                base_intrinsic,
+                width=int(scene_width),
+                height=int(scene_height),
+            )
+            touched_paths.add("table_base")
+            self.render_table_eye(
+                pose_world,
+                eye_intrinsic,
+                width=int(eye_width),
+                height=int(eye_height),
+            )
+            touched_paths.add("table_full")
+
+            if background_roi_bounds is not None:
+                self.render_background_eye_roi(
+                    pose_world,
+                    eye_intrinsic,
+                    tuple(int(v) for v in background_roi_bounds),
+                )
+                touched_paths.add("background_roi")
+            if focus_roi_bounds is not None:
+                self.render_eye_roi(
+                    pose_world,
+                    eye_intrinsic,
+                    tuple(int(v) for v in focus_roi_bounds),
+                    render_scale=float(focus_roi_render_scale),
+                )
+                touched_paths.add("full_roi")
+            if table_roi_bounds is not None:
+                self.render_table_eye_roi(
+                    pose_world,
+                    eye_intrinsic,
+                    tuple(int(v) for v in table_roi_bounds),
+                    render_scale=float(table_roi_render_scale),
+                )
+                touched_paths.add("table_roi")
+
+        return sorted(touched_paths)
 
     def render_eye(
         self,
@@ -1170,6 +1600,62 @@ class SimpleLabSceneRenderer:
         height: int | None = None,
     ) -> tuple[np.ndarray, np.ndarray]:
         return self._render_layer_eye("full", camera_pose_world, intrinsic, width=width, height=height)
+
+    def render_eye_roi(
+        self,
+        camera_pose_world: np.ndarray,
+        full_intrinsic: np.ndarray,
+        roi_bounds: tuple[int, int, int, int],
+        render_scale: float = 1.0,
+        return_render_info: bool = False,
+    ) -> (
+        tuple[np.ndarray, np.ndarray]
+        | tuple[np.ndarray, np.ndarray, dict[str, Any]]
+        | tuple[torch.Tensor, torch.Tensor]
+        | tuple[torch.Tensor, torch.Tensor, dict[str, Any]]
+    ):
+        return self._render_layer_eye_roi(
+            "full",
+            camera_pose_world,
+            full_intrinsic,
+            roi_bounds,
+            render_scale=render_scale,
+            return_render_info=return_render_info,
+        )
+
+    def render_focus_subset_eye(
+        self,
+        camera_pose_world: np.ndarray,
+        intrinsic: np.ndarray,
+        selected_entry_ids: list[int] | tuple[int, ...],
+        width: int | None = None,
+        height: int | None = None,
+    ) -> tuple[np.ndarray, np.ndarray] | tuple[torch.Tensor, torch.Tensor]:
+        return self._render_focus_scene_eye(
+            camera_pose_world,
+            intrinsic,
+            selected_entry_ids,
+            width=width,
+            height=height,
+        )
+
+    def render_focus_subset_eye_roi(
+        self,
+        camera_pose_world: np.ndarray,
+        full_intrinsic: np.ndarray,
+        selected_entry_ids: list[int] | tuple[int, ...],
+        roi_bounds: tuple[int, int, int, int],
+        render_scale: float = 1.0,
+        return_render_info: bool = False,
+    ):
+        return self._render_focus_scene_eye_roi(
+            camera_pose_world,
+            full_intrinsic,
+            selected_entry_ids,
+            roi_bounds,
+            render_scale=render_scale,
+            return_render_info=return_render_info,
+        )
 
     def render_background_eye(
         self,
@@ -1353,13 +1839,13 @@ class SimpleLabSceneRenderer:
             raise ValueError(f"Invalid ROI bounds: {roi_bounds}")
         roi_width = x1 - x0
         roi_height = y1 - y0
-        render_scale = max(float(render_scale), 1.0)
+        render_scale = max(float(render_scale), 0.05)
         roi_intrinsic = np.array(full_intrinsic, dtype=np.float32, copy=True)
         roi_intrinsic[0, 2] -= float(x0)
         roi_intrinsic[1, 2] -= float(y0)
         render_width = roi_width
         render_height = roi_height
-        if render_scale > 1.0:
+        if abs(render_scale - 1.0) > 1e-6:
             roi_intrinsic[0, 0] *= render_scale
             roi_intrinsic[1, 1] *= render_scale
             roi_intrinsic[0, 2] *= render_scale
@@ -1762,6 +2248,126 @@ class SimpleLabSceneRenderer:
                 retained.append(record)
         return retained
 
+    def _append_focus_render_catalog_entries(
+        self,
+        catalog_entries: list[dict[str, Any]],
+        *,
+        next_entry_id: int,
+        mesh: trimesh.Trimesh,
+        face_indices: np.ndarray,
+        source_mesh: str,
+        role: str,
+        parent_component_id: int | None,
+        always_include: bool,
+        allow_chunking: bool = True,
+    ) -> int:
+        if allow_chunking:
+            chunk_groups, chunk_kind = _split_focus_catalog_face_indices(
+                mesh,
+                face_indices,
+                role=role,
+            )
+        else:
+            chunk_groups = [np.asarray(face_indices, dtype=np.int64).copy()]
+            chunk_kind = "whole"
+        for chunk_index, chunk_face_indices in enumerate(chunk_groups):
+            chunk_face_indices = np.asarray(chunk_face_indices, dtype=np.int64)
+            if chunk_face_indices.size == 0:
+                continue
+            bounds_min, bounds_max = _component_bounds_for_face_indices(
+                mesh,
+                chunk_face_indices,
+            )
+            catalog_entries.append(
+                {
+                    "entry_id": int(next_entry_id),
+                    "parent_component_id": (
+                        None
+                        if parent_component_id is None
+                        else int(parent_component_id)
+                    ),
+                    "source_mesh": str(source_mesh),
+                    "role": str(role),
+                    "face_indices": chunk_face_indices.copy(),
+                    "bounds_min": bounds_min.astype(np.float32),
+                    "bounds_max": bounds_max.astype(np.float32),
+                    "face_count": int(chunk_face_indices.size),
+                    "chunk_kind": str(chunk_kind),
+                    "chunk_index": int(chunk_index),
+                    "always_include": bool(always_include),
+                }
+            )
+            next_entry_id += 1
+        return int(next_entry_id)
+
+    def _build_focus_render_catalog(self) -> None:
+        catalog_entries: list[dict[str, Any]] = []
+        next_entry_id = 0
+
+        structural_entries = [
+            ("floor", "floor", self._floor_asset_mesh),
+            ("left_wall", "left_wall", self._left_wall_asset_mesh),
+            ("right_wall", "right_wall", self._right_wall_asset_mesh),
+            ("front_back_walls", "front_back_walls", self._front_back_asset_mesh),
+        ]
+        for source_mesh, role, mesh in structural_entries:
+            if mesh.faces.shape[0] == 0:
+                continue
+            next_entry_id = self._append_focus_render_catalog_entries(
+                catalog_entries,
+                next_entry_id=next_entry_id,
+                mesh=mesh,
+                face_indices=np.arange(mesh.faces.shape[0], dtype=np.int64),
+                source_mesh=source_mesh,
+                role=role,
+                parent_component_id=None,
+                always_include=False,
+                allow_chunking=True,
+            )
+
+        table_component_id_set = {int(v) for v in self._table_component_ids}
+        table_face_index_groups: list[np.ndarray] = []
+        for record in sorted(
+            self._furniture_component_records,
+            key=lambda record: int(record["id"]),
+        ):
+            component_id = int(record["id"])
+            if component_id in table_component_id_set:
+                table_face_index_groups.append(
+                    np.asarray(record["face_indices"], dtype=np.int64)
+                )
+                continue
+            next_entry_id = self._append_focus_render_catalog_entries(
+                catalog_entries,
+                next_entry_id=next_entry_id,
+                mesh=self._furniture_asset_mesh,
+                face_indices=np.asarray(record["face_indices"], dtype=np.int64),
+                source_mesh="furniture",
+                role="background_furniture",
+                parent_component_id=component_id,
+                always_include=False,
+                allow_chunking=True,
+            )
+
+        if table_face_index_groups:
+            next_entry_id = self._append_focus_render_catalog_entries(
+                catalog_entries,
+                next_entry_id=next_entry_id,
+                mesh=self._furniture_asset_mesh,
+                face_indices=np.concatenate(table_face_index_groups, axis=0),
+                source_mesh="furniture",
+                role="table",
+                parent_component_id=None,
+                always_include=True,
+                allow_chunking=False,
+            )
+
+        self._focus_render_catalog = catalog_entries
+        self._focus_render_catalog_total_faces = int(
+            sum(int(entry["face_count"]) for entry in catalog_entries)
+        )
+        self._focus_render_bvh = _build_focus_render_bvh(catalog_entries)
+
     def _table_target_size_xy(self) -> np.ndarray:
         target_xy = np.asarray(self._target_table_size_xy, dtype=np.float32)
         if target_xy.shape[0] != 2:
@@ -2099,6 +2705,429 @@ class SimpleLabSceneRenderer:
             "table_render_bounds_source": "full_active_table_mesh",
         }
 
+        self._build_focus_render_catalog_world(world_transform)
+        self._build_support_surface_entries_world(
+            world_transform,
+            active_table_world_bounds.astype(np.float32),
+        )
+
+    def _build_support_surface_entries_world(
+        self,
+        world_transform: np.ndarray,
+        active_table_world_bounds: np.ndarray,
+    ) -> None:
+        support_entries_world: list[dict[str, Any]] = []
+        support_entries_world_by_id: dict[int, dict[str, Any]] = {}
+
+        if self.layout is None:
+            self._support_surface_entries_world = []
+            self._support_surface_entries_world_by_id = {}
+            return
+
+        scene_up = np.asarray(self.layout.scene_up, dtype=np.float32).reshape(-1)
+        vertical_axis = int(np.argmax(np.abs(scene_up)))
+        lateral_axes = [axis for axis in range(3) if axis != vertical_axis]
+        table_component_id = (
+            int(self._table_component_ids[0]) if self._table_component_ids else None
+        )
+        support_entry_id = 0
+        entry_padding_m = 0.08
+
+        def _support_area(bounds_min: np.ndarray, bounds_max: np.ndarray) -> float:
+            extent_a = max(
+                0.0,
+                float(bounds_max[lateral_axes[0]] - bounds_min[lateral_axes[0]]),
+            )
+            extent_b = max(
+                0.0,
+                float(bounds_max[lateral_axes[1]] - bounds_min[lateral_axes[1]]),
+            )
+            return float(extent_a * extent_b)
+
+        def _expanded_bounds(
+            bounds_min: np.ndarray,
+            bounds_max: np.ndarray,
+        ) -> tuple[np.ndarray, np.ndarray]:
+            expanded_min = np.asarray(bounds_min, dtype=np.float32).copy()
+            expanded_max = np.asarray(bounds_max, dtype=np.float32).copy()
+            expanded_min -= float(entry_padding_m)
+            expanded_max += float(entry_padding_m)
+            return expanded_min, expanded_max
+
+        def _overlaps(
+            bounds_min_a: np.ndarray,
+            bounds_max_a: np.ndarray,
+            bounds_min_b: np.ndarray,
+            bounds_max_b: np.ndarray,
+        ) -> bool:
+            return not (
+                float(bounds_max_a[0]) < float(bounds_min_b[0])
+                or float(bounds_min_a[0]) > float(bounds_max_b[0])
+                or float(bounds_max_a[1]) < float(bounds_min_b[1])
+                or float(bounds_min_a[1]) > float(bounds_max_b[1])
+                or float(bounds_max_a[2]) < float(bounds_min_b[2])
+                or float(bounds_min_a[2]) > float(bounds_max_b[2])
+            )
+
+        table_bounds_min = np.asarray(active_table_world_bounds[0], dtype=np.float32).copy()
+        table_bounds_max = np.asarray(active_table_world_bounds[1], dtype=np.float32).copy()
+        if self._table_world_bounds is None:
+            table_render_bounds_min = table_bounds_min.copy()
+            table_render_bounds_max = table_bounds_max.copy()
+        else:
+            table_render_bounds_min = np.asarray(
+                self._table_world_bounds[0], dtype=np.float32
+            ).copy()
+            table_render_bounds_max = np.asarray(
+                self._table_world_bounds[1], dtype=np.float32
+            ).copy()
+        table_entry = {
+            "support_id": int(support_entry_id),
+            "component_id": table_component_id,
+            "kind": "table",
+            "bounds_min": table_bounds_min,
+            "bounds_max": table_bounds_max,
+            "render_bounds_min": table_render_bounds_min,
+            "render_bounds_max": table_render_bounds_max,
+            "center": (0.5 * (table_bounds_min + table_bounds_max)).astype(np.float32),
+            "support_area": _support_area(table_bounds_min, table_bounds_max),
+            "selected_entry_ids": sorted(
+                int(v) for v in self._focus_render_active_table_entry_ids
+            ),
+        }
+        support_entries_world.append(table_entry)
+        support_entries_world_by_id[int(support_entry_id)] = table_entry
+        support_entry_id += 1
+
+        table_component_id_set = {int(v) for v in self._table_component_ids}
+        catalog_entries = self._focus_render_catalog_world
+        for record in sorted(
+            self._collision_component_records,
+            key=lambda record: int(record["id"]),
+        ):
+            component_id = int(record["id"])
+            if component_id in table_component_id_set:
+                continue
+            for patch in record.get("support_patches", []):
+                if not _support_patch_is_collision_usable(patch, self._asset_floor_y):
+                    continue
+                world_bounds_min, world_bounds_max = _transform_bounds(
+                    np.asarray(patch["bounds_min"], dtype=np.float32),
+                    np.asarray(patch["bounds_max"], dtype=np.float32),
+                    world_transform,
+                )
+                expanded_min, expanded_max = _expanded_bounds(
+                    world_bounds_min,
+                    world_bounds_max,
+                )
+                selected_entry_ids = [
+                    int(entry["entry_id"])
+                    for entry in catalog_entries
+                    if entry["parent_component_id"] == component_id
+                    and _overlaps(
+                        np.asarray(entry["bounds_min"], dtype=np.float32),
+                        np.asarray(entry["bounds_max"], dtype=np.float32),
+                        expanded_min,
+                        expanded_max,
+                    )
+                ]
+                if not selected_entry_ids:
+                    continue
+                entry = {
+                    "support_id": int(support_entry_id),
+                    "component_id": component_id,
+                    "kind": "support",
+                    "bounds_min": np.asarray(
+                        world_bounds_min,
+                        dtype=np.float32,
+                    ).copy(),
+                    "bounds_max": np.asarray(
+                        world_bounds_max,
+                        dtype=np.float32,
+                    ).copy(),
+                    "render_bounds_min": np.asarray(
+                        world_bounds_min,
+                        dtype=np.float32,
+                    ).copy(),
+                    "render_bounds_max": np.asarray(
+                        world_bounds_max,
+                        dtype=np.float32,
+                    ).copy(),
+                    "center": (
+                        0.5
+                        * (
+                            np.asarray(world_bounds_min, dtype=np.float32)
+                            + np.asarray(world_bounds_max, dtype=np.float32)
+                        )
+                    ).astype(np.float32),
+                    "support_area": _support_area(
+                        np.asarray(world_bounds_min, dtype=np.float32),
+                        np.asarray(world_bounds_max, dtype=np.float32),
+                    ),
+                    "selected_entry_ids": sorted(int(v) for v in selected_entry_ids),
+                }
+                support_entries_world.append(entry)
+                support_entries_world_by_id[int(support_entry_id)] = entry
+                support_entry_id += 1
+
+        self._support_surface_entries_world = support_entries_world
+        self._support_surface_entries_world_by_id = support_entries_world_by_id
+
+    def _focus_render_source_mesh(self, source_mesh: str) -> trimesh.Trimesh:
+        source_mesh = str(source_mesh)
+        if source_mesh == "floor":
+            return self._floor_asset_mesh
+        if source_mesh == "left_wall":
+            return self._left_wall_asset_mesh
+        if source_mesh == "right_wall":
+            return self._right_wall_asset_mesh
+        if source_mesh == "front_back_walls":
+            return self._front_back_asset_mesh
+        if source_mesh == "furniture":
+            return self._furniture_asset_mesh
+        raise KeyError(f"Unsupported focus source mesh: {source_mesh}")
+
+    def _build_focus_render_catalog_world(self, world_transform: np.ndarray) -> None:
+        catalog_world: list[dict[str, Any]] = []
+        catalog_world_by_id: dict[int, dict[str, Any]] = {}
+        bvh_world: list[dict[str, Any]] = []
+        active_table_entry_ids: set[int] = set()
+        self._focus_render_world_transform = np.asarray(world_transform, dtype=np.float32).copy()
+        for asset_entry in self._focus_render_catalog:
+            bounds_min, bounds_max = _transform_bounds(
+                np.asarray(asset_entry["bounds_min"], dtype=np.float32),
+                np.asarray(asset_entry["bounds_max"], dtype=np.float32),
+                self._focus_render_world_transform,
+            )
+            world_entry = {
+                "entry_id": int(asset_entry["entry_id"]),
+                "parent_component_id": asset_entry["parent_component_id"],
+                "source_mesh": str(asset_entry["source_mesh"]),
+                "role": str(asset_entry["role"]),
+                "face_count": int(asset_entry["face_count"]),
+                "chunk_kind": str(asset_entry["chunk_kind"]),
+                "chunk_index": int(asset_entry["chunk_index"]),
+                "always_include": bool(asset_entry["always_include"]),
+                "face_indices": np.asarray(asset_entry["face_indices"], dtype=np.int64).copy(),
+                "bounds_min": bounds_min.copy(),
+                "bounds_max": bounds_max.copy(),
+                "pyrender_mesh": None,
+            }
+            catalog_world.append(world_entry)
+            catalog_world_by_id[int(world_entry["entry_id"])] = world_entry
+            if bool(world_entry["always_include"]):
+                active_table_entry_ids.add(int(world_entry["entry_id"]))
+        for asset_node in self._focus_render_bvh:
+            bounds_min, bounds_max = _transform_bounds(
+                np.asarray(asset_node["bounds_min"], dtype=np.float32),
+                np.asarray(asset_node["bounds_max"], dtype=np.float32),
+                self._focus_render_world_transform,
+            )
+            bvh_world.append(
+                {
+                    "bounds_min": bounds_min.copy(),
+                    "bounds_max": bounds_max.copy(),
+                    "left_child": int(asset_node.get("left_child", -1)),
+                    "right_child": int(asset_node.get("right_child", -1)),
+                    "leaf_entry_ids": [
+                        int(v) for v in asset_node.get("leaf_entry_ids", [])
+                    ],
+                    "subtree_face_count": int(asset_node.get("subtree_face_count", 0)),
+                    "subtree_leaf_count": int(asset_node.get("subtree_leaf_count", 0)),
+                    "is_leaf": bool(asset_node.get("is_leaf", False)),
+                }
+            )
+        self._focus_render_catalog_world = catalog_world
+        self._focus_render_catalog_world_by_id = catalog_world_by_id
+        self._focus_render_bvh_world = bvh_world
+        self._focus_render_active_table_entry_ids = active_table_entry_ids
+        self._clear_focus_scene_entry_nodes()
+
+    def _make_focus_scene_entry(self) -> dict[str, Any]:
+        scene = self._pyrender.Scene(
+            bg_color=np.array(self._table_clear_color, copy=True),
+            ambient_light=np.array(self._ambient_light, copy=True),
+        )
+        camera = self._pyrender.IntrinsicsCamera(
+            fx=1.0,
+            fy=1.0,
+            cx=float(self.width) * 0.5,
+            cy=float(self.height) * 0.5,
+            znear=0.02,
+            zfar=100.0,
+        )
+        camera_node = scene.add(camera, pose=np.eye(4, dtype=np.float32))
+        self._setup_lights(scene)
+        return {
+            "scene": scene,
+            "camera": camera,
+            "camera_node": camera_node,
+            "renderer": None,
+            "entry_nodes": {},
+            "active_entry_ids": set(),
+        }
+
+    def _ensure_focus_scene_entry(self) -> dict[str, Any]:
+        if self._focus_scene_entry is None:
+            self._focus_scene_entry = self._make_focus_scene_entry()
+        return self._focus_scene_entry
+
+    def _clear_focus_scene_entry_nodes(self) -> None:
+        if self._focus_scene_entry is None:
+            return
+        scene = self._focus_scene_entry["scene"]
+        for node in self._focus_scene_entry["entry_nodes"].values():
+            scene.remove_node(node)
+        self._focus_scene_entry["entry_nodes"] = {}
+        self._focus_scene_entry["active_entry_ids"] = set()
+
+    def _get_focus_scene_renderer(self, width: int, height: int):
+        entry = self._ensure_focus_scene_entry()
+        renderer = entry.get("renderer")
+        if renderer is None:
+            renderer_cls = (
+                PyrenderCudaInteropOffscreenRenderer
+                if self._pyrender_cuda_interop_supported
+                else self._pyrender.OffscreenRenderer
+            )
+            renderer_kwargs = {}
+            if renderer_cls is PyrenderCudaInteropOffscreenRenderer:
+                renderer_kwargs["device"] = torch.device("cuda", torch.cuda.current_device())
+            renderer = renderer_cls(
+                viewport_width=int(width),
+                viewport_height=int(height),
+                **renderer_kwargs,
+            )
+            entry["renderer"] = renderer
+        else:
+            renderer.viewport_width = int(width)
+            renderer.viewport_height = int(height)
+        self._update_pyrender_readback_state(renderer)
+        return renderer
+
+    def _set_focus_scene_selection(self, selected_entry_ids: list[int] | tuple[int, ...]) -> None:
+        entry = self._ensure_focus_scene_entry()
+        desired_entry_ids = {int(v) for v in selected_entry_ids}
+        current_entry_ids = set(entry["active_entry_ids"])
+        if desired_entry_ids == current_entry_ids:
+            return
+        scene = entry["scene"]
+        for entry_id in sorted(current_entry_ids - desired_entry_ids):
+            node = entry["entry_nodes"].pop(int(entry_id), None)
+            if node is not None:
+                scene.remove_node(node)
+        for entry_id in sorted(desired_entry_ids - current_entry_ids):
+            focus_entry = self._focus_render_catalog_world_by_id.get(int(entry_id))
+            if focus_entry is None:
+                continue
+            if focus_entry.get("pyrender_mesh") is None:
+                if self._focus_render_world_transform is None:
+                    raise RuntimeError("Focus render world transform is unavailable.")
+                source_mesh = self._focus_render_source_mesh(focus_entry["source_mesh"])
+                entry_mesh_world = self._slice_mesh_by_face_indices(
+                    source_mesh,
+                    np.asarray(focus_entry["face_indices"], dtype=np.int64),
+                )
+                entry_mesh_world.apply_transform(self._focus_render_world_transform)
+                focus_entry["pyrender_mesh"] = self._pyrender.Mesh.from_trimesh(
+                    entry_mesh_world.copy(),
+                    smooth=False,
+                )
+            node = scene.add(focus_entry["pyrender_mesh"])
+            entry["entry_nodes"][int(entry_id)] = node
+        entry["active_entry_ids"] = desired_entry_ids
+
+    def _render_focus_scene_eye(
+        self,
+        camera_pose_world: np.ndarray,
+        intrinsic: np.ndarray,
+        selected_entry_ids: list[int] | tuple[int, ...],
+        width: int | None = None,
+        height: int | None = None,
+    ) -> tuple[np.ndarray, np.ndarray] | tuple[torch.Tensor, torch.Tensor]:
+        if self.layout is None:
+            raise RuntimeError("Immersive scene layout has not been configured.")
+        if width is None:
+            width = self.width
+        if height is None:
+            height = self.height
+        entry = self._ensure_focus_scene_entry()
+        self._set_focus_scene_selection(selected_entry_ids)
+        camera = entry["camera"]
+        camera.fx = float(intrinsic[0, 0])
+        camera.fy = float(intrinsic[1, 1])
+        camera.cx = float(intrinsic[0, 2])
+        camera.cy = float(intrinsic[1, 2])
+        entry["scene"].set_pose(
+            entry["camera_node"],
+            pose=np.asarray(camera_pose_world, dtype=np.float32),
+        )
+        renderer = self._get_focus_scene_renderer(width, height)
+        color, depth = renderer.render(
+            entry["scene"],
+            flags=self._pyrender.RenderFlags.RGBA,
+        )
+        self._update_pyrender_readback_state(renderer)
+        if torch.is_tensor(depth):
+            return color, depth.to(dtype=torch.float32)
+        return color, depth.astype(np.float32)
+
+    def _render_focus_scene_eye_roi(
+        self,
+        camera_pose_world: np.ndarray,
+        full_intrinsic: np.ndarray,
+        selected_entry_ids: list[int] | tuple[int, ...],
+        roi_bounds: tuple[int, int, int, int],
+        render_scale: float = 1.0,
+        return_render_info: bool = False,
+    ):
+        roi_intrinsic, render_width, render_height, render_info = self._resolve_roi_render_params(
+            full_intrinsic,
+            roi_bounds,
+            render_scale=render_scale,
+        )
+        render_color, render_depth = self._render_focus_scene_eye(
+            camera_pose_world,
+            roi_intrinsic,
+            selected_entry_ids,
+            width=render_width,
+            height=render_height,
+        )
+        if return_render_info:
+            return render_color, render_depth, render_info
+        return render_color, render_depth
+
+    def focus_render_catalog_world_entries(self) -> list[dict[str, Any]]:
+        return [
+            {
+                "entry_id": int(entry["entry_id"]),
+                "parent_component_id": entry["parent_component_id"],
+                "role": str(entry["role"]),
+                "face_count": int(entry["face_count"]),
+                "chunk_kind": str(entry["chunk_kind"]),
+                "chunk_index": int(entry["chunk_index"]),
+                "always_include": bool(entry["always_include"]),
+                "bounds_min": np.asarray(entry["bounds_min"], dtype=np.float32).copy(),
+                "bounds_max": np.asarray(entry["bounds_max"], dtype=np.float32).copy(),
+            }
+            for entry in self._focus_render_catalog_world
+        ]
+
+    def focus_render_catalog_world_entries_ref(self) -> list[dict[str, Any]]:
+        return self._focus_render_catalog_world
+
+    def focus_render_catalog_world_by_id_ref(self) -> dict[int, dict[str, Any]]:
+        return self._focus_render_catalog_world_by_id
+
+    def focus_render_bvh_world_nodes(self) -> list[dict[str, Any]]:
+        return self._focus_render_bvh_world
+
+    def focus_render_catalog_total_faces(self) -> int:
+        return int(self._focus_render_catalog_total_faces)
+
+    def focus_render_active_table_entry_ids(self) -> list[int]:
+        return sorted(int(v) for v in self._focus_render_active_table_entry_ids)
+
     def _rebuild_scene_nodes(self) -> None:
         if self.layout is None:
             return
@@ -2258,7 +3287,6 @@ class SimpleLabSceneRenderer:
         if return_render_info:
             return render_color, render_depth, render_info
         return render_color, render_depth
-
 
 def build_illixr_scene_analysis_cache(
     scene_assets_root: str | Path,

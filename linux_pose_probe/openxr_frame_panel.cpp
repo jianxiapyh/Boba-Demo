@@ -37,7 +37,7 @@ constexpr uint32_t kExpectedHeaderVersion = 1;
 #ifdef BOBA_IMMERSIVE_BRIDGE
 constexpr const char* kExpectedSharedFrameMagic = "BOBAQIM1";
 constexpr const char* kBinaryUsageName = "boba_immersive_bridge";
-constexpr const char* kApplicationName = "Boba Immersive Bridge";
+constexpr const char* kApplicationName = "Boba Immersive Demo";
 #else
 constexpr const char* kExpectedSharedFrameMagic = "BOBAQST1";
 constexpr const char* kBinaryUsageName = "boba_immersive_demo";
@@ -657,24 +657,38 @@ bool UpdateDisplayFrameIfNeeded(const SharedFrameFile& file, uint64_t* latest_fr
 
 #ifdef BOBA_IMMERSIVE_BRIDGE
 bool UpdateStereoFramesIfNeeded(const SharedFrameFile& file, uint64_t* latest_frame_id,
+                                uint64_t* frame_id_delta,
                                 std::vector<uint8_t>* left_eye_rgba,
                                 std::vector<uint8_t>* right_eye_rgba) {
     const SharedFrameHeader header = *file.header;
     if (header.latest_frame_id == *latest_frame_id) {
+        if (frame_id_delta != nullptr) {
+            *frame_id_delta = 0;
+        }
         return false;
     }
     if (header.latest_slot >= header.slot_count) {
         std::cerr << "Invalid latest_slot in shared frame header: " << header.latest_slot
                   << "\n";
+        if (frame_id_delta != nullptr) {
+            *frame_id_delta = 0;
+        }
         return false;
     }
 
     const uint32_t eye_frame_bytes = header.width * header.height * header.channels;
     const size_t slot_offset = static_cast<size_t>(header.latest_slot) * header.frame_bytes;
     const uint8_t* source = file.payload + slot_offset;
+    const uint64_t previous_frame_id = *latest_frame_id;
     left_eye_rgba->assign(source, source + eye_frame_bytes);
     right_eye_rgba->assign(source + eye_frame_bytes, source + header.frame_bytes);
     *latest_frame_id = header.latest_frame_id;
+    if (frame_id_delta != nullptr) {
+        *frame_id_delta =
+            (header.latest_frame_id > previous_frame_id)
+                ? (header.latest_frame_id - previous_frame_id)
+                : 1;
+    }
     return true;
 }
 #endif
@@ -1544,7 +1558,18 @@ int main(int argc, char** argv) {
     bool exit_requested = false;
     uint64_t latest_frame_id = 0;
     uint64_t logged_source_frame_id = 0;
+    uint64_t applied_source_update_count = 0;
+    uint64_t logged_applied_source_update_count = 0;
+    uint64_t source_frame_delta_count = 0;
+    uint64_t logged_source_frame_delta_count = 0;
+    uint64_t coalesced_source_frame_count = 0;
+    uint64_t rendered_frame_count = 0;
+    uint64_t logged_rendered_frame_count = 0;
     uint64_t controller_sample_count = 0;
+    auto first_source_update_time = std::chrono::steady_clock::time_point{};
+    auto last_source_update_log_time = std::chrono::steady_clock::time_point{};
+    auto first_render_frame_time = std::chrono::steady_clock::time_point{};
+    auto last_render_log_time = std::chrono::steady_clock::time_point{};
 #ifdef BOBA_IMMERSIVE_BRIDGE
     std::vector<uint8_t> display_rgba_left(eye_frame_bytes, 0);
     std::vector<uint8_t> display_rgba_right(eye_frame_bytes, 0);
@@ -1717,13 +1742,83 @@ int main(int argc, char** argv) {
             MakeXrStruct<XrCompositionLayerProjection>(XR_TYPE_COMPOSITION_LAYER_PROJECTION);
 
         if (frame_state.shouldRender == XR_TRUE) {
+            const auto now = std::chrono::steady_clock::now();
+            ++rendered_frame_count;
+            if (rendered_frame_count == 1) {
+                first_render_frame_time = now;
+                last_render_log_time = now;
+                logged_rendered_frame_count = 0;
+            }
+            const double render_elapsed_s =
+                std::chrono::duration<double>(now - first_render_frame_time).count();
+            const double render_since_last_log_s =
+                std::chrono::duration<double>(now - last_render_log_time).count();
+            if (rendered_frame_count == 1 || render_since_last_log_s >= 1.0) {
+                const uint64_t rendered_since_last_log =
+                    rendered_frame_count - logged_rendered_frame_count;
+                const double render_recent_fps =
+                    (render_since_last_log_s > 0.0)
+                        ? (static_cast<double>(rendered_since_last_log) / render_since_last_log_s)
+                        : 0.0;
+                std::cerr << std::fixed << std::setprecision(2)
+                          << "Immersive bridge viewer_render_stats "
+                          << "rendered_count=" << rendered_frame_count << " "
+                          << "elapsed_s=" << render_elapsed_s << " "
+                          << "recent_fps=" << render_recent_fps << "\n";
+                last_render_log_time = now;
+                logged_rendered_frame_count = rendered_frame_count;
+            }
 #ifdef BOBA_IMMERSIVE_BRIDGE
-            if (UpdateStereoFramesIfNeeded(
-                    shared_frame, &latest_frame_id, &display_rgba_left, &display_rgba_right)) {
+            uint64_t source_frame_delta = 0;
+            if (UpdateStereoFramesIfNeeded(shared_frame, &latest_frame_id, &source_frame_delta,
+                                           &display_rgba_left, &display_rgba_right)) {
+                ++applied_source_update_count;
+                source_frame_delta_count += source_frame_delta;
+                if (source_frame_delta > 0) {
+                    coalesced_source_frame_count += source_frame_delta - 1;
+                }
+                if (applied_source_update_count == 1) {
+                    first_source_update_time = now;
+                    last_source_update_log_time = now;
+                    logged_applied_source_update_count = 0;
+                    logged_source_frame_delta_count = 0;
+                }
                 if (latest_frame_id == 1 || latest_frame_id >= logged_source_frame_id + 120) {
                     std::cerr << "Immersive bridge received source frame " << latest_frame_id
                               << "\n";
                     logged_source_frame_id = latest_frame_id;
+                }
+                const double elapsed_s =
+                    std::chrono::duration<double>(now - first_source_update_time).count();
+                const double since_last_log_s =
+                    std::chrono::duration<double>(now - last_source_update_log_time).count();
+                if (applied_source_update_count == 1 || since_last_log_s >= 1.0) {
+                    const uint64_t applied_updates_since_last_log =
+                        applied_source_update_count - logged_applied_source_update_count;
+                    const uint64_t source_frame_delta_since_last_log =
+                        source_frame_delta_count - logged_source_frame_delta_count;
+                    const double update_recent_fps =
+                        (since_last_log_s > 0.0)
+                            ? (static_cast<double>(applied_updates_since_last_log) /
+                               since_last_log_s)
+                            : 0.0;
+                    const double source_delta_recent_fps =
+                        (since_last_log_s > 0.0)
+                            ? (static_cast<double>(source_frame_delta_since_last_log) /
+                               since_last_log_s)
+                            : 0.0;
+                    std::cerr << std::fixed << std::setprecision(2)
+                              << "Immersive bridge viewer_source_stats "
+                              << "latest_frame_id=" << latest_frame_id << " "
+                              << "update_count=" << applied_source_update_count << " "
+                              << "source_frame_delta_count=" << source_frame_delta_count << " "
+                              << "coalesced_frame_count=" << coalesced_source_frame_count << " "
+                              << "elapsed_s=" << elapsed_s << " "
+                              << "update_recent_fps=" << update_recent_fps << " "
+                              << "source_delta_recent_fps=" << source_delta_recent_fps << "\n";
+                    last_source_update_log_time = now;
+                    logged_applied_source_update_count = applied_source_update_count;
+                    logged_source_frame_delta_count = source_frame_delta_count;
                 }
             }
 

@@ -3,9 +3,9 @@
   "scene_preset": "ILLIXR_lab",
   "scene_model": "scene.obj",
   "scene_material": "scene.mtl",
-  "scene_analysis_cache": "scene_analysis_cache_v1.pkl.gz",
-  "scene_analysis_cache_schema": 1,
-  "scene_analysis_cache_inputs": "manifest_subset+scene_model_bytes+scene_material_bytes+texture_names",
+  "scene_analysis_cache": "scene_analysis_cache_v3.pkl.gz",
+  "scene_analysis_cache_schema": 3,
+  "scene_analysis_cache_inputs": "manifest_subset+scene_model_bytes+scene_material_bytes+texture_names+focus_render_catalog_chunking_v1+bvh_v1",
   "textures": [
     "FloorBake.png",
     "WallBake.png",

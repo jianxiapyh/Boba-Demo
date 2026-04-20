@@ -9,7 +9,7 @@ import pickle
 import random
 import shutil
 import sys
-from argparse import ArgumentParser
+from argparse import ArgumentDefaultsHelpFormatter, ArgumentParser
 from pathlib import Path
 
 np = None
@@ -218,6 +218,7 @@ def prioritize_conda_bin():
 
 def build_parser() -> ArgumentParser:
     parser = ArgumentParser(
+        formatter_class=ArgumentDefaultsHelpFormatter,
         description=(
             "Run the shipped Boba Quest immersive demo. "
             "This launcher is fixed to live OpenXR controllers, immersive Quest display, "
@@ -246,15 +247,18 @@ def build_parser() -> ArgumentParser:
         help="show or hide the local OpenGL window while Quest output stays active",
     )
     parser.add_argument(
-        "--render_profile",
+        "--profile",
         action="store_true",
-        help="write render_profile_summary.txt and render_profile_frames.csv",
+        help=(
+            "enable detailed immersive diagnostics and write "
+            "render_profile_summary.txt and render_profile_frames.csv"
+        ),
     )
     parser.add_argument(
-        "--render_profile_every",
+        "--profile_freq",
         type=int,
         default=30,
-        help="print one detailed render profile line every N profiled frames",
+        help="print one detailed profile line every N profiled frames",
     )
     parser.add_argument(
         "--immersive_timewarp",
@@ -263,17 +267,38 @@ def build_parser() -> ArgumentParser:
         help=(
             "late-warp mode for immersive Quest output: "
             "'off' keeps the current shipped path, "
-            "'scene_depth_reproject' late-warps the fully composed scene via depth reprojection"
+            "'scene_depth_reproject' late-warps the fully composed scene via depth reprojection "
+            "(requires --immersive_static_scene_overlap on; required for "
+            "--immersive_framegen static|adaptive)"
         ),
     )
     parser.add_argument(
         "--immersive_static_scene_overlap",
         choices=("off", "on"),
-        default="off",
+        default="on",
         help=(
             "static scene overlap mode for immersive Quest output: "
             "'off' keeps the serial reference path, "
-            "'on' overlaps balanced room/table rendering with simulation+LBS without enabling time warp"
+            "'on' overlaps balanced room/table rendering with simulation+LBS and "
+            "unlocks the overlap-only framegen, timewarp, and present-pipeline path"
+        ),
+    )
+    parser.add_argument(
+        "--immersive_static_scene_mode",
+        choices=("balanced_focus", "balanced_support_focus"),
+        default="balanced_support_focus",
+        help=(
+            "static-scene mode for immersive Quest output: "
+            "'balanced_focus' uses the fast table-special ROI path, "
+            "'balanced_support_focus' keeps the fast balanced path but lets one sharp ROI follow the active support surface"
+        ),
+    )
+    parser.add_argument(
+        "--immersive_support_entry_overlay",
+        action="store_true",
+        help=(
+            "draw scene-anchored component_id labels on visible support objects and "
+            "highlight the active support for debugging"
         ),
     )
     parser.add_argument(
@@ -281,23 +306,53 @@ def build_parser() -> ArgumentParser:
         choices=("off", "static", "adaptive"),
         default="off",
         help=(
-            "static-scene frame generation mode for immersive Quest output: "
-            "'off' renders the static room/table every frame, "
-            "'static' reuses the last static scene every other frame, "
-            "'adaptive' reuses only when head motion stays within conservative guardrails"
+            "in-between display-frame generation mode for immersive Quest output: "
+            "'off' sends only real source frames, "
+            "'static' keeps static-scene reuse enabled internally and may synthesize one extra "
+            "head-reprojected stereo frame after a real source frame, "
+            "'adaptive' does the same with stricter motion/freshness guardrails "
+            "(static/adaptive require --immersive_static_scene_overlap on and "
+            "--immersive_timewarp scene_depth_reproject)"
         ),
     )
     parser.add_argument(
         "--immersive_gaussian_render",
         choices=("serial", "stereo_parallel", "stereo_batched"),
-        default="serial",
+        default="stereo_parallel",
         help=(
             "Gaussian render scheduling mode for immersive Quest output: "
             "'serial' renders left/right Gaussian eyes sequentially, "
             "'stereo_parallel' experimentally renders both eyes concurrently on separate CUDA streams "
-            "(currently only supported with overlap=off and timewarp=off), "
+            "(requires --immersive_timewarp off on the reference path; overlap=on is also supported "
+            "on the narrow stable path with --immersive_present_pipeline, "
+            "--immersive_framegen off, and --immersive_timewarp off, and on the "
+            "framegen path with --immersive_framegen static|adaptive and "
+            "--immersive_timewarp scene_depth_reproject), "
             "'stereo_batched' experimentally renders both eyes in one batched gsplat call "
-            "(currently only supported with overlap=off and timewarp=off)"
+            "(requires --immersive_static_scene_overlap off and --immersive_timewarp off; "
+            "not supported for framegen v1)"
+        ),
+    )
+    parser.add_argument(
+        "--immersive_present_pipeline",
+        choices=("off", "on"),
+        default="on",
+        help=(
+            "experimentally pipelines compose + overlay + publish onto a presentation "
+            "worker while keeping the current same-frame overlap path "
+            "(requires --immersive_static_scene_overlap on; the narrow stable "
+            "stereo_parallel path also requires --immersive_timewarp off and "
+            "--immersive_framegen off; framegen may auto-use the same backend even "
+            "without this flag)"
+        ),
+    )
+    parser.add_argument(
+        "--immersive_controller_translation_scale",
+        type=float,
+        default=1.2,
+        help=(
+            "multiplier on the case-default live controller translation gain used "
+            "to map real controller motion into immersive world-space motion"
         ),
     )
     return parser
@@ -306,6 +361,9 @@ def build_parser() -> ArgumentParser:
 def main(argv: list[str] | None = None):
     parser = build_parser()
     args = parser.parse_args(argv)
+    immersive_present_pipeline_enabled = (
+        str(args.immersive_present_pipeline).strip().lower() == "on"
+    )
 
     global np, torch
     import numpy as np  # type: ignore[assignment]
@@ -338,6 +396,16 @@ def main(argv: list[str] | None = None):
     )
     print(
         f"[quest_display] immersive_gaussian_render={args.immersive_gaussian_render}",
+        flush=True,
+    )
+    print(
+        "[quest_display] immersive_present_pipeline="
+        f"{str(args.immersive_present_pipeline).strip().lower()}",
+        flush=True,
+    )
+    print(
+        "[quest_display] immersive_controller_translation_scale="
+        f"{float(args.immersive_controller_translation_scale):.3f}",
         flush=True,
     )
     print(
@@ -433,12 +501,18 @@ def main(argv: list[str] | None = None):
             cuda_ctx=ctx,
             interactive_window_mode=args.interactive_window_mode,
             scene_assets_root=args.scene_assets_root,
-            render_profile=args.render_profile,
-            render_profile_every=args.render_profile_every,
+            profile=args.profile,
+            profile_freq=args.profile_freq,
             immersive_timewarp=args.immersive_timewarp,
             immersive_static_scene_overlap=args.immersive_static_scene_overlap,
+            immersive_static_scene_mode=args.immersive_static_scene_mode,
+            immersive_support_entry_overlay=args.immersive_support_entry_overlay,
             immersive_framegen=args.immersive_framegen,
             immersive_gaussian_render=args.immersive_gaussian_render,
+            immersive_present_pipeline=immersive_present_pipeline_enabled,
+            immersive_controller_translation_scale=(
+                args.immersive_controller_translation_scale
+            ),
         )
     finally:
         import glfw

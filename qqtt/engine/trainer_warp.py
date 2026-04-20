@@ -5,6 +5,8 @@ from qqtt.model.diff_simulator import (
     SpringMassSystemWarp,
 )
 import copy
+import concurrent.futures
+import collections
 import csv
 import json
 import open3d as o3d
@@ -77,12 +79,48 @@ TINY_BITMAP_FONT = {
     "8": ("111", "101", "111", "101", "111"),
     "9": ("111", "101", "111", "001", "111"),
     ".": ("000", "000", "000", "000", "010"),
+    "_": ("000", "000", "000", "000", "111"),
+    ">": ("100", "010", "001", "010", "100"),
     " ": ("000", "000", "000", "000", "000"),
+    "a": ("010", "101", "111", "101", "101"),
+    "b": ("110", "101", "110", "101", "110"),
+    "c": ("011", "100", "100", "100", "011"),
+    "d": ("110", "101", "101", "101", "110"),
+    "e": ("111", "100", "110", "100", "111"),
+    "h": ("101", "101", "111", "101", "101"),
+    "i": ("111", "010", "010", "010", "111"),
+    "k": ("101", "101", "110", "101", "101"),
+    "l": ("100", "100", "100", "100", "111"),
     "m": ("101", "111", "101", "101", "101"),
+    "n": ("110", "101", "101", "101", "101"),
+    "o": ("111", "101", "101", "101", "111"),
     "s": ("111", "100", "111", "001", "111"),
     "f": ("111", "100", "110", "100", "100"),
     "p": ("110", "101", "110", "100", "100"),
+    "r": ("110", "101", "110", "101", "101"),
+    "t": ("111", "010", "010", "010", "010"),
+    "u": ("101", "101", "101", "101", "111"),
 }
+
+IMMERSIVE_BALANCED_LAYER_BACKGROUND_BASE = "background_base"
+IMMERSIVE_BALANCED_LAYER_FULL_BASE = "full_base"
+IMMERSIVE_BALANCED_LAYER_TABLE_BASE = "table_base"
+IMMERSIVE_BALANCED_LAYER_TABLE_OVERLAY = "table_overlay"
+IMMERSIVE_BALANCED_LAYER_SUPPORT_OVERLAY = "support_overlay"
+
+IMMERSIVE_BALANCED_BASE_LAYER_NAMES = frozenset(
+    {
+        IMMERSIVE_BALANCED_LAYER_BACKGROUND_BASE,
+        IMMERSIVE_BALANCED_LAYER_FULL_BASE,
+        IMMERSIVE_BALANCED_LAYER_TABLE_BASE,
+    }
+)
+IMMERSIVE_BALANCED_OVERLAY_LAYER_NAMES = frozenset(
+    {
+        IMMERSIVE_BALANCED_LAYER_TABLE_OVERLAY,
+        IMMERSIVE_BALANCED_LAYER_SUPPORT_OVERLAY,
+    }
+)
 #pyh moving timer class outside 
 class Timer:
     def __init__(self, name):
@@ -119,9 +157,48 @@ class Timer:
         self.cuda_end_event = None
 
 
-def _execute_immersive_balanced_scene_render_plan(
-    renderer,
+def _build_immersive_balanced_scene_eye_request(render_plan, eye_label):
+    eye_label = str(eye_label).strip().lower()
+    if eye_label not in {"left", "right"}:
+        raise ValueError(f"Unsupported immersive eye label: {eye_label}")
+    request = {
+        "static_scene_mode": str(
+            render_plan.get("static_scene_mode", "balanced_focus")
+        ).strip().lower(),
+        "scene_width": int(render_plan["scene_width"]),
+        "scene_height": int(render_plan["scene_height"]),
+        "eye_label": eye_label,
+        "eye": copy.deepcopy(render_plan[eye_label]),
+    }
+    if "table_roi_render_scale" in render_plan:
+        request["table_roi_render_scale"] = float(render_plan["table_roi_render_scale"])
+    if "support_roi_render_scale" in render_plan:
+        request["support_roi_render_scale"] = float(
+            render_plan["support_roi_render_scale"]
+        )
+    return request
+
+
+def _build_immersive_balanced_scene_layer_request(
     render_plan,
+    requested_layers_by_eye,
+):
+    return {
+        "request_type": "balanced_layers",
+        "render_plan": copy.deepcopy(render_plan),
+        "requested_layers_by_eye": {
+            eye_label: [
+                str(layer_name).strip().lower()
+                for layer_name in (requested_layers_by_eye.get(eye_label) or [])
+            ]
+            for eye_label in ("left", "right")
+        },
+    }
+
+
+def _execute_immersive_balanced_scene_render_eye(
+    renderer,
+    eye_request,
     *,
     tensor_validator=None,
 ):
@@ -130,92 +207,1210 @@ def _execute_immersive_balanced_scene_render_plan(
             return value
         return tensor_validator(value, label=label)
 
-    background_mode = str(render_plan["background_mode"])
-    result = {
-        "background_mode": background_mode,
-        "shared_background": None,
-        "left": {},
-        "right": {},
-    }
-    if background_mode == "per_eye_background":
-        for eye_label in ("left", "right"):
-            eye_plan = render_plan[eye_label]
-            background_render_start = time.perf_counter()
-            background_color, background_depth = renderer.render_background_eye(
-                eye_plan["eye_pose_world"],
-                eye_plan["background_scene_intrinsic"],
-                width=int(render_plan["scene_width"]),
-                height=int(render_plan["scene_height"]),
-            )
-            result[eye_label]["background_color"] = _validate_tensor(
-                background_color,
-                f"{eye_label}.background_color",
-            )
-            result[eye_label]["background_depth"] = _validate_tensor(
-                background_depth,
-                f"{eye_label}.background_depth",
-            )
-            result[eye_label]["background_render_wall_s"] = (
-                time.perf_counter() - background_render_start
-            )
-    elif background_mode == "mono_center_background":
-        background_render_start = time.perf_counter()
-        background_color, background_depth = renderer.render_background_eye(
-            render_plan["center_eye_pose_world"],
-            render_plan["center_scene_intrinsic"],
-            width=int(render_plan["scene_width"]),
-            height=int(render_plan["scene_height"]),
-        )
-        result["shared_background"] = {
-            "color": _validate_tensor(
-                background_color,
-                "shared_background.color",
-            ),
-            "depth": _validate_tensor(
-                background_depth,
-                "shared_background.depth",
-            ),
-            "render_wall_s": time.perf_counter() - background_render_start,
-        }
-    else:
-        raise ValueError(
-            f"Unsupported immersive balanced background mode: {background_mode}"
-        )
+    static_scene_mode = str(
+        eye_request.get("static_scene_mode", "balanced_focus")
+    ).strip().lower()
+    eye_label = str(eye_request.get("eye_label", "left")).strip().lower()
+    if eye_label not in {"left", "right"}:
+        raise ValueError(f"Unsupported immersive eye label: {eye_label}")
+    eye_plan = eye_request["eye"]
+    result = {}
 
-    for eye_label in ("left", "right"):
-        eye_plan = render_plan[eye_label]
-        table_render_start = time.perf_counter()
-        if bool(eye_plan.get("table_fullframe_fallback", True)):
-            table_color, table_depth = renderer.render_table_eye(
+    if static_scene_mode not in {
+        "balanced_focus",
+        "balanced_support_focus",
+    }:
+        raise ValueError(f"Unsupported immersive static scene mode: {static_scene_mode}")
+
+    if static_scene_mode == "balanced_support_focus":
+        support_render_kind = str(
+            eye_plan.get("support_render_kind", "none")
+        ).strip().lower()
+        base_render_start = time.perf_counter()
+        if support_render_kind in {"table", "none"}:
+            base_color, base_depth = renderer.render_background_eye(
+                eye_plan["eye_pose_world"],
+                eye_plan["base_scene_intrinsic"],
+                width=int(eye_request["scene_width"]),
+                height=int(eye_request["scene_height"]),
+            )
+        else:
+            base_color, base_depth = renderer.render_eye(
+                eye_plan["eye_pose_world"],
+                eye_plan["base_scene_intrinsic"],
+                width=int(eye_request["scene_width"]),
+                height=int(eye_request["scene_height"]),
+            )
+        result["base_color"] = _validate_tensor(
+            base_color,
+            f"{eye_label}.base_color",
+        )
+        result["base_depth"] = _validate_tensor(
+            base_depth,
+            f"{eye_label}.base_depth",
+        )
+        result["base_render_wall_s"] = time.perf_counter() - base_render_start
+        result["base_table_color"] = None
+        result["base_table_depth"] = None
+        result["base_table_render_wall_s"] = 0.0
+        if support_render_kind == "none":
+            base_table_render_start = time.perf_counter()
+            base_table_color, base_table_depth = renderer.render_table_eye(
+                eye_plan["eye_pose_world"],
+                eye_plan["base_scene_intrinsic"],
+                width=int(eye_request["scene_width"]),
+                height=int(eye_request["scene_height"]),
+            )
+            result["base_table_color"] = _validate_tensor(
+                base_table_color,
+                f"{eye_label}.base_table_color",
+            )
+            result["base_table_depth"] = _validate_tensor(
+                base_table_depth,
+                f"{eye_label}.base_table_depth",
+            )
+            result["base_table_render_wall_s"] = (
+                time.perf_counter() - base_table_render_start
+            )
+
+        support_render_start = time.perf_counter()
+        support_color = None
+        support_depth = None
+        support_render_info = None
+        if support_render_kind == "table":
+            if bool(eye_plan.get("support_fullframe_fallback", True)):
+                support_color, support_depth = renderer.render_table_eye(
+                    eye_plan["eye_pose_world"],
+                    eye_plan["eye_intrinsic"],
+                    width=int(eye_plan["eye_width"]),
+                    height=int(eye_plan["eye_height"]),
+                )
+            else:
+                support_color, support_depth, support_render_info = (
+                    renderer.render_table_eye_roi(
+                        eye_plan["eye_pose_world"],
+                        eye_plan["eye_intrinsic"],
+                        tuple(int(v) for v in eye_plan["support_roi_bounds"]),
+                        render_scale=float(
+                            eye_request["support_roi_render_scale"]
+                        ),
+                        return_render_info=True,
+                    )
+                )
+        elif support_render_kind == "focus":
+            if bool(eye_plan.get("support_fullframe_fallback", True)):
+                support_color, support_depth = renderer.render_eye(
+                    eye_plan["eye_pose_world"],
+                    eye_plan["eye_intrinsic"],
+                    width=int(eye_plan["eye_width"]),
+                    height=int(eye_plan["eye_height"]),
+                )
+            else:
+                support_color, support_depth, support_render_info = (
+                    renderer.render_eye_roi(
+                        eye_plan["eye_pose_world"],
+                        eye_plan["eye_intrinsic"],
+                        tuple(int(v) for v in eye_plan["support_roi_bounds"]),
+                        render_scale=float(
+                            eye_request["support_roi_render_scale"]
+                        ),
+                        return_render_info=True,
+                    )
+                )
+        result["support_render_kind"] = str(support_render_kind)
+        result["support_color"] = (
+            None
+            if support_color is None
+            else _validate_tensor(
+                support_color,
+                f"{eye_label}.support_color",
+            )
+        )
+        result["support_depth"] = (
+            None
+            if support_depth is None
+            else _validate_tensor(
+                support_depth,
+                f"{eye_label}.support_depth",
+            )
+        )
+        result["support_render_info"] = (
+            None if support_render_info is None else dict(support_render_info)
+        )
+        result["support_render_wall_s"] = (
+            time.perf_counter() - support_render_start
+        )
+        return result
+
+    background_render_start = time.perf_counter()
+    background_color, background_depth = renderer.render_background_eye(
+        eye_plan["eye_pose_world"],
+        eye_plan["base_scene_intrinsic"],
+        width=int(eye_request["scene_width"]),
+        height=int(eye_request["scene_height"]),
+    )
+    result["background_color"] = _validate_tensor(
+        background_color,
+        f"{eye_label}.background_color",
+    )
+    result["background_depth"] = _validate_tensor(
+        background_depth,
+        f"{eye_label}.background_depth",
+    )
+    result["background_render_wall_s"] = (
+        time.perf_counter() - background_render_start
+    )
+
+    table_render_start = time.perf_counter()
+    if bool(eye_plan.get("table_fullframe_fallback", True)):
+        table_color, table_depth = renderer.render_table_eye(
+            eye_plan["eye_pose_world"],
+            eye_plan["eye_intrinsic"],
+            width=int(eye_plan["eye_width"]),
+            height=int(eye_plan["eye_height"]),
+        )
+        table_render_info = None
+    else:
+        table_color, table_depth, table_render_info = (
+            renderer.render_table_eye_roi(
+                eye_plan["eye_pose_world"],
+                eye_plan["eye_intrinsic"],
+                tuple(int(v) for v in eye_plan["table_roi_bounds"]),
+                render_scale=float(eye_request["table_roi_render_scale"]),
+                return_render_info=True,
+            )
+        )
+    result["table_color"] = _validate_tensor(
+        table_color,
+        f"{eye_label}.table_color",
+    )
+    result["table_depth"] = _validate_tensor(
+        table_depth,
+        f"{eye_label}.table_depth",
+    )
+    result["table_render_info"] = (
+        None if table_render_info is None else dict(table_render_info)
+    )
+    result["table_render_wall_s"] = (
+        time.perf_counter() - table_render_start
+    )
+    return result
+
+
+def _execute_immersive_balanced_scene_render_eye_layers(
+    renderer,
+    eye_request,
+    requested_layers,
+    *,
+    tensor_validator=None,
+):
+    def _validate_tensor(value, label):
+        if tensor_validator is None:
+            return value
+        return tensor_validator(value, label=label)
+
+    def _render_background_base():
+        render_start = time.perf_counter()
+        color, depth = renderer.render_background_eye(
+            eye_plan["eye_pose_world"],
+            eye_plan["base_scene_intrinsic"],
+            width=int(eye_request["scene_width"]),
+            height=int(eye_request["scene_height"]),
+        )
+        return {
+            "color": _validate_tensor(color, f"{eye_label}.background_base.color"),
+            "depth": _validate_tensor(depth, f"{eye_label}.background_base.depth"),
+            "render_info": None,
+            "render_wall_s": time.perf_counter() - render_start,
+        }
+
+    def _render_full_base():
+        render_start = time.perf_counter()
+        color, depth = renderer.render_eye(
+            eye_plan["eye_pose_world"],
+            eye_plan["base_scene_intrinsic"],
+            width=int(eye_request["scene_width"]),
+            height=int(eye_request["scene_height"]),
+        )
+        return {
+            "color": _validate_tensor(color, f"{eye_label}.full_base.color"),
+            "depth": _validate_tensor(depth, f"{eye_label}.full_base.depth"),
+            "render_info": None,
+            "render_wall_s": time.perf_counter() - render_start,
+        }
+
+    def _render_table_base():
+        render_start = time.perf_counter()
+        color, depth = renderer.render_table_eye(
+            eye_plan["eye_pose_world"],
+            eye_plan["base_scene_intrinsic"],
+            width=int(eye_request["scene_width"]),
+            height=int(eye_request["scene_height"]),
+        )
+        return {
+            "color": _validate_tensor(color, f"{eye_label}.table_base.color"),
+            "depth": _validate_tensor(depth, f"{eye_label}.table_base.depth"),
+            "render_info": None,
+            "render_wall_s": time.perf_counter() - render_start,
+        }
+
+    def _render_table_overlay():
+        render_start = time.perf_counter()
+        if static_scene_mode == "balanced_focus":
+            fullframe_fallback = bool(eye_plan.get("table_fullframe_fallback", True))
+            roi_bounds = eye_plan.get("table_roi_bounds")
+            render_scale = float(eye_request["table_roi_render_scale"])
+        else:
+            support_render_kind = str(
+                eye_plan.get("support_render_kind", "none")
+            ).strip().lower()
+            if support_render_kind != "table":
+                raise RuntimeError(
+                    "Immersive balanced layer request asked for table_overlay on "
+                    f"{eye_label} without support_render_kind=table."
+                )
+            fullframe_fallback = bool(eye_plan.get("support_fullframe_fallback", True))
+            roi_bounds = eye_plan.get("support_roi_bounds")
+            render_scale = float(eye_request["support_roi_render_scale"])
+        if fullframe_fallback:
+            color, depth = renderer.render_table_eye(
                 eye_plan["eye_pose_world"],
                 eye_plan["eye_intrinsic"],
                 width=int(eye_plan["eye_width"]),
                 height=int(eye_plan["eye_height"]),
             )
-            table_render_info = None
+            render_info = None
         else:
-            table_color, table_depth, table_render_info = renderer.render_table_eye_roi(
+            color, depth, render_info = renderer.render_table_eye_roi(
                 eye_plan["eye_pose_world"],
                 eye_plan["eye_intrinsic"],
-                tuple(int(v) for v in eye_plan["table_roi_bounds"]),
-                render_scale=float(eye_plan["table_roi_render_scale"]),
+                tuple(int(v) for v in roi_bounds),
+                render_scale=render_scale,
                 return_render_info=True,
             )
-        result[eye_label]["table_color"] = _validate_tensor(
-            table_color,
-            f"{eye_label}.table_color",
+        return {
+            "color": _validate_tensor(color, f"{eye_label}.table_overlay.color"),
+            "depth": _validate_tensor(depth, f"{eye_label}.table_overlay.depth"),
+            "render_info": None if render_info is None else dict(render_info),
+            "render_wall_s": time.perf_counter() - render_start,
+        }
+
+    def _render_support_overlay():
+        support_render_kind = str(
+            eye_plan.get("support_render_kind", "none")
+        ).strip().lower()
+        if support_render_kind != "focus":
+            raise RuntimeError(
+                "Immersive balanced layer request asked for support_overlay on "
+                f"{eye_label} without support_render_kind=focus."
+            )
+        render_start = time.perf_counter()
+        if bool(eye_plan.get("support_fullframe_fallback", True)):
+            color, depth = renderer.render_eye(
+                eye_plan["eye_pose_world"],
+                eye_plan["eye_intrinsic"],
+                width=int(eye_plan["eye_width"]),
+                height=int(eye_plan["eye_height"]),
+            )
+            render_info = None
+        else:
+            color, depth, render_info = renderer.render_eye_roi(
+                eye_plan["eye_pose_world"],
+                eye_plan["eye_intrinsic"],
+                tuple(int(v) for v in eye_plan["support_roi_bounds"]),
+                render_scale=float(eye_request["support_roi_render_scale"]),
+                return_render_info=True,
+            )
+        return {
+            "color": _validate_tensor(color, f"{eye_label}.support_overlay.color"),
+            "depth": _validate_tensor(depth, f"{eye_label}.support_overlay.depth"),
+            "render_info": None if render_info is None else dict(render_info),
+            "render_wall_s": time.perf_counter() - render_start,
+        }
+
+    static_scene_mode = str(
+        eye_request.get("static_scene_mode", "balanced_focus")
+    ).strip().lower()
+    eye_label = str(eye_request.get("eye_label", "left")).strip().lower()
+    if eye_label not in {"left", "right"}:
+        raise ValueError(f"Unsupported immersive eye label: {eye_label}")
+    eye_plan = eye_request["eye"]
+    normalized_layers = {
+        str(layer_name).strip().lower() for layer_name in (requested_layers or [])
+    }
+    if not normalized_layers:
+        return {}
+
+    layer_outputs = {}
+    layer_renderers = {
+        IMMERSIVE_BALANCED_LAYER_BACKGROUND_BASE: _render_background_base,
+        IMMERSIVE_BALANCED_LAYER_FULL_BASE: _render_full_base,
+        IMMERSIVE_BALANCED_LAYER_TABLE_BASE: _render_table_base,
+        IMMERSIVE_BALANCED_LAYER_TABLE_OVERLAY: _render_table_overlay,
+        IMMERSIVE_BALANCED_LAYER_SUPPORT_OVERLAY: _render_support_overlay,
+    }
+    unknown_layers = sorted(set(normalized_layers) - set(layer_renderers.keys()))
+    if unknown_layers:
+        raise ValueError(
+            "Unsupported immersive balanced layer request for "
+            f"{eye_label}: {unknown_layers}"
         )
-        result[eye_label]["table_depth"] = _validate_tensor(
-            table_depth,
-            f"{eye_label}.table_depth",
-        )
-        result[eye_label]["table_render_info"] = (
-            None if table_render_info is None else dict(table_render_info)
-        )
-        result[eye_label]["table_render_wall_s"] = (
-            time.perf_counter() - table_render_start
+    for layer_name in sorted(normalized_layers):
+        layer_outputs[layer_name] = layer_renderers[layer_name]()
+    return layer_outputs
+
+
+def _execute_immersive_balanced_scene_render_layers(
+    renderer,
+    layer_request,
+    *,
+    tensor_validator=None,
+):
+    render_plan = layer_request["render_plan"]
+    static_scene_mode = str(
+        render_plan.get("static_scene_mode", "balanced_focus")
+    ).strip().lower()
+    requested_layers_by_eye = layer_request.get("requested_layers_by_eye") or {}
+    result = {
+        "static_scene_mode": static_scene_mode,
+        "left": {},
+        "right": {},
+    }
+    for eye_label in ("left", "right"):
+        requested_layers = requested_layers_by_eye.get(eye_label) or []
+        eye_request = _build_immersive_balanced_scene_eye_request(render_plan, eye_label)
+        result[eye_label] = _execute_immersive_balanced_scene_render_eye_layers(
+            renderer,
+            eye_request,
+            requested_layers,
+            tensor_validator=tensor_validator,
         )
     return result
+
+
+def _build_immersive_balanced_render_outputs_from_layer_cache(
+    render_plan,
+    layer_caches,
+    *,
+    fresh_layers_by_eye=None,
+):
+    static_scene_mode = str(
+        render_plan.get("static_scene_mode", "balanced_focus")
+    ).strip().lower()
+    result = {
+        "static_scene_mode": static_scene_mode,
+        "left": {},
+        "right": {},
+    }
+    fresh_layers_by_eye = fresh_layers_by_eye or {}
+
+    def _require_layer(eye_label, layer_name):
+        eye_cache = {} if layer_caches is None else layer_caches.get(eye_label, {})
+        layer_entry = None if eye_cache is None else eye_cache.get(layer_name)
+        if layer_entry is None:
+            raise RuntimeError(
+                "Immersive balanced layer cache is missing required layer "
+                f"{layer_name} for {eye_label}."
+            )
+        return layer_entry
+
+    def _render_wall_s(eye_label, layer_name):
+        fresh_layers = {
+            str(v).strip().lower()
+            for v in (fresh_layers_by_eye.get(eye_label) or [])
+        }
+        if layer_name not in fresh_layers:
+            return 0.0
+        layer_entry = _require_layer(eye_label, layer_name)
+        return float(layer_entry.get("render_wall_s", 0.0))
+
+    for eye_label in ("left", "right"):
+        eye_plan = render_plan[eye_label]
+        if static_scene_mode == "balanced_focus":
+            background_entry = _require_layer(
+                eye_label,
+                IMMERSIVE_BALANCED_LAYER_BACKGROUND_BASE,
+            )
+            table_entry = _require_layer(
+                eye_label,
+                IMMERSIVE_BALANCED_LAYER_TABLE_OVERLAY,
+            )
+            result[eye_label] = {
+                "background_color": background_entry["color"],
+                "background_depth": background_entry["depth"],
+                "background_render_wall_s": _render_wall_s(
+                    eye_label,
+                    IMMERSIVE_BALANCED_LAYER_BACKGROUND_BASE,
+                ),
+                "table_color": table_entry["color"],
+                "table_depth": table_entry["depth"],
+                "table_render_info": copy.deepcopy(table_entry.get("render_info")),
+                "table_render_wall_s": _render_wall_s(
+                    eye_label,
+                    IMMERSIVE_BALANCED_LAYER_TABLE_OVERLAY,
+                ),
+            }
+            continue
+
+        support_render_kind = str(
+            eye_plan.get("support_render_kind", "none")
+        ).strip().lower()
+        base_layer_name = (
+            IMMERSIVE_BALANCED_LAYER_FULL_BASE
+            if support_render_kind == "focus"
+            else IMMERSIVE_BALANCED_LAYER_BACKGROUND_BASE
+        )
+        base_entry = _require_layer(eye_label, base_layer_name)
+        eye_output = {
+            "base_color": base_entry["color"],
+            "base_depth": base_entry["depth"],
+            "base_render_wall_s": _render_wall_s(eye_label, base_layer_name),
+            "base_table_color": None,
+            "base_table_depth": None,
+            "base_table_render_wall_s": 0.0,
+            "support_render_kind": support_render_kind,
+            "support_color": None,
+            "support_depth": None,
+            "support_render_info": None,
+            "support_render_wall_s": 0.0,
+        }
+        if support_render_kind == "none":
+            table_base_entry = _require_layer(
+                eye_label,
+                IMMERSIVE_BALANCED_LAYER_TABLE_BASE,
+            )
+            eye_output["base_table_color"] = table_base_entry["color"]
+            eye_output["base_table_depth"] = table_base_entry["depth"]
+            eye_output["base_table_render_wall_s"] = _render_wall_s(
+                eye_label,
+                IMMERSIVE_BALANCED_LAYER_TABLE_BASE,
+            )
+        elif support_render_kind == "table":
+            table_entry = _require_layer(
+                eye_label,
+                IMMERSIVE_BALANCED_LAYER_TABLE_OVERLAY,
+            )
+            eye_output["support_color"] = table_entry["color"]
+            eye_output["support_depth"] = table_entry["depth"]
+            eye_output["support_render_info"] = copy.deepcopy(
+                table_entry.get("render_info")
+            )
+            eye_output["support_render_wall_s"] = _render_wall_s(
+                eye_label,
+                IMMERSIVE_BALANCED_LAYER_TABLE_OVERLAY,
+            )
+        elif support_render_kind == "focus":
+            support_entry = _require_layer(
+                eye_label,
+                IMMERSIVE_BALANCED_LAYER_SUPPORT_OVERLAY,
+            )
+            eye_output["support_color"] = support_entry["color"]
+            eye_output["support_depth"] = support_entry["depth"]
+            eye_output["support_render_info"] = copy.deepcopy(
+                support_entry.get("render_info")
+            )
+            eye_output["support_render_wall_s"] = _render_wall_s(
+                eye_label,
+                IMMERSIVE_BALANCED_LAYER_SUPPORT_OVERLAY,
+            )
+        else:
+            raise RuntimeError(
+                "Immersive balanced layer cache has unsupported support_render_kind "
+                f"for {eye_label}: {support_render_kind}"
+            )
+        result[eye_label] = eye_output
+
+    _validate_immersive_balanced_render_outputs(render_plan, result)
+    return result
+
+
+def _extract_immersive_balanced_layer_outputs_from_render_outputs(
+    render_plan,
+    render_outputs,
+):
+    static_scene_mode = str(
+        render_plan.get("static_scene_mode", "balanced_focus")
+    ).strip().lower()
+    layer_outputs = {"left": {}, "right": {}}
+    for eye_label in ("left", "right"):
+        eye_output = render_outputs[eye_label]
+        if static_scene_mode == "balanced_focus":
+            layer_outputs[eye_label][IMMERSIVE_BALANCED_LAYER_BACKGROUND_BASE] = {
+                "color": eye_output["background_color"],
+                "depth": eye_output["background_depth"],
+                "render_info": None,
+                "render_wall_s": float(eye_output.get("background_render_wall_s", 0.0)),
+            }
+            layer_outputs[eye_label][IMMERSIVE_BALANCED_LAYER_TABLE_OVERLAY] = {
+                "color": eye_output["table_color"],
+                "depth": eye_output["table_depth"],
+                "render_info": copy.deepcopy(eye_output.get("table_render_info")),
+                "render_wall_s": float(eye_output.get("table_render_wall_s", 0.0)),
+            }
+            continue
+
+        support_render_kind = str(
+            eye_output.get("support_render_kind", "none")
+        ).strip().lower()
+        base_layer_name = (
+            IMMERSIVE_BALANCED_LAYER_FULL_BASE
+            if support_render_kind == "focus"
+            else IMMERSIVE_BALANCED_LAYER_BACKGROUND_BASE
+        )
+        layer_outputs[eye_label][base_layer_name] = {
+            "color": eye_output["base_color"],
+            "depth": eye_output["base_depth"],
+            "render_info": None,
+            "render_wall_s": float(eye_output.get("base_render_wall_s", 0.0)),
+        }
+        if support_render_kind == "none":
+            layer_outputs[eye_label][IMMERSIVE_BALANCED_LAYER_TABLE_BASE] = {
+                "color": eye_output["base_table_color"],
+                "depth": eye_output["base_table_depth"],
+                "render_info": None,
+                "render_wall_s": float(
+                    eye_output.get("base_table_render_wall_s", 0.0)
+                ),
+            }
+        elif support_render_kind == "table":
+            layer_outputs[eye_label][IMMERSIVE_BALANCED_LAYER_TABLE_OVERLAY] = {
+                "color": eye_output["support_color"],
+                "depth": eye_output["support_depth"],
+                "render_info": copy.deepcopy(eye_output.get("support_render_info")),
+                "render_wall_s": float(
+                    eye_output.get("support_render_wall_s", 0.0)
+                ),
+            }
+        elif support_render_kind == "focus":
+            layer_outputs[eye_label][IMMERSIVE_BALANCED_LAYER_SUPPORT_OVERLAY] = {
+                "color": eye_output["support_color"],
+                "depth": eye_output["support_depth"],
+                "render_info": copy.deepcopy(eye_output.get("support_render_info")),
+                "render_wall_s": float(
+                    eye_output.get("support_render_wall_s", 0.0)
+                ),
+            }
+    return layer_outputs
+
+
+def _validate_immersive_balanced_output_keys(payload, expected_keys, *, label):
+    actual_keys = set(payload.keys())
+    expected_keys = set(expected_keys)
+    if actual_keys != expected_keys:
+        missing_keys = sorted(expected_keys - actual_keys)
+        extra_keys = sorted(actual_keys - expected_keys)
+        raise RuntimeError(
+            f"Immersive balanced render output schema mismatch for {label}: "
+            f"missing={missing_keys} extra={extra_keys}"
+        )
+
+
+def _validate_immersive_balanced_tensor_shape(value, expected_shape, *, label):
+    if not torch.is_tensor(value):
+        raise RuntimeError(
+            f"Immersive balanced render output expected tensor for {label}, "
+            f"got {type(value).__name__}"
+        )
+    actual_shape = tuple(int(v) for v in value.shape)
+    expected_shape = tuple(int(v) for v in expected_shape)
+    if actual_shape != expected_shape:
+        raise RuntimeError(
+            f"Immersive balanced render output shape mismatch for {label}: "
+            f"expected={expected_shape} got={actual_shape}"
+        )
+
+
+def _validate_immersive_balanced_render_info(render_info, *, label):
+    if not isinstance(render_info, dict):
+        raise RuntimeError(
+            f"Immersive balanced render output expected dict render_info for {label}, "
+            f"got {type(render_info).__name__}"
+        )
+    required_keys = {
+        "roi_width",
+        "roi_height",
+        "render_width",
+        "render_height",
+        "render_scale",
+    }
+    missing_keys = sorted(required_keys - set(render_info.keys()))
+    if missing_keys:
+        raise RuntimeError(
+            f"Immersive balanced render output missing render_info keys for {label}: "
+            f"{missing_keys}"
+        )
+    render_width = int(render_info["render_width"])
+    render_height = int(render_info["render_height"])
+    if render_width <= 0 or render_height <= 0:
+        raise RuntimeError(
+            f"Immersive balanced render output has invalid render_info dims for {label}: "
+            f"render_width={render_width} render_height={render_height}"
+        )
+    return render_height, render_width
+
+
+def _validate_immersive_balanced_render_outputs(render_plan, render_outputs):
+    if not isinstance(render_outputs, dict):
+        raise RuntimeError(
+            "Immersive balanced render outputs must be a dict before assembly."
+        )
+    static_scene_mode = str(
+        render_plan.get("static_scene_mode", "balanced_focus")
+    ).strip().lower()
+    _validate_immersive_balanced_output_keys(
+        render_outputs,
+        {"static_scene_mode", "left", "right"},
+        label="top_level",
+    )
+    output_static_scene_mode = str(
+        render_outputs.get("static_scene_mode", "")
+    ).strip().lower()
+    if output_static_scene_mode != static_scene_mode:
+        raise RuntimeError(
+            "Immersive balanced render output static_scene_mode mismatch: "
+            f"expected={static_scene_mode} got={output_static_scene_mode}"
+        )
+
+    scene_width = int(render_plan["scene_width"])
+    scene_height = int(render_plan["scene_height"])
+    for eye_label in ("left", "right"):
+        eye_plan = render_plan[eye_label]
+        eye_output = render_outputs[eye_label]
+        eye_width = int(eye_plan["eye_width"])
+        eye_height = int(eye_plan["eye_height"])
+        full_scene_color_shape = (scene_height, scene_width, 4)
+        full_scene_depth_shape = (scene_height, scene_width)
+        eye_color_shape = (eye_height, eye_width, 4)
+        eye_depth_shape = (eye_height, eye_width)
+
+        if static_scene_mode == "balanced_focus":
+            _validate_immersive_balanced_output_keys(
+                eye_output,
+                {
+                    "background_color",
+                    "background_depth",
+                    "background_render_wall_s",
+                    "table_color",
+                    "table_depth",
+                    "table_render_info",
+                    "table_render_wall_s",
+                },
+                label=f"{eye_label}",
+            )
+            _validate_immersive_balanced_tensor_shape(
+                eye_output["background_color"],
+                full_scene_color_shape,
+                label=f"{eye_label}.background_color",
+            )
+            _validate_immersive_balanced_tensor_shape(
+                eye_output["background_depth"],
+                full_scene_depth_shape,
+                label=f"{eye_label}.background_depth",
+            )
+            if bool(eye_plan.get("table_fullframe_fallback", True)):
+                if eye_output.get("table_render_info") is not None:
+                    raise RuntimeError(
+                        f"Immersive balanced render output expected no table_render_info "
+                        f"for full-frame fallback in {eye_label}"
+                    )
+                _validate_immersive_balanced_tensor_shape(
+                    eye_output["table_color"],
+                    eye_color_shape,
+                    label=f"{eye_label}.table_color",
+                )
+                _validate_immersive_balanced_tensor_shape(
+                    eye_output["table_depth"],
+                    eye_depth_shape,
+                    label=f"{eye_label}.table_depth",
+                )
+            else:
+                render_height, render_width = _validate_immersive_balanced_render_info(
+                    eye_output.get("table_render_info"),
+                    label=f"{eye_label}.table_render_info",
+                )
+                _validate_immersive_balanced_tensor_shape(
+                    eye_output["table_color"],
+                    (render_height, render_width, 4),
+                    label=f"{eye_label}.table_color",
+                )
+                _validate_immersive_balanced_tensor_shape(
+                    eye_output["table_depth"],
+                    (render_height, render_width),
+                    label=f"{eye_label}.table_depth",
+                )
+            continue
+
+        if static_scene_mode != "balanced_support_focus":
+            raise RuntimeError(
+                f"Unsupported immersive static scene mode for validation: {static_scene_mode}"
+            )
+
+        _validate_immersive_balanced_output_keys(
+            eye_output,
+            {
+                "base_color",
+                "base_depth",
+                "base_render_wall_s",
+                "base_table_color",
+                "base_table_depth",
+                "base_table_render_wall_s",
+                "support_render_kind",
+                "support_color",
+                "support_depth",
+                "support_render_info",
+                "support_render_wall_s",
+            },
+            label=f"{eye_label}",
+        )
+        _validate_immersive_balanced_tensor_shape(
+            eye_output["base_color"],
+            full_scene_color_shape,
+            label=f"{eye_label}.base_color",
+        )
+        _validate_immersive_balanced_tensor_shape(
+            eye_output["base_depth"],
+            full_scene_depth_shape,
+            label=f"{eye_label}.base_depth",
+        )
+        support_render_kind = str(
+            eye_output.get("support_render_kind", "none")
+        ).strip().lower()
+        expected_support_render_kind = str(
+            eye_plan.get("support_render_kind", "none")
+        ).strip().lower()
+        if support_render_kind != expected_support_render_kind:
+            raise RuntimeError(
+                "Immersive balanced render output support_render_kind mismatch for "
+                f"{eye_label}: expected={expected_support_render_kind} got={support_render_kind}"
+            )
+
+        if support_render_kind == "none":
+            _validate_immersive_balanced_tensor_shape(
+                eye_output["base_table_color"],
+                full_scene_color_shape,
+                label=f"{eye_label}.base_table_color",
+            )
+            _validate_immersive_balanced_tensor_shape(
+                eye_output["base_table_depth"],
+                full_scene_depth_shape,
+                label=f"{eye_label}.base_table_depth",
+            )
+            if eye_output.get("support_color") is not None:
+                raise RuntimeError(
+                    f"Immersive balanced render output expected no support_color for {eye_label}.none"
+                )
+            if eye_output.get("support_depth") is not None:
+                raise RuntimeError(
+                    f"Immersive balanced render output expected no support_depth for {eye_label}.none"
+                )
+            if eye_output.get("support_render_info") is not None:
+                raise RuntimeError(
+                    f"Immersive balanced render output expected no support_render_info for {eye_label}.none"
+                )
+            continue
+
+        if eye_output.get("base_table_color") is not None:
+            raise RuntimeError(
+                f"Immersive balanced render output expected no base_table_color for {eye_label}.{support_render_kind}"
+            )
+        if eye_output.get("base_table_depth") is not None:
+            raise RuntimeError(
+                f"Immersive balanced render output expected no base_table_depth for {eye_label}.{support_render_kind}"
+            )
+        if support_render_kind not in {"table", "focus"}:
+            raise RuntimeError(
+                f"Immersive balanced render output has invalid support_render_kind for {eye_label}: "
+                f"{support_render_kind}"
+            )
+        if bool(eye_plan.get("support_fullframe_fallback", True)):
+            if eye_output.get("support_render_info") is not None:
+                raise RuntimeError(
+                    f"Immersive balanced render output expected no support_render_info "
+                    f"for full-frame {eye_label}.{support_render_kind}"
+                )
+            _validate_immersive_balanced_tensor_shape(
+                eye_output["support_color"],
+                eye_color_shape,
+                label=f"{eye_label}.support_color",
+            )
+            _validate_immersive_balanced_tensor_shape(
+                eye_output["support_depth"],
+                eye_depth_shape,
+                label=f"{eye_label}.support_depth",
+            )
+        else:
+            render_height, render_width = _validate_immersive_balanced_render_info(
+                eye_output.get("support_render_info"),
+                label=f"{eye_label}.support_render_info",
+            )
+            _validate_immersive_balanced_tensor_shape(
+                eye_output["support_color"],
+                (render_height, render_width, 4),
+                label=f"{eye_label}.support_color",
+            )
+            _validate_immersive_balanced_tensor_shape(
+                eye_output["support_depth"],
+                (render_height, render_width),
+                label=f"{eye_label}.support_depth",
+            )
+
+
+def _execute_immersive_balanced_scene_render_plan(
+    renderer,
+    render_plan,
+    *,
+    tensor_validator=None,
+):
+    static_scene_mode = str(
+        render_plan.get("static_scene_mode", "balanced_focus")
+    ).strip().lower()
+    result = {
+        "static_scene_mode": static_scene_mode,
+        "left": {},
+        "right": {},
+    }
+
+    if static_scene_mode not in {
+        "balanced_focus",
+        "balanced_support_focus",
+    }:
+        raise ValueError(f"Unsupported immersive static scene mode: {static_scene_mode}")
+
+    for eye_label in ("left", "right"):
+        eye_request = _build_immersive_balanced_scene_eye_request(
+            render_plan,
+            eye_label,
+        )
+        result[eye_label] = _execute_immersive_balanced_scene_render_eye(
+            renderer,
+            eye_request,
+            tensor_validator=tensor_validator,
+        )
+    _validate_immersive_balanced_render_outputs(render_plan, result)
+    return result
+
+
+def _execute_immersive_balanced_scene_render_plan_parallel(
+    eye_workers,
+    render_plan,
+):
+    static_scene_mode = str(
+        render_plan.get("static_scene_mode", "balanced_focus")
+    ).strip().lower()
+    result = {
+        "static_scene_mode": static_scene_mode,
+        "left": {},
+        "right": {},
+    }
+    parallel_dispatch_start = time.perf_counter()
+    eye_requests = {
+        eye_label: _build_immersive_balanced_scene_eye_request(render_plan, eye_label)
+        for eye_label in ("left", "right")
+    }
+    eye_dispatch_wall_s = {}
+    for eye_label in ("left", "right"):
+        enqueue_wall_time_s = time.perf_counter()
+        dispatch_start = enqueue_wall_time_s
+        eye_workers[eye_label].submit(
+            eye_requests[eye_label],
+            enqueue_wall_time_s=enqueue_wall_time_s,
+        )
+        eye_dispatch_wall_s[eye_label] = time.perf_counter() - dispatch_start
+    parallel_dispatch_wall_s = time.perf_counter() - parallel_dispatch_start
+    parallel_wait_start = time.perf_counter()
+    worker_results = {
+        eye_label: eye_workers[eye_label].get_result(timeout=60.0)
+        for eye_label in ("left", "right")
+    }
+    parallel_wait_wall_s = time.perf_counter() - parallel_wait_start
+    for eye_label in ("left", "right"):
+        worker_eye_label = str(
+            worker_results[eye_label].get("eye_label", eye_label)
+        ).strip().lower()
+        if worker_eye_label != eye_label:
+            raise RuntimeError(
+                "Immersive balanced eye-parallel worker returned mismatched eye "
+                f"payload: expected={eye_label} got={worker_eye_label}"
+            )
+        result[eye_label] = worker_results[eye_label]["eye_output"]
+    _validate_immersive_balanced_render_outputs(render_plan, result)
+    left_worker_wall_s = (
+        float(worker_results["left"].get("worker_wall_ms", 0.0)) / 1000.0
+    )
+    right_worker_wall_s = (
+        float(worker_results["right"].get("worker_wall_ms", 0.0)) / 1000.0
+    )
+    parallel_join_overhead_s = max(
+        0.0,
+        float(parallel_wait_wall_s) - max(left_worker_wall_s, right_worker_wall_s),
+    )
+    # Render-profile time metrics are stored in seconds even when the key name
+    # ends with "_ms"; the formatter converts them to milliseconds later.
+    metrics = {
+        "scene_render_eye_left_total_ms": left_worker_wall_s,
+        "scene_render_eye_right_total_ms": right_worker_wall_s,
+        "scene_render_eye_left_dispatch_ms": float(
+            eye_dispatch_wall_s.get("left", 0.0)
+        ),
+        "scene_render_eye_right_dispatch_ms": float(
+            eye_dispatch_wall_s.get("right", 0.0)
+        ),
+        "scene_render_eye_left_queue_wait_ms": float(
+            worker_results["left"].get("queue_wait_ms", 0.0)
+        )
+        / 1000.0,
+        "scene_render_eye_right_queue_wait_ms": float(
+            worker_results["right"].get("queue_wait_ms", 0.0)
+        )
+        / 1000.0,
+        "scene_render_parallel_dispatch_ms": float(parallel_dispatch_wall_s),
+        "scene_render_parallel_wait_ms": float(parallel_wait_wall_s),
+        "scene_render_parallel_join_overhead_ms": float(parallel_join_overhead_s),
+    }
+    return result, metrics
+
+
+class _ImmersiveBalancedSceneEyeRenderWorker:
+    def __init__(
+        self,
+        *,
+        eye_label,
+        scene_assets_root,
+        scene_width,
+        scene_height,
+        lighting_mode,
+        balanced_render_backend,
+        static_scene_mode,
+        layout,
+        cuda_device_index,
+    ):
+        eye_label = str(eye_label).strip().lower()
+        if eye_label not in {"left", "right"}:
+            raise ValueError(
+                f"Unsupported immersive balanced eye worker label: {eye_label}"
+            )
+        self._eye_label = eye_label
+        self._scene_assets_root = scene_assets_root
+        self._scene_width = int(scene_width)
+        self._scene_height = int(scene_height)
+        self._lighting_mode = str(lighting_mode)
+        self._balanced_render_backend = str(balanced_render_backend)
+        self._static_scene_mode = str(static_scene_mode).strip().lower()
+        self._layout = copy.deepcopy(layout)
+        self._cuda_device_index = int(cuda_device_index)
+        self._request_queue: queue.Queue = queue.Queue(maxsize=1)
+        self._response_queue: queue.Queue = queue.Queue(maxsize=1)
+        self._thread = None
+        self._startup_validation_request = None
+        self._startup_warmup_kwargs = None
+        self._worker_readback_mode = None
+        self._worker_readback_reason = None
+        self._worker_warmup_paths = []
+
+    @staticmethod
+    def _require_cuda_tensor(value, *, label):
+        if not torch.is_tensor(value):
+            raise TypeError(
+                f"Immersive balanced eye worker expected tensor output for {label}, "
+                f"got {type(value).__name__}."
+            )
+        if value.device.type != "cuda":
+            raise TypeError(
+                f"Immersive balanced eye worker expected CUDA tensor output for {label}, "
+                f"got device={value.device}."
+            )
+        return value.contiguous()
+
+    @staticmethod
+    def _attach_worker_cuda_context(cuda_device_index):
+        cuda_driver.init()
+        cuda_device = cuda_driver.Device(int(cuda_device_index))
+        worker_cuda_context = cuda_device.retain_primary_context()
+        worker_cuda_context.push()
+        return worker_cuda_context
+
+    def start(self, validation_request=None, warmup_kwargs=None):
+        if self._thread is not None:
+            return {
+                "readback_mode": self._worker_readback_mode,
+                "readback_reason": self._worker_readback_reason,
+                "warmup_paths": list(self._worker_warmup_paths),
+            }
+        self._startup_validation_request = copy.deepcopy(validation_request)
+        self._startup_warmup_kwargs = copy.deepcopy(warmup_kwargs)
+        self._thread = threading.Thread(
+            target=self._thread_main,
+            name=f"ImmersiveBalancedEyeWorker-{self._eye_label}",
+            daemon=True,
+        )
+        self._thread.start()
+        init_result = self._response_queue.get(timeout=120.0)
+        self._worker_readback_mode = init_result.get("readback_mode")
+        self._worker_readback_reason = init_result.get("readback_reason")
+        self._worker_warmup_paths = list(init_result.get("warmup_paths") or [])
+        if not bool(init_result.get("ok", False)):
+            raise RuntimeError(
+                "Failed to initialize immersive balanced eye worker "
+                f"{self._eye_label}: {init_result.get('error', 'unknown error')}"
+            )
+        return {
+            "readback_mode": self._worker_readback_mode,
+            "readback_reason": self._worker_readback_reason,
+            "warmup_paths": list(self._worker_warmup_paths),
+        }
+
+    def stop(self):
+        if self._thread is None:
+            return
+        try:
+            self._request_queue.put({"type": "stop"}, timeout=1.0)
+        except queue.Full:
+            pass
+        self._thread.join(timeout=10.0)
+        self._thread = None
+
+    def submit(self, request, *, enqueue_wall_time_s=None):
+        if self._thread is None:
+            raise RuntimeError(
+                f"Immersive balanced eye worker {self._eye_label} has not been started."
+            )
+        self._request_queue.put(
+            {
+                "type": "render",
+                "request": request,
+                "enqueue_wall_time_s": enqueue_wall_time_s,
+            },
+            timeout=10.0,
+        )
+
+    def get_result(self, timeout=None):
+        if self._thread is None:
+            raise RuntimeError(
+                f"Immersive balanced eye worker {self._eye_label} has not been started."
+            )
+        result = self._response_queue.get(timeout=timeout)
+        if not bool(result.get("ok", False)):
+            raise RuntimeError(
+                "Immersive balanced eye worker render failed "
+                f"for {self._eye_label}: {result.get('error', 'unknown error')}"
+            )
+        return result["payload"]
+
+    def _thread_main(self):
+        renderer = None
+        execute_renderer = None
+        worker_cuda_context = None
+        try:
+            if torch.cuda.is_available():
+                torch.cuda.set_device(self._cuda_device_index)
+                worker_cuda_context = self._attach_worker_cuda_context(
+                    self._cuda_device_index
+                )
+            renderer = SimpleLabSceneRenderer(
+                scene_assets_root=self._scene_assets_root,
+                width=self._scene_width,
+                height=self._scene_height,
+                lighting_mode=self._lighting_mode,
+                balanced_render_backend=self._balanced_render_backend,
+                scene_analysis_cache_mode="auto",
+            )
+            renderer.set_layout(self._layout)
+            execute_renderer = renderer
+            warmup_paths = []
+            if self._startup_warmup_kwargs is not None:
+                warmup_paths = renderer.warmup_balanced_runtime_paths(
+                    **self._startup_warmup_kwargs
+                )
+            if self._startup_validation_request is not None:
+                _ = _execute_immersive_balanced_scene_render_eye(
+                    execute_renderer,
+                    self._startup_validation_request,
+                    tensor_validator=self._require_cuda_tensor,
+                )
+            worker_readback_mode = str(renderer.pyrender_readback_mode())
+            worker_readback_reason = renderer.pyrender_readback_reason()
+            if worker_readback_mode != "gl_cuda_interop":
+                raise RuntimeError(
+                    "immersive balanced eye-parallel rendering requires worker "
+                    "pyrender_readback_mode=gl_cuda_interop "
+                    f"(mode={worker_readback_mode} reason={worker_readback_reason})"
+                )
+            self._response_queue.put(
+                {
+                    "ok": True,
+                    "readback_mode": worker_readback_mode,
+                    "readback_reason": worker_readback_reason,
+                    "warmup_paths": list(warmup_paths),
+                }
+            )
+            while True:
+                item = self._request_queue.get()
+                if item.get("type") == "stop":
+                    break
+                if item.get("type") != "render":
+                    continue
+                request = item["request"]
+                request_eye_label = str(
+                    request.get("eye_label", self._eye_label)
+                ).strip().lower()
+                if request_eye_label != self._eye_label:
+                    raise RuntimeError(
+                        "Immersive balanced eye worker received mismatched request: "
+                        f"worker={self._eye_label} request={request_eye_label}"
+                    )
+                dequeue_wall_time_s = time.perf_counter()
+                enqueue_wall_time_s = item.get("enqueue_wall_time_s")
+                queue_wait_ms = 0.0
+                if enqueue_wall_time_s is not None:
+                    queue_wait_ms = max(
+                        0.0,
+                        (dequeue_wall_time_s - float(enqueue_wall_time_s)) * 1000.0,
+                    )
+                render_start = time.perf_counter()
+                eye_output = _execute_immersive_balanced_scene_render_eye(
+                    execute_renderer,
+                    request,
+                    tensor_validator=self._require_cuda_tensor,
+                )
+                worker_wall_ms = 1000.0 * (time.perf_counter() - render_start)
+                self._response_queue.put(
+                    {
+                        "ok": True,
+                        "payload": {
+                            "eye_label": self._eye_label,
+                            "eye_output": eye_output,
+                            "queue_wait_ms": float(queue_wait_ms),
+                            "worker_wall_ms": float(worker_wall_ms),
+                        },
+                    }
+                )
+        except Exception as exc:
+            self._response_queue.put(
+                {
+                    "ok": False,
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "readback_mode": None
+                    if renderer is None
+                    else str(renderer.pyrender_readback_mode()),
+                    "readback_reason": None
+                    if renderer is None
+                    else renderer.pyrender_readback_reason(),
+                }
+            )
+        finally:
+            if execute_renderer is not None and execute_renderer is not renderer:
+                execute_renderer.delete()
+            if renderer is not None:
+                renderer.delete()
+            if worker_cuda_context is not None:
+                try:
+                    worker_cuda_context.pop()
+                except Exception:
+                    pass
+                try:
+                    worker_cuda_context.detach()
+                except Exception:
+                    pass
 
 
 class _ImmersiveStaticSceneRenderWorker:
@@ -227,6 +1422,7 @@ class _ImmersiveStaticSceneRenderWorker:
         scene_height,
         lighting_mode,
         balanced_render_backend,
+        static_scene_mode,
         layout,
         cuda_device_index,
     ):
@@ -235,14 +1431,17 @@ class _ImmersiveStaticSceneRenderWorker:
         self._scene_height = int(scene_height)
         self._lighting_mode = str(lighting_mode)
         self._balanced_render_backend = str(balanced_render_backend)
+        self._static_scene_mode = str(static_scene_mode).strip().lower()
         self._layout = copy.deepcopy(layout)
         self._cuda_device_index = int(cuda_device_index)
         self._request_queue: queue.Queue = queue.Queue(maxsize=1)
         self._response_queue: queue.Queue = queue.Queue(maxsize=1)
         self._thread = None
         self._startup_validation_request = None
+        self._startup_warmup_kwargs = None
         self._worker_readback_mode = None
         self._worker_readback_reason = None
+        self._worker_warmup_paths = []
 
     @staticmethod
     def _require_cuda_tensor(value, *, label):
@@ -266,13 +1465,15 @@ class _ImmersiveStaticSceneRenderWorker:
         worker_cuda_context.push()
         return worker_cuda_context
 
-    def start(self, validation_request=None):
+    def start(self, validation_request=None, warmup_kwargs=None):
         if self._thread is not None:
             return {
                 "readback_mode": self._worker_readback_mode,
                 "readback_reason": self._worker_readback_reason,
+                "warmup_paths": list(self._worker_warmup_paths),
             }
         self._startup_validation_request = validation_request
+        self._startup_warmup_kwargs = copy.deepcopy(warmup_kwargs)
         self._thread = threading.Thread(
             target=self._thread_main,
             name="ImmersiveStaticSceneWorker",
@@ -282,6 +1483,7 @@ class _ImmersiveStaticSceneRenderWorker:
         init_result = self._response_queue.get(timeout=120.0)
         self._worker_readback_mode = init_result.get("readback_mode")
         self._worker_readback_reason = init_result.get("readback_reason")
+        self._worker_warmup_paths = list(init_result.get("warmup_paths") or [])
         if not bool(init_result.get("ok", False)):
             raise RuntimeError(
                 "Failed to initialize immersive static-scene worker: "
@@ -290,6 +1492,7 @@ class _ImmersiveStaticSceneRenderWorker:
         return {
             "readback_mode": self._worker_readback_mode,
             "readback_reason": self._worker_readback_reason,
+            "warmup_paths": list(self._worker_warmup_paths),
         }
 
     def stop(self):
@@ -320,6 +1523,7 @@ class _ImmersiveStaticSceneRenderWorker:
 
     def _thread_main(self):
         renderer = None
+        execute_renderer = None
         worker_cuda_context = None
         try:
             if torch.cuda.is_available():
@@ -336,9 +1540,15 @@ class _ImmersiveStaticSceneRenderWorker:
                 scene_analysis_cache_mode="auto",
             )
             renderer.set_layout(self._layout)
+            execute_renderer = renderer
+            warmup_paths = []
+            if self._startup_warmup_kwargs is not None:
+                warmup_paths = renderer.warmup_balanced_runtime_paths(
+                    **self._startup_warmup_kwargs
+                )
             if self._startup_validation_request is not None:
                 _ = _execute_immersive_balanced_scene_render_plan(
-                    renderer,
+                    execute_renderer,
                     self._startup_validation_request,
                     tensor_validator=self._require_cuda_tensor,
                 )
@@ -355,6 +1565,7 @@ class _ImmersiveStaticSceneRenderWorker:
                     "ok": True,
                     "readback_mode": worker_readback_mode,
                     "readback_reason": worker_readback_reason,
+                    "warmup_paths": list(warmup_paths),
                 }
             )
             while True:
@@ -365,11 +1576,18 @@ class _ImmersiveStaticSceneRenderWorker:
                     continue
                 request = item["request"]
                 render_start = time.perf_counter()
-                payload = _execute_immersive_balanced_scene_render_plan(
-                    renderer,
-                    request,
-                    tensor_validator=self._require_cuda_tensor,
-                )
+                if str(request.get("request_type", "")).strip().lower() == "balanced_layers":
+                    payload = _execute_immersive_balanced_scene_render_layers(
+                        execute_renderer,
+                        request,
+                        tensor_validator=self._require_cuda_tensor,
+                    )
+                else:
+                    payload = _execute_immersive_balanced_scene_render_plan(
+                        execute_renderer,
+                        request,
+                        tensor_validator=self._require_cuda_tensor,
+                    )
                 payload["worker_wall_ms"] = 1000.0 * (
                     time.perf_counter() - render_start
                 )
@@ -384,6 +1602,8 @@ class _ImmersiveStaticSceneRenderWorker:
                 }
             )
         finally:
+            if execute_renderer is not None and execute_renderer is not renderer:
+                execute_renderer.delete()
             if renderer is not None:
                 renderer.delete()
             if worker_cuda_context is not None:
@@ -395,6 +1615,4291 @@ class _ImmersiveStaticSceneRenderWorker:
                     worker_cuda_context.detach()
                 except Exception:
                     pass
+
+
+class _ImmersivePresentationWorkerLegacy:
+    def __init__(
+        self,
+        *,
+        owner,
+        immersive_bridge,
+        eye_width,
+        eye_height,
+        preview_enabled,
+        cuda_device_index,
+    ):
+        self._owner = owner
+        self._immersive_bridge = immersive_bridge
+        self._eye_width = int(eye_width)
+        self._eye_height = int(eye_height)
+        self._preview_enabled = bool(preview_enabled)
+        self._cuda_device_index = int(cuda_device_index)
+        self._thread = None
+        self._response_queue: queue.Queue = queue.Queue()
+        self._condition = threading.Condition()
+        self._pending_packet = None
+        self._processing_packet = False
+        self._stop_requested = False
+        self._scene_reproject_caches = {}
+        self._submit_serial = 0
+        self._latest_submitted_serial = 0
+        self._synthetic_source_state = None
+        self._stable_cover_left_frame = None
+        self._stable_cover_right_frame = None
+        self._stable_cover_preview_frame = None
+
+    @staticmethod
+    def _attach_worker_cuda_context(cuda_device_index):
+        cuda_driver.init()
+        cuda_device = cuda_driver.Device(int(cuda_device_index))
+        worker_cuda_context = cuda_device.retain_primary_context()
+        worker_cuda_context.push()
+        return worker_cuda_context
+
+    @staticmethod
+    def _make_high_priority_stream():
+        return torch.cuda.Stream(priority=-1)
+
+    @staticmethod
+    def _elapsed_event_ms(start_event, end_event):
+        if start_event is None or end_event is None:
+            return 0.0
+        try:
+            if not end_event.query():
+                end_event.synchronize()
+        except Exception:
+            end_event.synchronize()
+        return float(start_event.elapsed_time(end_event))
+
+    def _reset_stable_cover_frame_cache(self):
+        self._stable_cover_left_frame = None
+        self._stable_cover_right_frame = None
+        self._stable_cover_preview_frame = None
+
+    def _update_stable_cover_frame_cache(
+        self,
+        *,
+        left_frame,
+        right_frame,
+        preview_frame=None,
+    ):
+        if not torch.is_tensor(left_frame) or not torch.is_tensor(right_frame):
+            self._reset_stable_cover_frame_cache()
+            return
+        self._stable_cover_left_frame = left_frame.clone()
+        self._stable_cover_right_frame = right_frame.clone()
+        if preview_frame is None:
+            preview_frame = left_frame
+        self._stable_cover_preview_frame = (
+            None if preview_frame is None else preview_frame.clone()
+        )
+
+    def _build_stable_cover_publish_payload(
+        self,
+        *,
+        source_frame_index,
+        queue_wait_ms,
+        worker_start,
+        reject_source,
+        affected_sources,
+        trigger_reasons,
+        blue_scene_exposure_reject,
+        gaussian_blue_source_reject,
+        compose_reject_metrics,
+    ):
+        owner = self._owner
+        cover_result = owner._publish_immersive_stable_cover_frame(
+            self._immersive_bridge,
+            left_eye_frame=self._stable_cover_left_frame,
+            right_eye_frame=self._stable_cover_right_frame,
+            preview_frame=self._stable_cover_preview_frame,
+            reject_source=reject_source,
+            backend_kind="legacy_single_worker",
+        )
+        if not bool(cover_result.get("cache_hit", False)):
+            return None
+        preview_frame = cover_result.get("preview_frame")
+        if torch.is_tensor(preview_frame):
+            preview_frame = preview_frame.clone()
+        worker_wall_ms = 1000.0 * (time.perf_counter() - worker_start)
+        return {
+            "payload_kind": "stable_cover_publish",
+            "presentation_backend_kind": "legacy_single_worker",
+            "source_frame_index": int(source_frame_index),
+            "queue_wait_ms": float(queue_wait_ms),
+            "worker_wall_ms": float(worker_wall_ms),
+            "publish_wall_ms": float(cover_result.get("publish_wall_ms", 0.0)),
+            "affected_sources": list(affected_sources or []),
+            "trigger_reasons": list(trigger_reasons or []),
+            "blue_scene_exposure_reject": bool(blue_scene_exposure_reject),
+            "gaussian_blue_source_reject": bool(gaussian_blue_source_reject),
+            "compose_reject_metrics": copy.deepcopy(compose_reject_metrics or {}),
+            "reject_source": str(reject_source).strip().lower(),
+            "cover_cache_hit": True,
+            "cover_cache_missing": False,
+            "preview_frame": preview_frame,
+            "preview_ready_event": None,
+        }
+
+    def start(self):
+        if self._thread is not None:
+            return
+        self._stop_requested = False
+        self._reset_stable_cover_frame_cache()
+        self._thread = threading.Thread(
+            target=self._thread_main,
+            name="ImmersivePresentationWorker",
+            daemon=True,
+        )
+        self._thread.start()
+        init_result = self._response_queue.get(timeout=120.0)
+        if not bool(init_result.get("ok", False)):
+            raise RuntimeError(
+                "Failed to initialize immersive presentation worker: "
+                f"{init_result.get('error', 'unknown error')}"
+            )
+
+    def stop(self):
+        if self._thread is None:
+            return {"dropped_packet": None, "results": []}
+        with self._condition:
+            dropped_packet = self._pending_packet
+            self._pending_packet = None
+            self._synthetic_source_state = None
+            self._stop_requested = True
+            self._condition.notify_all()
+        self._thread.join(timeout=10.0)
+        self._thread = None
+        self._reset_stable_cover_frame_cache()
+        results = []
+        while True:
+            try:
+                results.append(self._response_queue.get_nowait())
+            except queue.Empty:
+                break
+        return {
+            "dropped_packet": dropped_packet,
+            "results": results,
+        }
+
+    def submit(self, packet):
+        if self._thread is None:
+            raise RuntimeError("Immersive presentation worker has not been started.")
+        with self._condition:
+            if self._stop_requested:
+                raise RuntimeError("Immersive presentation worker is stopping.")
+            synthetic_skip_payload = None
+            if self._synthetic_source_state is not None:
+                synthetic_skip_payload = self._build_synthetic_skip_payload(
+                    self._synthetic_source_state,
+                    reason="stale_packet",
+                )
+                self._synthetic_source_state = None
+            self._submit_serial += 1
+            packet["submit_serial"] = int(self._submit_serial)
+            self._latest_submitted_serial = int(self._submit_serial)
+            dropped_packet = self._pending_packet
+            self._pending_packet = packet
+            self._condition.notify_all()
+        if synthetic_skip_payload is not None:
+            self._response_queue.put(
+                {
+                    "ok": True,
+                    "payload": synthetic_skip_payload,
+                }
+            )
+        return dropped_packet
+
+    def poll_result(self):
+        if self._thread is None:
+            return None
+        try:
+            return self._response_queue.get_nowait()
+        except queue.Empty:
+            return None
+
+    def wait_for_idle(self, timeout=None):
+        if self._thread is None:
+            return True
+        deadline = None if timeout is None else (time.perf_counter() + float(timeout))
+        with self._condition:
+            while True:
+                if (
+                    self._pending_packet is None
+                    and not self._processing_packet
+                    and self._synthetic_source_state is None
+                ):
+                    return True
+                if deadline is None:
+                    self._condition.wait(timeout=0.05)
+                    continue
+                remaining = deadline - time.perf_counter()
+                if remaining <= 0.0:
+                    return False
+                self._condition.wait(timeout=min(0.05, remaining))
+
+    def _build_synthetic_source_state(
+        self,
+        *,
+        packet,
+        left_eye_frame,
+        left_eye_frame_depth,
+        right_eye_frame,
+        right_eye_frame_depth,
+        source_sample_id=None,
+        source_left_eye_pose_world=None,
+        source_right_eye_pose_world=None,
+        source_left_intrinsic=None,
+        source_right_intrinsic=None,
+        real_publish_sample_id=None,
+        scene_source_received_monotonic_s=None,
+    ):
+        framegen_mode = str(packet.get("immersive_framegen_mode", "off")).strip().lower()
+        if framegen_mode not in {"static", "adaptive"}:
+            return None
+        if not bool(packet.get("scene_depth_reproject_enabled", False)):
+            return None
+        resolved_source_sample_id = int(
+            packet["scene_source_sample_id"]
+            if source_sample_id is None
+            else source_sample_id
+        )
+        resolved_left_eye_pose_world = (
+            packet["scene_source_left_eye_pose_world"]
+            if source_left_eye_pose_world is None
+            else source_left_eye_pose_world
+        )
+        resolved_right_eye_pose_world = (
+            packet["scene_source_right_eye_pose_world"]
+            if source_right_eye_pose_world is None
+            else source_right_eye_pose_world
+        )
+        resolved_left_intrinsic = (
+            packet["scene_source_left_intrinsic"]
+            if source_left_intrinsic is None
+            else source_left_intrinsic
+        )
+        resolved_right_intrinsic = (
+            packet["scene_source_right_intrinsic"]
+            if source_right_intrinsic is None
+            else source_right_intrinsic
+        )
+        resolved_scene_source_received_monotonic_s = (
+            packet.get("scene_source_received_monotonic_s")
+            if scene_source_received_monotonic_s is None
+            else scene_source_received_monotonic_s
+        )
+        return {
+            "source_frame_index": int(packet["source_frame_index"]),
+            "submit_serial": int(packet.get("submit_serial", 0)),
+            "framegen_mode": framegen_mode,
+            "source_ready_wall_time_s": float(packet["source_ready_wall_time_s"]),
+            "scene_source_ready_wall_time_s": float(packet["source_ready_wall_time_s"]),
+            "synthetic_source_ready_wall_time_s": float(
+                packet["source_ready_wall_time_s"]
+            ),
+            "scene_source_sample_id": int(resolved_source_sample_id),
+            "real_publish_sample_id": int(
+                resolved_source_sample_id
+                if real_publish_sample_id is None
+                else real_publish_sample_id
+            ),
+            "scene_source_left_eye_pose_world": np.asarray(
+                resolved_left_eye_pose_world,
+                dtype=np.float32,
+            ).copy(),
+            "scene_source_right_eye_pose_world": np.asarray(
+                resolved_right_eye_pose_world,
+                dtype=np.float32,
+            ).copy(),
+            "scene_source_left_intrinsic": np.asarray(
+                resolved_left_intrinsic,
+                dtype=np.float32,
+            ).copy(),
+            "scene_source_right_intrinsic": np.asarray(
+                resolved_right_intrinsic,
+                dtype=np.float32,
+            ).copy(),
+            "render_sample_received_monotonic_s": packet.get(
+                "render_sample_received_monotonic_s"
+            ),
+            "scene_source_received_monotonic_s": resolved_scene_source_received_monotonic_s,
+            "static_scene_reuse_age_frames": float(
+                packet.get("static_scene_reuse_age_frames", 0.0)
+            ),
+            "live_head_alignment": packet.get("live_head_alignment"),
+            "head_pose_state": packet.get("head_pose_state"),
+            "left_eye_frame": left_eye_frame.clone(),
+            "left_eye_frame_depth": left_eye_frame_depth.clone(),
+            "right_eye_frame": right_eye_frame.clone(),
+            "right_eye_frame_depth": right_eye_frame_depth.clone(),
+            "controller_overlay_entries": copy.deepcopy(
+                packet.get("controller_overlay_entries") or []
+            ),
+            "support_overlay_enabled": bool(
+                packet.get("support_overlay_enabled", False)
+            ),
+            "support_overlay_cache": packet.get("support_overlay_cache"),
+            "support_overlay_active_support_id": packet.get(
+                "support_overlay_active_support_id"
+            ),
+            "left_overlay_eye_render_state": packet["left_overlay_eye_render_state"],
+            "right_overlay_eye_render_state": packet["right_overlay_eye_render_state"],
+            "synthetic_source_real_timewarp_applied": 0.0,
+            "synthetic_source_real_timewarp_fallback_left": 0.0,
+            "synthetic_source_real_timewarp_fallback_right": 0.0,
+            "synthetic_source_consistent": 1.0,
+            "synthetic_source_inconsistent_reason": "",
+            "synthetic_emitted": False,
+        }
+
+    def _build_actual_real_view_source_bundle(
+        self,
+        *,
+        packet,
+        left_eye_frame,
+        left_eye_frame_depth,
+        right_eye_frame,
+        right_eye_frame_depth,
+        publish_state,
+        publish_sample_id,
+        left_overlay_eye_render_state,
+        right_overlay_eye_render_state,
+        real_timewarp_applied,
+        left_timewarp_fallback_used,
+        right_timewarp_fallback_used,
+        scene_source_received_monotonic_s=None,
+    ):
+        original_source_sample_id = int(
+            packet.get(
+                "scene_source_sample_id",
+                packet.get("render_sample_id", -1),
+            )
+        )
+        original_left_eye_pose_world = packet.get("scene_source_left_eye_pose_world")
+        original_right_eye_pose_world = packet.get("scene_source_right_eye_pose_world")
+        original_left_intrinsic = packet.get("scene_source_left_intrinsic")
+        original_right_intrinsic = packet.get("scene_source_right_intrinsic")
+        publish_left_eye_pose_world = None
+        publish_right_eye_pose_world = None
+        publish_left_intrinsic = None
+        publish_right_intrinsic = None
+        if publish_state is not None:
+            publish_left_eye_pose_world = publish_state.get(
+                "publish_left_eye_pose_world"
+            )
+            publish_right_eye_pose_world = publish_state.get(
+                "publish_right_eye_pose_world"
+            )
+            publish_left_intrinsic = publish_state.get("publish_left_intrinsic")
+            publish_right_intrinsic = publish_state.get("publish_right_intrinsic")
+
+        left_real_timewarp_applied = bool(real_timewarp_applied) and not bool(
+            left_timewarp_fallback_used
+        )
+        right_real_timewarp_applied = bool(real_timewarp_applied) and not bool(
+            right_timewarp_fallback_used
+        )
+        left_real_timewarp_fallback = bool(real_timewarp_applied) and bool(
+            left_timewarp_fallback_used
+        )
+        right_real_timewarp_fallback = bool(real_timewarp_applied) and bool(
+            right_timewarp_fallback_used
+        )
+
+        actual_left_eye_pose_world = (
+            publish_left_eye_pose_world
+            if left_real_timewarp_applied
+            else original_left_eye_pose_world
+        )
+        actual_right_eye_pose_world = (
+            publish_right_eye_pose_world
+            if right_real_timewarp_applied
+            else original_right_eye_pose_world
+        )
+        actual_left_intrinsic = (
+            publish_left_intrinsic
+            if left_real_timewarp_applied
+            else original_left_intrinsic
+        )
+        actual_right_intrinsic = (
+            publish_right_intrinsic
+            if right_real_timewarp_applied
+            else original_right_intrinsic
+        )
+
+        consistent = True
+        inconsistent_reason = ""
+        if left_real_timewarp_applied != right_real_timewarp_applied:
+            consistent = False
+            inconsistent_reason = "mixed_eye_real_timewarp"
+        elif (
+            actual_left_eye_pose_world is None
+            or actual_right_eye_pose_world is None
+            or actual_left_intrinsic is None
+            or actual_right_intrinsic is None
+        ):
+            consistent = False
+            inconsistent_reason = "missing_actual_source_metadata"
+
+        if left_real_timewarp_applied and right_real_timewarp_applied:
+            actual_source_sample_id = int(publish_sample_id)
+            actual_source_received_monotonic_s = scene_source_received_monotonic_s
+            actual_source_kind = "timewarped_publish"
+        else:
+            actual_source_sample_id = int(original_source_sample_id)
+            actual_source_received_monotonic_s = packet.get(
+                "scene_source_received_monotonic_s"
+            )
+            actual_source_kind = "scene_source"
+        if actual_source_received_monotonic_s is None:
+            actual_source_received_monotonic_s = packet.get(
+                "scene_source_received_monotonic_s"
+            )
+
+        return {
+            "left_eye_frame": left_eye_frame,
+            "left_eye_frame_depth": left_eye_frame_depth,
+            "right_eye_frame": right_eye_frame,
+            "right_eye_frame_depth": right_eye_frame_depth,
+            "scene_source_sample_id": int(actual_source_sample_id),
+            "real_publish_sample_id": int(actual_source_sample_id),
+            "scene_source_left_eye_pose_world": actual_left_eye_pose_world,
+            "scene_source_right_eye_pose_world": actual_right_eye_pose_world,
+            "scene_source_left_intrinsic": actual_left_intrinsic,
+            "scene_source_right_intrinsic": actual_right_intrinsic,
+            "scene_source_received_monotonic_s": actual_source_received_monotonic_s,
+            "left_overlay_eye_render_state": left_overlay_eye_render_state,
+            "right_overlay_eye_render_state": right_overlay_eye_render_state,
+            "synthetic_source_real_timewarp_applied": 1.0
+            if (left_real_timewarp_applied and right_real_timewarp_applied)
+            else 0.0,
+            "synthetic_source_real_timewarp_fallback_left": 1.0
+            if left_real_timewarp_fallback
+            else 0.0,
+            "synthetic_source_real_timewarp_fallback_right": 1.0
+            if right_real_timewarp_fallback
+            else 0.0,
+            "synthetic_source_consistent": 1.0 if consistent else 0.0,
+            "synthetic_source_inconsistent_reason": inconsistent_reason,
+            "synthetic_source_actual_view_kind": actual_source_kind,
+        }
+
+    def _synthetic_source_diagnostic_payload_fields(self, synthetic_source_state):
+        if synthetic_source_state is None:
+            return {
+                "synthetic_source_real_timewarp_applied": 0.0,
+                "synthetic_source_real_timewarp_fallback_left": 0.0,
+                "synthetic_source_real_timewarp_fallback_right": 0.0,
+                "synthetic_source_consistent": 1.0,
+                "synthetic_source_inconsistent_reason": "",
+            }
+        return {
+            "synthetic_source_real_timewarp_applied": float(
+                synthetic_source_state.get(
+                    "synthetic_source_real_timewarp_applied",
+                    0.0,
+                )
+            ),
+            "synthetic_source_real_timewarp_fallback_left": float(
+                synthetic_source_state.get(
+                    "synthetic_source_real_timewarp_fallback_left",
+                    0.0,
+                )
+            ),
+            "synthetic_source_real_timewarp_fallback_right": float(
+                synthetic_source_state.get(
+                    "synthetic_source_real_timewarp_fallback_right",
+                    0.0,
+                )
+            ),
+            "synthetic_source_consistent": float(
+                synthetic_source_state.get("synthetic_source_consistent", 1.0)
+            ),
+            "synthetic_source_inconsistent_reason": str(
+                synthetic_source_state.get(
+                    "synthetic_source_inconsistent_reason",
+                    "",
+                )
+            ).strip().lower(),
+        }
+
+    def _rebase_synthetic_source_state_to_actual_real_view(
+        self,
+        synthetic_source_state,
+        *,
+        actual_real_view_source,
+    ):
+        if synthetic_source_state is None:
+            return None
+        if actual_real_view_source is None:
+            return synthetic_source_state
+        synthetic_source_state["left_eye_frame"] = actual_real_view_source[
+            "left_eye_frame"
+        ].clone()
+        synthetic_source_state["left_eye_frame_depth"] = actual_real_view_source[
+            "left_eye_frame_depth"
+        ].clone()
+        synthetic_source_state["right_eye_frame"] = actual_real_view_source[
+            "right_eye_frame"
+        ].clone()
+        synthetic_source_state["right_eye_frame_depth"] = actual_real_view_source[
+            "right_eye_frame_depth"
+        ].clone()
+        synthetic_source_state["scene_source_sample_id"] = int(
+            actual_real_view_source["scene_source_sample_id"]
+        )
+        synthetic_source_state["real_publish_sample_id"] = int(
+            actual_real_view_source["real_publish_sample_id"]
+        )
+        synthetic_source_state["scene_source_left_eye_pose_world"] = np.asarray(
+            actual_real_view_source["scene_source_left_eye_pose_world"],
+            dtype=np.float32,
+        ).copy()
+        synthetic_source_state["scene_source_right_eye_pose_world"] = np.asarray(
+            actual_real_view_source["scene_source_right_eye_pose_world"],
+            dtype=np.float32,
+        ).copy()
+        synthetic_source_state["scene_source_left_intrinsic"] = np.asarray(
+            actual_real_view_source["scene_source_left_intrinsic"],
+            dtype=np.float32,
+        ).copy()
+        synthetic_source_state["scene_source_right_intrinsic"] = np.asarray(
+            actual_real_view_source["scene_source_right_intrinsic"],
+            dtype=np.float32,
+        ).copy()
+        scene_source_received_monotonic_s = actual_real_view_source.get(
+            "scene_source_received_monotonic_s"
+        )
+        if scene_source_received_monotonic_s is not None:
+            synthetic_source_state["scene_source_received_monotonic_s"] = float(
+                scene_source_received_monotonic_s
+            )
+        left_overlay_eye_render_state = actual_real_view_source.get(
+            "left_overlay_eye_render_state"
+        )
+        right_overlay_eye_render_state = actual_real_view_source.get(
+            "right_overlay_eye_render_state"
+        )
+        if left_overlay_eye_render_state is not None:
+            synthetic_source_state["left_overlay_eye_render_state"] = (
+                left_overlay_eye_render_state
+            )
+        if right_overlay_eye_render_state is not None:
+            synthetic_source_state["right_overlay_eye_render_state"] = (
+                right_overlay_eye_render_state
+            )
+        synthetic_source_state["synthetic_source_real_timewarp_applied"] = float(
+            actual_real_view_source.get(
+                "synthetic_source_real_timewarp_applied",
+                0.0,
+            )
+        )
+        synthetic_source_state["synthetic_source_real_timewarp_fallback_left"] = float(
+            actual_real_view_source.get(
+                "synthetic_source_real_timewarp_fallback_left",
+                0.0,
+            )
+        )
+        synthetic_source_state["synthetic_source_real_timewarp_fallback_right"] = float(
+            actual_real_view_source.get(
+                "synthetic_source_real_timewarp_fallback_right",
+                0.0,
+            )
+        )
+        synthetic_source_state["synthetic_source_consistent"] = float(
+            actual_real_view_source.get("synthetic_source_consistent", 1.0)
+        )
+        synthetic_source_state["synthetic_source_inconsistent_reason"] = str(
+            actual_real_view_source.get(
+                "synthetic_source_inconsistent_reason",
+                "",
+            )
+        ).strip().lower()
+        return synthetic_source_state
+
+    def _build_synthetic_skip_payload(
+        self,
+        synthetic_source_state,
+        *,
+        reason,
+        source_age_ms=0.0,
+        total_scene_age_ms=0.0,
+        handoff_delay_ms=0.0,
+        translation_m=0.0,
+        rotation_deg=0.0,
+    ):
+        payload = {
+            "payload_kind": "synthetic_skip",
+            "source_frame_index": int(
+                synthetic_source_state.get("source_frame_index", -1)
+            ),
+            "synthetic_framegen_applied": 0.0,
+            "synthetic_skip_reason": str(reason).strip().lower(),
+            "synthetic_source_age_ms": float(source_age_ms),
+            "synthetic_total_scene_age_ms": float(total_scene_age_ms),
+            "synthetic_handoff_delay_ms": float(handoff_delay_ms),
+            "synthetic_translation_m": float(translation_m),
+            "synthetic_rotation_deg": float(rotation_deg),
+        }
+        payload.update(
+            self._synthetic_source_diagnostic_payload_fields(synthetic_source_state)
+        )
+        return payload
+
+    def _wait_for_synthetic_publish_sample(self, synthetic_source_state):
+        framegen_mode = str(synthetic_source_state["framegen_mode"]).strip().lower()
+        max_source_age_ms = (
+            float(self._owner.IMMERSIVE_SYNTHETIC_FRAMEGEN_STATIC_MAX_SOURCE_AGE_MS)
+            if framegen_mode == "static"
+            else float(
+                self._owner.IMMERSIVE_SYNTHETIC_FRAMEGEN_ADAPTIVE_MAX_SOURCE_AGE_MS
+            )
+        )
+        min_sample_id = int(
+            synthetic_source_state.get(
+                "real_publish_sample_id",
+                synthetic_source_state["scene_source_sample_id"],
+            )
+        )
+        age_metrics = self._owner._compute_immersive_synthetic_framegen_age_metrics(
+            scene_source_ready_wall_time_s=synthetic_source_state.get(
+                "scene_source_ready_wall_time_s",
+                synthetic_source_state["source_ready_wall_time_s"],
+            ),
+            synthetic_source_ready_wall_time_s=synthetic_source_state.get(
+                "synthetic_source_ready_wall_time_s",
+                synthetic_source_state.get(
+                    "scene_source_ready_wall_time_s",
+                    synthetic_source_state["source_ready_wall_time_s"],
+                ),
+            ),
+        )
+        while True:
+            with self._condition:
+                stale_packet = bool(
+                    self._stop_requested
+                    or self._pending_packet is not None
+                    or int(self._latest_submitted_serial)
+                    > int(synthetic_source_state.get("submit_serial", 0))
+                )
+            if stale_packet:
+                return {
+                    "sample": None,
+                    "reason": "stale_packet",
+                    "source_age_ms": float(
+                        age_metrics["synthetic_candidate_age_ms"]
+                    ),
+                    "total_scene_age_ms": float(
+                        age_metrics["synthetic_total_scene_age_ms"]
+                    ),
+                    "handoff_delay_ms": float(
+                        age_metrics["synthetic_handoff_delay_ms"]
+                    ),
+                }
+            age_metrics = self._owner._compute_immersive_synthetic_framegen_age_metrics(
+                scene_source_ready_wall_time_s=synthetic_source_state.get(
+                    "scene_source_ready_wall_time_s",
+                    synthetic_source_state["source_ready_wall_time_s"],
+                ),
+                synthetic_source_ready_wall_time_s=synthetic_source_state.get(
+                    "synthetic_source_ready_wall_time_s",
+                    synthetic_source_state.get(
+                        "scene_source_ready_wall_time_s",
+                        synthetic_source_state["source_ready_wall_time_s"],
+                    ),
+                ),
+            )
+            source_age_ms = float(age_metrics["synthetic_candidate_age_ms"])
+            remaining_s = max(0.0, (max_source_age_ms - source_age_ms) / 1000.0)
+            if remaining_s <= 0.0:
+                return {
+                    "sample": None,
+                    "reason": "source_age",
+                    "source_age_ms": source_age_ms,
+                    "total_scene_age_ms": float(
+                        age_metrics["synthetic_total_scene_age_ms"]
+                    ),
+                    "handoff_delay_ms": float(
+                        age_metrics["synthetic_handoff_delay_ms"]
+                    ),
+                }
+            publish_sample = self._immersive_bridge.wait_for_newer_sample(
+                min_sample_id=min_sample_id,
+                timeout_s=min(
+                    remaining_s,
+                    float(
+                        self._owner.IMMERSIVE_SYNTHETIC_FRAMEGEN_WAIT_POLL_TIMEOUT_S
+                    ),
+                ),
+            )
+            if publish_sample is None:
+                continue
+            age_metrics = self._owner._compute_immersive_synthetic_framegen_age_metrics(
+                scene_source_ready_wall_time_s=synthetic_source_state.get(
+                    "scene_source_ready_wall_time_s",
+                    synthetic_source_state["source_ready_wall_time_s"],
+                ),
+                synthetic_source_ready_wall_time_s=synthetic_source_state.get(
+                    "synthetic_source_ready_wall_time_s",
+                    synthetic_source_state.get(
+                        "scene_source_ready_wall_time_s",
+                        synthetic_source_state["source_ready_wall_time_s"],
+                    ),
+                ),
+            )
+            return {
+                "sample": publish_sample,
+                "reason": None,
+                "source_age_ms": float(age_metrics["synthetic_candidate_age_ms"]),
+                "total_scene_age_ms": float(
+                    age_metrics["synthetic_total_scene_age_ms"]
+                ),
+                "handoff_delay_ms": float(
+                    age_metrics["synthetic_handoff_delay_ms"]
+                ),
+            }
+
+    def _maybe_publish_synthetic_frame(self, synthetic_source_state, *, presentation_streams):
+        if synthetic_source_state is None:
+            return None, True
+        if not bool(synthetic_source_state.get("synthetic_source_consistent", 1.0)):
+            return (
+                self._build_synthetic_skip_payload(
+                    synthetic_source_state,
+                    reason="real_source_inconsistent",
+                ),
+                True,
+            )
+        wait_result = self._wait_for_synthetic_publish_sample(synthetic_source_state)
+        wait_reason = wait_result.get("reason")
+        if wait_reason is not None:
+            return (
+                self._build_synthetic_skip_payload(
+                    synthetic_source_state,
+                    reason=wait_reason,
+                    source_age_ms=float(wait_result.get("source_age_ms", 0.0)),
+                    total_scene_age_ms=float(
+                        wait_result.get("total_scene_age_ms", 0.0)
+                    ),
+                    handoff_delay_ms=float(
+                        wait_result.get("handoff_delay_ms", 0.0)
+                    ),
+                ),
+                True,
+            )
+
+        publish_sample = wait_result.get("sample")
+        publish_state = self._owner._resolve_immersive_scene_publish_state(
+            self._immersive_bridge,
+            scene_depth_reproject_enabled=True,
+            scene_source_sample_id=int(
+                synthetic_source_state["scene_source_sample_id"]
+            ),
+            scene_source_left_eye_pose_world=synthetic_source_state[
+                "scene_source_left_eye_pose_world"
+            ],
+            scene_source_right_eye_pose_world=synthetic_source_state[
+                "scene_source_right_eye_pose_world"
+            ],
+            scene_source_left_intrinsic=synthetic_source_state[
+                "scene_source_left_intrinsic"
+            ],
+            scene_source_right_intrinsic=synthetic_source_state[
+                "scene_source_right_intrinsic"
+            ],
+            default_left_overlay_eye_render_state=synthetic_source_state[
+                "left_overlay_eye_render_state"
+            ],
+            default_right_overlay_eye_render_state=synthetic_source_state[
+                "right_overlay_eye_render_state"
+            ],
+            live_head_alignment=synthetic_source_state.get("live_head_alignment"),
+            head_pose_state=synthetic_source_state.get("head_pose_state"),
+            frame_index=int(synthetic_source_state["source_frame_index"]),
+            eye_width=self._eye_width,
+            eye_height=self._eye_height,
+            publish_sample_override=publish_sample,
+        )
+        with self._condition:
+            stale_packet = bool(
+                self._stop_requested
+                or self._pending_packet is not None
+                or int(self._latest_submitted_serial)
+                > int(synthetic_source_state.get("submit_serial", 0))
+            )
+        decision = self._owner._evaluate_immersive_synthetic_framegen_admission(
+            framegen_mode=synthetic_source_state["framegen_mode"],
+            publish_state=publish_state,
+            scene_source_ready_wall_time_s=synthetic_source_state.get(
+                "scene_source_ready_wall_time_s",
+                synthetic_source_state["source_ready_wall_time_s"],
+            ),
+            synthetic_source_ready_wall_time_s=synthetic_source_state.get(
+                "synthetic_source_ready_wall_time_s",
+                synthetic_source_state.get(
+                    "scene_source_ready_wall_time_s",
+                    synthetic_source_state["source_ready_wall_time_s"],
+                ),
+            ),
+            source_sample_id=synthetic_source_state["scene_source_sample_id"],
+            source_left_eye_pose_world=synthetic_source_state[
+                "scene_source_left_eye_pose_world"
+            ],
+            source_right_eye_pose_world=synthetic_source_state[
+                "scene_source_right_eye_pose_world"
+            ],
+            synthetic_emitted=bool(
+                synthetic_source_state.get("synthetic_emitted", False)
+            ),
+            stale_packet=stale_packet,
+        )
+        if not bool(decision.get("apply", False)):
+            return (
+                self._build_synthetic_skip_payload(
+                    synthetic_source_state,
+                    reason=decision.get("reason", "invalid_pose"),
+                    source_age_ms=float(decision.get("source_age_ms", 0.0)),
+                    total_scene_age_ms=float(
+                        decision.get("total_scene_age_ms", 0.0)
+                    ),
+                    handoff_delay_ms=float(
+                        decision.get("handoff_delay_ms", 0.0)
+                    ),
+                    translation_m=float(decision.get("translation_m", 0.0)),
+                    rotation_deg=float(decision.get("rotation_deg", 0.0)),
+                ),
+                True,
+            )
+
+        owner = self._owner
+        left_stream = presentation_streams["left"]
+        right_stream = presentation_streams["right"]
+        control_stream = presentation_streams["control"]
+        left_eye_frame = synthetic_source_state["left_eye_frame"].clone()
+        left_eye_frame_depth = synthetic_source_state["left_eye_frame_depth"].clone()
+        right_eye_frame = synthetic_source_state["right_eye_frame"].clone()
+        right_eye_frame_depth = synthetic_source_state["right_eye_frame_depth"].clone()
+        left_overlay_eye_render_state = publish_state["left_overlay_eye_render_state"]
+        right_overlay_eye_render_state = publish_state["right_overlay_eye_render_state"]
+        preview_frame = None
+        preview_ready_event = None
+        with torch.cuda.stream(left_stream):
+            (
+                warped_left_eye_frame,
+                warped_left_eye_depth,
+                _,
+            ) = owner._latewarp_immersive_scene_eye(
+                left_eye_frame,
+                left_eye_frame_depth,
+                synthetic_source_state["scene_source_left_eye_pose_world"],
+                publish_state["publish_left_eye_pose_world"],
+                synthetic_source_state["scene_source_left_intrinsic"],
+                publish_state["publish_left_intrinsic"],
+                self._eye_height,
+                self._eye_width,
+                "left_synthetic",
+                reproject_caches=self._scene_reproject_caches,
+                render_profile_frame=None,
+            )
+            if (
+                not torch.is_tensor(warped_left_eye_frame)
+                or not torch.is_tensor(warped_left_eye_depth)
+                or tuple(warped_left_eye_frame.shape)
+                != (self._eye_height, self._eye_width, 4)
+                or tuple(warped_left_eye_depth.shape)
+                != (self._eye_height, self._eye_width)
+                or not owner._is_finite_tensor(warped_left_eye_frame)
+                or not owner._is_finite_tensor(warped_left_eye_depth)
+            ):
+                return (
+                    self._build_synthetic_skip_payload(
+                        synthetic_source_state,
+                        reason="latewarp_failure",
+                        source_age_ms=float(decision.get("source_age_ms", 0.0)),
+                        total_scene_age_ms=float(
+                            decision.get("total_scene_age_ms", 0.0)
+                        ),
+                        handoff_delay_ms=float(
+                            decision.get("handoff_delay_ms", 0.0)
+                        ),
+                        translation_m=float(decision.get("translation_m", 0.0)),
+                        rotation_deg=float(decision.get("rotation_deg", 0.0)),
+                    ),
+                    True,
+                )
+            left_eye_frame = warped_left_eye_frame
+            left_eye_frame_depth = warped_left_eye_depth
+        with torch.cuda.stream(right_stream):
+            (
+                warped_right_eye_frame,
+                warped_right_eye_depth,
+                _,
+            ) = owner._latewarp_immersive_scene_eye(
+                right_eye_frame,
+                right_eye_frame_depth,
+                synthetic_source_state["scene_source_right_eye_pose_world"],
+                publish_state["publish_right_eye_pose_world"],
+                synthetic_source_state["scene_source_right_intrinsic"],
+                publish_state["publish_right_intrinsic"],
+                self._eye_height,
+                self._eye_width,
+                "right_synthetic",
+                reproject_caches=self._scene_reproject_caches,
+                render_profile_frame=None,
+            )
+            if (
+                not torch.is_tensor(warped_right_eye_frame)
+                or not torch.is_tensor(warped_right_eye_depth)
+                or tuple(warped_right_eye_frame.shape)
+                != (self._eye_height, self._eye_width, 4)
+                or tuple(warped_right_eye_depth.shape)
+                != (self._eye_height, self._eye_width)
+                or not owner._is_finite_tensor(warped_right_eye_frame)
+                or not owner._is_finite_tensor(warped_right_eye_depth)
+            ):
+                return (
+                    self._build_synthetic_skip_payload(
+                        synthetic_source_state,
+                        reason="latewarp_failure",
+                        source_age_ms=float(decision.get("source_age_ms", 0.0)),
+                        total_scene_age_ms=float(
+                            decision.get("total_scene_age_ms", 0.0)
+                        ),
+                        handoff_delay_ms=float(
+                            decision.get("handoff_delay_ms", 0.0)
+                        ),
+                        translation_m=float(decision.get("translation_m", 0.0)),
+                        rotation_deg=float(decision.get("rotation_deg", 0.0)),
+                    ),
+                    True,
+                )
+            right_eye_frame = warped_right_eye_frame
+            right_eye_frame_depth = warped_right_eye_depth
+
+        with torch.cuda.stream(control_stream):
+            control_stream.wait_stream(left_stream)
+            control_stream.wait_stream(right_stream)
+            projected_overlay_entries = owner._project_live_controller_world_overlays_batched(
+                synthetic_source_state.get("controller_overlay_entries") or [],
+                {
+                    "left": left_overlay_eye_render_state,
+                    "right": right_overlay_eye_render_state,
+                },
+                self._eye_height,
+                self._eye_width,
+            )
+        with torch.cuda.stream(left_stream):
+            left_stream.wait_stream(control_stream)
+            left_eye_overlay_entries = projected_overlay_entries.get("left", [])
+            if left_eye_overlay_entries:
+                owner._draw_live_controller_overlay(
+                    left_eye_frame,
+                    left_eye_overlay_entries,
+                )
+            if synthetic_source_state.get("support_overlay_enabled", False):
+                owner._draw_immersive_support_entry_overlay(
+                    left_eye_frame,
+                    synthetic_source_state.get("support_overlay_cache"),
+                    synthetic_source_state.get("support_overlay_active_support_id"),
+                    left_overlay_eye_render_state,
+                )
+        with torch.cuda.stream(right_stream):
+            right_stream.wait_stream(control_stream)
+            right_eye_overlay_entries = projected_overlay_entries.get("right", [])
+            if right_eye_overlay_entries:
+                owner._draw_live_controller_overlay(
+                    right_eye_frame,
+                    right_eye_overlay_entries,
+                )
+            if synthetic_source_state.get("support_overlay_enabled", False):
+                owner._draw_immersive_support_entry_overlay(
+                    right_eye_frame,
+                    synthetic_source_state.get("support_overlay_cache"),
+                    synthetic_source_state.get("support_overlay_active_support_id"),
+                    right_overlay_eye_render_state,
+                )
+        with torch.cuda.stream(control_stream):
+            control_stream.wait_stream(left_stream)
+            control_stream.wait_stream(right_stream)
+            if left_eye_frame.dtype != torch.uint8:
+                left_eye_frame = left_eye_frame.clamp(0.0, 255.0).to(torch.uint8)
+            if right_eye_frame.dtype != torch.uint8:
+                right_eye_frame = right_eye_frame.clamp(0.0, 255.0).to(torch.uint8)
+            publish_ok, _ = self._immersive_bridge.publish_stereo_frames(
+                left_eye_frame,
+                right_eye_frame,
+            )
+            if self._preview_enabled:
+                preview_frame = left_eye_frame.clone()
+                preview_ready_event = torch.cuda.Event()
+                preview_ready_event.record(control_stream)
+        control_stream.synchronize()
+        if not publish_ok:
+            raise RuntimeError(
+                "Quest immersive bridge stopped accepting stereo frames.\n"
+                + self._immersive_bridge.debug_summary()
+            )
+        return (
+            {
+                "payload_kind": "synthetic_publish",
+                "source_frame_index": int(
+                    synthetic_source_state["source_frame_index"]
+                ),
+                "synthetic_framegen_applied": 1.0,
+                "synthetic_skip_reason": "applied",
+                "synthetic_source_age_ms": float(decision.get("source_age_ms", 0.0)),
+                "synthetic_total_scene_age_ms": float(
+                    decision.get("total_scene_age_ms", 0.0)
+                ),
+                "synthetic_handoff_delay_ms": float(
+                    decision.get("handoff_delay_ms", 0.0)
+                ),
+                "synthetic_translation_m": float(decision.get("translation_m", 0.0)),
+                "synthetic_rotation_deg": float(decision.get("rotation_deg", 0.0)),
+                "preview_frame": preview_frame,
+                "preview_ready_event": preview_ready_event,
+            },
+            True,
+        )
+
+    def _thread_main(self):
+        worker_cuda_context = None
+        presentation_streams = None
+        try:
+            if torch.cuda.is_available():
+                torch.cuda.set_device(self._cuda_device_index)
+                worker_cuda_context = self._attach_worker_cuda_context(
+                    self._cuda_device_index
+                )
+                presentation_streams = {
+                    "left": self._make_high_priority_stream(),
+                    "right": self._make_high_priority_stream(),
+                    "control": self._make_high_priority_stream(),
+                }
+                self._warmup_worker(presentation_streams)
+            self._response_queue.put({"ok": True})
+            while True:
+                action = None
+                packet = None
+                synthetic_source_state = None
+                with self._condition:
+                    while (
+                        self._pending_packet is None
+                        and self._synthetic_source_state is None
+                        and not self._stop_requested
+                    ):
+                        self._condition.wait(timeout=0.1)
+                    if (
+                        self._pending_packet is None
+                        and self._synthetic_source_state is None
+                        and self._stop_requested
+                    ):
+                        break
+                    if self._pending_packet is not None:
+                        packet = self._pending_packet
+                        self._pending_packet = None
+                        action = "packet"
+                    else:
+                        synthetic_source_state = self._synthetic_source_state
+                        action = "synthetic"
+                    self._processing_packet = True
+                try:
+                    if action == "packet":
+                        process_result = self._process_packet(
+                            packet,
+                            presentation_streams=presentation_streams,
+                        )
+                        payload = None if process_result is None else process_result.get(
+                            "payload"
+                        )
+                        next_synthetic_source_state = (
+                            None
+                            if process_result is None
+                            else process_result.get("synthetic_source_state")
+                        )
+                        with self._condition:
+                            self._synthetic_source_state = next_synthetic_source_state
+                        if payload is not None:
+                            self._response_queue.put(
+                                {
+                                    "ok": True,
+                                    "payload": payload,
+                                }
+                            )
+                    elif action == "synthetic":
+                        payload, clear_state = self._maybe_publish_synthetic_frame(
+                            synthetic_source_state,
+                            presentation_streams=presentation_streams,
+                        )
+                        with self._condition:
+                            if clear_state and self._synthetic_source_state is synthetic_source_state:
+                                self._synthetic_source_state = None
+                        if payload is not None:
+                            self._response_queue.put(
+                                {
+                                    "ok": True,
+                                    "payload": payload,
+                                }
+                            )
+                finally:
+                    with self._condition:
+                        self._processing_packet = False
+                        self._condition.notify_all()
+        except Exception as exc:
+            self._response_queue.put(
+                {
+                    "ok": False,
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            )
+            with self._condition:
+                self._processing_packet = False
+                self._condition.notify_all()
+        finally:
+            if worker_cuda_context is not None:
+                try:
+                    worker_cuda_context.pop()
+                except Exception:
+                    pass
+                try:
+                    worker_cuda_context.detach()
+                except Exception:
+                    pass
+
+    def _warmup_worker(self, presentation_streams):
+        if presentation_streams is None:
+            return
+        left_stream = presentation_streams["left"]
+        right_stream = presentation_streams["right"]
+        control_stream = presentation_streams["control"]
+        dummy_intrinsic = np.array(
+            [
+                [float(self._eye_width), 0.0, float(self._eye_width) * 0.5],
+                [0.0, float(self._eye_height), float(self._eye_height) * 0.5],
+                [0.0, 0.0, 1.0],
+            ],
+            dtype=np.float32,
+        )
+        dummy_left_render_pose = np.eye(4, dtype=np.float32)
+        dummy_left_render_pose[0, 3] = -0.032
+        dummy_right_render_pose = np.eye(4, dtype=np.float32)
+        dummy_right_render_pose[0, 3] = 0.032
+        dummy_left_publish_pose = np.asarray(
+            dummy_left_render_pose,
+            dtype=np.float32,
+        ).copy()
+        dummy_left_publish_pose[0, 3] += 0.01
+        dummy_right_publish_pose = np.asarray(
+            dummy_right_render_pose,
+            dtype=np.float32,
+        ).copy()
+        dummy_right_publish_pose[0, 3] += 0.01
+        zeros_scene_rgba = torch.zeros(
+            (self._eye_height, self._eye_width, 4),
+            dtype=torch.uint8,
+            device=cfg.device,
+        )
+        zeros_scene_depth = torch.zeros(
+            (self._eye_height, self._eye_width),
+            dtype=torch.float32,
+            device=cfg.device,
+        )
+        zeros_gaussian_rgba = torch.zeros(
+            (4, self._eye_height, self._eye_width),
+            dtype=torch.float32,
+            device=cfg.device,
+        )
+        zeros_gaussian_depth = torch.zeros(
+            (self._eye_height, self._eye_width),
+            dtype=torch.float32,
+            device=cfg.device,
+        )
+        dummy_left_overlay = [
+            {
+                "source": "left",
+                "origin_pixel": torch.tensor(
+                    [64.0, 64.0], dtype=torch.float32, device=cfg.device
+                ),
+                "end_pixel": torch.tensor(
+                    [128.0, 96.0], dtype=torch.float32, device=cfg.device
+                ),
+                "hit_pixel": torch.tensor(
+                    [96.0, 80.0], dtype=torch.float32, device=cfg.device
+                ),
+                "attach_candidate_pixel": None,
+                "attach_active_pixel": None,
+                "attach_candidate": False,
+                "attachment_active": False,
+                "color": self._owner.LIVE_CONTROLLER_LEFT_COLOR,
+                "select_available": False,
+                "select_pressed": False,
+                "select_value": 0.0,
+                "select_source": "",
+                "anchor_cycle_available": False,
+                "anchor_cycle_pressed": False,
+                "anchor_cycle_source": "",
+                "snap_assist_available": False,
+                "snap_assist_pressed": False,
+                "snap_assist_source": "",
+                "anchor_preview_entries": [],
+            }
+        ]
+        dummy_right_overlay = [
+            {
+                "source": "right",
+                "origin_pixel": torch.tensor(
+                    [80.0, 72.0], dtype=torch.float32, device=cfg.device
+                ),
+                "end_pixel": torch.tensor(
+                    [140.0, 100.0], dtype=torch.float32, device=cfg.device
+                ),
+                "hit_pixel": torch.tensor(
+                    [112.0, 88.0], dtype=torch.float32, device=cfg.device
+                ),
+                "attach_candidate_pixel": None,
+                "attach_active_pixel": None,
+                "attach_candidate": False,
+                "attachment_active": False,
+                "color": self._owner.LIVE_CONTROLLER_RIGHT_COLOR,
+                "select_available": False,
+                "select_pressed": False,
+                "select_value": 0.0,
+                "select_source": "",
+                "anchor_cycle_available": False,
+                "anchor_cycle_pressed": False,
+                "anchor_cycle_source": "",
+                "snap_assist_available": False,
+                "snap_assist_pressed": False,
+                "snap_assist_source": "",
+                "anchor_preview_entries": [],
+            }
+        ]
+        with torch.cuda.stream(left_stream):
+            left_eye_frame, _ = self._owner._compose_immersive_eye_frame(
+                zeros_scene_rgba,
+                zeros_scene_depth,
+                zeros_gaussian_rgba,
+                zeros_gaussian_depth,
+                target_height=self._eye_height,
+                target_width=self._eye_width,
+                compose_mode="depth_aware",
+                compose_roi_padding=None,
+                output_dtype=torch.float32,
+                return_depth=True,
+            )
+            left_eye_frame_depth = torch.ones(
+                (self._eye_height, self._eye_width),
+                dtype=torch.float32,
+                device=cfg.device,
+            )
+            (
+                left_eye_frame,
+                left_eye_frame_depth,
+                _,
+            ) = self._owner._latewarp_immersive_scene_eye(
+                left_eye_frame,
+                left_eye_frame_depth,
+                dummy_left_render_pose,
+                dummy_left_publish_pose,
+                dummy_intrinsic,
+                dummy_intrinsic,
+                self._eye_height,
+                self._eye_width,
+                "left_present_warmup",
+                reproject_caches=self._scene_reproject_caches,
+            )
+            self._owner._draw_live_controller_overlay(
+                left_eye_frame,
+                dummy_left_overlay,
+            )
+        with torch.cuda.stream(right_stream):
+            right_eye_frame, _ = self._owner._compose_immersive_eye_frame(
+                zeros_scene_rgba,
+                zeros_scene_depth,
+                zeros_gaussian_rgba,
+                zeros_gaussian_depth,
+                target_height=self._eye_height,
+                target_width=self._eye_width,
+                compose_mode="depth_aware",
+                compose_roi_padding=None,
+                output_dtype=torch.float32,
+                return_depth=True,
+            )
+            right_eye_frame_depth = torch.ones(
+                (self._eye_height, self._eye_width),
+                dtype=torch.float32,
+                device=cfg.device,
+            )
+            (
+                right_eye_frame,
+                right_eye_frame_depth,
+                _,
+            ) = self._owner._latewarp_immersive_scene_eye(
+                right_eye_frame,
+                right_eye_frame_depth,
+                dummy_right_render_pose,
+                dummy_right_publish_pose,
+                dummy_intrinsic,
+                dummy_intrinsic,
+                self._eye_height,
+                self._eye_width,
+                "right_present_warmup",
+                reproject_caches=self._scene_reproject_caches,
+            )
+            self._owner._draw_live_controller_overlay(
+                right_eye_frame,
+                dummy_right_overlay,
+            )
+        with torch.cuda.stream(control_stream):
+            control_stream.wait_stream(left_stream)
+            control_stream.wait_stream(right_stream)
+            left_eye_frame_u8 = left_eye_frame.clamp(0.0, 255.0).to(torch.uint8)
+            right_eye_frame_u8 = right_eye_frame.clamp(0.0, 255.0).to(torch.uint8)
+            self._immersive_bridge.publish_stereo_frames(
+                left_eye_frame_u8,
+                right_eye_frame_u8,
+            )
+        control_stream.synchronize()
+        try:
+            self._immersive_bridge._drain_pending_stage_copies(block=True)
+        except Exception:
+            pass
+
+    def _process_packet(self, packet, *, presentation_streams):
+        owner = self._owner
+        left_stream = None if presentation_streams is None else presentation_streams["left"]
+        right_stream = None if presentation_streams is None else presentation_streams["right"]
+        control_stream = (
+            None if presentation_streams is None else presentation_streams["control"]
+        )
+        queue_wait_ms = 0.0
+        enqueue_wall_time_s = packet.get("enqueue_wall_time_s")
+        dequeue_wall_time_s = time.perf_counter()
+        if enqueue_wall_time_s is not None:
+            queue_wait_ms = max(
+                0.0,
+                (dequeue_wall_time_s - float(enqueue_wall_time_s)) * 1000.0,
+            )
+        worker_start = time.perf_counter()
+        render_profile_enabled = bool(packet.get("render_profile_enabled", False))
+        worker_profile = {"_cuda_spans": []} if render_profile_enabled else None
+        producer_ready_event = packet.get("producer_ready_event")
+        presentation_complete_event = None
+        overlay_projection_wall_s = 0.0
+        publish_sample_id = int(
+            packet.get(
+                "scene_source_sample_id",
+                packet.get("render_sample_id", -1),
+            )
+        )
+        scene_timewarp_applied = 0.0
+        scene_timewarp_fallback_left_used = 0.0
+        scene_timewarp_fallback_right_used = 0.0
+        timewarp_decision = owner._evaluate_immersive_scene_timewarp_admission(
+            apply_requested=False,
+            queue_wait_ms=queue_wait_ms,
+            source_age_ms=0.0,
+            static_scene_reuse_age_frames=float(
+                packet.get("static_scene_reuse_age_frames", 0.0)
+            ),
+            stale_packet=False,
+        )
+        scene_pose_staleness_ms_at_publish = 0.0
+        scene_pose_staleness_savings_ms = 0.0
+        if control_stream is None or left_stream is None or right_stream is None:
+            raise RuntimeError("Immersive presentation worker requires CUDA streams.")
+
+        left_compose_start_event = torch.cuda.Event(enable_timing=True)
+        left_compose_end_event = torch.cuda.Event(enable_timing=True)
+        right_compose_start_event = torch.cuda.Event(enable_timing=True)
+        right_compose_end_event = torch.cuda.Event(enable_timing=True)
+        left_overlay_start_event = torch.cuda.Event(enable_timing=True)
+        left_overlay_end_event = torch.cuda.Event(enable_timing=True)
+        right_overlay_start_event = torch.cuda.Event(enable_timing=True)
+        right_overlay_end_event = torch.cuda.Event(enable_timing=True)
+        parallel_wait_start_event = torch.cuda.Event(enable_timing=True)
+        parallel_wait_end_event = torch.cuda.Event(enable_timing=True)
+        left_compose_metrics = None
+        right_compose_metrics = None
+        left_compose_artifact_analysis = None
+        right_compose_artifact_analysis = None
+        left_compose_artifact_token = None
+        right_compose_artifact_token = None
+        left_compose_artifact_pre_overlay = None
+        right_compose_artifact_pre_overlay = None
+        left_compose_artifact_extra_metadata = None
+        right_compose_artifact_extra_metadata = None
+        left_compose_artifact_pre_stabilization = None
+        right_compose_artifact_pre_stabilization = None
+        left_overlay_eye_render_state = packet["left_overlay_eye_render_state"]
+        right_overlay_eye_render_state = packet["right_overlay_eye_render_state"]
+        scene_pose_sample = None
+        stable_compose_debug_enabled = bool(
+            (not bool(packet.get("scene_depth_reproject_enabled", False)))
+            and str(packet.get("immersive_framegen_mode", "off")) == "off"
+        )
+        stable_compose_reject_enabled = bool(
+            stable_compose_debug_enabled and owner._is_rope_family_case()
+        )
+        compose_artifact_interaction_context = packet.get(
+            "compose_artifact_interaction_context"
+        )
+        left_real_timewarp_validity = {
+            "eye_label": "left",
+            "accepted": False,
+            "reason": "not_requested",
+        }
+        right_real_timewarp_validity = {
+            "eye_label": "right",
+            "accepted": False,
+            "reason": "not_requested",
+        }
+
+        with torch.cuda.stream(left_stream):
+            if producer_ready_event is not None:
+                left_stream.wait_event(producer_ready_event)
+            left_compose_span = owner._render_profile_begin_cuda_span(
+                worker_profile,
+                "compose_left_cuda",
+            )
+            left_compose_start_event.record(left_stream)
+            if worker_profile is not None or stable_compose_debug_enabled:
+                (
+                    left_eye_frame,
+                    left_eye_frame_depth,
+                    left_compose_metrics,
+                    _,
+                ) = owner._compose_immersive_eye_frame(
+                    packet["left_scene_color"],
+                    packet["left_scene_depth"],
+                    packet["left_gaussian_rgba"],
+                    packet["left_gaussian_depth"],
+                    target_height=self._eye_height,
+                    target_width=self._eye_width,
+                    compose_mode=packet["immersive_compose_mode"],
+                    compose_roi_padding=packet["gaussian_compose_roi_padding"],
+                    collect_debug=True,
+                    output_dtype=torch.float32,
+                    return_depth=True,
+                )
+            else:
+                left_eye_frame, left_eye_frame_depth = owner._compose_immersive_eye_frame(
+                    packet["left_scene_color"],
+                    packet["left_scene_depth"],
+                    packet["left_gaussian_rgba"],
+                    packet["left_gaussian_depth"],
+                    target_height=self._eye_height,
+                    target_width=self._eye_width,
+                    compose_mode=packet["immersive_compose_mode"],
+                    compose_roi_padding=packet["gaussian_compose_roi_padding"],
+                    output_dtype=torch.float32,
+                    return_depth=True,
+                )
+                left_compose_metrics = None
+            left_compose_end_event.record(left_stream)
+            owner._render_profile_end_cuda_span(
+                worker_profile,
+                left_compose_span,
+            )
+
+        with torch.cuda.stream(right_stream):
+            if producer_ready_event is not None:
+                right_stream.wait_event(producer_ready_event)
+            right_compose_span = owner._render_profile_begin_cuda_span(
+                worker_profile,
+                "compose_right_cuda",
+            )
+            right_compose_start_event.record(right_stream)
+            if worker_profile is not None or stable_compose_debug_enabled:
+                (
+                    right_eye_frame,
+                    right_eye_frame_depth,
+                    right_compose_metrics,
+                    _,
+                ) = owner._compose_immersive_eye_frame(
+                    packet["right_scene_color"],
+                    packet["right_scene_depth"],
+                    packet["right_gaussian_rgba"],
+                    packet["right_gaussian_depth"],
+                    target_height=self._eye_height,
+                    target_width=self._eye_width,
+                    compose_mode=packet["immersive_compose_mode"],
+                    compose_roi_padding=packet["gaussian_compose_roi_padding"],
+                    collect_debug=True,
+                    output_dtype=torch.float32,
+                    return_depth=True,
+                )
+            else:
+                right_eye_frame, right_eye_frame_depth = owner._compose_immersive_eye_frame(
+                    packet["right_scene_color"],
+                    packet["right_scene_depth"],
+                    packet["right_gaussian_rgba"],
+                    packet["right_gaussian_depth"],
+                    target_height=self._eye_height,
+                    target_width=self._eye_width,
+                    compose_mode=packet["immersive_compose_mode"],
+                    compose_roi_padding=packet["gaussian_compose_roi_padding"],
+                    output_dtype=torch.float32,
+                    return_depth=True,
+                )
+                right_compose_metrics = None
+            right_compose_end_event.record(right_stream)
+            owner._render_profile_end_cuda_span(
+                worker_profile,
+                right_compose_span,
+            )
+
+        left_compose_end_event.synchronize()
+        right_compose_end_event.synchronize()
+        if stable_compose_debug_enabled:
+            left_stabilized_compose = owner._stabilize_immersive_stable_compose_eye(
+                eye_label="left",
+                frame_index=int(packet["source_frame_index"]),
+                sample_id=int(
+                    packet.get(
+                        "scene_source_sample_id",
+                        packet.get("render_sample_id", -1),
+                    )
+                ),
+                backend_kind="legacy_single_worker",
+                path_kind="stable_present_pipeline",
+                compose_mode=packet["immersive_compose_mode"],
+                scene_color=packet["left_scene_color"],
+                scene_depth=packet["left_scene_depth"],
+                gaussian_rgba=packet["left_gaussian_rgba"],
+                gaussian_depth=packet["left_gaussian_depth"],
+                composed_pre_overlay=left_eye_frame,
+                composed_pre_overlay_depth=left_eye_frame_depth,
+                compose_metrics=left_compose_metrics or {},
+                interaction_context=compose_artifact_interaction_context,
+            )
+            left_eye_frame = left_stabilized_compose["final_eye_frame"]
+            left_eye_frame_depth = left_stabilized_compose["final_eye_frame_depth"]
+            left_compose_metrics = left_stabilized_compose["final_compose_metrics"]
+            left_compose_artifact_analysis = left_stabilized_compose["final_analysis"]
+            left_compose_artifact_token = left_stabilized_compose["artifact_token"]
+            if left_compose_artifact_token is not None:
+                left_compose_artifact_pre_overlay = left_eye_frame.clone()
+            left_compose_artifact_pre_stabilization = left_stabilized_compose.get(
+                "pre_stabilization_frame"
+            )
+            left_compose_artifact_extra_metadata = {
+                "pre_stabilization": copy.deepcopy(
+                    left_compose_artifact_analysis.get("pre_stabilization")
+                ),
+                "stabilization": copy.deepcopy(
+                    left_compose_artifact_analysis.get("stabilization")
+                ),
+                "post_stabilization_cleared": not bool(
+                    left_compose_artifact_analysis.get("trigger_reasons")
+                ),
+            }
+            right_stabilized_compose = owner._stabilize_immersive_stable_compose_eye(
+                eye_label="right",
+                frame_index=int(packet["source_frame_index"]),
+                sample_id=int(
+                    packet.get(
+                        "scene_source_sample_id",
+                        packet.get("render_sample_id", -1),
+                    )
+                ),
+                backend_kind="legacy_single_worker",
+                path_kind="stable_present_pipeline",
+                compose_mode=packet["immersive_compose_mode"],
+                scene_color=packet["right_scene_color"],
+                scene_depth=packet["right_scene_depth"],
+                gaussian_rgba=packet["right_gaussian_rgba"],
+                gaussian_depth=packet["right_gaussian_depth"],
+                composed_pre_overlay=right_eye_frame,
+                composed_pre_overlay_depth=right_eye_frame_depth,
+                compose_metrics=right_compose_metrics or {},
+                interaction_context=compose_artifact_interaction_context,
+            )
+            right_eye_frame = right_stabilized_compose["final_eye_frame"]
+            right_eye_frame_depth = right_stabilized_compose["final_eye_frame_depth"]
+            right_compose_metrics = right_stabilized_compose["final_compose_metrics"]
+            right_compose_artifact_analysis = right_stabilized_compose["final_analysis"]
+            right_compose_artifact_token = right_stabilized_compose["artifact_token"]
+            if right_compose_artifact_token is not None:
+                right_compose_artifact_pre_overlay = right_eye_frame.clone()
+            right_compose_artifact_pre_stabilization = right_stabilized_compose.get(
+                "pre_stabilization_frame"
+            )
+            right_compose_artifact_extra_metadata = {
+                "pre_stabilization": copy.deepcopy(
+                    right_compose_artifact_analysis.get("pre_stabilization")
+                ),
+                "stabilization": copy.deepcopy(
+                    right_compose_artifact_analysis.get("stabilization")
+                ),
+                "post_stabilization_cleared": not bool(
+                    right_compose_artifact_analysis.get("trigger_reasons")
+                ),
+            }
+        stable_compose_reject_decision = (
+            owner._evaluate_immersive_stable_compose_safety_gate(
+                left_analysis=left_compose_artifact_analysis,
+                right_analysis=right_compose_artifact_analysis,
+            )
+            if stable_compose_reject_enabled
+            else None
+        )
+        if (
+            stable_compose_reject_decision is not None
+            and bool(stable_compose_reject_decision.get("reject_publish", False))
+        ):
+            owner._record_immersive_stable_compose_stabilization_fallback_reject(
+                left_compose_artifact_analysis,
+                right_compose_artifact_analysis,
+            )
+            owner._finalize_immersive_runtime_compose_artifact(
+                left_compose_artifact_token,
+                scene_color=packet["left_scene_color"],
+                scene_depth=packet["left_scene_depth"],
+                gaussian_rgba=packet["left_gaussian_rgba"],
+                gaussian_depth=packet["left_gaussian_depth"],
+                composed_pre_overlay=left_compose_artifact_pre_overlay,
+                final_post_overlay=left_eye_frame,
+                compose_mode=packet["immersive_compose_mode"],
+                pre_stabilization_composed_pre_overlay=left_compose_artifact_pre_stabilization,
+                extra_metadata=left_compose_artifact_extra_metadata,
+            )
+            owner._finalize_immersive_runtime_compose_artifact(
+                right_compose_artifact_token,
+                scene_color=packet["right_scene_color"],
+                scene_depth=packet["right_scene_depth"],
+                gaussian_rgba=packet["right_gaussian_rgba"],
+                gaussian_depth=packet["right_gaussian_depth"],
+                composed_pre_overlay=right_compose_artifact_pre_overlay,
+                final_post_overlay=right_eye_frame,
+                compose_mode=packet["immersive_compose_mode"],
+                pre_stabilization_composed_pre_overlay=right_compose_artifact_pre_stabilization,
+                extra_metadata=right_compose_artifact_extra_metadata,
+            )
+            cover_publish_payload = self._build_stable_cover_publish_payload(
+                source_frame_index=int(packet["source_frame_index"]),
+                queue_wait_ms=float(queue_wait_ms),
+                worker_start=worker_start,
+                reject_source="compose_reject",
+                affected_sources=stable_compose_reject_decision.get(
+                    "affected_sources",
+                    [],
+                ),
+                trigger_reasons=stable_compose_reject_decision.get(
+                    "trigger_reasons",
+                    [],
+                ),
+                blue_scene_exposure_reject=stable_compose_reject_decision.get(
+                    "blue_scene_exposure_reject",
+                    False,
+                ),
+                gaussian_blue_source_reject=stable_compose_reject_decision.get(
+                    "gaussian_blue_source_reject",
+                    False,
+                ),
+                compose_reject_metrics=stable_compose_reject_decision.get(
+                    "per_eye_metrics",
+                    {},
+                ),
+            )
+            if cover_publish_payload is not None:
+                return {
+                    "payload": cover_publish_payload,
+                    "synthetic_source_state": None,
+                }
+            worker_wall_ms = 1000.0 * (time.perf_counter() - worker_start)
+            return {
+                "payload": {
+                    "payload_kind": "stable_compose_rejected",
+                    "presentation_backend_kind": "legacy_single_worker",
+                    "source_frame_index": int(packet["source_frame_index"]),
+                    "queue_wait_ms": float(queue_wait_ms),
+                    "worker_wall_ms": float(worker_wall_ms),
+                    "affected_sources": list(
+                        stable_compose_reject_decision.get(
+                            "affected_sources",
+                            [],
+                        )
+                    ),
+                    "trigger_reasons": list(
+                        stable_compose_reject_decision.get(
+                            "trigger_reasons",
+                            [],
+                        )
+                    ),
+                    "blue_scene_exposure_reject": bool(
+                        stable_compose_reject_decision.get(
+                            "blue_scene_exposure_reject",
+                            False,
+                        )
+                    ),
+                    "gaussian_blue_source_reject": bool(
+                        stable_compose_reject_decision.get(
+                            "gaussian_blue_source_reject",
+                            False,
+                        )
+                    ),
+                    "compose_reject_metrics": copy.deepcopy(
+                        stable_compose_reject_decision.get(
+                            "per_eye_metrics",
+                            {},
+                        )
+                    ),
+                    "reject_source": "compose_reject",
+                    "cover_cache_hit": False,
+                    "cover_cache_missing": True,
+                },
+                "synthetic_source_state": None,
+            }
+        synthetic_source_state = self._build_synthetic_source_state(
+            packet=packet,
+            left_eye_frame=left_eye_frame,
+            left_eye_frame_depth=left_eye_frame_depth,
+            right_eye_frame=right_eye_frame,
+            right_eye_frame_depth=right_eye_frame_depth,
+        )
+
+        publish_state = owner._resolve_immersive_scene_publish_state(
+            self._immersive_bridge,
+            scene_depth_reproject_enabled=bool(
+                packet.get("scene_depth_reproject_enabled", False)
+            ),
+            scene_source_sample_id=int(
+                packet.get(
+                    "scene_source_sample_id",
+                    packet.get("render_sample_id", -1),
+                )
+            ),
+            scene_source_left_eye_pose_world=packet["scene_source_left_eye_pose_world"],
+            scene_source_right_eye_pose_world=packet["scene_source_right_eye_pose_world"],
+            scene_source_left_intrinsic=packet["scene_source_left_intrinsic"],
+            scene_source_right_intrinsic=packet["scene_source_right_intrinsic"],
+            default_left_overlay_eye_render_state=packet["left_overlay_eye_render_state"],
+            default_right_overlay_eye_render_state=packet["right_overlay_eye_render_state"],
+            live_head_alignment=packet.get("live_head_alignment"),
+            head_pose_state=packet.get("head_pose_state"),
+            frame_index=int(packet["source_frame_index"]),
+            eye_width=self._eye_width,
+            eye_height=self._eye_height,
+        )
+        publish_sample = publish_state["publish_sample"]
+        if publish_state["apply_timewarp"]:
+            scene_pose_sample = publish_sample
+        default_left_overlay_eye_render_state = packet["left_overlay_eye_render_state"]
+        default_right_overlay_eye_render_state = packet["right_overlay_eye_render_state"]
+        left_overlay_eye_render_state = publish_state["left_overlay_eye_render_state"]
+        right_overlay_eye_render_state = publish_state["right_overlay_eye_render_state"]
+        timewarp_source_age_ms = max(
+            0.0,
+            (time.perf_counter() - float(packet["source_ready_wall_time_s"])) * 1000.0,
+        )
+        with self._condition:
+            stale_packet = int(self._latest_submitted_serial) > int(
+                packet.get("submit_serial", 0)
+            )
+        timewarp_decision = owner._evaluate_immersive_scene_timewarp_admission(
+            apply_requested=bool(publish_state["apply_timewarp"]),
+            queue_wait_ms=queue_wait_ms,
+            source_age_ms=timewarp_source_age_ms,
+            static_scene_reuse_age_frames=float(
+                packet.get("static_scene_reuse_age_frames", 0.0)
+            ),
+            stale_packet=stale_packet,
+        )
+        owner._record_immersive_scene_timewarp_skip_profile_metrics(
+            worker_profile,
+            timewarp_decision,
+        )
+        if bool(timewarp_decision["apply"]):
+            publish_sample_id = int(publish_state["publish_sample_id"])
+            timewarp_span = None
+            left_timewarp_stats = {}
+            right_timewarp_stats = {}
+            with torch.cuda.stream(control_stream):
+                timewarp_span = owner._render_profile_begin_cuda_span(
+                    worker_profile,
+                    "scene_timewarp_gpu_ms",
+                )
+            with torch.cuda.stream(left_stream):
+                try:
+                    (
+                        warped_left_eye_frame,
+                        warped_left_eye_depth,
+                        warped_left_valid_mask,
+                    ) = owner._latewarp_immersive_scene_eye(
+                        left_eye_frame,
+                        left_eye_frame_depth,
+                        packet["scene_source_left_eye_pose_world"],
+                        publish_state["publish_left_eye_pose_world"],
+                        packet["scene_source_left_intrinsic"],
+                        publish_state["publish_left_intrinsic"],
+                        self._eye_height,
+                        self._eye_width,
+                        "left_present",
+                        reproject_caches=self._scene_reproject_caches,
+                        render_profile_frame=None,
+                    )
+                    if (
+                        torch.is_tensor(warped_left_eye_frame)
+                        and torch.is_tensor(warped_left_eye_depth)
+                        and tuple(warped_left_eye_frame.shape)
+                        == (self._eye_height, self._eye_width, 4)
+                        and tuple(warped_left_eye_depth.shape)
+                        == (self._eye_height, self._eye_width)
+                        and owner._is_finite_tensor(warped_left_eye_frame)
+                        and owner._is_finite_tensor(warped_left_eye_depth)
+                    ):
+                        left_eye_frame = warped_left_eye_frame
+                        left_eye_frame_depth = warped_left_eye_depth
+                    else:
+                        scene_timewarp_fallback_left_used = 1.0
+                except Exception:
+                    scene_timewarp_fallback_left_used = 1.0
+            with torch.cuda.stream(right_stream):
+                try:
+                    (
+                        warped_right_eye_frame,
+                        warped_right_eye_depth,
+                        _,
+                    ) = owner._latewarp_immersive_scene_eye(
+                        right_eye_frame,
+                        right_eye_frame_depth,
+                        packet["scene_source_right_eye_pose_world"],
+                        publish_state["publish_right_eye_pose_world"],
+                        packet["scene_source_right_intrinsic"],
+                        publish_state["publish_right_intrinsic"],
+                        self._eye_height,
+                        self._eye_width,
+                        "right_present",
+                        reproject_caches=self._scene_reproject_caches,
+                        render_profile_frame=None,
+                    )
+                    if (
+                        torch.is_tensor(warped_right_eye_frame)
+                        and torch.is_tensor(warped_right_eye_depth)
+                        and tuple(warped_right_eye_frame.shape)
+                        == (self._eye_height, self._eye_width, 4)
+                        and tuple(warped_right_eye_depth.shape)
+                        == (self._eye_height, self._eye_width)
+                        and owner._is_finite_tensor(warped_right_eye_frame)
+                        and owner._is_finite_tensor(warped_right_eye_depth)
+                    ):
+                        right_eye_frame = warped_right_eye_frame
+                        right_eye_frame_depth = warped_right_eye_depth
+                    else:
+                        scene_timewarp_fallback_right_used = 1.0
+                except Exception:
+                    scene_timewarp_fallback_right_used = 1.0
+            with torch.cuda.stream(control_stream):
+                control_stream.wait_stream(left_stream)
+                control_stream.wait_stream(right_stream)
+                owner._render_profile_end_cuda_span(
+                    worker_profile,
+                    timewarp_span,
+                )
+            scene_timewarp_applied = 1.0
+        else:
+            publish_sample = None
+            scene_pose_sample = None
+            publish_sample_id = int(
+                packet.get(
+                    "scene_source_sample_id",
+                    packet.get("render_sample_id", -1),
+                )
+            )
+            left_overlay_eye_render_state = default_left_overlay_eye_render_state
+            right_overlay_eye_render_state = default_right_overlay_eye_render_state
+
+        if synthetic_source_state is not None:
+            scene_source_received_monotonic_s = packet.get(
+                "scene_source_received_monotonic_s"
+            )
+            if scene_pose_sample is not None:
+                publish_pose_received_monotonic_s = owner._sample_received_monotonic_s(
+                    scene_pose_sample
+                )
+                if publish_pose_received_monotonic_s is not None:
+                    scene_source_received_monotonic_s = float(
+                        publish_pose_received_monotonic_s
+                    )
+            actual_real_view_source = self._build_actual_real_view_source_bundle(
+                packet=packet,
+                left_eye_frame=left_eye_frame,
+                left_eye_frame_depth=left_eye_frame_depth,
+                right_eye_frame=right_eye_frame,
+                right_eye_frame_depth=right_eye_frame_depth,
+                publish_state=publish_state,
+                publish_sample_id=publish_sample_id,
+                left_overlay_eye_render_state=left_overlay_eye_render_state,
+                right_overlay_eye_render_state=right_overlay_eye_render_state,
+                real_timewarp_applied=bool(scene_timewarp_applied),
+                left_timewarp_fallback_used=bool(scene_timewarp_fallback_left_used),
+                right_timewarp_fallback_used=bool(scene_timewarp_fallback_right_used),
+                scene_source_received_monotonic_s=scene_source_received_monotonic_s,
+            )
+            if bool(actual_real_view_source.get("synthetic_source_consistent", 0.0)):
+                synthetic_source_state = (
+                    self._rebase_synthetic_source_state_to_actual_real_view(
+                        synthetic_source_state,
+                        actual_real_view_source=actual_real_view_source,
+                    )
+                )
+            else:
+                synthetic_source_state = None
+
+        with torch.cuda.stream(control_stream):
+            overlay_start = time.perf_counter()
+            projected_overlay_entries = owner._project_live_controller_world_overlays_batched(
+                packet.get("controller_overlay_entries") or [],
+                {
+                    "left": left_overlay_eye_render_state,
+                    "right": right_overlay_eye_render_state,
+                },
+                self._eye_height,
+                self._eye_width,
+            )
+            overlay_projection_wall_s = time.perf_counter() - overlay_start
+            if worker_profile is not None:
+                worker_profile["overlay_projection_wall"] = overlay_projection_wall_s
+
+        with torch.cuda.stream(left_stream):
+            left_stream.wait_stream(control_stream)
+            left_overlay_start_event.record(left_stream)
+            left_eye_overlay_entries = projected_overlay_entries.get("left", [])
+            if left_eye_overlay_entries:
+                owner._draw_live_controller_overlay(
+                    left_eye_frame,
+                    left_eye_overlay_entries,
+                )
+            if packet.get("support_overlay_enabled", False):
+                owner._draw_immersive_support_entry_overlay(
+                    left_eye_frame,
+                    packet.get("support_overlay_cache"),
+                    packet.get("support_overlay_active_support_id"),
+                    left_overlay_eye_render_state,
+                )
+            left_overlay_end_event.record(left_stream)
+
+        with torch.cuda.stream(right_stream):
+            right_stream.wait_stream(control_stream)
+            right_overlay_start_event.record(right_stream)
+            right_eye_overlay_entries = projected_overlay_entries.get("right", [])
+            if right_eye_overlay_entries:
+                owner._draw_live_controller_overlay(
+                    right_eye_frame,
+                    right_eye_overlay_entries,
+                )
+            if packet.get("support_overlay_enabled", False):
+                owner._draw_immersive_support_entry_overlay(
+                    right_eye_frame,
+                    packet.get("support_overlay_cache"),
+                    packet.get("support_overlay_active_support_id"),
+                    right_overlay_eye_render_state,
+                )
+            right_overlay_end_event.record(right_stream)
+
+        with torch.cuda.stream(control_stream):
+            parallel_wait_start_event.record(control_stream)
+            control_stream.wait_stream(left_stream)
+            control_stream.wait_stream(right_stream)
+            parallel_wait_end_event.record(control_stream)
+            if left_eye_frame.dtype != torch.uint8:
+                left_eye_frame = left_eye_frame.clamp(0.0, 255.0).to(torch.uint8)
+            if right_eye_frame.dtype != torch.uint8:
+                right_eye_frame = right_eye_frame.clamp(0.0, 255.0).to(torch.uint8)
+            if stable_compose_debug_enabled:
+                owner._finalize_immersive_runtime_compose_artifact(
+                    left_compose_artifact_token,
+                    scene_color=packet["left_scene_color"],
+                    scene_depth=packet["left_scene_depth"],
+                    gaussian_rgba=packet["left_gaussian_rgba"],
+                    gaussian_depth=packet["left_gaussian_depth"],
+                    composed_pre_overlay=left_compose_artifact_pre_overlay,
+                    final_post_overlay=left_eye_frame,
+                    compose_mode=packet["immersive_compose_mode"],
+                    pre_stabilization_composed_pre_overlay=left_compose_artifact_pre_stabilization,
+                    extra_metadata=left_compose_artifact_extra_metadata,
+                )
+                owner._finalize_immersive_runtime_compose_artifact(
+                    right_compose_artifact_token,
+                    scene_color=packet["right_scene_color"],
+                    scene_depth=packet["right_scene_depth"],
+                    gaussian_rgba=packet["right_gaussian_rgba"],
+                    gaussian_depth=packet["right_gaussian_depth"],
+                    composed_pre_overlay=right_compose_artifact_pre_overlay,
+                    final_post_overlay=right_eye_frame,
+                    compose_mode=packet["immersive_compose_mode"],
+                    pre_stabilization_composed_pre_overlay=right_compose_artifact_pre_stabilization,
+                    extra_metadata=right_compose_artifact_extra_metadata,
+                )
+
+            publish_start = time.perf_counter()
+            publish_ok, publish_stats = self._immersive_bridge.publish_stereo_frames(
+                left_eye_frame,
+                right_eye_frame,
+            )
+            publish_wall_s = time.perf_counter() - publish_start
+            preview_frame = None
+            preview_ready_event = None
+            if self._preview_enabled:
+                preview_frame = left_eye_frame.clone()
+                preview_ready_event = torch.cuda.Event()
+                preview_ready_event.record(control_stream)
+            if torch.cuda.is_available():
+                presentation_complete_event = torch.cuda.Event()
+                presentation_complete_event.record(control_stream)
+        if presentation_complete_event is not None:
+            presentation_complete_event.synchronize()
+        if not publish_ok:
+            raise RuntimeError(
+                "Quest immersive bridge stopped accepting stereo frames.\n"
+                + self._immersive_bridge.debug_summary()
+            )
+        self._update_stable_cover_frame_cache(
+            left_frame=left_eye_frame,
+            right_frame=right_eye_frame,
+            preview_frame=preview_frame,
+        )
+        left_compose_ms = self._elapsed_event_ms(
+            left_compose_start_event,
+            left_compose_end_event,
+        )
+        right_compose_ms = self._elapsed_event_ms(
+            right_compose_start_event,
+            right_compose_end_event,
+        )
+        left_overlay_ms = self._elapsed_event_ms(
+            left_overlay_start_event,
+            left_overlay_end_event,
+        )
+        right_overlay_ms = self._elapsed_event_ms(
+            right_overlay_start_event,
+            right_overlay_end_event,
+        )
+        parallel_wait_ms = self._elapsed_event_ms(
+            parallel_wait_start_event,
+            parallel_wait_end_event,
+        )
+        compose_wall_s = max(left_compose_ms, right_compose_ms) / 1000.0
+        overlay_wall_s = (
+            overlay_projection_wall_s + max(left_overlay_ms, right_overlay_ms) / 1000.0
+        )
+        if worker_profile is not None:
+            if left_compose_metrics is not None:
+                owner._render_profile_record_immersive_compose_metrics(
+                    worker_profile,
+                    "left",
+                    left_compose_metrics,
+                )
+            if right_compose_metrics is not None:
+                owner._render_profile_record_immersive_compose_metrics(
+                    worker_profile,
+                    "right",
+                    right_compose_metrics,
+                )
+            worker_profile["overlay_draw_left_wall"] = left_overlay_ms / 1000.0
+            worker_profile["overlay_draw_right_wall"] = right_overlay_ms / 1000.0
+        if worker_profile is not None:
+            worker_profile["publish_sample_id"] = float(publish_sample_id)
+            worker_profile["scene_timewarp_applied"] = float(scene_timewarp_applied)
+            worker_profile["scene_timewarp_fallback_left_used"] = float(
+                scene_timewarp_fallback_left_used
+            )
+            worker_profile["scene_timewarp_fallback_right_used"] = float(
+                scene_timewarp_fallback_right_used
+            )
+            worker_profile["publish_total_wall"] = float(
+                publish_stats.get("total_wall", 0.0)
+            )
+            worker_profile["publish_process_check_wall"] = float(
+                publish_stats.get("process_check_wall", 0.0)
+            )
+            worker_profile["publish_pending_drain_nonblock_wall"] = float(
+                publish_stats.get("pending_drain_nonblock_wall", 0.0)
+            )
+            worker_profile["publish_pending_drain_block_wall"] = float(
+                publish_stats.get("pending_drain_block_wall", 0.0)
+            )
+            worker_profile["publish_gpu_to_cpu_wait_wall"] = float(
+                publish_stats.get("gpu_to_cpu_wait_wall", 0.0)
+            )
+            worker_profile["publish_gpu_to_cpu_copy_cuda"] = float(
+                publish_stats.get("gpu_to_cpu_copy_cuda", 0.0)
+            )
+            worker_profile["publish_cpu_mmap_copy_wall"] = float(
+                publish_stats.get("cpu_mmap_copy_wall", 0.0)
+            )
+            worker_profile["publish_header_write_wall"] = float(
+                publish_stats.get("header_write_wall", 0.0)
+            )
+            worker_profile["publish_stage_enqueue_wall"] = float(
+                publish_stats.get("stage_enqueue_wall", 0.0)
+            )
+            worker_profile["publish_fallback_copy_wall"] = float(
+                publish_stats.get("fallback_copy_wall", 0.0)
+            )
+            if bool(packet.get("scene_depth_reproject_enabled", False)):
+                publish_measurement_s = time.monotonic()
+                render_pose_staleness_ms = 0.0
+                render_sample_received_monotonic_s = packet.get(
+                    "render_sample_received_monotonic_s"
+                )
+                if render_sample_received_monotonic_s is not None:
+                    render_pose_staleness_ms = max(
+                        0.0,
+                        (
+                            publish_measurement_s
+                            - float(render_sample_received_monotonic_s)
+                        )
+                        * 1000.0,
+                    )
+                scene_pose_received_monotonic_s = packet.get(
+                    "scene_source_received_monotonic_s"
+                )
+                if scene_pose_sample is not None:
+                    publish_pose_received_monotonic_s = owner._sample_received_monotonic_s(
+                        scene_pose_sample
+                    )
+                    if publish_pose_received_monotonic_s is not None:
+                        scene_pose_received_monotonic_s = (
+                            publish_pose_received_monotonic_s
+                        )
+                if scene_pose_received_monotonic_s is None:
+                    scene_pose_staleness_ms_at_publish = render_pose_staleness_ms
+                else:
+                    scene_pose_staleness_ms_at_publish = max(
+                        0.0,
+                        (
+                            publish_measurement_s
+                            - float(scene_pose_received_monotonic_s)
+                        )
+                        * 1000.0,
+                    )
+                scene_pose_staleness_savings_ms = max(
+                    0.0,
+                    render_pose_staleness_ms - scene_pose_staleness_ms_at_publish,
+                )
+                worker_profile["scene_pose_staleness_ms_at_publish"] = float(
+                    scene_pose_staleness_ms_at_publish / 1000.0
+                )
+                worker_profile["scene_pose_staleness_savings_ms"] = float(
+                    scene_pose_staleness_savings_ms / 1000.0
+                )
+            worker_profile = owner._render_profile_finalize_frame(worker_profile)
+        worker_wall_ms = 1000.0 * (time.perf_counter() - worker_start)
+        source_age_ms = max(
+            0.0,
+            (time.perf_counter() - float(packet["source_ready_wall_time_s"])) * 1000.0,
+        )
+        return {
+            "payload": {
+                "payload_kind": "real_publish",
+                "source_frame_index": int(packet["source_frame_index"]),
+                "queue_wait_ms": float(queue_wait_ms),
+                "worker_wall_ms": float(worker_wall_ms),
+                "compose_wall_ms": float(compose_wall_s * 1000.0),
+                "compose_left_ms": float(left_compose_ms),
+                "compose_right_ms": float(right_compose_ms),
+                "overlay_wall_ms": float(overlay_wall_s * 1000.0),
+                "overlay_left_ms": float(left_overlay_ms),
+                "overlay_right_ms": float(right_overlay_ms),
+                "parallel_wait_ms": float(parallel_wait_ms),
+                "publish_wall_ms": float(publish_wall_s * 1000.0),
+                "source_age_ms": float(source_age_ms),
+                "scene_pose_staleness_ms_at_publish": float(
+                    scene_pose_staleness_ms_at_publish
+                ),
+                "scene_pose_staleness_savings_ms": float(
+                    scene_pose_staleness_savings_ms
+                ),
+                "render_profile_updates": None
+                if worker_profile is None
+                else worker_profile,
+                "preview_frame": preview_frame,
+                "preview_ready_event": preview_ready_event,
+                "stable_cover_frame_snapshot": {
+                    "left_frame": self._stable_cover_left_frame,
+                    "right_frame": self._stable_cover_right_frame,
+                    "preview_frame": self._stable_cover_preview_frame,
+                },
+            },
+            "synthetic_source_state": synthetic_source_state,
+        }
+
+class _ImmersivePresentationWorker(_ImmersivePresentationWorkerLegacy):
+    def __init__(
+        self,
+        *,
+        owner,
+        immersive_bridge,
+        eye_width,
+        eye_height,
+        preview_enabled,
+        cuda_device_index,
+    ):
+        super().__init__(
+            owner=owner,
+            immersive_bridge=immersive_bridge,
+            eye_width=eye_width,
+            eye_height=eye_height,
+            preview_enabled=preview_enabled,
+            cuda_device_index=cuda_device_index,
+        )
+        self._init_queue: queue.Queue = queue.Queue()
+        self._real_thread = None
+        self._synthetic_thread = None
+        self._arbiter_thread = None
+        self._pending_real_packet = None
+        self._pending_synthetic_source = None
+        self._ready_real_candidate = None
+        self._ready_synthetic_candidate = None
+        self._real_processing = False
+        self._synthetic_processing = False
+        self._arbiter_publishing = False
+        self._latest_completed_real_frame_index = -1
+        self._real_scene_reproject_caches = {}
+        self._synthetic_scene_reproject_caches = {}
+        self._thread = None
+        self._pending_packet = None
+        self._processing_packet = False
+        self._synthetic_source_state = None
+        self._first_real_publish_completed = False
+        self._first_real_submit_wall_time_s = None
+        self._first_real_submit_source_frame_index = -1
+        self._real_submit_count = 0
+        self._real_start_count = 0
+        self._real_ready_count = 0
+        self._real_publish_count = 0
+        self._latest_real_timewarp_validity = None
+        self._transition_trace = collections.deque(maxlen=64)
+
+    def start(self):
+        if (
+            self._real_thread is not None
+            or self._synthetic_thread is not None
+            or self._arbiter_thread is not None
+        ):
+            return
+        self._stop_requested = False
+        with self._condition:
+            self._pending_real_packet = None
+            self._pending_synthetic_source = None
+            self._ready_real_candidate = None
+            self._ready_synthetic_candidate = None
+            self._real_processing = False
+            self._synthetic_processing = False
+            self._arbiter_publishing = False
+            self._latest_completed_real_frame_index = -1
+            self._first_real_publish_completed = False
+            self._first_real_submit_wall_time_s = None
+            self._first_real_submit_source_frame_index = -1
+            self._real_submit_count = 0
+            self._real_start_count = 0
+            self._real_ready_count = 0
+            self._real_publish_count = 0
+            self._latest_real_timewarp_validity = None
+            self._transition_trace.clear()
+        self._real_thread = threading.Thread(
+            target=self._real_thread_main,
+            name="ImmersiveRealPresentWorker",
+            daemon=True,
+        )
+        self._synthetic_thread = threading.Thread(
+            target=self._synthetic_thread_main,
+            name="ImmersiveSyntheticPresentWorker",
+            daemon=True,
+        )
+        self._arbiter_thread = threading.Thread(
+            target=self._arbiter_thread_main,
+            name="ImmersivePresentArbiter",
+            daemon=True,
+        )
+        self._real_thread.start()
+        self._synthetic_thread.start()
+        self._arbiter_thread.start()
+        init_errors = []
+        for _ in range(3):
+            init_result = self._init_queue.get(timeout=120.0)
+            if not bool(init_result.get("ok", False)):
+                init_errors.append(
+                    init_result.get("error", "unknown immersive worker init error")
+                )
+        if init_errors:
+            self.stop()
+            raise RuntimeError(
+                "Failed to initialize immersive presentation workers: "
+                + "; ".join(str(err) for err in init_errors)
+            )
+
+    def stop(self):
+        if (
+            self._real_thread is None
+            and self._synthetic_thread is None
+            and self._arbiter_thread is None
+        ):
+            return {"dropped_packet": None, "results": []}
+        with self._condition:
+            dropped_packet = self._pending_real_packet
+            self._pending_real_packet = None
+            self._pending_synthetic_source = None
+            self._ready_real_candidate = None
+            self._ready_synthetic_candidate = None
+            self._stop_requested = True
+            self._condition.notify_all()
+        for thread in (self._real_thread, self._synthetic_thread, self._arbiter_thread):
+            if thread is not None:
+                thread.join(timeout=10.0)
+        self._real_thread = None
+        self._synthetic_thread = None
+        self._arbiter_thread = None
+        results = []
+        while True:
+            try:
+                results.append(self._response_queue.get_nowait())
+            except queue.Empty:
+                break
+        return {
+            "dropped_packet": dropped_packet,
+            "results": results,
+        }
+
+    def submit(self, packet):
+        if self._real_thread is None:
+            raise RuntimeError("Immersive presentation worker has not been started.")
+        with self._condition:
+            if self._stop_requested:
+                raise RuntimeError("Immersive presentation worker is stopping.")
+            self._submit_serial += 1
+            packet["submit_serial"] = int(self._submit_serial)
+            self._latest_submitted_serial = int(self._submit_serial)
+            self._real_submit_count += 1
+            if self._first_real_submit_wall_time_s is None:
+                self._first_real_submit_wall_time_s = float(time.perf_counter())
+                self._first_real_submit_source_frame_index = int(
+                    packet.get("source_frame_index", -1)
+                )
+            self._trace_transition_locked(
+                "real_submit",
+                source_frame_index=int(packet.get("source_frame_index", -1)),
+                submit_serial=int(packet["submit_serial"]),
+            )
+            dropped_packet = self._pending_real_packet
+            self._pending_real_packet = packet
+            self._condition.notify_all()
+        return dropped_packet
+
+    def poll_result(self):
+        if self._real_thread is None:
+            return None
+        try:
+            return self._response_queue.get_nowait()
+        except queue.Empty:
+            return None
+
+    def wait_for_idle(self, timeout=None):
+        if (
+            self._real_thread is None
+            and self._synthetic_thread is None
+            and self._arbiter_thread is None
+        ):
+            return True
+        deadline = None if timeout is None else (time.perf_counter() + float(timeout))
+        with self._condition:
+            while True:
+                if (
+                    self._pending_real_packet is None
+                    and self._pending_synthetic_source is None
+                    and self._ready_real_candidate is None
+                    and self._ready_synthetic_candidate is None
+                    and not self._real_processing
+                    and not self._synthetic_processing
+                    and not self._arbiter_publishing
+                ):
+                    return True
+                if deadline is None:
+                    self._condition.wait(timeout=0.05)
+                    continue
+                remaining = deadline - time.perf_counter()
+                if remaining <= 0.0:
+                    return False
+                self._condition.wait(timeout=min(0.05, remaining))
+
+    def _push_payload(self, payload):
+        if payload is None:
+            return
+        self._response_queue.put({"ok": True, "payload": payload})
+
+    def _push_error(self, exc):
+        self._response_queue.put(
+            {
+                "ok": False,
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+        )
+        with self._condition:
+            self._stop_requested = True
+            self._condition.notify_all()
+
+    def _trace_transition_locked(self, event, **fields):
+        trace_entry = {
+            "event": str(event),
+            "elapsed_ms": float(time.perf_counter() * 1000.0),
+        }
+        for key, value in fields.items():
+            if isinstance(value, (np.generic,)):
+                value = value.item()
+            if isinstance(value, (int, float, str, bool)) or value is None:
+                trace_entry[str(key)] = value
+            else:
+                trace_entry[str(key)] = str(value)
+        self._transition_trace.append(trace_entry)
+
+    def mark_first_real_publish_timeout(self):
+        with self._condition:
+            self._trace_transition_locked(
+                "first_real_publish_timeout",
+                first_real_submit_source_frame_index=int(
+                    self._first_real_submit_source_frame_index
+                ),
+                real_submit_count=int(self._real_submit_count),
+                real_ready_count=int(self._real_ready_count),
+                real_publish_count=int(self._real_publish_count),
+            )
+
+    def first_real_publish_watchdog_snapshot(self):
+        with self._condition:
+            return {
+                "first_real_publish_completed": bool(
+                    self._first_real_publish_completed
+                ),
+                "first_real_submit_wall_time_s": None
+                if self._first_real_submit_wall_time_s is None
+                else float(self._first_real_submit_wall_time_s),
+                "first_real_submit_source_frame_index": int(
+                    self._first_real_submit_source_frame_index
+                ),
+                "real_submit_count": int(self._real_submit_count),
+                "real_start_count": int(self._real_start_count),
+                "real_ready_count": int(self._real_ready_count),
+                "real_publish_count": int(self._real_publish_count),
+                "latest_submitted_serial": int(self._latest_submitted_serial),
+                "latest_completed_real_frame_index": int(
+                    self._latest_completed_real_frame_index
+                ),
+                "pending_real": bool(self._pending_real_packet is not None),
+                "pending_synthetic": bool(
+                    self._pending_synthetic_source is not None
+                ),
+                "ready_real": bool(self._ready_real_candidate is not None),
+                "ready_synthetic": bool(
+                    self._ready_synthetic_candidate is not None
+                ),
+                "real_processing": bool(self._real_processing),
+                "synthetic_processing": bool(self._synthetic_processing),
+                "arbiter_publishing": bool(self._arbiter_publishing),
+                "latest_real_timewarp_validity": copy.deepcopy(
+                    self._latest_real_timewarp_validity
+                ),
+                "transition_trace": list(self._transition_trace),
+            }
+
+    def format_first_real_publish_watchdog_snapshot(self, snapshot):
+        if not snapshot:
+            return ""
+        first_submit_wall_time_s = snapshot.get("first_real_submit_wall_time_s")
+        first_submit_age_ms = None
+        if first_submit_wall_time_s is not None:
+            first_submit_age_ms = max(
+                0.0,
+                (time.perf_counter() - float(first_submit_wall_time_s)) * 1000.0,
+            )
+        lines = [
+            "presentation worker first-real watchdog:",
+            "  "
+            + " ".join(
+                [
+                    f"completed={bool(snapshot.get('first_real_publish_completed', False))}",
+                    f"submit_count={int(snapshot.get('real_submit_count', 0))}",
+                    f"start_count={int(snapshot.get('real_start_count', 0))}",
+                    f"ready_count={int(snapshot.get('real_ready_count', 0))}",
+                    f"publish_count={int(snapshot.get('real_publish_count', 0))}",
+                ]
+            ),
+            "  "
+            + " ".join(
+                [
+                    f"first_submit_source_frame_index={int(snapshot.get('first_real_submit_source_frame_index', -1))}",
+                    f"latest_submitted_serial={int(snapshot.get('latest_submitted_serial', -1))}",
+                    f"latest_completed_real_frame_index={int(snapshot.get('latest_completed_real_frame_index', -1))}",
+                ]
+            ),
+            "  "
+            + " ".join(
+                [
+                    f"pending_real={bool(snapshot.get('pending_real', False))}",
+                    f"pending_synthetic={bool(snapshot.get('pending_synthetic', False))}",
+                    f"ready_real={bool(snapshot.get('ready_real', False))}",
+                    f"ready_synthetic={bool(snapshot.get('ready_synthetic', False))}",
+                    f"real_processing={bool(snapshot.get('real_processing', False))}",
+                    f"synthetic_processing={bool(snapshot.get('synthetic_processing', False))}",
+                    f"arbiter_publishing={bool(snapshot.get('arbiter_publishing', False))}",
+                ]
+            ),
+        ]
+        if first_submit_age_ms is not None:
+            lines.append(f"  first_submit_age_ms={first_submit_age_ms:.1f}")
+        latest_real_timewarp_validity = snapshot.get("latest_real_timewarp_validity")
+        if latest_real_timewarp_validity:
+            lines.append(
+                "  latest_real_timewarp_validity="
+                + repr(latest_real_timewarp_validity)
+            )
+        transition_trace = snapshot.get("transition_trace") or []
+        if transition_trace:
+            lines.append("  recent_transition_trace:")
+            for entry in transition_trace[-12:]:
+                parts = []
+                for key, value in entry.items():
+                    parts.append(f"{key}={value}")
+                lines.append("    " + " ".join(parts))
+        return "\n".join(lines)
+
+    def _make_synthetic_skip_payload(
+        self,
+        *,
+        source_frame_index,
+        reason,
+        source_age_ms=0.0,
+        total_scene_age_ms=0.0,
+        handoff_delay_ms=0.0,
+        translation_m=0.0,
+        rotation_deg=0.0,
+        launch_count_increment=0.0,
+        pending_real_at_launch=0.0,
+        immediate_sample_hit=0.0,
+    ):
+        return {
+            "payload_kind": "synthetic_skip",
+            "source_frame_index": int(source_frame_index),
+            "synthetic_framegen_applied": 0.0,
+            "synthetic_skip_reason": str(reason).strip().lower(),
+            "synthetic_source_age_ms": float(source_age_ms),
+            "synthetic_total_scene_age_ms": float(total_scene_age_ms),
+            "synthetic_handoff_delay_ms": float(handoff_delay_ms),
+            "synthetic_translation_m": float(translation_m),
+            "synthetic_rotation_deg": float(rotation_deg),
+            "synthetic_launch_count_increment": float(launch_count_increment),
+            "synthetic_pending_real_at_launch": float(pending_real_at_launch),
+            "synthetic_immediate_sample_hit": float(immediate_sample_hit),
+        }
+
+    def _build_pending_real_yield_payload(self, candidate):
+        payload = self._make_synthetic_skip_payload(
+            source_frame_index=int(candidate.get("source_frame_index", -1)),
+            reason="pending_real_yield",
+            source_age_ms=float(candidate.get("synthetic_source_age_ms", 0.0)),
+            total_scene_age_ms=float(
+                candidate.get("synthetic_total_scene_age_ms", 0.0)
+            ),
+            handoff_delay_ms=float(
+                candidate.get("synthetic_handoff_delay_ms", 0.0)
+            ),
+            translation_m=float(candidate.get("synthetic_translation_m", 0.0)),
+            rotation_deg=float(candidate.get("synthetic_rotation_deg", 0.0)),
+            launch_count_increment=float(
+                candidate.get("synthetic_launch_count_increment", 0.0)
+            ),
+            pending_real_at_launch=float(
+                candidate.get("synthetic_pending_real_at_launch", 0.0)
+            ),
+            immediate_sample_hit=float(
+                candidate.get("synthetic_immediate_sample_hit", 0.0)
+            ),
+        )
+        payload.update(self._synthetic_source_diagnostic_payload_fields(candidate))
+        return payload
+
+    def _wait_for_synthetic_publish_sample(self, synthetic_source_state):
+        framegen_mode = str(synthetic_source_state["framegen_mode"]).strip().lower()
+        max_source_age_ms = (
+            float(self._owner.IMMERSIVE_SYNTHETIC_FRAMEGEN_STATIC_MAX_SOURCE_AGE_MS)
+            if framegen_mode == "static"
+            else float(
+                self._owner.IMMERSIVE_SYNTHETIC_FRAMEGEN_ADAPTIVE_MAX_SOURCE_AGE_MS
+            )
+        )
+        min_sample_id = int(
+            synthetic_source_state.get(
+                "real_publish_sample_id",
+                synthetic_source_state["scene_source_sample_id"],
+            )
+        )
+        source_frame_index = int(synthetic_source_state["source_frame_index"])
+        age_metrics = self._owner._compute_immersive_synthetic_framegen_age_metrics(
+            scene_source_ready_wall_time_s=synthetic_source_state.get(
+                "scene_source_ready_wall_time_s",
+                synthetic_source_state["source_ready_wall_time_s"],
+            ),
+            synthetic_source_ready_wall_time_s=synthetic_source_state.get(
+                "synthetic_source_ready_wall_time_s",
+                synthetic_source_state.get(
+                    "scene_source_ready_wall_time_s",
+                    synthetic_source_state["source_ready_wall_time_s"],
+                ),
+            ),
+        )
+        source_age_ms = float(age_metrics["synthetic_candidate_age_ms"])
+        with self._condition:
+            superseded_source = bool(
+                self._stop_requested
+                or int(self._latest_completed_real_frame_index)
+                > int(source_frame_index)
+            )
+        if superseded_source:
+            return {
+                "sample": None,
+                "reason": "stale_packet",
+                "source_age_ms": source_age_ms,
+                "total_scene_age_ms": float(
+                    age_metrics["synthetic_total_scene_age_ms"]
+                ),
+                "handoff_delay_ms": float(
+                    age_metrics["synthetic_handoff_delay_ms"]
+                ),
+                "immediate_sample_hit": False,
+            }
+        if source_age_ms >= max_source_age_ms:
+            return {
+                "sample": None,
+                "reason": "source_age",
+                "source_age_ms": source_age_ms,
+                "total_scene_age_ms": float(
+                    age_metrics["synthetic_total_scene_age_ms"]
+                ),
+                "handoff_delay_ms": float(
+                    age_metrics["synthetic_handoff_delay_ms"]
+                ),
+                "immediate_sample_hit": False,
+            }
+        latest_sample = self._immersive_bridge.get_latest_sample()
+        if latest_sample is not None and int(getattr(latest_sample, "sample", -1)) > min_sample_id:
+            age_metrics = self._owner._compute_immersive_synthetic_framegen_age_metrics(
+                scene_source_ready_wall_time_s=synthetic_source_state.get(
+                    "scene_source_ready_wall_time_s",
+                    synthetic_source_state["source_ready_wall_time_s"],
+                ),
+                synthetic_source_ready_wall_time_s=synthetic_source_state.get(
+                    "synthetic_source_ready_wall_time_s",
+                    synthetic_source_state.get(
+                        "scene_source_ready_wall_time_s",
+                        synthetic_source_state["source_ready_wall_time_s"],
+                    ),
+                ),
+            )
+            return {
+                "sample": latest_sample,
+                "reason": None,
+                "source_age_ms": float(age_metrics["synthetic_candidate_age_ms"]),
+                "total_scene_age_ms": float(
+                    age_metrics["synthetic_total_scene_age_ms"]
+                ),
+                "handoff_delay_ms": float(
+                    age_metrics["synthetic_handoff_delay_ms"]
+                ),
+                "immediate_sample_hit": True,
+            }
+        waited_for_new_sample = False
+        while True:
+            with self._condition:
+                superseded_source = bool(
+                    self._stop_requested
+                    or int(self._latest_completed_real_frame_index)
+                    > int(source_frame_index)
+                )
+            if superseded_source:
+                age_metrics = self._owner._compute_immersive_synthetic_framegen_age_metrics(
+                    scene_source_ready_wall_time_s=synthetic_source_state.get(
+                        "scene_source_ready_wall_time_s",
+                        synthetic_source_state["source_ready_wall_time_s"],
+                    ),
+                    synthetic_source_ready_wall_time_s=synthetic_source_state.get(
+                        "synthetic_source_ready_wall_time_s",
+                        synthetic_source_state.get(
+                            "scene_source_ready_wall_time_s",
+                            synthetic_source_state["source_ready_wall_time_s"],
+                        ),
+                    ),
+                )
+                return {
+                    "sample": None,
+                    "reason": "stale_packet",
+                    "source_age_ms": float(age_metrics["synthetic_candidate_age_ms"]),
+                    "total_scene_age_ms": float(
+                        age_metrics["synthetic_total_scene_age_ms"]
+                    ),
+                    "handoff_delay_ms": float(
+                        age_metrics["synthetic_handoff_delay_ms"]
+                    ),
+                    "immediate_sample_hit": False,
+                }
+            age_metrics = self._owner._compute_immersive_synthetic_framegen_age_metrics(
+                scene_source_ready_wall_time_s=synthetic_source_state.get(
+                    "scene_source_ready_wall_time_s",
+                    synthetic_source_state["source_ready_wall_time_s"],
+                ),
+                synthetic_source_ready_wall_time_s=synthetic_source_state.get(
+                    "synthetic_source_ready_wall_time_s",
+                    synthetic_source_state.get(
+                        "scene_source_ready_wall_time_s",
+                        synthetic_source_state["source_ready_wall_time_s"],
+                    ),
+                ),
+            )
+            source_age_ms = float(age_metrics["synthetic_candidate_age_ms"])
+            remaining_s = max(0.0, (max_source_age_ms - source_age_ms) / 1000.0)
+            if remaining_s <= 0.0:
+                return {
+                    "sample": None,
+                    "reason": "no_new_sample" if waited_for_new_sample else "source_age",
+                    "source_age_ms": source_age_ms,
+                    "total_scene_age_ms": float(
+                        age_metrics["synthetic_total_scene_age_ms"]
+                    ),
+                    "handoff_delay_ms": float(
+                        age_metrics["synthetic_handoff_delay_ms"]
+                    ),
+                    "immediate_sample_hit": False,
+                }
+            publish_sample = self._immersive_bridge.wait_for_newer_sample(
+                min_sample_id=min_sample_id,
+                timeout_s=min(
+                    remaining_s,
+                    float(
+                        self._owner.IMMERSIVE_SYNTHETIC_FRAMEGEN_WAIT_POLL_TIMEOUT_S
+                    ),
+                ),
+            )
+            waited_for_new_sample = True
+            if publish_sample is None:
+                continue
+            age_metrics = self._owner._compute_immersive_synthetic_framegen_age_metrics(
+                scene_source_ready_wall_time_s=synthetic_source_state.get(
+                    "scene_source_ready_wall_time_s",
+                    synthetic_source_state["source_ready_wall_time_s"],
+                ),
+                synthetic_source_ready_wall_time_s=synthetic_source_state.get(
+                    "synthetic_source_ready_wall_time_s",
+                    synthetic_source_state.get(
+                        "scene_source_ready_wall_time_s",
+                        synthetic_source_state["source_ready_wall_time_s"],
+                    ),
+                ),
+            )
+            return {
+                "sample": publish_sample,
+                "reason": None,
+                "source_age_ms": float(age_metrics["synthetic_candidate_age_ms"]),
+                "total_scene_age_ms": float(
+                    age_metrics["synthetic_total_scene_age_ms"]
+                ),
+                "handoff_delay_ms": float(
+                    age_metrics["synthetic_handoff_delay_ms"]
+                ),
+                "immediate_sample_hit": False,
+            }
+
+    def _warmup_real_worker(self, presentation_streams):
+        if presentation_streams is None:
+            return
+        left_stream = presentation_streams["left"]
+        right_stream = presentation_streams["right"]
+        control_stream = presentation_streams["control"]
+        dummy_intrinsic = np.array(
+            [
+                [float(self._eye_width), 0.0, float(self._eye_width) * 0.5],
+                [0.0, float(self._eye_height), float(self._eye_height) * 0.5],
+                [0.0, 0.0, 1.0],
+            ],
+            dtype=np.float32,
+        )
+        dummy_left_render_pose = np.eye(4, dtype=np.float32)
+        dummy_left_render_pose[0, 3] = -0.032
+        dummy_right_render_pose = np.eye(4, dtype=np.float32)
+        dummy_right_render_pose[0, 3] = 0.032
+        dummy_left_publish_pose = np.asarray(dummy_left_render_pose, dtype=np.float32).copy()
+        dummy_left_publish_pose[0, 3] += 0.01
+        dummy_right_publish_pose = np.asarray(dummy_right_render_pose, dtype=np.float32).copy()
+        dummy_right_publish_pose[0, 3] += 0.01
+        zeros_scene_rgba = torch.zeros(
+            (self._eye_height, self._eye_width, 4),
+            dtype=torch.uint8,
+            device=cfg.device,
+        )
+        zeros_scene_depth = torch.zeros(
+            (self._eye_height, self._eye_width),
+            dtype=torch.float32,
+            device=cfg.device,
+        )
+        zeros_gaussian_rgba = torch.zeros(
+            (4, self._eye_height, self._eye_width),
+            dtype=torch.float32,
+            device=cfg.device,
+        )
+        zeros_gaussian_depth = torch.zeros(
+            (self._eye_height, self._eye_width),
+            dtype=torch.float32,
+            device=cfg.device,
+        )
+        with torch.cuda.stream(left_stream):
+            left_eye_frame, left_eye_depth = self._owner._compose_immersive_eye_frame(
+                zeros_scene_rgba,
+                zeros_scene_depth,
+                zeros_gaussian_rgba,
+                zeros_gaussian_depth,
+                target_height=self._eye_height,
+                target_width=self._eye_width,
+                compose_mode="depth_aware",
+                compose_roi_padding=None,
+                output_dtype=torch.float32,
+                return_depth=True,
+            )
+            self._owner._latewarp_immersive_scene_eye(
+                left_eye_frame,
+                left_eye_depth,
+                dummy_left_render_pose,
+                dummy_left_publish_pose,
+                dummy_intrinsic,
+                dummy_intrinsic,
+                self._eye_height,
+                self._eye_width,
+                "left_real_present_warmup",
+                reproject_caches=self._real_scene_reproject_caches,
+            )
+        with torch.cuda.stream(right_stream):
+            right_eye_frame, right_eye_depth = self._owner._compose_immersive_eye_frame(
+                zeros_scene_rgba,
+                zeros_scene_depth,
+                zeros_gaussian_rgba,
+                zeros_gaussian_depth,
+                target_height=self._eye_height,
+                target_width=self._eye_width,
+                compose_mode="depth_aware",
+                compose_roi_padding=None,
+                output_dtype=torch.float32,
+                return_depth=True,
+            )
+            self._owner._latewarp_immersive_scene_eye(
+                right_eye_frame,
+                right_eye_depth,
+                dummy_right_render_pose,
+                dummy_right_publish_pose,
+                dummy_intrinsic,
+                dummy_intrinsic,
+                self._eye_height,
+                self._eye_width,
+                "right_real_present_warmup",
+                reproject_caches=self._real_scene_reproject_caches,
+            )
+        with torch.cuda.stream(control_stream):
+            control_stream.wait_stream(left_stream)
+            control_stream.wait_stream(right_stream)
+        control_stream.synchronize()
+
+    def _warmup_synthetic_worker(self, presentation_streams):
+        if presentation_streams is None:
+            return
+        left_stream = presentation_streams["left"]
+        right_stream = presentation_streams["right"]
+        control_stream = presentation_streams["control"]
+        dummy_intrinsic = np.array(
+            [
+                [float(self._eye_width), 0.0, float(self._eye_width) * 0.5],
+                [0.0, float(self._eye_height), float(self._eye_height) * 0.5],
+                [0.0, 0.0, 1.0],
+            ],
+            dtype=np.float32,
+        )
+        dummy_left_render_pose = np.eye(4, dtype=np.float32)
+        dummy_left_render_pose[0, 3] = -0.032
+        dummy_right_render_pose = np.eye(4, dtype=np.float32)
+        dummy_right_render_pose[0, 3] = 0.032
+        dummy_left_publish_pose = np.asarray(dummy_left_render_pose, dtype=np.float32).copy()
+        dummy_left_publish_pose[0, 3] += 0.01
+        dummy_right_publish_pose = np.asarray(dummy_right_render_pose, dtype=np.float32).copy()
+        dummy_right_publish_pose[0, 3] += 0.01
+        zeros_frame = torch.zeros(
+            (self._eye_height, self._eye_width, 4),
+            dtype=torch.float32,
+            device=cfg.device,
+        )
+        zeros_depth = torch.ones(
+            (self._eye_height, self._eye_width),
+            dtype=torch.float32,
+            device=cfg.device,
+        )
+        with torch.cuda.stream(left_stream):
+            self._owner._latewarp_immersive_scene_eye(
+                zeros_frame.clone(),
+                zeros_depth.clone(),
+                dummy_left_render_pose,
+                dummy_left_publish_pose,
+                dummy_intrinsic,
+                dummy_intrinsic,
+                self._eye_height,
+                self._eye_width,
+                "left_synthetic_present_warmup",
+                reproject_caches=self._synthetic_scene_reproject_caches,
+            )
+        with torch.cuda.stream(right_stream):
+            self._owner._latewarp_immersive_scene_eye(
+                zeros_frame.clone(),
+                zeros_depth.clone(),
+                dummy_right_render_pose,
+                dummy_right_publish_pose,
+                dummy_intrinsic,
+                dummy_intrinsic,
+                self._eye_height,
+                self._eye_width,
+                "right_synthetic_present_warmup",
+                reproject_caches=self._synthetic_scene_reproject_caches,
+            )
+        with torch.cuda.stream(control_stream):
+            control_stream.wait_stream(left_stream)
+            control_stream.wait_stream(right_stream)
+        control_stream.synchronize()
+
+    def _warmup_arbiter(self):
+        if not torch.cuda.is_available():
+            return
+        left_frame = torch.zeros(
+            (self._eye_height, self._eye_width, 4),
+            dtype=torch.uint8,
+            device=cfg.device,
+        )
+        right_frame = torch.zeros(
+            (self._eye_height, self._eye_width, 4),
+            dtype=torch.uint8,
+            device=cfg.device,
+        )
+        self._immersive_bridge.publish_stereo_frames(left_frame, right_frame)
+        try:
+            self._immersive_bridge._drain_pending_stage_copies(block=True)
+        except Exception:
+            pass
+
+    def _build_real_ready_candidate(self, packet, *, presentation_streams):
+        owner = self._owner
+        left_stream = None if presentation_streams is None else presentation_streams["left"]
+        right_stream = None if presentation_streams is None else presentation_streams["right"]
+        control_stream = None if presentation_streams is None else presentation_streams["control"]
+        queue_wait_ms = 0.0
+        enqueue_wall_time_s = packet.get("enqueue_wall_time_s")
+        dequeue_wall_time_s = time.perf_counter()
+        if enqueue_wall_time_s is not None:
+            queue_wait_ms = max(
+                0.0,
+                (dequeue_wall_time_s - float(enqueue_wall_time_s)) * 1000.0,
+            )
+        worker_start = time.perf_counter()
+        render_profile_enabled = bool(packet.get("render_profile_enabled", False))
+        worker_profile = {"_cuda_spans": []} if render_profile_enabled else None
+        producer_ready_event = packet.get("producer_ready_event")
+        overlay_projection_wall_s = 0.0
+        publish_sample_id = int(
+            packet.get(
+                "scene_source_sample_id",
+                packet.get("render_sample_id", -1),
+            )
+        )
+        scene_timewarp_applied = 0.0
+        scene_timewarp_fallback_left_used = 0.0
+        scene_timewarp_fallback_right_used = 0.0
+        scene_pose_received_monotonic_s = packet.get("scene_source_received_monotonic_s")
+        if control_stream is None or left_stream is None or right_stream is None:
+            raise RuntimeError("Immersive real presentation worker requires CUDA streams.")
+
+        left_compose_start_event = torch.cuda.Event(enable_timing=True)
+        left_compose_end_event = torch.cuda.Event(enable_timing=True)
+        right_compose_start_event = torch.cuda.Event(enable_timing=True)
+        right_compose_end_event = torch.cuda.Event(enable_timing=True)
+        left_overlay_start_event = torch.cuda.Event(enable_timing=True)
+        left_overlay_end_event = torch.cuda.Event(enable_timing=True)
+        right_overlay_start_event = torch.cuda.Event(enable_timing=True)
+        right_overlay_end_event = torch.cuda.Event(enable_timing=True)
+        parallel_wait_start_event = torch.cuda.Event(enable_timing=True)
+        parallel_wait_end_event = torch.cuda.Event(enable_timing=True)
+        left_compose_metrics = None
+        right_compose_metrics = None
+        left_overlay_eye_render_state = packet["left_overlay_eye_render_state"]
+        right_overlay_eye_render_state = packet["right_overlay_eye_render_state"]
+        scene_pose_sample = None
+
+        with torch.cuda.stream(left_stream):
+            if producer_ready_event is not None:
+                left_stream.wait_event(producer_ready_event)
+            left_compose_span = owner._render_profile_begin_cuda_span(
+                worker_profile,
+                "compose_left_cuda",
+            )
+            left_compose_start_event.record(left_stream)
+            if worker_profile is not None:
+                (
+                    left_eye_frame,
+                    left_eye_frame_depth,
+                    left_compose_metrics,
+                    _,
+                ) = owner._compose_immersive_eye_frame(
+                    packet["left_scene_color"],
+                    packet["left_scene_depth"],
+                    packet["left_gaussian_rgba"],
+                    packet["left_gaussian_depth"],
+                    target_height=self._eye_height,
+                    target_width=self._eye_width,
+                    compose_mode=packet["immersive_compose_mode"],
+                    compose_roi_padding=packet["gaussian_compose_roi_padding"],
+                    collect_debug=True,
+                    output_dtype=torch.float32,
+                    return_depth=True,
+                )
+            else:
+                left_eye_frame, left_eye_frame_depth = owner._compose_immersive_eye_frame(
+                    packet["left_scene_color"],
+                    packet["left_scene_depth"],
+                    packet["left_gaussian_rgba"],
+                    packet["left_gaussian_depth"],
+                    target_height=self._eye_height,
+                    target_width=self._eye_width,
+                    compose_mode=packet["immersive_compose_mode"],
+                    compose_roi_padding=packet["gaussian_compose_roi_padding"],
+                    output_dtype=torch.float32,
+                    return_depth=True,
+                )
+            left_compose_end_event.record(left_stream)
+            owner._render_profile_end_cuda_span(worker_profile, left_compose_span)
+
+        with torch.cuda.stream(right_stream):
+            if producer_ready_event is not None:
+                right_stream.wait_event(producer_ready_event)
+            right_compose_span = owner._render_profile_begin_cuda_span(
+                worker_profile,
+                "compose_right_cuda",
+            )
+            right_compose_start_event.record(right_stream)
+            if worker_profile is not None:
+                (
+                    right_eye_frame,
+                    right_eye_frame_depth,
+                    right_compose_metrics,
+                    _,
+                ) = owner._compose_immersive_eye_frame(
+                    packet["right_scene_color"],
+                    packet["right_scene_depth"],
+                    packet["right_gaussian_rgba"],
+                    packet["right_gaussian_depth"],
+                    target_height=self._eye_height,
+                    target_width=self._eye_width,
+                    compose_mode=packet["immersive_compose_mode"],
+                    compose_roi_padding=packet["gaussian_compose_roi_padding"],
+                    collect_debug=True,
+                    output_dtype=torch.float32,
+                    return_depth=True,
+                )
+            else:
+                right_eye_frame, right_eye_frame_depth = owner._compose_immersive_eye_frame(
+                    packet["right_scene_color"],
+                    packet["right_scene_depth"],
+                    packet["right_gaussian_rgba"],
+                    packet["right_gaussian_depth"],
+                    target_height=self._eye_height,
+                    target_width=self._eye_width,
+                    compose_mode=packet["immersive_compose_mode"],
+                    compose_roi_padding=packet["gaussian_compose_roi_padding"],
+                    output_dtype=torch.float32,
+                    return_depth=True,
+                )
+            right_compose_end_event.record(right_stream)
+            owner._render_profile_end_cuda_span(worker_profile, right_compose_span)
+
+        left_compose_end_event.synchronize()
+        right_compose_end_event.synchronize()
+        synthetic_source_state = super()._build_synthetic_source_state(
+            packet=packet,
+            left_eye_frame=left_eye_frame,
+            left_eye_frame_depth=left_eye_frame_depth,
+            right_eye_frame=right_eye_frame,
+            right_eye_frame_depth=right_eye_frame_depth,
+        )
+
+        default_left_overlay_eye_render_state = packet["left_overlay_eye_render_state"]
+        default_right_overlay_eye_render_state = packet["right_overlay_eye_render_state"]
+        with self._condition:
+            stale_packet = int(self._latest_submitted_serial) > int(
+                packet.get("submit_serial", 0)
+            )
+        real_publish_state = owner._resolve_and_apply_immersive_real_publish_state(
+            self._immersive_bridge,
+            left_eye_frame=left_eye_frame,
+            left_eye_frame_depth=left_eye_frame_depth,
+            right_eye_frame=right_eye_frame,
+            right_eye_frame_depth=right_eye_frame_depth,
+            scene_depth_reproject_enabled=bool(
+                packet.get("scene_depth_reproject_enabled", False)
+            ),
+            scene_source_sample_id=int(
+                packet.get(
+                    "scene_source_sample_id",
+                    packet.get("render_sample_id", -1),
+                )
+            ),
+            scene_source_left_eye_pose_world=packet["scene_source_left_eye_pose_world"],
+            scene_source_right_eye_pose_world=packet["scene_source_right_eye_pose_world"],
+            scene_source_left_intrinsic=packet["scene_source_left_intrinsic"],
+            scene_source_right_intrinsic=packet["scene_source_right_intrinsic"],
+            default_left_overlay_eye_render_state=default_left_overlay_eye_render_state,
+            default_right_overlay_eye_render_state=default_right_overlay_eye_render_state,
+            live_head_alignment=packet.get("live_head_alignment"),
+            head_pose_state=packet.get("head_pose_state"),
+            frame_index=int(packet["source_frame_index"]),
+            eye_width=self._eye_width,
+            eye_height=self._eye_height,
+            queue_wait_ms=queue_wait_ms,
+            source_ready_wall_time_s=packet["source_ready_wall_time_s"],
+            static_scene_reuse_age_frames=float(
+                packet.get("static_scene_reuse_age_frames", 0.0)
+            ),
+            stale_packet=stale_packet,
+            reproject_caches=self._real_scene_reproject_caches,
+            render_profile_frame=worker_profile,
+            latewarp_render_profile_frame=None,
+            scene_source_received_monotonic_s=packet.get(
+                "scene_source_received_monotonic_s"
+            ),
+            left_stream=left_stream,
+            right_stream=right_stream,
+            control_stream=control_stream,
+            left_latewarp_eye_label="left_present",
+            right_latewarp_eye_label="right_present",
+        )
+        left_eye_frame = real_publish_state["left_eye_frame"]
+        left_eye_frame_depth = real_publish_state["left_eye_frame_depth"]
+        right_eye_frame = real_publish_state["right_eye_frame"]
+        right_eye_frame_depth = real_publish_state["right_eye_frame_depth"]
+        publish_state = real_publish_state["publish_state"]
+        publish_sample = real_publish_state["publish_sample"]
+        publish_sample_id = int(real_publish_state["publish_sample_id"])
+        left_overlay_eye_render_state = real_publish_state[
+            "left_overlay_eye_render_state"
+        ]
+        right_overlay_eye_render_state = real_publish_state[
+            "right_overlay_eye_render_state"
+        ]
+        scene_timewarp_applied = float(real_publish_state["scene_timewarp_applied"])
+        scene_timewarp_fallback_left_used = float(
+            real_publish_state["scene_timewarp_fallback_left_used"]
+        )
+        scene_timewarp_fallback_right_used = float(
+            real_publish_state["scene_timewarp_fallback_right_used"]
+        )
+        scene_pose_sample = real_publish_state["scene_pose_sample"]
+        scene_pose_received_monotonic_s = real_publish_state[
+            "scene_pose_received_monotonic_s"
+        ]
+        left_real_timewarp_validity = real_publish_state[
+            "left_real_timewarp_validity"
+        ]
+        right_real_timewarp_validity = real_publish_state[
+            "right_real_timewarp_validity"
+        ]
+        timewarp_decision = real_publish_state["timewarp_decision"]
+
+        synthetic_skip_payload = None
+        if synthetic_source_state is not None:
+            actual_real_view_source = self._build_actual_real_view_source_bundle(
+                packet=packet,
+                left_eye_frame=left_eye_frame,
+                left_eye_frame_depth=left_eye_frame_depth,
+                right_eye_frame=right_eye_frame,
+                right_eye_frame_depth=right_eye_frame_depth,
+                publish_state=publish_state,
+                publish_sample_id=publish_sample_id,
+                left_overlay_eye_render_state=left_overlay_eye_render_state,
+                right_overlay_eye_render_state=right_overlay_eye_render_state,
+                real_timewarp_applied=bool(scene_timewarp_applied),
+                left_timewarp_fallback_used=bool(scene_timewarp_fallback_left_used),
+                right_timewarp_fallback_used=bool(scene_timewarp_fallback_right_used),
+                scene_source_received_monotonic_s=scene_pose_received_monotonic_s,
+            )
+            if bool(actual_real_view_source.get("synthetic_source_consistent", 0.0)):
+                synthetic_source_state = (
+                    self._rebase_synthetic_source_state_to_actual_real_view(
+                        synthetic_source_state,
+                        actual_real_view_source=actual_real_view_source,
+                    )
+                )
+                synthetic_source_state["synthetic_source_ready_wall_time_s"] = float(
+                    time.perf_counter()
+                )
+                with self._condition:
+                    if self._first_real_publish_completed:
+                        self._pending_synthetic_source = synthetic_source_state
+                        self._condition.notify_all()
+                    else:
+                        self._trace_transition_locked(
+                            "synthetic_launch_blocked_before_first_real",
+                            source_frame_index=int(packet.get("source_frame_index", -1)),
+                            submit_serial=int(packet.get("submit_serial", 0)),
+                        )
+            else:
+                age_metrics = owner._compute_immersive_synthetic_framegen_age_metrics(
+                    scene_source_ready_wall_time_s=packet.get(
+                        "scene_source_ready_wall_time_s",
+                        packet["source_ready_wall_time_s"],
+                    ),
+                    synthetic_source_ready_wall_time_s=time.perf_counter(),
+                )
+                synthetic_skip_payload = self._make_synthetic_skip_payload(
+                    source_frame_index=int(packet["source_frame_index"]),
+                    reason="real_source_inconsistent",
+                    source_age_ms=float(
+                        age_metrics.get("synthetic_candidate_age_ms", 0.0)
+                    ),
+                    total_scene_age_ms=float(
+                        age_metrics.get("synthetic_total_scene_age_ms", 0.0)
+                    ),
+                    handoff_delay_ms=float(
+                        age_metrics.get("synthetic_handoff_delay_ms", 0.0)
+                    ),
+                )
+                synthetic_skip_payload.update(
+                    self._synthetic_source_diagnostic_payload_fields(
+                        actual_real_view_source
+                    )
+                )
+
+        with torch.cuda.stream(control_stream):
+            overlay_start = time.perf_counter()
+            projected_overlay_entries = owner._project_live_controller_world_overlays_batched(
+                packet.get("controller_overlay_entries") or [],
+                {
+                    "left": left_overlay_eye_render_state,
+                    "right": right_overlay_eye_render_state,
+                },
+                self._eye_height,
+                self._eye_width,
+            )
+            overlay_projection_wall_s = time.perf_counter() - overlay_start
+            if worker_profile is not None:
+                worker_profile["overlay_projection_wall"] = overlay_projection_wall_s
+
+        with torch.cuda.stream(left_stream):
+            left_stream.wait_stream(control_stream)
+            left_overlay_start_event.record(left_stream)
+            left_eye_overlay_entries = projected_overlay_entries.get("left", [])
+            if left_eye_overlay_entries:
+                owner._draw_live_controller_overlay(
+                    left_eye_frame,
+                    left_eye_overlay_entries,
+                )
+            if packet.get("support_overlay_enabled", False):
+                owner._draw_immersive_support_entry_overlay(
+                    left_eye_frame,
+                    packet.get("support_overlay_cache"),
+                    packet.get("support_overlay_active_support_id"),
+                    left_overlay_eye_render_state,
+                )
+            left_overlay_end_event.record(left_stream)
+
+        with torch.cuda.stream(right_stream):
+            right_stream.wait_stream(control_stream)
+            right_overlay_start_event.record(right_stream)
+            right_eye_overlay_entries = projected_overlay_entries.get("right", [])
+            if right_eye_overlay_entries:
+                owner._draw_live_controller_overlay(
+                    right_eye_frame,
+                    right_eye_overlay_entries,
+                )
+            if packet.get("support_overlay_enabled", False):
+                owner._draw_immersive_support_entry_overlay(
+                    right_eye_frame,
+                    packet.get("support_overlay_cache"),
+                    packet.get("support_overlay_active_support_id"),
+                    right_overlay_eye_render_state,
+                )
+            right_overlay_end_event.record(right_stream)
+
+        with torch.cuda.stream(control_stream):
+            parallel_wait_start_event.record(control_stream)
+            control_stream.wait_stream(left_stream)
+            control_stream.wait_stream(right_stream)
+            parallel_wait_end_event.record(control_stream)
+            if left_eye_frame.dtype != torch.uint8:
+                left_eye_frame = left_eye_frame.clamp(0.0, 255.0).to(torch.uint8)
+            if right_eye_frame.dtype != torch.uint8:
+                right_eye_frame = right_eye_frame.clamp(0.0, 255.0).to(torch.uint8)
+        control_stream.synchronize()
+
+        left_compose_ms = self._elapsed_event_ms(left_compose_start_event, left_compose_end_event)
+        right_compose_ms = self._elapsed_event_ms(right_compose_start_event, right_compose_end_event)
+        left_overlay_ms = self._elapsed_event_ms(left_overlay_start_event, left_overlay_end_event)
+        right_overlay_ms = self._elapsed_event_ms(right_overlay_start_event, right_overlay_end_event)
+        parallel_wait_ms = self._elapsed_event_ms(parallel_wait_start_event, parallel_wait_end_event)
+        compose_wall_s = max(left_compose_ms, right_compose_ms) / 1000.0
+        overlay_wall_s = overlay_projection_wall_s + max(left_overlay_ms, right_overlay_ms) / 1000.0
+        if worker_profile is not None:
+            if left_compose_metrics is not None:
+                owner._render_profile_record_immersive_compose_metrics(
+                    worker_profile,
+                    "left",
+                    left_compose_metrics,
+                )
+            if right_compose_metrics is not None:
+                owner._render_profile_record_immersive_compose_metrics(
+                    worker_profile,
+                    "right",
+                    right_compose_metrics,
+                )
+            worker_profile["overlay_draw_left_wall"] = left_overlay_ms / 1000.0
+            worker_profile["overlay_draw_right_wall"] = right_overlay_ms / 1000.0
+            worker_profile["publish_sample_id"] = float(publish_sample_id)
+            worker_profile["scene_timewarp_applied"] = float(scene_timewarp_applied)
+            worker_profile["scene_timewarp_fallback_left_used"] = float(
+                scene_timewarp_fallback_left_used
+            )
+            worker_profile["scene_timewarp_fallback_right_used"] = float(
+                scene_timewarp_fallback_right_used
+            )
+            worker_profile = owner._render_profile_finalize_frame(worker_profile)
+
+        worker_wall_ms = 1000.0 * (time.perf_counter() - worker_start)
+        source_age_ms = max(
+            0.0,
+            (time.perf_counter() - float(packet["source_ready_wall_time_s"])) * 1000.0,
+        )
+        ready_candidate = {
+            "candidate_kind": "real_ready",
+            "source_frame_index": int(packet["source_frame_index"]),
+            "left_eye_frame": left_eye_frame,
+            "right_eye_frame": right_eye_frame,
+            "queue_wait_ms": float(queue_wait_ms),
+            "worker_wall_ms": float(worker_wall_ms),
+            "compose_wall_ms": float(compose_wall_s * 1000.0),
+            "compose_left_ms": float(left_compose_ms),
+            "compose_right_ms": float(right_compose_ms),
+            "overlay_wall_ms": float(overlay_wall_s * 1000.0),
+            "overlay_left_ms": float(left_overlay_ms),
+            "overlay_right_ms": float(right_overlay_ms),
+            "parallel_wait_ms": float(parallel_wait_ms),
+            "source_age_ms": float(source_age_ms),
+            "publish_sample_id": int(publish_sample_id),
+            "scene_pose_received_monotonic_s": None
+            if scene_pose_received_monotonic_s is None
+            else float(scene_pose_received_monotonic_s),
+            "render_sample_received_monotonic_s": packet.get(
+                "render_sample_received_monotonic_s"
+            ),
+            "render_profile_updates": None
+            if worker_profile is None
+            else worker_profile,
+            "scene_timewarp_applied": float(scene_timewarp_applied),
+            "scene_timewarp_fallback_left_used": float(
+                scene_timewarp_fallback_left_used
+            ),
+            "scene_timewarp_fallback_right_used": float(
+                scene_timewarp_fallback_right_used
+            ),
+            "real_timewarp_validity": {
+                "requested": bool(timewarp_decision.get("apply", False)),
+                "left": left_real_timewarp_validity,
+                "right": right_real_timewarp_validity,
+            },
+        }
+        return {
+            "ready_candidate": ready_candidate,
+            "synthetic_skip_payload": synthetic_skip_payload,
+        }
+
+    def _build_synthetic_ready_candidate(
+        self,
+        synthetic_source_state,
+        *,
+        presentation_streams,
+        pending_real_at_launch,
+    ):
+        if synthetic_source_state is None:
+            return None
+        if not bool(synthetic_source_state.get("synthetic_source_consistent", 1.0)):
+            payload = self._make_synthetic_skip_payload(
+                source_frame_index=int(
+                    synthetic_source_state.get("source_frame_index", -1)
+                ),
+                reason="real_source_inconsistent",
+                source_age_ms=0.0,
+                total_scene_age_ms=0.0,
+                handoff_delay_ms=0.0,
+                launch_count_increment=0.0,
+                pending_real_at_launch=1.0 if pending_real_at_launch else 0.0,
+                immediate_sample_hit=0.0,
+            )
+            payload.update(
+                self._synthetic_source_diagnostic_payload_fields(
+                    synthetic_source_state
+                )
+            )
+            return payload
+        wait_result = self._wait_for_synthetic_publish_sample(synthetic_source_state)
+        wait_reason = wait_result.get("reason")
+        if wait_reason is not None:
+            payload = self._make_synthetic_skip_payload(
+                source_frame_index=int(synthetic_source_state.get("source_frame_index", -1)),
+                reason=wait_reason,
+                source_age_ms=float(wait_result.get("source_age_ms", 0.0)),
+                total_scene_age_ms=float(
+                    wait_result.get("total_scene_age_ms", 0.0)
+                ),
+                handoff_delay_ms=float(wait_result.get("handoff_delay_ms", 0.0)),
+                launch_count_increment=1.0,
+                pending_real_at_launch=1.0 if pending_real_at_launch else 0.0,
+                immediate_sample_hit=1.0 if wait_result.get("immediate_sample_hit", False) else 0.0,
+            )
+            payload.update(
+                self._synthetic_source_diagnostic_payload_fields(
+                    synthetic_source_state
+                )
+            )
+            return payload
+
+        publish_sample = wait_result.get("sample")
+        boundary_sample_id = int(
+            synthetic_source_state.get(
+                "real_publish_sample_id",
+                synthetic_source_state["scene_source_sample_id"],
+            )
+        )
+        publish_state = self._owner._resolve_immersive_scene_publish_state(
+            self._immersive_bridge,
+            scene_depth_reproject_enabled=True,
+            scene_source_sample_id=boundary_sample_id,
+            scene_source_left_eye_pose_world=synthetic_source_state[
+                "scene_source_left_eye_pose_world"
+            ],
+            scene_source_right_eye_pose_world=synthetic_source_state[
+                "scene_source_right_eye_pose_world"
+            ],
+            scene_source_left_intrinsic=synthetic_source_state[
+                "scene_source_left_intrinsic"
+            ],
+            scene_source_right_intrinsic=synthetic_source_state[
+                "scene_source_right_intrinsic"
+            ],
+            default_left_overlay_eye_render_state=synthetic_source_state[
+                "left_overlay_eye_render_state"
+            ],
+            default_right_overlay_eye_render_state=synthetic_source_state[
+                "right_overlay_eye_render_state"
+            ],
+            live_head_alignment=synthetic_source_state.get("live_head_alignment"),
+            head_pose_state=synthetic_source_state.get("head_pose_state"),
+            frame_index=int(synthetic_source_state["source_frame_index"]),
+            eye_width=self._eye_width,
+            eye_height=self._eye_height,
+            publish_sample_override=publish_sample,
+        )
+        with self._condition:
+            stale_packet = bool(
+                self._stop_requested
+                or int(self._latest_completed_real_frame_index)
+                > int(synthetic_source_state.get("source_frame_index", -1))
+            )
+        decision = self._owner._evaluate_immersive_synthetic_framegen_admission(
+            framegen_mode=synthetic_source_state["framegen_mode"],
+            publish_state=publish_state,
+            scene_source_ready_wall_time_s=synthetic_source_state.get(
+                "scene_source_ready_wall_time_s",
+                synthetic_source_state["source_ready_wall_time_s"],
+            ),
+            synthetic_source_ready_wall_time_s=synthetic_source_state.get(
+                "synthetic_source_ready_wall_time_s",
+                synthetic_source_state.get(
+                    "scene_source_ready_wall_time_s",
+                    synthetic_source_state["source_ready_wall_time_s"],
+                ),
+            ),
+            source_sample_id=boundary_sample_id,
+            source_left_eye_pose_world=synthetic_source_state[
+                "scene_source_left_eye_pose_world"
+            ],
+            source_right_eye_pose_world=synthetic_source_state[
+                "scene_source_right_eye_pose_world"
+            ],
+            synthetic_emitted=bool(
+                synthetic_source_state.get("synthetic_emitted", False)
+            ),
+            stale_packet=stale_packet,
+        )
+        if not bool(decision.get("apply", False)):
+            payload = self._make_synthetic_skip_payload(
+                source_frame_index=int(synthetic_source_state.get("source_frame_index", -1)),
+                reason=decision.get("reason", "invalid_pose"),
+                source_age_ms=float(decision.get("source_age_ms", 0.0)),
+                total_scene_age_ms=float(
+                    decision.get("total_scene_age_ms", 0.0)
+                ),
+                handoff_delay_ms=float(decision.get("handoff_delay_ms", 0.0)),
+                translation_m=float(decision.get("translation_m", 0.0)),
+                rotation_deg=float(decision.get("rotation_deg", 0.0)),
+                launch_count_increment=1.0,
+                pending_real_at_launch=1.0 if pending_real_at_launch else 0.0,
+                immediate_sample_hit=1.0 if wait_result.get("immediate_sample_hit", False) else 0.0,
+            )
+            payload.update(
+                self._synthetic_source_diagnostic_payload_fields(
+                    synthetic_source_state
+                )
+            )
+            return payload
+
+        owner = self._owner
+        left_stream = presentation_streams["left"]
+        right_stream = presentation_streams["right"]
+        control_stream = presentation_streams["control"]
+        left_eye_frame = synthetic_source_state["left_eye_frame"].clone()
+        left_eye_frame_depth = synthetic_source_state["left_eye_frame_depth"].clone()
+        right_eye_frame = synthetic_source_state["right_eye_frame"].clone()
+        right_eye_frame_depth = synthetic_source_state["right_eye_frame_depth"].clone()
+        left_overlay_eye_render_state = publish_state["left_overlay_eye_render_state"]
+        right_overlay_eye_render_state = publish_state["right_overlay_eye_render_state"]
+
+        with torch.cuda.stream(left_stream):
+            (
+                warped_left_eye_frame,
+                warped_left_eye_depth,
+                _,
+            ) = owner._latewarp_immersive_scene_eye(
+                left_eye_frame,
+                left_eye_frame_depth,
+                synthetic_source_state["scene_source_left_eye_pose_world"],
+                publish_state["publish_left_eye_pose_world"],
+                synthetic_source_state["scene_source_left_intrinsic"],
+                publish_state["publish_left_intrinsic"],
+                self._eye_height,
+                self._eye_width,
+                "left_synthetic",
+                reproject_caches=self._synthetic_scene_reproject_caches,
+                render_profile_frame=None,
+            )
+            if (
+                not torch.is_tensor(warped_left_eye_frame)
+                or not torch.is_tensor(warped_left_eye_depth)
+                or tuple(warped_left_eye_frame.shape)
+                != (self._eye_height, self._eye_width, 4)
+                or tuple(warped_left_eye_depth.shape)
+                != (self._eye_height, self._eye_width)
+                or not owner._is_finite_tensor(warped_left_eye_frame)
+                or not owner._is_finite_tensor(warped_left_eye_depth)
+            ):
+                payload = self._make_synthetic_skip_payload(
+                    source_frame_index=int(synthetic_source_state.get("source_frame_index", -1)),
+                    reason="latewarp_failure",
+                    source_age_ms=float(decision.get("source_age_ms", 0.0)),
+                    total_scene_age_ms=float(
+                        decision.get("total_scene_age_ms", 0.0)
+                    ),
+                    handoff_delay_ms=float(
+                        decision.get("handoff_delay_ms", 0.0)
+                    ),
+                    translation_m=float(decision.get("translation_m", 0.0)),
+                    rotation_deg=float(decision.get("rotation_deg", 0.0)),
+                    launch_count_increment=1.0,
+                    pending_real_at_launch=1.0 if pending_real_at_launch else 0.0,
+                    immediate_sample_hit=1.0 if wait_result.get("immediate_sample_hit", False) else 0.0,
+                )
+                payload.update(
+                    self._synthetic_source_diagnostic_payload_fields(
+                        synthetic_source_state
+                    )
+                )
+                return payload
+            left_eye_frame = warped_left_eye_frame
+            left_eye_frame_depth = warped_left_eye_depth
+        with torch.cuda.stream(right_stream):
+            (
+                warped_right_eye_frame,
+                warped_right_eye_depth,
+                _,
+            ) = owner._latewarp_immersive_scene_eye(
+                right_eye_frame,
+                right_eye_frame_depth,
+                synthetic_source_state["scene_source_right_eye_pose_world"],
+                publish_state["publish_right_eye_pose_world"],
+                synthetic_source_state["scene_source_right_intrinsic"],
+                publish_state["publish_right_intrinsic"],
+                self._eye_height,
+                self._eye_width,
+                "right_synthetic",
+                reproject_caches=self._synthetic_scene_reproject_caches,
+                render_profile_frame=None,
+            )
+            if (
+                not torch.is_tensor(warped_right_eye_frame)
+                or not torch.is_tensor(warped_right_eye_depth)
+                or tuple(warped_right_eye_frame.shape)
+                != (self._eye_height, self._eye_width, 4)
+                or tuple(warped_right_eye_depth.shape)
+                != (self._eye_height, self._eye_width)
+                or not owner._is_finite_tensor(warped_right_eye_frame)
+                or not owner._is_finite_tensor(warped_right_eye_depth)
+            ):
+                payload = self._make_synthetic_skip_payload(
+                    source_frame_index=int(synthetic_source_state.get("source_frame_index", -1)),
+                    reason="latewarp_failure",
+                    source_age_ms=float(decision.get("source_age_ms", 0.0)),
+                    total_scene_age_ms=float(
+                        decision.get("total_scene_age_ms", 0.0)
+                    ),
+                    handoff_delay_ms=float(
+                        decision.get("handoff_delay_ms", 0.0)
+                    ),
+                    translation_m=float(decision.get("translation_m", 0.0)),
+                    rotation_deg=float(decision.get("rotation_deg", 0.0)),
+                    launch_count_increment=1.0,
+                    pending_real_at_launch=1.0 if pending_real_at_launch else 0.0,
+                    immediate_sample_hit=1.0 if wait_result.get("immediate_sample_hit", False) else 0.0,
+                )
+                payload.update(
+                    self._synthetic_source_diagnostic_payload_fields(
+                        synthetic_source_state
+                    )
+                )
+                return payload
+            right_eye_frame = warped_right_eye_frame
+            right_eye_frame_depth = warped_right_eye_depth
+
+        with torch.cuda.stream(control_stream):
+            control_stream.wait_stream(left_stream)
+            control_stream.wait_stream(right_stream)
+            projected_overlay_entries = owner._project_live_controller_world_overlays_batched(
+                synthetic_source_state.get("controller_overlay_entries") or [],
+                {
+                    "left": left_overlay_eye_render_state,
+                    "right": right_overlay_eye_render_state,
+                },
+                self._eye_height,
+                self._eye_width,
+            )
+        with torch.cuda.stream(left_stream):
+            left_stream.wait_stream(control_stream)
+            left_eye_overlay_entries = projected_overlay_entries.get("left", [])
+            if left_eye_overlay_entries:
+                owner._draw_live_controller_overlay(
+                    left_eye_frame,
+                    left_eye_overlay_entries,
+                )
+            if synthetic_source_state.get("support_overlay_enabled", False):
+                owner._draw_immersive_support_entry_overlay(
+                    left_eye_frame,
+                    synthetic_source_state.get("support_overlay_cache"),
+                    synthetic_source_state.get("support_overlay_active_support_id"),
+                    left_overlay_eye_render_state,
+                )
+        with torch.cuda.stream(right_stream):
+            right_stream.wait_stream(control_stream)
+            right_eye_overlay_entries = projected_overlay_entries.get("right", [])
+            if right_eye_overlay_entries:
+                owner._draw_live_controller_overlay(
+                    right_eye_frame,
+                    right_eye_overlay_entries,
+                )
+            if synthetic_source_state.get("support_overlay_enabled", False):
+                owner._draw_immersive_support_entry_overlay(
+                    right_eye_frame,
+                    synthetic_source_state.get("support_overlay_cache"),
+                    synthetic_source_state.get("support_overlay_active_support_id"),
+                    right_overlay_eye_render_state,
+                )
+        with torch.cuda.stream(control_stream):
+            control_stream.wait_stream(left_stream)
+            control_stream.wait_stream(right_stream)
+            if left_eye_frame.dtype != torch.uint8:
+                left_eye_frame = left_eye_frame.clamp(0.0, 255.0).to(torch.uint8)
+            if right_eye_frame.dtype != torch.uint8:
+                right_eye_frame = right_eye_frame.clamp(0.0, 255.0).to(torch.uint8)
+        control_stream.synchronize()
+
+        with self._condition:
+            if int(self._latest_completed_real_frame_index) > int(
+                synthetic_source_state.get("source_frame_index", -1)
+            ):
+                payload = self._make_synthetic_skip_payload(
+                    source_frame_index=int(synthetic_source_state.get("source_frame_index", -1)),
+                    reason="stale_packet",
+                    source_age_ms=float(decision.get("source_age_ms", 0.0)),
+                    total_scene_age_ms=float(
+                        decision.get("total_scene_age_ms", 0.0)
+                    ),
+                    handoff_delay_ms=float(
+                        decision.get("handoff_delay_ms", 0.0)
+                    ),
+                    translation_m=float(decision.get("translation_m", 0.0)),
+                    rotation_deg=float(decision.get("rotation_deg", 0.0)),
+                    launch_count_increment=1.0,
+                    pending_real_at_launch=1.0 if pending_real_at_launch else 0.0,
+                    immediate_sample_hit=1.0 if wait_result.get("immediate_sample_hit", False) else 0.0,
+                )
+                payload.update(
+                    self._synthetic_source_diagnostic_payload_fields(
+                        synthetic_source_state
+                    )
+                )
+                return payload
+
+        return {
+            "candidate_kind": "synthetic_ready",
+            "source_frame_index": int(
+                synthetic_source_state.get("source_frame_index", -1)
+            ),
+            "left_eye_frame": left_eye_frame,
+            "right_eye_frame": right_eye_frame,
+            "synthetic_source_age_ms": float(decision.get("source_age_ms", 0.0)),
+            "synthetic_total_scene_age_ms": float(
+                decision.get("total_scene_age_ms", 0.0)
+            ),
+            "synthetic_handoff_delay_ms": float(
+                decision.get("handoff_delay_ms", 0.0)
+            ),
+            "synthetic_translation_m": float(decision.get("translation_m", 0.0)),
+            "synthetic_rotation_deg": float(decision.get("rotation_deg", 0.0)),
+            "synthetic_launch_count_increment": 1.0,
+            "synthetic_pending_real_at_launch": 1.0 if pending_real_at_launch else 0.0,
+            "synthetic_immediate_sample_hit": 1.0 if wait_result.get("immediate_sample_hit", False) else 0.0,
+            "synthetic_source_real_timewarp_applied": float(
+                synthetic_source_state.get(
+                    "synthetic_source_real_timewarp_applied",
+                    0.0,
+                )
+            ),
+            "synthetic_source_real_timewarp_fallback_left": float(
+                synthetic_source_state.get(
+                    "synthetic_source_real_timewarp_fallback_left",
+                    0.0,
+                )
+            ),
+            "synthetic_source_real_timewarp_fallback_right": float(
+                synthetic_source_state.get(
+                    "synthetic_source_real_timewarp_fallback_right",
+                    0.0,
+                )
+            ),
+            "synthetic_source_consistent": float(
+                synthetic_source_state.get("synthetic_source_consistent", 1.0)
+            ),
+            "synthetic_source_inconsistent_reason": str(
+                synthetic_source_state.get(
+                    "synthetic_source_inconsistent_reason",
+                    "",
+                )
+            ).strip().lower(),
+        }
+
+    def _publish_candidate(self, candidate):
+        left_eye_frame = candidate["left_eye_frame"]
+        right_eye_frame = candidate["right_eye_frame"]
+        candidate_kind = str(candidate.get("candidate_kind", "")).strip().lower()
+        publish_start = time.perf_counter()
+        publish_ok, publish_stats = self._immersive_bridge.publish_stereo_frames(
+            left_eye_frame,
+            right_eye_frame,
+        )
+        publish_wall_ms = 1000.0 * (time.perf_counter() - publish_start)
+        preview_frame = None
+        preview_ready_event = None
+        if self._preview_enabled:
+            preview_frame = left_eye_frame.clone()
+            if torch.cuda.is_available():
+                preview_ready_event = torch.cuda.Event()
+                preview_ready_event.record(torch.cuda.current_stream())
+        if not publish_ok:
+            raise RuntimeError(
+                "Quest immersive bridge stopped accepting stereo frames.\n"
+                + self._immersive_bridge.debug_summary()
+            )
+        if candidate_kind == "synthetic_ready":
+            payload = {
+                "payload_kind": "synthetic_publish",
+                "source_frame_index": int(candidate["source_frame_index"]),
+                "synthetic_framegen_applied": 1.0,
+                "synthetic_skip_reason": "applied",
+                "synthetic_source_age_ms": float(
+                    candidate.get("synthetic_source_age_ms", 0.0)
+                ),
+                "synthetic_total_scene_age_ms": float(
+                    candidate.get("synthetic_total_scene_age_ms", 0.0)
+                ),
+                "synthetic_handoff_delay_ms": float(
+                    candidate.get("synthetic_handoff_delay_ms", 0.0)
+                ),
+                "synthetic_translation_m": float(
+                    candidate.get("synthetic_translation_m", 0.0)
+                ),
+                "synthetic_rotation_deg": float(
+                    candidate.get("synthetic_rotation_deg", 0.0)
+                ),
+                "synthetic_launch_count_increment": float(
+                    candidate.get("synthetic_launch_count_increment", 0.0)
+                ),
+                "synthetic_pending_real_at_launch": float(
+                    candidate.get("synthetic_pending_real_at_launch", 0.0)
+                ),
+                "synthetic_immediate_sample_hit": float(
+                    candidate.get("synthetic_immediate_sample_hit", 0.0)
+                ),
+                "preview_frame": preview_frame,
+                "preview_ready_event": preview_ready_event,
+            }
+            payload.update(self._synthetic_source_diagnostic_payload_fields(candidate))
+            return payload
+
+        with self._condition:
+            self._real_publish_count += 1
+            self._first_real_publish_completed = True
+            self._trace_transition_locked(
+                "real_publish",
+                source_frame_index=int(candidate.get("source_frame_index", -1)),
+                publish_sample_id=int(candidate.get("publish_sample_id", -1)),
+            )
+
+        payload = {
+            "payload_kind": "real_publish",
+            "source_frame_index": int(candidate["source_frame_index"]),
+            "queue_wait_ms": float(candidate.get("queue_wait_ms", 0.0)),
+            "worker_wall_ms": float(candidate.get("worker_wall_ms", 0.0)),
+            "compose_wall_ms": float(candidate.get("compose_wall_ms", 0.0)),
+            "compose_left_ms": float(candidate.get("compose_left_ms", 0.0)),
+            "compose_right_ms": float(candidate.get("compose_right_ms", 0.0)),
+            "overlay_wall_ms": float(candidate.get("overlay_wall_ms", 0.0)),
+            "overlay_left_ms": float(candidate.get("overlay_left_ms", 0.0)),
+            "overlay_right_ms": float(candidate.get("overlay_right_ms", 0.0)),
+            "parallel_wait_ms": float(candidate.get("parallel_wait_ms", 0.0)),
+            "publish_wall_ms": float(publish_wall_ms),
+            "source_age_ms": max(
+                0.0,
+                float(candidate.get("source_age_ms", 0.0))
+                + publish_wall_ms,
+            ),
+            "scene_pose_staleness_ms_at_publish": 0.0,
+            "scene_pose_staleness_savings_ms": 0.0,
+            "render_profile_updates": candidate.get("render_profile_updates"),
+            "preview_frame": preview_frame,
+            "preview_ready_event": preview_ready_event,
+            "real_timewarp_validity": copy.deepcopy(
+                candidate.get("real_timewarp_validity")
+            ),
+        }
+        render_profile_updates = payload.get("render_profile_updates")
+        if render_profile_updates is not None:
+            render_profile_updates["publish_total_wall"] = float(
+                publish_stats.get("total_wall", 0.0)
+            )
+            render_profile_updates["publish_process_check_wall"] = float(
+                publish_stats.get("process_check_wall", 0.0)
+            )
+            render_profile_updates["publish_pending_drain_nonblock_wall"] = float(
+                publish_stats.get("pending_drain_nonblock_wall", 0.0)
+            )
+            render_profile_updates["publish_pending_drain_block_wall"] = float(
+                publish_stats.get("pending_drain_block_wall", 0.0)
+            )
+            render_profile_updates["publish_gpu_to_cpu_wait_wall"] = float(
+                publish_stats.get("gpu_to_cpu_wait_wall", 0.0)
+            )
+            render_profile_updates["publish_gpu_to_cpu_copy_cuda"] = float(
+                publish_stats.get("gpu_to_cpu_copy_cuda", 0.0)
+            )
+            render_profile_updates["publish_cpu_mmap_copy_wall"] = float(
+                publish_stats.get("cpu_mmap_copy_wall", 0.0)
+            )
+            render_profile_updates["publish_header_write_wall"] = float(
+                publish_stats.get("header_write_wall", 0.0)
+            )
+            render_profile_updates["publish_stage_enqueue_wall"] = float(
+                publish_stats.get("stage_enqueue_wall", 0.0)
+            )
+            render_profile_updates["publish_fallback_copy_wall"] = float(
+                publish_stats.get("fallback_copy_wall", 0.0)
+            )
+            render_profile_updates["publish_sample_id"] = float(
+                candidate.get("publish_sample_id", -1)
+            )
+            render_profile_updates["scene_timewarp_applied"] = float(
+                candidate.get("scene_timewarp_applied", 0.0)
+            )
+            render_profile_updates["scene_timewarp_fallback_left_used"] = float(
+                candidate.get("scene_timewarp_fallback_left_used", 0.0)
+            )
+            render_profile_updates["scene_timewarp_fallback_right_used"] = float(
+                candidate.get("scene_timewarp_fallback_right_used", 0.0)
+            )
+            publish_measurement_s = time.monotonic()
+            render_sample_received_monotonic_s = candidate.get(
+                "render_sample_received_monotonic_s"
+            )
+            render_pose_staleness_ms = 0.0
+            if render_sample_received_monotonic_s is not None:
+                render_pose_staleness_ms = max(
+                    0.0,
+                    (
+                        publish_measurement_s
+                        - float(render_sample_received_monotonic_s)
+                    )
+                    * 1000.0,
+                )
+            scene_pose_received_monotonic_s = candidate.get(
+                "scene_pose_received_monotonic_s"
+            )
+            if scene_pose_received_monotonic_s is None:
+                scene_pose_staleness_ms_at_publish = render_pose_staleness_ms
+            else:
+                scene_pose_staleness_ms_at_publish = max(
+                    0.0,
+                    (
+                        publish_measurement_s
+                        - float(scene_pose_received_monotonic_s)
+                    )
+                    * 1000.0,
+                )
+            scene_pose_staleness_savings_ms = max(
+                0.0,
+                render_pose_staleness_ms - scene_pose_staleness_ms_at_publish,
+            )
+            render_profile_updates["scene_pose_staleness_ms_at_publish"] = float(
+                scene_pose_staleness_ms_at_publish / 1000.0
+            )
+            render_profile_updates["scene_pose_staleness_savings_ms"] = float(
+                scene_pose_staleness_savings_ms / 1000.0
+            )
+            payload["scene_pose_staleness_ms_at_publish"] = float(
+                scene_pose_staleness_ms_at_publish
+            )
+            payload["scene_pose_staleness_savings_ms"] = float(
+                scene_pose_staleness_savings_ms
+            )
+        return payload
+
+    def _real_thread_main(self):
+        worker_cuda_context = None
+        presentation_streams = None
+        try:
+            if torch.cuda.is_available():
+                torch.cuda.set_device(self._cuda_device_index)
+                worker_cuda_context = self._attach_worker_cuda_context(
+                    self._cuda_device_index
+                )
+                presentation_streams = {
+                    "left": self._make_high_priority_stream(),
+                    "right": self._make_high_priority_stream(),
+                    "control": self._make_high_priority_stream(),
+                }
+                self._warmup_real_worker(presentation_streams)
+            self._init_queue.put({"ok": True})
+            while True:
+                packet = None
+                with self._condition:
+                    while self._pending_real_packet is None and not self._stop_requested:
+                        self._condition.wait(timeout=0.1)
+                    if self._pending_real_packet is None and self._stop_requested:
+                        break
+                    packet = self._pending_real_packet
+                    self._pending_real_packet = None
+                    self._real_processing = True
+                    self._real_start_count += 1
+                    self._trace_transition_locked(
+                        "real_start",
+                        source_frame_index=int(packet.get("source_frame_index", -1)),
+                        submit_serial=int(packet.get("submit_serial", 0)),
+                    )
+                try:
+                    process_result = self._build_real_ready_candidate(
+                        packet,
+                        presentation_streams=presentation_streams,
+                    )
+                    ready_candidate = None if process_result is None else process_result.get(
+                        "ready_candidate"
+                    )
+                    synthetic_skip_payload = (
+                        None
+                        if process_result is None
+                        else process_result.get("synthetic_skip_payload")
+                    )
+                    with self._condition:
+                        if ready_candidate is not None:
+                            self._latest_completed_real_frame_index = max(
+                                int(self._latest_completed_real_frame_index),
+                                int(ready_candidate["source_frame_index"]),
+                            )
+                            self._ready_real_candidate = ready_candidate
+                            self._real_ready_count += 1
+                            self._latest_real_timewarp_validity = copy.deepcopy(
+                                ready_candidate.get("real_timewarp_validity")
+                            )
+                            self._trace_transition_locked(
+                                "real_ready",
+                                source_frame_index=int(
+                                    ready_candidate.get("source_frame_index", -1)
+                                ),
+                                publish_sample_id=int(
+                                    ready_candidate.get("publish_sample_id", -1)
+                                ),
+                            )
+                        self._condition.notify_all()
+                    if synthetic_skip_payload is not None:
+                        self._push_payload(synthetic_skip_payload)
+                finally:
+                    with self._condition:
+                        self._real_processing = False
+                        self._condition.notify_all()
+        except Exception as exc:
+            self._init_queue.put({"ok": False, "error": f"{type(exc).__name__}: {exc}"})
+            self._push_error(exc)
+        finally:
+            if worker_cuda_context is not None:
+                try:
+                    worker_cuda_context.pop()
+                except Exception:
+                    pass
+                try:
+                    worker_cuda_context.detach()
+                except Exception:
+                    pass
+
+    def _synthetic_thread_main(self):
+        worker_cuda_context = None
+        presentation_streams = None
+        init_sent = False
+        try:
+            if torch.cuda.is_available():
+                torch.cuda.set_device(self._cuda_device_index)
+                worker_cuda_context = self._attach_worker_cuda_context(
+                    self._cuda_device_index
+                )
+                presentation_streams = {
+                    "left": self._make_high_priority_stream(),
+                    "right": self._make_high_priority_stream(),
+                    "control": self._make_high_priority_stream(),
+                }
+                self._warmup_synthetic_worker(presentation_streams)
+            self._init_queue.put({"ok": True})
+            init_sent = True
+            while True:
+                synthetic_source_state = None
+                pending_real_at_launch = False
+                with self._condition:
+                    while (
+                        self._pending_synthetic_source is None and not self._stop_requested
+                    ):
+                        self._condition.wait(timeout=0.1)
+                    if self._pending_synthetic_source is None and self._stop_requested:
+                        break
+                    synthetic_source_state = self._pending_synthetic_source
+                    self._pending_synthetic_source = None
+                    if not self._first_real_publish_completed:
+                        self._trace_transition_locked(
+                            "synthetic_launch_blocked_before_first_real",
+                            source_frame_index=int(
+                                synthetic_source_state.get("source_frame_index", -1)
+                            ),
+                        )
+                        synthetic_source_state = None
+                        self._condition.notify_all()
+                        continue
+                    pending_real_at_launch = bool(
+                        self._pending_real_packet is not None
+                        or self._ready_real_candidate is not None
+                        or self._real_processing
+                    )
+                    self._synthetic_processing = True
+                try:
+                    synthetic_result = self._build_synthetic_ready_candidate(
+                        synthetic_source_state,
+                        presentation_streams=presentation_streams,
+                        pending_real_at_launch=pending_real_at_launch,
+                    )
+                    if synthetic_result is None:
+                        pass
+                    elif str(
+                        synthetic_result.get("candidate_kind", "")
+                    ).strip().lower() == "synthetic_ready":
+                        with self._condition:
+                            if int(self._latest_completed_real_frame_index) > int(
+                                synthetic_result.get("source_frame_index", -1)
+                            ):
+                                stale_payload = self._make_synthetic_skip_payload(
+                                    source_frame_index=int(
+                                        synthetic_result.get(
+                                            "source_frame_index", -1
+                                        )
+                                    ),
+                                    reason="stale_packet",
+                                    source_age_ms=float(
+                                        synthetic_result.get(
+                                            "synthetic_source_age_ms", 0.0
+                                        )
+                                    ),
+                                    total_scene_age_ms=float(
+                                        synthetic_result.get(
+                                            "synthetic_total_scene_age_ms",
+                                            0.0,
+                                        )
+                                    ),
+                                    handoff_delay_ms=float(
+                                        synthetic_result.get(
+                                            "synthetic_handoff_delay_ms",
+                                            0.0,
+                                        )
+                                    ),
+                                    translation_m=float(
+                                        synthetic_result.get(
+                                            "synthetic_translation_m", 0.0
+                                        )
+                                    ),
+                                    rotation_deg=float(
+                                        synthetic_result.get(
+                                            "synthetic_rotation_deg", 0.0
+                                        )
+                                    ),
+                                    launch_count_increment=float(
+                                        synthetic_result.get(
+                                            "synthetic_launch_count_increment", 0.0
+                                        )
+                                    ),
+                                    pending_real_at_launch=float(
+                                        synthetic_result.get(
+                                            "synthetic_pending_real_at_launch", 0.0
+                                        )
+                                    ),
+                                    immediate_sample_hit=float(
+                                        synthetic_result.get(
+                                            "synthetic_immediate_sample_hit",
+                                            0.0,
+                                        )
+                                    ),
+                                )
+                                stale_payload.update(
+                                    self._synthetic_source_diagnostic_payload_fields(
+                                        synthetic_result
+                                    )
+                                )
+                                self._push_payload(stale_payload)
+                            else:
+                                self._ready_synthetic_candidate = synthetic_result
+                                self._condition.notify_all()
+                    else:
+                        self._push_payload(synthetic_result)
+                finally:
+                    with self._condition:
+                        self._synthetic_processing = False
+                        self._condition.notify_all()
+        except Exception as exc:
+            if not init_sent:
+                self._init_queue.put({"ok": False, "error": f"{type(exc).__name__}: {exc}"})
+            self._push_error(exc)
+        finally:
+            if worker_cuda_context is not None:
+                try:
+                    worker_cuda_context.pop()
+                except Exception:
+                    pass
+                try:
+                    worker_cuda_context.detach()
+                except Exception:
+                    pass
+
+    def _arbiter_thread_main(self):
+        worker_cuda_context = None
+        init_sent = False
+        try:
+            if torch.cuda.is_available():
+                torch.cuda.set_device(self._cuda_device_index)
+                worker_cuda_context = self._attach_worker_cuda_context(
+                    self._cuda_device_index
+                )
+                self._warmup_arbiter()
+            self._init_queue.put({"ok": True})
+            init_sent = True
+            while True:
+                candidate = None
+                synthetic_drop_payload = None
+                with self._condition:
+                    while (
+                        self._ready_real_candidate is None
+                        and self._ready_synthetic_candidate is None
+                        and not self._stop_requested
+                    ):
+                        self._condition.wait(timeout=0.1)
+                    if (
+                        self._ready_real_candidate is None
+                        and self._ready_synthetic_candidate is None
+                        and self._stop_requested
+                    ):
+                        break
+                    if self._ready_real_candidate is not None:
+                        candidate = self._ready_real_candidate
+                        self._ready_real_candidate = None
+                        if (
+                            self._ready_synthetic_candidate is not None
+                            and int(self._ready_synthetic_candidate.get("source_frame_index", -1))
+                            < int(candidate.get("source_frame_index", -1))
+                        ):
+                            # Drop only synthetic work from an older completed real source.
+                            # A same-source synthetic candidate remains eligible after the
+                            # real publish and serves as the intended in-between view.
+                            synthetic_drop_payload = self._build_pending_real_yield_payload(
+                                self._ready_synthetic_candidate
+                            )
+                            self._ready_synthetic_candidate = None
+                    elif self._ready_synthetic_candidate is not None:
+                        candidate = self._ready_synthetic_candidate
+                        self._ready_synthetic_candidate = None
+                    self._arbiter_publishing = True
+                try:
+                    if synthetic_drop_payload is not None:
+                        self._push_payload(synthetic_drop_payload)
+                    publish_payload = self._publish_candidate(candidate)
+                    self._push_payload(publish_payload)
+                    delayed_drop_payload = None
+                    with self._condition:
+                        if (
+                            str(candidate.get("candidate_kind", "")).strip().lower()
+                            == "real_ready"
+                            and self._ready_synthetic_candidate is not None
+                            and int(self._ready_synthetic_candidate.get("source_frame_index", -1))
+                            < int(candidate.get("source_frame_index", -1))
+                        ):
+                            delayed_drop_payload = self._build_pending_real_yield_payload(
+                                self._ready_synthetic_candidate
+                            )
+                            self._ready_synthetic_candidate = None
+                            self._condition.notify_all()
+                    if delayed_drop_payload is not None:
+                        self._push_payload(delayed_drop_payload)
+                finally:
+                    with self._condition:
+                        self._arbiter_publishing = False
+                        self._condition.notify_all()
+        except Exception as exc:
+            if not init_sent:
+                self._init_queue.put({"ok": False, "error": f"{type(exc).__name__}: {exc}"})
+            self._push_error(exc)
+        finally:
+            if worker_cuda_context is not None:
+                try:
+                    worker_cuda_context.pop()
+                except Exception:
+                    pass
+                try:
+                    worker_cuda_context.detach()
+                except Exception:
+                    pass
+
 
 class InvPhyTrainerWarp:
     LIVE_HAND_MIN_VALID_JOINTS = 6
@@ -411,6 +5916,7 @@ class InvPhyTrainerWarp:
     LIVE_CONTROLLER_RAY_LENGTH = 0.65
     LIVE_CONTROLLER_ORIGIN_RADIUS = 3
     LIVE_CONTROLLER_HIT_RADIUS = 4
+    LIVE_CONTROLLER_ACTIVE_OVERLAY_HOLD_FRAMES = 2
     LIVE_CONTROLLER_INDICATOR_RADIUS = 2
     LIVE_CONTROLLER_LEFT_COLOR = [255.0, 96.0, 96.0]
     LIVE_CONTROLLER_RIGHT_COLOR = [96.0, 160.0, 255.0]
@@ -456,6 +5962,24 @@ class InvPhyTrainerWarp:
     IMMERSIVE_BALANCED_INTERNAL_STEREO_MODE = (
         "mono_center_background_table_roi_per_eye"
     )
+    IMMERSIVE_STATIC_SCENE_MODE_BALANCED_FOCUS = "balanced_focus"
+    IMMERSIVE_STATIC_SCENE_MODE_BALANCED_SUPPORT_FOCUS = "balanced_support_focus"
+    IMMERSIVE_FRAMEGEN_ADAPTIVE_MAX_AGE_FRAMES = 4
+    IMMERSIVE_FRAMEGEN_STATIC_MAX_AGE_FRAMES = 8
+    IMMERSIVE_FRAMEGEN_ADAPTIVE_TRANSLATION_GUARD_M = 0.015
+    IMMERSIVE_FRAMEGEN_ADAPTIVE_ROTATION_GUARD_DEG = 1.5
+    IMMERSIVE_STABLE_PRESENT_ADAPTIVE_MAX_AGE_FRAMES = 1
+    IMMERSIVE_STABLE_PRESENT_STATIC_MAX_AGE_FRAMES = 2
+    IMMERSIVE_STABLE_PRESENT_TRANSLATION_GUARD_M = 0.0075
+    IMMERSIVE_STABLE_PRESENT_ROTATION_GUARD_DEG = 0.5
+    IMMERSIVE_STABLE_PRESENT_TIMEWARP_MAX_QUEUE_WAIT_MS = 4.0
+    IMMERSIVE_STABLE_PRESENT_TIMEWARP_MAX_SOURCE_AGE_MS = 12.0
+    IMMERSIVE_STABLE_PRESENT_TIMEWARP_MAX_REUSE_AGE_FRAMES = 1.0
+    IMMERSIVE_SYNTHETIC_FRAMEGEN_STATIC_MAX_SOURCE_AGE_MS = 30.0
+    IMMERSIVE_SYNTHETIC_FRAMEGEN_ADAPTIVE_MAX_SOURCE_AGE_MS = 20.0
+    IMMERSIVE_SYNTHETIC_FRAMEGEN_ADAPTIVE_MAX_TRANSLATION_M = 0.010
+    IMMERSIVE_SYNTHETIC_FRAMEGEN_ADAPTIVE_MAX_ROTATION_DEG = 1.0
+    IMMERSIVE_SYNTHETIC_FRAMEGEN_WAIT_POLL_TIMEOUT_S = 0.005
     IMMERSIVE_BALANCED_BACKGROUND_RENDER_SCALE = 0.625
     IMMERSIVE_BALANCED_BACKGROUND_OVERSCAN = 1.10
     IMMERSIVE_BALANCED_REFERENCE_DEPTH_MIN_M = 0.9
@@ -503,8 +6027,21 @@ class InvPhyTrainerWarp:
     IMMERSIVE_STARTUP_YAW_RADIANS = 0.5 * np.pi
     IMMERSIVE_COMPOSE_ALPHA_EPS = 1.0 / 255.0
     IMMERSIVE_COMPOSE_RAW_MIN_COVERAGE_RATIO = 5e-4
+    IMMERSIVE_COMPOSE_POST_RELEASE_WINDOW_FRAMES = 24
+    IMMERSIVE_COMPOSE_POST_RELEASE_RAW_MIN_COVERAGE_RATIO = 2e-4
     IMMERSIVE_COMPOSE_VISIBLE_MIN_COVERAGE_RATIO = 1e-4
     IMMERSIVE_COMPOSE_MIN_RETENTION_RATIO = 0.08
+    IMMERSIVE_STABLE_COMPOSE_STABILIZATION_RAW_MIN_COVERAGE_RATIO = 8e-4
+    IMMERSIVE_STABLE_COMPOSE_STABILIZATION_RAW_MAX_COVERAGE_RATIO = 1e-2
+    IMMERSIVE_STABLE_COMPOSE_STABILIZATION_MIN_DEPTH_POSITIVE_RATIO = 0.95
+    IMMERSIVE_STABLE_COMPOSE_STABILIZATION_ROI_PADDING = 6
+    IMMERSIVE_GAUSSIAN_SOURCE_INTERACTION_COOLDOWN_FRAMES = 6
+    IMMERSIVE_GAUSSIAN_SOURCE_CORRUPTION_RAW_COVERAGE_MIN = 0.20
+    IMMERSIVE_GAUSSIAN_SOURCE_CORRUPTION_COVERAGE_JUMP_RATIO = 20.0
+    IMMERSIVE_GAUSSIAN_SOURCE_CORRUPTION_PREV_RAW_COVERAGE_MAX = 0.05
+    IMMERSIVE_GAUSSIAN_SOURCE_CORRUPTION_BBOX_AREA_MIN = 0.30
+    IMMERSIVE_GAUSSIAN_SOURCE_CORRUPTION_DEPTH_POSITIVE_MIN = 0.95
+    IMMERSIVE_GAUSSIAN_SOURCE_DEBUG_MAX_BUNDLES = 4
     IMMERSIVE_SCENE_DEPTH_MIN_FINITE_RATIO = 0.95
     IMMERSIVE_SCENE_DEPTH_MIN_POSITIVE_RATIO = 0.02
     IMMERSIVE_GRAB_START_VALIDATION_DELAY_FRAMES = 1
@@ -549,6 +6086,26 @@ class InvPhyTrainerWarp:
     IMMERSIVE_BALANCED_TABLE_ROI_MIN_SIZE = 64
     IMMERSIVE_BALANCED_TABLE_ROI_SHRINK_MAX_PX = 16
     IMMERSIVE_BALANCED_TABLE_ROI_SUPERSAMPLE_SCALE = 1.25
+    IMMERSIVE_BALANCED_SUPPORT_HORIZONTAL_DISTANCE_M = 0.15
+    IMMERSIVE_BALANCED_SUPPORT_VERTICAL_DISTANCE_M = 0.10
+    IMMERSIVE_BALANCED_SUPPORT_SWITCH_DISTANCE_M = 0.05
+    IMMERSIVE_BALANCED_SUPPORT_INVALID_FRAMES_TO_SWITCH = 8
+    IMMERSIVE_BALANCED_SUPPORT_INVALID_FRAMES_TO_HOLD = 12
+    IMMERSIVE_SUPPORT_OCCLUSION_DEBOUNCE_FRAMES = 2
+    IMMERSIVE_SUPPORT_OCCLUSION_OVERLAP_RATIO = 0.70
+    IMMERSIVE_SUPPORT_OCCLUSION_DEPTH_GAP_M = 0.08
+    IMMERSIVE_BALANCED_FOCUS_CENTER_WIDTH_RATIO = 0.45
+    IMMERSIVE_BALANCED_FOCUS_CENTER_HEIGHT_RATIO = 0.45
+    IMMERSIVE_BALANCED_FOCUS_ROI_PADDING = 40
+    IMMERSIVE_BALANCED_FOCUS_ROI_SNAP = 8
+    IMMERSIVE_BALANCED_FOCUS_ROI_MIN_SIZE = 96
+    IMMERSIVE_BALANCED_FOCUS_ROI_SHRINK_MAX_PX = 16
+    IMMERSIVE_BALANCED_FOCUS_ROI_SUPERSAMPLE_SCALE = 1.25
+    IMMERSIVE_BALANCED_FOCUS_ROI_FULLFRAME_THRESHOLD = 0.70
+    IMMERSIVE_BALANCED_FOCUS_SUBSET_SELECTION_PADDING = 24
+    IMMERSIVE_BALANCED_FOCUS_SUBSET_OBJECT_PADDING_M = 0.20
+    IMMERSIVE_BALANCED_FOCUS_SUBSET_FULLSCENE_FACE_RATIO = 0.70
+    IMMERSIVE_BALANCED_FOCUS_SUBSET_FULLSCENE_ENTRY_COUNT = 40
     IMMERSIVE_STARTUP_KEEPALIVE_INTERVAL_SECONDS = 0.25
     IMMERSIVE_CONTROLLER_HANDNESS_CONFIRM_STREAK = 5
     IMMERSIVE_CONTROLLER_HANDNESS_MAX_VALID_SAMPLES = 90
@@ -560,6 +6117,18 @@ class InvPhyTrainerWarp:
     TIMING_OVERLAY_MARGIN = 10
     TIMING_OVERLAY_REFERENCE_HEIGHT = 480
     TIMING_OVERLAY_MAX_SCALE = 12
+    SUPPORT_ENTRY_OVERLAY_TEXT_COLOR = [232.0, 232.0, 232.0]
+    SUPPORT_ENTRY_OVERLAY_ACTIVE_TEXT_COLOR = [255.0, 255.0, 255.0]
+    SUPPORT_ENTRY_OVERLAY_HEADER_TEXT_COLOR = [255.0, 255.0, 255.0]
+    SUPPORT_ENTRY_OVERLAY_BG_COLOR = [0.0, 0.0, 0.0]
+    SUPPORT_ENTRY_OVERLAY_HEADER_BG_COLOR = [28.0, 28.0, 28.0]
+    SUPPORT_ENTRY_OVERLAY_ACTIVE_BG_COLOR = [40.0, 108.0, 40.0]
+    SUPPORT_ENTRY_OVERLAY_SCALE = 3
+    SUPPORT_ENTRY_OVERLAY_MARGIN = 10
+    SUPPORT_ENTRY_OVERLAY_REFERENCE_HEIGHT = 480
+    SUPPORT_ENTRY_OVERLAY_MAX_SCALE = 10
+    SUPPORT_ENTRY_OVERLAY_LABEL_OFFSET_PX = 10
+    SUPPORT_ENTRY_OVERLAY_COLLISION_PADDING_PX = 4
 
     #getting called automatically right after you create an instance of the class
     def __init__(
@@ -595,6 +6164,7 @@ class InvPhyTrainerWarp:
             f"points_per_frame={int(self.controller_points_group.shape[2])}",
             flush=True,
         )
+        self._immersive_controller_translation_scale_multiplier = 1.0
         self.check_controller_group_same_start(
             self.controller_points_group,
             atol=1e-5,
@@ -964,15 +6534,29 @@ class InvPhyTrainerWarp:
         if self._is_rope_family_case(case_name):
             default_anchor_names = {"left": "left_end", "right": "right_end"}
             translation_case_name = "rope"
-        translation_scale = self.LIVE_CONTROLLER_CASE_TRANSLATION_SCALE.get(
+        default_translation_scale = self.LIVE_CONTROLLER_CASE_TRANSLATION_SCALE.get(
             translation_case_name,
             self.LIVE_CONTROLLER_TRANSLATION_SCALE_DEFAULT,
+        )
+        translation_scale_multiplier = float(
+            getattr(
+                self,
+                "_immersive_controller_translation_scale_multiplier",
+                1.0,
+            )
+        )
+        translation_scale = float(default_translation_scale) * float(
+            translation_scale_multiplier
         )
         return {
             "case_name": case_name,
             "post_select_grab_mode": "translation_only",
             "post_select_translation_only": True,
             "default_anchor_names": dict(default_anchor_names),
+            "controller_translation_scale_default": float(default_translation_scale),
+            "controller_translation_scale_multiplier": float(
+                translation_scale_multiplier
+            ),
             "controller_translation_scale": float(translation_scale),
         }
 
@@ -1796,9 +7380,12 @@ class InvPhyTrainerWarp:
             return self._anchor_state_by_name(anchor_states, state["selected_anchor_name"])
 
         hit_world = None if overlay is None else overlay.get("hit_world")
-        ray_origin_world, ray_direction_world = self._controller_world_ray_pose(
-            controller_world
-        )
+        ray_origin_world = None if overlay is None else overlay.get("origin_world")
+        ray_direction_world = None if overlay is None else overlay.get("direction_world")
+        if ray_origin_world is None or ray_direction_world is None:
+            ray_origin_world, ray_direction_world = self._controller_world_ray_pose(
+                controller_world
+            )
         ranked_anchors_all = self._rank_predefined_interaction_anchors(
             hit_world,
             ray_origin_world,
@@ -3538,6 +9125,7 @@ class InvPhyTrainerWarp:
                 controller_predefined_anchor_states,
                 controller_anchor_preview_state,
                 object_points,
+                frame_index=frame_index,
                 allow_implicit_fallback_start=allow_implicit_fallback_start,
                 post_select_translation_only=post_select_translation_only,
             )
@@ -3841,8 +9429,78 @@ class InvPhyTrainerWarp:
         y0 = max(0, y - radius)
         y1 = min(height, y + radius + 1)
         rgb_frame = frame[..., :3]
-        color_tensor = rgb_frame.new_tensor(color[:3])
-        rgb_frame[y0:y1, x0:x1].mul_(1.0 - blend).add_(color_tensor * blend)
+        self._blend_rgb_patch_inplace(
+            rgb_frame[y0:y1, x0:x1],
+            color,
+            blend=blend,
+        )
+
+    def _blend_rgb_patch_inplace(self, rgb_patch, color, blend=0.45):
+        if rgb_patch is None or rgb_patch.numel() == 0:
+            return
+        blend = float(blend)
+        if blend <= 0.0:
+            return
+        channel_count = int(rgb_patch.shape[-1])
+        color_values = list(color[:channel_count])
+        if torch.is_floating_point(rgb_patch):
+            color_tensor = rgb_patch.new_tensor(color_values).view(
+                *((1,) * (rgb_patch.ndim - 1)),
+                channel_count,
+            )
+            rgb_patch.mul_(1.0 - blend).add_(color_tensor * blend)
+            return
+
+        color_tensor = torch.as_tensor(
+            color_values,
+            dtype=torch.float32,
+            device=rgb_patch.device,
+        ).view(*((1,) * (rgb_patch.ndim - 1)), channel_count)
+        blended = rgb_patch.to(torch.float32).mul(1.0 - blend).add(
+            color_tensor * blend
+        )
+        if rgb_patch.dtype == torch.uint8:
+            rgb_patch.copy_(blended.round().clamp(0.0, 255.0).to(torch.uint8))
+            return
+        dtype_info = torch.iinfo(rgb_patch.dtype)
+        rgb_patch.copy_(
+            blended.round()
+            .clamp(float(dtype_info.min), float(dtype_info.max))
+            .to(rgb_patch.dtype)
+        )
+
+    def _blend_rgb_patch_masked_inplace(self, rgb_patch, mask, color, blend=0.45):
+        if rgb_patch is None or rgb_patch.numel() == 0 or mask is None:
+            return
+        blend = float(blend)
+        if blend <= 0.0:
+            return
+        mask_t = mask.to(device=rgb_patch.device)
+        if mask_t.dtype != torch.bool:
+            mask_t = mask_t != 0
+        if not bool(mask_t.any().item()):
+            return
+        channel_count = int(rgb_patch.shape[-1])
+        color_tensor = torch.as_tensor(
+            list(color[:channel_count]),
+            dtype=torch.float32,
+            device=rgb_patch.device,
+        )
+        blended = rgb_patch[mask_t].to(torch.float32).mul(1.0 - blend).add(
+            color_tensor * blend
+        )
+        if torch.is_floating_point(rgb_patch):
+            rgb_patch[mask_t] = blended.to(rgb_patch.dtype)
+            return
+        if rgb_patch.dtype == torch.uint8:
+            rgb_patch[mask_t] = blended.round().clamp(0.0, 255.0).to(torch.uint8)
+            return
+        dtype_info = torch.iinfo(rgb_patch.dtype)
+        rgb_patch[mask_t] = (
+            blended.round()
+            .clamp(float(dtype_info.min), float(dtype_info.max))
+            .to(rgb_patch.dtype)
+        )
 
     def _blend_rect(self, frame, x0, y0, x1, y1, color, blend=0.45):
         height, width = frame.shape[:2]
@@ -3853,8 +9511,11 @@ class InvPhyTrainerWarp:
         if x0 >= x1 or y0 >= y1:
             return
         rgb_frame = frame[..., :3]
-        color_tensor = rgb_frame.new_tensor(color[:3])
-        rgb_frame[y0:y1, x0:x1].mul_(1.0 - blend).add_(color_tensor * blend)
+        self._blend_rgb_patch_inplace(
+            rgb_frame[y0:y1, x0:x1],
+            color,
+            blend=blend,
+        )
 
     def _blend_square_marker(self, frame, pixel, color, radius, blend=0.78):
         height, width = frame.shape[:2]
@@ -3883,7 +9544,6 @@ class InvPhyTrainerWarp:
         cursor_x = int(x)
         cursor_y = int(y)
         rgb_frame = frame[..., :3]
-        color_tensor = rgb_frame.new_tensor(color[:3])
         advance = 3 * scale + scale
         height, width = frame.shape[:2]
         for char in text:
@@ -3902,9 +9562,53 @@ class InvPhyTrainerWarp:
                     y0 = max(0, y0)
                     x1 = min(width, x1)
                     y1 = min(height, y1)
-                    patch = rgb_frame[y0:y1, x0:x1]
-                    patch.mul_(1.0 - blend).add_(color_tensor * blend)
+                    self._blend_rgb_patch_inplace(
+                        rgb_frame[y0:y1, x0:x1],
+                        color,
+                        blend=blend,
+                    )
             cursor_x += advance
+
+    def _bitmap_text_block_size(self, lines, scale=1, line_spacing=None):
+        if not lines:
+            return 0, 0
+        if line_spacing is None:
+            line_spacing = scale
+        widths = [self._bitmap_text_size(line, scale=scale)[0] for line in lines]
+        line_height = 5 * scale
+        total_height = len(lines) * line_height + max(0, len(lines) - 1) * int(
+            line_spacing
+        )
+        return max(widths), total_height
+
+    def _draw_bitmap_text_lines(
+        self,
+        frame,
+        lines,
+        x,
+        y,
+        color,
+        scale=1,
+        blend=0.88,
+        line_spacing=None,
+    ):
+        if not lines:
+            return
+        if line_spacing is None:
+            line_spacing = scale
+        cursor_y = int(y)
+        line_step = 5 * scale + int(line_spacing)
+        for line in lines:
+            self._draw_bitmap_text(
+                frame,
+                line,
+                x,
+                cursor_y,
+                color,
+                scale=scale,
+                blend=blend,
+            )
+            cursor_y += line_step
 
     def _draw_timing_overlay(self, frame, total_time_seconds):
         if total_time_seconds is None or total_time_seconds <= 0.0:
@@ -3948,6 +9652,536 @@ class InvPhyTrainerWarp:
             scale=scale,
             blend=0.92,
         )
+
+    def _copy_immersive_support_entry(self, support_entry):
+        if support_entry is None:
+            return None
+        return {
+            "support_id": int(support_entry["support_id"]),
+            "component_id": support_entry.get("component_id"),
+            "kind": str(support_entry.get("kind", "support")),
+            "bounds_min": np.asarray(
+                support_entry["bounds_min"],
+                dtype=np.float32,
+            ).copy(),
+            "bounds_max": np.asarray(
+                support_entry["bounds_max"],
+                dtype=np.float32,
+            ).copy(),
+            "render_bounds_min": np.asarray(
+                support_entry.get(
+                    "render_bounds_min",
+                    support_entry["bounds_min"],
+                ),
+                dtype=np.float32,
+            ).copy(),
+            "render_bounds_max": np.asarray(
+                support_entry.get(
+                    "render_bounds_max",
+                    support_entry["bounds_max"],
+                ),
+                dtype=np.float32,
+            ).copy(),
+            "center": np.asarray(
+                support_entry.get("center"),
+                dtype=np.float32,
+            ).copy(),
+        }
+
+    def _find_immersive_table_support_entry(self, scene_renderer):
+        if scene_renderer is None:
+            return None
+        for entry in scene_renderer.support_surface_entries_ref():
+            if str(entry.get("kind", "")).strip().lower() == "table":
+                return entry
+        return None
+
+    def _resolve_immersive_support_overlay_entry(
+        self,
+        scene_renderer,
+        render_plan,
+        static_scene_mode,
+    ):
+        if render_plan is not None:
+            active_support = render_plan.get("active_support")
+            if active_support is not None:
+                return active_support
+        static_scene_mode = str(static_scene_mode or "").strip().lower()
+        if static_scene_mode == self.IMMERSIVE_STATIC_SCENE_MODE_BALANCED_FOCUS:
+            return self._copy_immersive_support_entry(
+                self._find_immersive_table_support_entry(scene_renderer)
+            )
+        if (
+            static_scene_mode
+            != self.IMMERSIVE_STATIC_SCENE_MODE_BALANCED_SUPPORT_FOCUS
+            or scene_renderer is None
+        ):
+            return None
+        balanced_runtime_state = getattr(self, "_immersive_balanced_runtime_state", None)
+        if balanced_runtime_state is None:
+            return None
+        active_support_state = balanced_runtime_state.get("active_support_state", {})
+        active_support_id = active_support_state.get("active_support_id")
+        if active_support_id is None:
+            return None
+        for entry in scene_renderer.support_surface_entries_ref():
+            if int(entry["support_id"]) == int(active_support_id):
+                return self._copy_immersive_support_entry(entry)
+        return None
+
+    def _project_immersive_bounds_into_eye(
+        self,
+        bounds_min,
+        bounds_max,
+        intrinsic,
+        w2c,
+        width,
+        height,
+    ):
+        return self._compute_immersive_projected_roi_bounds(
+            bounds_min,
+            bounds_max,
+            intrinsic,
+            w2c,
+            width,
+            height,
+            padding=0,
+            snap=1,
+            min_size=1,
+        )
+
+    def _projected_roi_overlap_ratio(
+        self,
+        source_bounds,
+        occluder_bounds,
+    ):
+        if source_bounds is None or occluder_bounds is None:
+            return 0.0
+        sx0, sy0, sx1, sy1 = [int(v) for v in source_bounds]
+        ox0, oy0, ox1, oy1 = [int(v) for v in occluder_bounds]
+        source_area = max(0, sx1 - sx0) * max(0, sy1 - sy0)
+        if source_area <= 0:
+            return 0.0
+        ix0 = max(sx0, ox0)
+        iy0 = max(sy0, oy0)
+        ix1 = min(sx1, ox1)
+        iy1 = min(sy1, oy1)
+        intersection_area = max(0, ix1 - ix0) * max(0, iy1 - iy0)
+        return float(intersection_area / max(float(source_area), 1.0))
+
+    def _compute_immersive_front_depth_for_bounds(
+        self,
+        bounds_min,
+        bounds_max,
+        intrinsic,
+        w2c,
+        width,
+        height,
+    ):
+        positive_depths = []
+        for point in self._object_bounds_corners(bounds_min, bounds_max):
+            projection = self._project_world_point_into_eye(
+                point,
+                intrinsic,
+                w2c,
+                width,
+                height,
+            )
+            depth = projection.get("depth")
+            if depth is None or not np.isfinite(depth):
+                continue
+            if float(depth) <= self.IMMERSIVE_STARTUP_DEPTH_EPS:
+                continue
+            if not bool(projection.get("in_bounds", False)):
+                continue
+            positive_depths.append(float(depth))
+        if not positive_depths:
+            return None
+        return float(min(positive_depths))
+
+    def _update_immersive_support_occlusion_state_for_eye(
+        self,
+        eye_state,
+        support_id,
+        candidate_suppress,
+    ):
+        if eye_state is None:
+            eye_state = {
+                "suppressed": False,
+                "candidate_suppress": None,
+                "candidate_frames": 0,
+                "support_id": None,
+                "flip_count": 0,
+            }
+        if eye_state.get("support_id") != support_id:
+            eye_state["suppressed"] = False
+            eye_state["candidate_suppress"] = None
+            eye_state["candidate_frames"] = 0
+            eye_state["support_id"] = support_id
+        suppressed = bool(eye_state.get("suppressed", False))
+        flipped = False
+        if bool(candidate_suppress) == suppressed:
+            eye_state["candidate_suppress"] = bool(candidate_suppress)
+            eye_state["candidate_frames"] = 0
+            return suppressed, flipped
+        previous_candidate = eye_state.get("candidate_suppress")
+        if previous_candidate is None or bool(previous_candidate) != bool(candidate_suppress):
+            eye_state["candidate_suppress"] = bool(candidate_suppress)
+            eye_state["candidate_frames"] = 1
+            return suppressed, flipped
+        eye_state["candidate_frames"] = int(eye_state.get("candidate_frames", 0)) + 1
+        if eye_state["candidate_frames"] >= int(
+            self.IMMERSIVE_SUPPORT_OCCLUSION_DEBOUNCE_FRAMES
+        ):
+            suppressed = bool(candidate_suppress)
+            eye_state["suppressed"] = suppressed
+            eye_state["candidate_suppress"] = bool(candidate_suppress)
+            eye_state["candidate_frames"] = 0
+            eye_state["flip_count"] = int(eye_state.get("flip_count", 0)) + 1
+            flipped = True
+        return suppressed, flipped
+
+    def _should_suppress_immersive_support_roi_for_eye(
+        self,
+        active_support_entry,
+        table_support_entry,
+        eye_intrinsic,
+        eye_w2c_cv,
+        eye_width,
+        eye_height,
+    ):
+        debug = {
+            "candidate_suppress": False,
+            "overlap_ratio": 0.0,
+            "depth_gap_m": 0.0,
+            "support_center_in_table": False,
+            "support_roi_bounds": None,
+            "table_roi_bounds": None,
+            "support_center_depth_m": None,
+            "table_front_depth_m": None,
+        }
+        if active_support_entry is None or table_support_entry is None:
+            return False, debug
+        if str(active_support_entry.get("kind", "")).strip().lower() != "support":
+            return False, debug
+        support_roi_bounds = self._project_immersive_bounds_into_eye(
+            active_support_entry.get(
+                "render_bounds_min",
+                active_support_entry["bounds_min"],
+            ),
+            active_support_entry.get(
+                "render_bounds_max",
+                active_support_entry["bounds_max"],
+            ),
+            eye_intrinsic,
+            eye_w2c_cv,
+            eye_width,
+            eye_height,
+        )
+        table_roi_bounds = self._project_immersive_bounds_into_eye(
+            table_support_entry.get(
+                "render_bounds_min",
+                table_support_entry["bounds_min"],
+            ),
+            table_support_entry.get(
+                "render_bounds_max",
+                table_support_entry["bounds_max"],
+            ),
+            eye_intrinsic,
+            eye_w2c_cv,
+            eye_width,
+            eye_height,
+        )
+        debug["support_roi_bounds"] = support_roi_bounds
+        debug["table_roi_bounds"] = table_roi_bounds
+        if support_roi_bounds is None or table_roi_bounds is None:
+            return False, debug
+        overlap_ratio = self._projected_roi_overlap_ratio(
+            support_roi_bounds,
+            table_roi_bounds,
+        )
+        debug["overlap_ratio"] = float(overlap_ratio)
+        support_center_projection = self._project_world_point_into_eye(
+            active_support_entry.get("center"),
+            eye_intrinsic,
+            eye_w2c_cv,
+            eye_width,
+            eye_height,
+        )
+        support_center_pixel = support_center_projection.get("pixel")
+        support_center_depth_m = support_center_projection.get("depth")
+        debug["support_center_depth_m"] = (
+            None
+            if support_center_depth_m is None or not np.isfinite(support_center_depth_m)
+            else float(support_center_depth_m)
+        )
+        if (
+            support_center_pixel is None
+            or support_center_depth_m is None
+            or not np.isfinite(support_center_depth_m)
+            or float(support_center_depth_m) <= self.IMMERSIVE_STARTUP_DEPTH_EPS
+        ):
+            return False, debug
+        tx0, ty0, tx1, ty1 = [int(v) for v in table_roi_bounds]
+        center_in_table = (
+            float(support_center_pixel[0]) >= float(tx0)
+            and float(support_center_pixel[0]) < float(tx1)
+            and float(support_center_pixel[1]) >= float(ty0)
+            and float(support_center_pixel[1]) < float(ty1)
+        )
+        debug["support_center_in_table"] = bool(center_in_table)
+        if not center_in_table:
+            return False, debug
+        table_front_depth_m = self._compute_immersive_front_depth_for_bounds(
+            table_support_entry.get(
+                "render_bounds_min",
+                table_support_entry["bounds_min"],
+            ),
+            table_support_entry.get(
+                "render_bounds_max",
+                table_support_entry["bounds_max"],
+            ),
+            eye_intrinsic,
+            eye_w2c_cv,
+            eye_width,
+            eye_height,
+        )
+        debug["table_front_depth_m"] = (
+            None
+            if table_front_depth_m is None or not np.isfinite(table_front_depth_m)
+            else float(table_front_depth_m)
+        )
+        if table_front_depth_m is None:
+            return False, debug
+        depth_gap_m = float(support_center_depth_m) - float(table_front_depth_m)
+        debug["depth_gap_m"] = float(depth_gap_m)
+        candidate_suppress = (
+            float(overlap_ratio)
+            >= float(self.IMMERSIVE_SUPPORT_OCCLUSION_OVERLAP_RATIO)
+            and depth_gap_m >= float(self.IMMERSIVE_SUPPORT_OCCLUSION_DEPTH_GAP_M)
+        )
+        debug["candidate_suppress"] = bool(candidate_suppress)
+        return bool(candidate_suppress), debug
+
+    def _build_immersive_support_overlay_cache(self, scene_renderer):
+        runtime_state = getattr(self, "_immersive_balanced_runtime_state", None)
+        if runtime_state is None:
+            cache_store = getattr(self, "_immersive_support_overlay_cache", None)
+            if cache_store is None:
+                cache_store = {}
+                self._immersive_support_overlay_cache = cache_store
+        else:
+            cache_store = runtime_state.setdefault("support_overlay_cache", {})
+
+        support_entries = []
+        if scene_renderer is not None:
+            support_entries = sorted(
+                (
+                    entry
+                    for entry in scene_renderer.support_surface_entries_ref()
+                    if entry.get("component_id") is not None
+                ),
+                key=lambda entry: int(entry["support_id"]),
+            )
+        signature = tuple(
+            (
+                int(entry["support_id"]),
+                int(entry["component_id"]),
+            )
+            for entry in support_entries
+        )
+        overlay_cache = cache_store.get("scene_labels")
+        if overlay_cache is not None and overlay_cache.get("signature") == signature:
+            return overlay_cache
+
+        entries = []
+        for entry in support_entries:
+            entries.append(
+                {
+                    "support_id": int(entry["support_id"]),
+                    "component_id": int(entry["component_id"]),
+                    "center": np.asarray(entry["center"], dtype=np.float32).copy(),
+                    "bounds_min": np.asarray(entry["bounds_min"], dtype=np.float32).copy(),
+                    "bounds_max": np.asarray(entry["bounds_max"], dtype=np.float32).copy(),
+                }
+            )
+        overlay_cache = {
+            "signature": signature,
+            "entries": entries,
+        }
+        cache_store["scene_labels"] = overlay_cache
+        return overlay_cache
+
+    def _overlay_rects_overlap(self, rect_a, rect_b, padding=0):
+        if rect_a is None or rect_b is None:
+            return False
+        ax0, ay0, ax1, ay1 = [int(v) for v in rect_a]
+        bx0, by0, bx1, by1 = [int(v) for v in rect_b]
+        pad = int(max(padding, 0))
+        return not (
+            ax1 + pad <= bx0
+            or bx1 + pad <= ax0
+            or ay1 + pad <= by0
+            or by1 + pad <= ay0
+        )
+
+    def _draw_immersive_support_entry_overlay(
+        self,
+        frame,
+        overlay_cache,
+        active_support_id,
+        eye_render_state,
+    ):
+        if frame is None or overlay_cache is None or eye_render_state is None:
+            return
+        height, width = frame.shape[:2]
+        scale = max(
+            self.SUPPORT_ENTRY_OVERLAY_SCALE,
+            int(
+                round(
+                    height
+                    / float(self.SUPPORT_ENTRY_OVERLAY_REFERENCE_HEIGHT)
+                    * self.SUPPORT_ENTRY_OVERLAY_SCALE
+                )
+            ),
+        )
+        scale = min(scale, self.SUPPORT_ENTRY_OVERLAY_MAX_SCALE)
+        pad = scale + 2
+        offset = max(
+            self.SUPPORT_ENTRY_OVERLAY_LABEL_OFFSET_PX,
+            int(round(scale * 2.0)),
+        )
+        collision_padding = max(
+            self.SUPPORT_ENTRY_OVERLAY_COLLISION_PADDING_PX,
+            int(round(scale * 1.5)),
+        )
+        entries = overlay_cache.get("entries", [])
+        candidates = []
+        for entry in entries:
+            component_id = int(entry["component_id"])
+            label_text = str(component_id)
+            label_width, label_height = self._bitmap_text_size(label_text, scale=scale)
+            box_width = label_width + 2 * pad
+            box_height = label_height + 2 * pad
+            projected_box = self._compute_immersive_projected_roi_bounds(
+                entry["bounds_min"],
+                entry["bounds_max"],
+                eye_render_state.get("intrinsic_np"),
+                eye_render_state.get("w2c_cv_np"),
+                width,
+                height,
+                padding=0,
+                snap=1,
+                min_size=1,
+            )
+            projected_center = self._project_world_point_to_pixel(
+                entry["center"],
+                eye_render_state.get("intrinsic_t"),
+                eye_render_state.get("w2c_cv_t"),
+                height,
+                width,
+            )
+            if projected_center is None and projected_box is None:
+                continue
+            anchor_x = None
+            anchor_y = None
+            if projected_center is not None:
+                anchor_x = float(projected_center[0].item())
+                anchor_y = float(projected_center[1].item())
+            elif projected_box is not None:
+                anchor_x = 0.5 * float(projected_box[0] + projected_box[2])
+                anchor_y = float(projected_box[1])
+            depth_info = self._project_world_point_into_eye(
+                entry["center"],
+                eye_render_state.get("intrinsic_np"),
+                eye_render_state.get("w2c_cv_np"),
+                width,
+                height,
+            )
+            depth = float(depth_info["depth"]) if depth_info["depth"] is not None else float("inf")
+            if not np.isfinite(depth):
+                depth = float("inf")
+            candidates.append(
+                {
+                    "support_id": int(entry["support_id"]),
+                    "label_text": label_text,
+                    "anchor_x": float(anchor_x),
+                    "anchor_y": float(anchor_y),
+                    "box_width": int(box_width),
+                    "box_height": int(box_height),
+                    "depth": float(depth),
+                    "is_active": (
+                        active_support_id is not None
+                        and int(entry["support_id"]) == int(active_support_id)
+                    ),
+                }
+            )
+        candidates.sort(
+            key=lambda item: (
+                0 if item["is_active"] else 1,
+                item["depth"],
+                item["support_id"],
+            )
+        )
+        placed_boxes = []
+        for candidate in candidates:
+            anchor_x = float(candidate["anchor_x"])
+            anchor_y = float(candidate["anchor_y"])
+            box_width = int(candidate["box_width"])
+            box_height = int(candidate["box_height"])
+            placements = [
+                (anchor_x + offset, anchor_y - box_height - offset),
+                (anchor_x - box_width - offset, anchor_y - box_height - offset),
+                (anchor_x + offset, anchor_y + offset),
+                (anchor_x - box_width - offset, anchor_y + offset),
+                (anchor_x + offset, anchor_y - 0.5 * box_height),
+                (anchor_x - box_width - offset, anchor_y - 0.5 * box_height),
+            ]
+            chosen_rect = None
+            for place_x, place_y in placements:
+                x0 = int(round(place_x))
+                y0 = int(round(place_y))
+                x0 = max(0, min(x0, max(0, width - box_width)))
+                y0 = max(0, min(y0, max(0, height - box_height)))
+                rect = (x0, y0, x0 + box_width, y0 + box_height)
+                if any(
+                    self._overlay_rects_overlap(rect, other_rect, collision_padding)
+                    for other_rect in placed_boxes
+                ):
+                    continue
+                chosen_rect = rect
+                break
+            if chosen_rect is None:
+                continue
+            placed_boxes.append(chosen_rect)
+            x0, y0, x1, y1 = chosen_rect
+            is_active = bool(candidate["is_active"])
+            self._blend_rect(
+                frame,
+                x0,
+                y0,
+                x1,
+                y1,
+                (
+                    self.SUPPORT_ENTRY_OVERLAY_ACTIVE_BG_COLOR
+                    if is_active
+                    else self.SUPPORT_ENTRY_OVERLAY_BG_COLOR
+                ),
+                blend=0.80 if is_active else 0.54,
+            )
+            self._draw_bitmap_text(
+                frame,
+                candidate["label_text"],
+                x0 + pad,
+                y0 + pad,
+                (
+                    self.SUPPORT_ENTRY_OVERLAY_ACTIVE_TEXT_COLOR
+                    if is_active
+                    else self.SUPPORT_ENTRY_OVERLAY_TEXT_COLOR
+                ),
+                scale=scale,
+                blend=0.94,
+            )
 
     def _render_profile_new_frame(self, enabled):
         if not enabled:
@@ -4028,6 +10262,12 @@ class InvPhyTrainerWarp:
             return None
         cuda_spans = frame_profile.pop("_cuda_spans", [])
         for key, start_event, end_event in cuda_spans:
+            if torch.cuda.is_available():
+                try:
+                    if not end_event.query():
+                        end_event.synchronize()
+                except Exception:
+                    end_event.synchronize()
             frame_profile[key] = frame_profile.get(key, 0.0) + (
                 start_event.elapsed_time(end_event) / 1000.0
             )
@@ -4059,9 +10299,16 @@ class InvPhyTrainerWarp:
         if key.endswith("_gib"):
             return "memory"
         if (
+            key.endswith("_wall")
+            or key.endswith("_cuda")
+            or key.endswith("_ms")
+        ):
+            return "time"
+        if (
             key.endswith("_fps")
             or key.endswith("_scale")
             or key.endswith("_used")
+            or key.endswith("_count")
             or key.endswith("_sample_id")
             or key.endswith("_applied")
             or key.endswith("_dx_px")
@@ -4070,6 +10317,7 @@ class InvPhyTrainerWarp:
             or key.endswith("_m")
             or key.endswith("_age_frames")
             or key.endswith("_forced_render")
+            or "fallback" in key
         ):
             return "scalar"
         return "time"
@@ -4154,6 +10402,414 @@ class InvPhyTrainerWarp:
             )
         return lines
 
+    def _render_profile_time_hierarchy(self):
+        return [
+            (
+                "rendering",
+                "Rendering stage",
+                [
+                    (
+                        "static_scene_render_ms",
+                        "static_scene_render_ms",
+                        [
+                            (
+                                "static_scene_execute_wall_ms",
+                                "static_scene_execute_wall_ms",
+                                [],
+                            ),
+                            (
+                                "static_scene_assemble_wall_ms",
+                                "static_scene_assemble_wall_ms",
+                                [],
+                            ),
+                            (
+                                "render_eye_intrinsics_setup_wall",
+                                "render_eye_intrinsics_setup_wall",
+                                [],
+                            ),
+                            (
+                                "scene_render_eye_left_total_ms",
+                                "scene_render_eye_left_total_ms",
+                                [],
+                            ),
+                            (
+                                "scene_render_eye_right_total_ms",
+                                "scene_render_eye_right_total_ms",
+                                [],
+                            ),
+                            (
+                                "scene_render_eye_left_dispatch_ms",
+                                "scene_render_eye_left_dispatch_ms",
+                                [],
+                            ),
+                            (
+                                "scene_render_eye_right_dispatch_ms",
+                                "scene_render_eye_right_dispatch_ms",
+                                [],
+                            ),
+                            (
+                                "scene_render_eye_left_queue_wait_ms",
+                                "scene_render_eye_left_queue_wait_ms",
+                                [],
+                            ),
+                            (
+                                "scene_render_eye_right_queue_wait_ms",
+                                "scene_render_eye_right_queue_wait_ms",
+                                [],
+                            ),
+                            (
+                                "scene_render_parallel_dispatch_ms",
+                                "scene_render_parallel_dispatch_ms",
+                                [],
+                            ),
+                            (
+                                "scene_render_parallel_wait_ms",
+                                "scene_render_parallel_wait_ms",
+                                [],
+                            ),
+                            (
+                                "scene_render_parallel_join_overhead_ms",
+                                "scene_render_parallel_join_overhead_ms (derived)",
+                                [],
+                            ),
+                            ("scene_render_left_wall", "scene_render_left_wall", []),
+                            ("scene_render_right_wall", "scene_render_right_wall", []),
+                            ("scene_render_center_wall", "scene_render_center_wall", []),
+                            (
+                                "scene_render_background_center_wall",
+                                "scene_render_background_center_wall",
+                                [],
+                            ),
+                            (
+                                "scene_prepare_background_eye_wall",
+                                "scene_prepare_background_eye_wall",
+                                [],
+                            ),
+                            ("scene_render_far_center_wall", "scene_render_far_center_wall", []),
+                            ("scene_render_near_center_wall", "scene_render_near_center_wall", []),
+                            ("scene_render_side_left_wall", "scene_render_side_left_wall", []),
+                            ("scene_render_side_right_wall", "scene_render_side_right_wall", []),
+                            (
+                                "scene_render_table_base_left_wall",
+                                "scene_render_table_base_left_wall",
+                                [],
+                            ),
+                            (
+                                "scene_render_table_base_right_wall",
+                                "scene_render_table_base_right_wall",
+                                [],
+                            ),
+                            ("scene_render_table_left_wall", "scene_render_table_left_wall", []),
+                            ("scene_render_table_right_wall", "scene_render_table_right_wall", []),
+                            ("scene_render_focus_left_wall", "scene_render_focus_left_wall", []),
+                            ("scene_render_focus_right_wall", "scene_render_focus_right_wall", []),
+                        ],
+                    ),
+                    ("branch_b_ready_ms", "branch_b_ready_ms", []),
+                    ("pre_compose_ready_ms", "pre_compose_ready_ms", []),
+                    ("simulation_lbs_wall_ms", "simulation_lbs_wall_ms", []),
+                    (
+                        "gaussian_render_wall_ms",
+                        "gaussian_render_wall_ms",
+                        [
+                            ("gaussian_render_left_cuda", "gaussian_render_left_cuda", []),
+                            ("gaussian_render_right_cuda", "gaussian_render_right_cuda", []),
+                            (
+                                "gaussian_render_stereo_batched_cuda",
+                                "gaussian_render_stereo_batched_cuda",
+                                [],
+                            ),
+                        ],
+                    ),
+                    (
+                        "compositing_ms",
+                        "compositing_ms",
+                        [
+                            ("compose_left_cuda", "compose_left_cuda", []),
+                            ("compose_right_cuda", "compose_right_cuda", []),
+                            (
+                                "scene_compose_table_base_left_cuda",
+                                "scene_compose_table_base_left_cuda",
+                                [],
+                            ),
+                            (
+                                "scene_compose_table_base_right_cuda",
+                                "scene_compose_table_base_right_cuda",
+                                [],
+                            ),
+                            (
+                                "scene_compose_table_left_cuda",
+                                "scene_compose_table_left_cuda",
+                                [],
+                            ),
+                            (
+                                "scene_compose_table_right_cuda",
+                                "scene_compose_table_right_cuda",
+                                [],
+                            ),
+                            (
+                                "scene_compose_focus_left_cuda",
+                                "scene_compose_focus_left_cuda",
+                                [],
+                            ),
+                            (
+                                "scene_compose_focus_right_cuda",
+                                "scene_compose_focus_right_cuda",
+                                [],
+                            ),
+                            (
+                                "scene_compose_side_left_cuda",
+                                "scene_compose_side_left_cuda",
+                                [],
+                            ),
+                            (
+                                "scene_compose_side_right_cuda",
+                                "scene_compose_side_right_cuda",
+                                [],
+                            ),
+                        ],
+                    ),
+                    (
+                        "overlay_publish_ms",
+                        "overlay_publish_ms",
+                        [
+                            ("overlay_projection_wall", "overlay_projection_wall", []),
+                            ("overlay_draw_left_wall", "overlay_draw_left_wall", []),
+                            ("overlay_draw_right_wall", "overlay_draw_right_wall", []),
+                            ("publish_total_wall", "publish_total_wall", []),
+                            (
+                                "publish_process_check_wall",
+                                "publish_process_check_wall",
+                                [],
+                            ),
+                            (
+                                "publish_pending_drain_nonblock_wall",
+                                "publish_pending_drain_nonblock_wall",
+                                [],
+                            ),
+                            (
+                                "publish_pending_drain_block_wall",
+                                "publish_pending_drain_block_wall",
+                                [],
+                            ),
+                            (
+                                "publish_gpu_to_cpu_wait_wall",
+                                "publish_gpu_to_cpu_wait_wall",
+                                [],
+                            ),
+                            (
+                                "publish_gpu_to_cpu_copy_cuda",
+                                "publish_gpu_to_cpu_copy_cuda",
+                                [],
+                            ),
+                            ("publish_cpu_mmap_copy_wall", "publish_cpu_mmap_copy_wall", []),
+                            (
+                                "publish_header_write_wall",
+                                "publish_header_write_wall",
+                                [],
+                            ),
+                            (
+                                "publish_stage_enqueue_wall",
+                                "publish_stage_enqueue_wall",
+                                [],
+                            ),
+                            (
+                                "publish_fallback_copy_wall",
+                                "publish_fallback_copy_wall",
+                                [],
+                            ),
+                        ],
+                    ),
+                    (
+                        "scene_present_worker_ms",
+                        "scene_present_worker_ms",
+                        [
+                            ("scene_present_submit_ms", "scene_present_submit_ms", []),
+                            (
+                                "scene_present_queue_wait_ms",
+                                "scene_present_queue_wait_ms",
+                                [],
+                            ),
+                            (
+                                "scene_present_compose_ms",
+                                "scene_present_compose_ms",
+                                [],
+                            ),
+                            (
+                                "scene_present_compose_left_ms",
+                                "scene_present_compose_left_ms",
+                                [],
+                            ),
+                            (
+                                "scene_present_compose_right_ms",
+                                "scene_present_compose_right_ms",
+                                [],
+                            ),
+                            (
+                                "scene_present_overlay_ms",
+                                "scene_present_overlay_ms",
+                                [],
+                            ),
+                            (
+                                "scene_present_overlay_left_ms",
+                                "scene_present_overlay_left_ms",
+                                [],
+                            ),
+                            (
+                                "scene_present_overlay_right_ms",
+                                "scene_present_overlay_right_ms",
+                                [],
+                            ),
+                            (
+                                "scene_present_parallel_wait_ms",
+                                "scene_present_parallel_wait_ms",
+                                [],
+                            ),
+                            (
+                                "scene_present_publish_ms",
+                                "scene_present_publish_ms",
+                                [],
+                            ),
+                            (
+                                "scene_present_preview_ms",
+                                "scene_present_preview_ms",
+                                [],
+                            ),
+                            (
+                                "scene_present_source_age_ms",
+                                "scene_present_source_age_ms",
+                                [],
+                            ),
+                        ],
+                    ),
+                    (
+                        "scene_timewarp_gpu_ms",
+                        "scene_timewarp_gpu_ms",
+                        [
+                            ("scene_reproject_left_cuda", "scene_reproject_left_cuda", []),
+                            ("scene_reproject_right_cuda", "scene_reproject_right_cuda", []),
+                            (
+                                "scene_reproject_hole_fill_left_cuda",
+                                "scene_reproject_hole_fill_left_cuda",
+                                [],
+                            ),
+                            (
+                                "scene_reproject_hole_fill_right_cuda",
+                                "scene_reproject_hole_fill_right_cuda",
+                                [],
+                            ),
+                            (
+                                "scene_reproject_background_left_cuda",
+                                "scene_reproject_background_left_cuda",
+                                [],
+                            ),
+                            (
+                                "scene_reproject_background_right_cuda",
+                                "scene_reproject_background_right_cuda",
+                                [],
+                            ),
+                            (
+                                "scene_reproject_background_hole_fill_left_cuda",
+                                "scene_reproject_background_hole_fill_left_cuda",
+                                [],
+                            ),
+                            (
+                                "scene_reproject_background_hole_fill_right_cuda",
+                                "scene_reproject_background_hole_fill_right_cuda",
+                                [],
+                            ),
+                            ("scene_warp_far_left_cuda", "scene_warp_far_left_cuda", []),
+                            ("scene_warp_far_right_cuda", "scene_warp_far_right_cuda", []),
+                            ("scene_warp_near_left_cuda", "scene_warp_near_left_cuda", []),
+                            ("scene_warp_near_right_cuda", "scene_warp_near_right_cuda", []),
+                        ],
+                    ),
+                    ("overlap_wait_wall_ms", "overlap_wait_wall_ms", []),
+                    ("static_scene_worker_wall_ms", "static_scene_worker_wall_ms", []),
+                ],
+            )
+        ]
+
+    def _render_profile_section_lines(self, title, rows):
+        if not rows:
+            return []
+        metric_width = max(len("metric"), *(len(row[0]) for row in rows))
+        avg_width = max(len("avg"), *(len(row[1]) for row in rows))
+        p95_width = max(len("p95"), *(len(row[2]) for row in rows))
+        max_width = max(len("max"), *(len(row[3]) for row in rows))
+        lines = [
+            f"{title}:",
+            f"{'metric':<{metric_width}}  {'avg':>{avg_width}}  {'p95':>{p95_width}}  {'max':>{max_width}}",
+        ]
+        for metric, avg_text, p95_text, max_text in rows:
+            lines.append(
+                f"{metric:<{metric_width}}  {avg_text:>{avg_width}}  {p95_text:>{p95_width}}  {max_text:>{max_width}}"
+            )
+        return lines
+
+    def _render_profile_time_section_rows(self, rows_by_key):
+        used_keys = set()
+        section_rows = []
+
+        def add_node(node, depth):
+            key, label, children = node
+            row = rows_by_key.get(key)
+            if row is None:
+                return
+            used_keys.add(key)
+            display_label = f"{'  ' * depth}{'- ' if depth > 0 else ''}{label}"
+            section_rows.append(
+                (
+                    display_label,
+                    row["avg_text"],
+                    row["p95_text"],
+                    row["max_text"],
+                )
+            )
+            available_children = [
+                child for child in children if rows_by_key.get(child[0]) is not None
+            ]
+            available_children.sort(
+                key=lambda child: rows_by_key[child[0]]["avg_value"],
+                reverse=True,
+            )
+            for child in available_children:
+                add_node(child, depth + 1)
+
+        top_nodes = [
+            node
+            for node in self._render_profile_time_hierarchy()
+            if rows_by_key.get(node[0]) is not None
+        ]
+        top_nodes.sort(key=lambda node: rows_by_key[node[0]]["avg_value"], reverse=True)
+        for node in top_nodes:
+            add_node(node, depth=0)
+
+        other_time_rows = []
+        for key, row in rows_by_key.items():
+            if row["group"] != "time" or key in used_keys:
+                continue
+            other_time_rows.append(
+                (
+                    key,
+                    row["avg_text"],
+                    row["p95_text"],
+                    row["max_text"],
+                    row["avg_value"],
+                )
+            )
+        other_time_rows.sort(key=lambda row: row[4], reverse=True)
+        return section_rows, [
+            (label, avg_text, p95_text, max_text)
+            for label, avg_text, p95_text, max_text, _ in other_time_rows
+        ]
+
+    def _render_profile_series_average(self, render_profile_series, key):
+        values = render_profile_series.get(key, [])
+        if not values:
+            return None
+        return float(np.mean(np.asarray(values, dtype=np.float64)))
+
     def _render_profile_summary_lines(self, mode, render_profile_series, ordered_keys):
         if not render_profile_series:
             return []
@@ -4165,7 +10821,7 @@ class InvPhyTrainerWarp:
         lines = [
             f"=== Render Profile Summary ({mode}, avg/p95/max over {sample_count} frames) ==="
         ]
-        rows = []
+        rows_by_key = {}
         for key in ordered_keys:
             values = render_profile_series.get(key, [])
             if not values:
@@ -4174,37 +10830,42 @@ class InvPhyTrainerWarp:
             avg_value = float(np.mean(values_np))
             p95_value = float(np.percentile(values_np, 95))
             max_value = float(np.max(values_np))
-            rows.append(
-                (
-                    key,
-                    self._render_profile_metric_group(key),
-                    avg_value,
-                    self._format_render_profile_stat(key, avg_value),
-                    self._format_render_profile_stat(key, p95_value),
-                    self._format_render_profile_stat(key, max_value),
-                )
-            )
-        if not rows:
+            rows_by_key[key] = {
+                "key": key,
+                "group": self._render_profile_metric_group(key),
+                "avg_value": avg_value,
+                "avg_text": self._format_render_profile_stat(key, avg_value),
+                "p95_text": self._format_render_profile_stat(key, p95_value),
+                "max_text": self._format_render_profile_stat(key, max_value),
+            }
+        if not rows_by_key:
             return lines
-        group_rank = {"time": 0, "ratio": 1, "scalar": 2, "memory": 3}
-        rows.sort(
-            key=lambda row: (
-                group_rank.get(row[1], 99),
-                -row[2] if row[1] == "time" else 0.0,
-                row[0],
-            )
-        )
-        metric_width = max(len("metric"), *(len(row[0]) for row in rows))
-        avg_width = max(len("avg"), *(len(row[3]) for row in rows))
-        p95_width = max(len("p95"), *(len(row[4]) for row in rows))
-        max_width = max(len("max"), *(len(row[5]) for row in rows))
-        lines.append(
-            f"{'metric':<{metric_width}}  {'avg':>{avg_width}}  {'p95':>{p95_width}}  {'max':>{max_width}}"
-        )
-        for metric, _, _, avg_text, p95_text, max_text in rows:
-            lines.append(
-                f"{metric:<{metric_width}}  {avg_text:>{avg_width}}  {p95_text:>{p95_width}}  {max_text:>{max_width}}"
-            )
+        time_rows, other_time_rows = self._render_profile_time_section_rows(rows_by_key)
+        if time_rows:
+            lines.extend(self._render_profile_section_lines("Timing metrics", time_rows))
+        if other_time_rows:
+            lines.extend(self._render_profile_section_lines("Other timing", other_time_rows))
+
+        for group_name, section_title in (
+            ("ratio", "Ratio metrics"),
+            ("scalar", "Scalar metrics"),
+            ("memory", "Memory metrics"),
+        ):
+            section_rows = []
+            for key, row in rows_by_key.items():
+                if row["group"] != group_name:
+                    continue
+                section_rows.append(
+                    (
+                        key,
+                        row["avg_text"],
+                        row["p95_text"],
+                        row["max_text"],
+                    )
+                )
+            section_rows.sort(key=lambda row: row[0])
+            if section_rows:
+                lines.extend(self._render_profile_section_lines(section_title, section_rows))
         return lines
 
     def _write_render_profile_outputs(
@@ -4241,7 +10902,7 @@ class InvPhyTrainerWarp:
             "[render_profile][immersive] "
             f"frame={int(frame_index)} "
             f"rendering={frame_profile.get('rendering', 0.0) * 1000.0:.2f}ms "
-            f"scene=C{frame_profile.get('scene_render_center_wall', 0.0) * 1000.0:.2f}/"
+            f"base=C{frame_profile.get('scene_render_center_wall', 0.0) * 1000.0:.2f}/"
             f"L{frame_profile.get('scene_render_left_wall', 0.0) * 1000.0:.2f}/"
             f"R{frame_profile.get('scene_render_right_wall', 0.0) * 1000.0:.2f}ms "
             f"bg=C{frame_profile.get('scene_render_background_center_wall', 0.0) * 1000.0:.2f}ms "
@@ -4286,13 +10947,26 @@ class InvPhyTrainerWarp:
             f"{frame_profile.get('scene_reproject_background_roi_post_right_ratio', 0.0) * 100.0:.0f}% "
             f"table=L{frame_profile.get('scene_render_table_left_wall', 0.0) * 1000.0:.2f}/"
             f"R{frame_profile.get('scene_render_table_right_wall', 0.0) * 1000.0:.2f}ms "
+            f"table_base=L{frame_profile.get('scene_render_table_base_left_wall', 0.0) * 1000.0:.2f}/"
+            f"R{frame_profile.get('scene_render_table_base_right_wall', 0.0) * 1000.0:.2f}ms "
             f"table_comp=L{frame_profile.get('scene_compose_table_left_cuda', 0.0) * 1000.0:.2f}/"
             f"R{frame_profile.get('scene_compose_table_right_cuda', 0.0) * 1000.0:.2f}ms "
+            f"table_base_comp=L{frame_profile.get('scene_compose_table_base_left_cuda', 0.0) * 1000.0:.2f}/"
+            f"R{frame_profile.get('scene_compose_table_base_right_cuda', 0.0) * 1000.0:.2f}ms "
             f"table_roi=L{frame_profile.get('scene_table_roi_left_ratio', 0.0) * 100.0:.1f}/"
             f"R{frame_profile.get('scene_table_roi_right_ratio', 0.0) * 100.0:.1f}% "
             f"table_ss={frame_profile.get('scene_table_roi_supersample_scale', 0.0):.2f} "
             f"table_ff=L{frame_profile.get('scene_table_fullframe_fallback_left_ratio', 0.0) * 100.0:.0f}/"
             f"R{frame_profile.get('scene_table_fullframe_fallback_right_ratio', 0.0) * 100.0:.0f}% "
+            f"focus=L{frame_profile.get('scene_render_focus_left_wall', 0.0) * 1000.0:.2f}/"
+            f"R{frame_profile.get('scene_render_focus_right_wall', 0.0) * 1000.0:.2f}ms "
+            f"focus_comp=L{frame_profile.get('scene_compose_focus_left_cuda', 0.0) * 1000.0:.2f}/"
+            f"R{frame_profile.get('scene_compose_focus_right_cuda', 0.0) * 1000.0:.2f}ms "
+            f"focus_roi=L{frame_profile.get('scene_focus_roi_left_ratio', 0.0) * 100.0:.1f}/"
+            f"R{frame_profile.get('scene_focus_roi_right_ratio', 0.0) * 100.0:.1f}% "
+            f"focus_ss={frame_profile.get('scene_focus_roi_supersample_scale', 0.0):.2f} "
+            f"focus_ff=L{frame_profile.get('scene_focus_fullframe_fallback_left_ratio', 0.0) * 100.0:.0f}/"
+            f"R{frame_profile.get('scene_focus_fullframe_fallback_right_ratio', 0.0) * 100.0:.0f}% "
             f"gaussian=L{frame_profile.get('gaussian_render_left_cuda', 0.0) * 1000.0:.2f}/"
             f"R{frame_profile.get('gaussian_render_right_cuda', 0.0) * 1000.0:.2f}/"
             f"B{frame_profile.get('gaussian_render_stereo_batched_cuda', 0.0) * 1000.0:.2f}ms "
@@ -4381,9 +11055,13 @@ class InvPhyTrainerWarp:
             return
 
         rgb_frame = frame[..., :3]
-        color_tensor = rgb_frame.new_tensor(color[:3])
         patch = rgb_frame[y0:y1, x0:x1]
-        patch[ellipse_mask] = patch[ellipse_mask] * (1.0 - blend) + color_tensor * blend
+        self._blend_rgb_patch_masked_inplace(
+            patch,
+            ellipse_mask,
+            color,
+            blend=blend,
+        )
 
     def _draw_marker_line(self, frame, start_pixel, end_pixel, color, radius=1, blend=0.45):
         height, width = frame.shape[:2]
@@ -4422,9 +11100,13 @@ class InvPhyTrainerWarp:
             return
 
         rgb_frame = frame[..., :3]
-        color_tensor = rgb_frame.new_tensor(color[:3])
         patch = rgb_frame[min_y:max_y, min_x:max_x]
-        patch[line_mask] = patch[line_mask] * (1.0 - blend) + color_tensor * blend
+        self._blend_rgb_patch_masked_inplace(
+            patch,
+            line_mask,
+            color,
+            blend=blend,
+        )
 
     def _mirror_symbol_about_palm(self, projected):
         mirrored = {"palm": projected["palm"]}
@@ -6037,6 +12719,77 @@ class InvPhyTrainerWarp:
             return None
         return received_s
 
+    def _copy_immersive_packet_value(self, value):
+        if torch.is_tensor(value):
+            return value.clone()
+        if isinstance(value, np.ndarray):
+            return value.copy()
+        if isinstance(value, dict):
+            return {
+                key: self._copy_immersive_packet_value(subvalue)
+                for key, subvalue in value.items()
+            }
+        if isinstance(value, list):
+            return [self._copy_immersive_packet_value(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(self._copy_immersive_packet_value(item) for item in value)
+        return copy.deepcopy(value)
+
+    def _publish_immersive_stable_cover_frame(
+        self,
+        immersive_bridge,
+        *,
+        left_eye_frame,
+        right_eye_frame,
+        preview_frame=None,
+        reject_source,
+        backend_kind,
+    ):
+        if (
+            immersive_bridge is None
+            or not torch.is_tensor(left_eye_frame)
+            or not torch.is_tensor(right_eye_frame)
+        ):
+            return {
+                "cache_hit": False,
+                "cache_missing": True,
+                "publish_wall_ms": 0.0,
+                "publish_stats": {},
+                "preview_frame": preview_frame,
+                "reject_source": str(reject_source).strip().lower(),
+                "backend_kind": str(backend_kind).strip().lower(),
+            }
+        if left_eye_frame.dtype != torch.uint8:
+            left_eye_frame = left_eye_frame.clamp(0.0, 255.0).to(torch.uint8)
+        if right_eye_frame.dtype != torch.uint8:
+            right_eye_frame = right_eye_frame.clamp(0.0, 255.0).to(torch.uint8)
+        if preview_frame is None:
+            preview_frame = left_eye_frame
+        elif torch.is_tensor(preview_frame) and preview_frame.dtype != torch.uint8:
+            preview_frame = preview_frame.clamp(0.0, 255.0).to(torch.uint8)
+        publish_start = time.perf_counter()
+        publish_ok, publish_stats = immersive_bridge.publish_stereo_frames(
+            left_eye_frame,
+            right_eye_frame,
+        )
+        publish_wall_ms = 1000.0 * (time.perf_counter() - publish_start)
+        if not publish_ok:
+            raise RuntimeError(
+                "Quest immersive bridge stopped accepting stereo frames during "
+                f"stable cover publish ({str(backend_kind).strip().lower()} / "
+                f"{str(reject_source).strip().lower()}).\n"
+                + immersive_bridge.debug_summary()
+            )
+        return {
+            "cache_hit": True,
+            "cache_missing": False,
+            "publish_wall_ms": float(publish_wall_ms),
+            "publish_stats": publish_stats,
+            "preview_frame": preview_frame,
+            "reject_source": str(reject_source).strip().lower(),
+            "backend_kind": str(backend_kind).strip().lower(),
+        }
+
     def _predict_immersive_eye_poses_for_sample(
         self,
         sample,
@@ -6047,7 +12800,7 @@ class InvPhyTrainerWarp:
         if sample is None or live_head_alignment is None:
             return None, None
         state_copy = None if head_pose_state is None else copy.deepcopy(head_pose_state)
-        left_eye_pose_world, right_eye_pose_world, _ = (
+        left_eye_pose_world, right_eye_pose_world, predicted_head_pose_state = (
             self._update_immersive_head_pose_state(
                 sample,
                 live_head_alignment,
@@ -6055,7 +12808,272 @@ class InvPhyTrainerWarp:
                 frame_index=frame_index,
             )
         )
-        return left_eye_pose_world, right_eye_pose_world
+        return left_eye_pose_world, right_eye_pose_world, predicted_head_pose_state
+
+    def _resolve_immersive_scene_publish_state(
+        self,
+        immersive_bridge,
+        *,
+        scene_depth_reproject_enabled,
+        scene_source_sample_id,
+        scene_source_left_eye_pose_world,
+        scene_source_right_eye_pose_world,
+        scene_source_left_intrinsic,
+        scene_source_right_intrinsic,
+        default_left_overlay_eye_render_state,
+        default_right_overlay_eye_render_state,
+        live_head_alignment,
+        head_pose_state,
+        frame_index,
+        eye_width,
+        eye_height,
+        publish_sample_override=None,
+    ):
+        resolved = {
+            "publish_sample": None,
+            "publish_sample_id": int(scene_source_sample_id),
+            "apply_timewarp": False,
+            "publish_left_eye_pose_world": scene_source_left_eye_pose_world,
+            "publish_right_eye_pose_world": scene_source_right_eye_pose_world,
+            "publish_left_intrinsic": np.asarray(
+                scene_source_left_intrinsic, dtype=np.float32
+            ).copy(),
+            "publish_right_intrinsic": np.asarray(
+                scene_source_right_intrinsic, dtype=np.float32
+            ).copy(),
+            "left_overlay_eye_render_state": default_left_overlay_eye_render_state,
+            "right_overlay_eye_render_state": default_right_overlay_eye_render_state,
+            "head_pose_reset": False,
+        }
+        if not scene_depth_reproject_enabled:
+            return resolved
+        publish_sample = (
+            publish_sample_override
+            if publish_sample_override is not None
+            else immersive_bridge.get_latest_sample()
+        )
+        resolved["publish_sample"] = publish_sample
+        if (
+            publish_sample is None
+            or not self._immersive_sample_has_valid_eye_pose(publish_sample)
+            or int(publish_sample.sample) <= int(scene_source_sample_id)
+        ):
+            return resolved
+
+        (
+            predicted_left_eye_pose_world,
+            predicted_right_eye_pose_world,
+            predicted_head_pose_state,
+        ) = self._predict_immersive_eye_poses_for_sample(
+            publish_sample,
+            live_head_alignment,
+            head_pose_state,
+            frame_index,
+        )
+        if head_pose_state is not None and predicted_head_pose_state is not None:
+            resolved["head_pose_reset"] = bool(
+                int(predicted_head_pose_state.get("last_reset_frame_index", -1))
+                != int(head_pose_state.get("last_reset_frame_index", -1))
+            )
+        publish_left_eye_pose_world = scene_source_left_eye_pose_world
+        publish_right_eye_pose_world = scene_source_right_eye_pose_world
+        if predicted_left_eye_pose_world is not None:
+            publish_left_eye_pose_world = predicted_left_eye_pose_world
+        if predicted_right_eye_pose_world is not None:
+            publish_right_eye_pose_world = predicted_right_eye_pose_world
+
+        publish_left_intrinsic = np.asarray(
+            scene_source_left_intrinsic,
+            dtype=np.float32,
+        ).copy()
+        publish_right_intrinsic = np.asarray(
+            scene_source_right_intrinsic,
+            dtype=np.float32,
+        ).copy()
+        if publish_sample.left_eye is not None and publish_sample.left_eye.pose_valid:
+            publish_left_intrinsic = self._eye_sample_intrinsic(
+                publish_sample.left_eye,
+                eye_width,
+                eye_height,
+            )
+        if publish_sample.right_eye is not None and publish_sample.right_eye.pose_valid:
+            publish_right_intrinsic = self._eye_sample_intrinsic(
+                publish_sample.right_eye,
+                eye_width,
+                eye_height,
+            )
+
+        resolved.update(
+            {
+                "publish_sample": publish_sample,
+                "publish_sample_id": int(publish_sample.sample),
+                "apply_timewarp": True,
+                "publish_left_eye_pose_world": publish_left_eye_pose_world,
+                "publish_right_eye_pose_world": publish_right_eye_pose_world,
+                "publish_left_intrinsic": publish_left_intrinsic,
+                "publish_right_intrinsic": publish_right_intrinsic,
+                "left_overlay_eye_render_state": (
+                    self._prepare_immersive_overlay_eye_render_state(
+                        publish_left_eye_pose_world,
+                        publish_left_intrinsic,
+                        eye_height,
+                        eye_width,
+                    )
+                ),
+                "right_overlay_eye_render_state": (
+                    self._prepare_immersive_overlay_eye_render_state(
+                        publish_right_eye_pose_world,
+                        publish_right_intrinsic,
+                        eye_height,
+                        eye_width,
+                    )
+                ),
+            }
+        )
+        return resolved
+
+    def _compute_immersive_synthetic_framegen_age_metrics(
+        self,
+        *,
+        scene_source_ready_wall_time_s,
+        synthetic_source_ready_wall_time_s=None,
+        now_s=None,
+    ):
+        scene_ready_s = float(scene_source_ready_wall_time_s)
+        synthetic_ready_s = (
+            scene_ready_s
+            if synthetic_source_ready_wall_time_s is None
+            else float(synthetic_source_ready_wall_time_s)
+        )
+        now_s = time.perf_counter() if now_s is None else float(now_s)
+        return {
+            "synthetic_candidate_age_ms": max(
+                0.0,
+                (now_s - synthetic_ready_s) * 1000.0,
+            ),
+            "synthetic_total_scene_age_ms": max(
+                0.0,
+                (now_s - scene_ready_s) * 1000.0,
+            ),
+            "synthetic_handoff_delay_ms": max(
+                0.0,
+                (synthetic_ready_s - scene_ready_s) * 1000.0,
+            ),
+        }
+
+    def _evaluate_immersive_synthetic_framegen_admission(
+        self,
+        *,
+        framegen_mode,
+        publish_state,
+        scene_source_ready_wall_time_s,
+        synthetic_source_ready_wall_time_s=None,
+        source_sample_id,
+        source_left_eye_pose_world,
+        source_right_eye_pose_world,
+        synthetic_emitted,
+        stale_packet,
+    ):
+        decision = {
+            "apply": False,
+            "reason": "off",
+            "source_age_ms": 0.0,
+            "total_scene_age_ms": 0.0,
+            "handoff_delay_ms": 0.0,
+            "translation_m": 0.0,
+            "rotation_deg": 0.0,
+        }
+        mode = str(framegen_mode).strip().lower()
+        if mode not in {"static", "adaptive"}:
+            return decision
+        if bool(synthetic_emitted):
+            decision["reason"] = "already_emitted"
+            return decision
+        if bool(stale_packet):
+            decision["reason"] = "stale_packet"
+            return decision
+        age_metrics = self._compute_immersive_synthetic_framegen_age_metrics(
+            scene_source_ready_wall_time_s=scene_source_ready_wall_time_s,
+            synthetic_source_ready_wall_time_s=synthetic_source_ready_wall_time_s,
+        )
+        decision["source_age_ms"] = float(age_metrics["synthetic_candidate_age_ms"])
+        decision["total_scene_age_ms"] = float(
+            age_metrics["synthetic_total_scene_age_ms"]
+        )
+        decision["handoff_delay_ms"] = float(
+            age_metrics["synthetic_handoff_delay_ms"]
+        )
+        publish_sample = None if publish_state is None else publish_state.get("publish_sample")
+        if publish_sample is None or int(getattr(publish_sample, "sample", -1)) <= int(source_sample_id):
+            decision["reason"] = "no_new_sample"
+            return decision
+        max_source_age_ms = (
+            float(self.IMMERSIVE_SYNTHETIC_FRAMEGEN_STATIC_MAX_SOURCE_AGE_MS)
+            if mode == "static"
+            else float(self.IMMERSIVE_SYNTHETIC_FRAMEGEN_ADAPTIVE_MAX_SOURCE_AGE_MS)
+        )
+        if decision["source_age_ms"] > max_source_age_ms:
+            decision["reason"] = "source_age"
+            return decision
+        if bool(publish_state.get("head_pose_reset", False)):
+            decision["reason"] = "invalid_pose"
+            return decision
+        publish_left_eye_pose_world = publish_state.get("publish_left_eye_pose_world")
+        publish_right_eye_pose_world = publish_state.get("publish_right_eye_pose_world")
+        publish_left_intrinsic = publish_state.get("publish_left_intrinsic")
+        publish_right_intrinsic = publish_state.get("publish_right_intrinsic")
+        if (
+            publish_left_eye_pose_world is None
+            or publish_right_eye_pose_world is None
+            or publish_left_intrinsic is None
+            or publish_right_intrinsic is None
+        ):
+            decision["reason"] = "invalid_pose"
+            return decision
+
+        source_center = self._immersive_eye_pair_center_world(
+            source_left_eye_pose_world,
+            source_right_eye_pose_world,
+        )
+        publish_center = self._immersive_eye_pair_center_world(
+            publish_left_eye_pose_world,
+            publish_right_eye_pose_world,
+        )
+        if source_center is not None and publish_center is not None:
+            decision["translation_m"] = float(
+                np.linalg.norm(publish_center - source_center)
+            )
+
+        rotation_deltas_deg = []
+        for source_pose_world, publish_pose_world in (
+            (source_left_eye_pose_world, publish_left_eye_pose_world),
+            (source_right_eye_pose_world, publish_right_eye_pose_world),
+        ):
+            rotation_delta_deg = self._immersive_pose_rotation_delta_deg(
+                source_pose_world,
+                publish_pose_world,
+            )
+            if rotation_delta_deg is not None:
+                rotation_deltas_deg.append(rotation_delta_deg)
+        if rotation_deltas_deg:
+            decision["rotation_deg"] = float(max(rotation_deltas_deg))
+
+        if mode == "adaptive":
+            if (
+                decision["translation_m"]
+                > float(self.IMMERSIVE_SYNTHETIC_FRAMEGEN_ADAPTIVE_MAX_TRANSLATION_M)
+            ):
+                decision["reason"] = "translation"
+                return decision
+            if (
+                decision["rotation_deg"]
+                > float(self.IMMERSIVE_SYNTHETIC_FRAMEGEN_ADAPTIVE_MAX_ROTATION_DEG)
+            ):
+                decision["reason"] = "rotation"
+                return decision
+        decision["apply"] = True
+        decision["reason"] = "applied"
+        return decision
 
     def _immersive_eye_pair_center_world(
         self,
@@ -6086,7 +13104,7 @@ class InvPhyTrainerWarp:
         cos_theta = float(np.clip((np.trace(delta_rot) - 1.0) * 0.5, -1.0, 1.0))
         return float(np.degrees(np.arccos(cos_theta)))
 
-    def _make_immersive_static_scene_framegen_cache_entry(
+    def _make_immersive_static_scene_reuse_cache_entry(
         self,
         *,
         render_plan,
@@ -6107,7 +13125,13 @@ class InvPhyTrainerWarp:
             "right_scene_color": right_scene_color,
             "right_scene_depth": right_scene_depth,
             "source_render_plan": copy.deepcopy(render_plan),
+            "static_scene_signature": self._build_immersive_static_scene_signature(
+                render_plan
+            ),
             "source_sample_id": -1 if render_sample is None else int(render_sample.sample),
+            "source_sample_received_monotonic_s": self._sample_received_monotonic_s(
+                render_sample
+            ),
             "source_left_eye_pose_world": None
             if left_eye_pose_world is None
             else np.asarray(left_eye_pose_world, dtype=np.float32).copy(),
@@ -6122,6 +13146,1018 @@ class InvPhyTrainerWarp:
             "age_displayed_frames": 0,
         }
 
+    def _make_immersive_static_scene_layer_cache_entry(
+        self,
+        *,
+        layer_name,
+        layer_output,
+        layer_signature,
+        head_pose_state,
+        eye_pose_world,
+        eye_intrinsic,
+    ):
+        return {
+            "layer_name": str(layer_name).strip().lower(),
+            "color": layer_output["color"],
+            "depth": layer_output["depth"],
+            "render_info": copy.deepcopy(layer_output.get("render_info")),
+            "render_wall_s": float(layer_output.get("render_wall_s", 0.0)),
+            "layer_signature": layer_signature,
+            "source_eye_pose_world": None
+            if eye_pose_world is None
+            else np.asarray(eye_pose_world, dtype=np.float32).copy(),
+            "source_eye_intrinsic": np.asarray(eye_intrinsic, dtype=np.float32).copy(),
+            "head_pose_reset_frame_index": -1
+            if head_pose_state is None
+            else int(head_pose_state.get("last_reset_frame_index", -1)),
+            "age_displayed_frames": 0,
+        }
+
+    def _immersive_static_scene_framegen_max_age_frames(self, framegen_mode):
+        mode = str(framegen_mode).strip().lower()
+        if self._immersive_stable_present_policy_enabled():
+            if mode == "adaptive":
+                return int(self.IMMERSIVE_STABLE_PRESENT_ADAPTIVE_MAX_AGE_FRAMES)
+            if mode == "static":
+                return int(self.IMMERSIVE_STABLE_PRESENT_STATIC_MAX_AGE_FRAMES)
+        if mode == "adaptive":
+            return int(self.IMMERSIVE_FRAMEGEN_ADAPTIVE_MAX_AGE_FRAMES)
+        if mode == "static":
+            return int(self.IMMERSIVE_FRAMEGEN_STATIC_MAX_AGE_FRAMES)
+        return 0
+
+    def _immersive_stable_present_policy_enabled(self):
+        return bool(
+            getattr(self, "_immersive_stable_present_policy_active", False)
+        )
+
+    def _immersive_active_render_preset_name(self):
+        return str(
+            getattr(
+                self,
+                "_immersive_active_render_preset_name_value",
+                "balanced",
+            )
+        ).strip().lower()
+
+    def _immersive_framegen_translation_guard_m(self):
+        if self._immersive_stable_present_policy_enabled():
+            return float(self.IMMERSIVE_STABLE_PRESENT_TRANSLATION_GUARD_M)
+        return float(self.IMMERSIVE_FRAMEGEN_ADAPTIVE_TRANSLATION_GUARD_M)
+
+    def _immersive_framegen_rotation_guard_deg(self):
+        if self._immersive_stable_present_policy_enabled():
+            return float(self.IMMERSIVE_STABLE_PRESENT_ROTATION_GUARD_DEG)
+        return float(self.IMMERSIVE_FRAMEGEN_ADAPTIVE_ROTATION_GUARD_DEG)
+
+    def _evaluate_immersive_scene_timewarp_admission(
+        self,
+        *,
+        apply_requested,
+        queue_wait_ms,
+        source_age_ms,
+        static_scene_reuse_age_frames,
+        stale_packet,
+    ):
+        decision = {
+            "apply": bool(apply_requested),
+            "skipped": False,
+            "skip_queue_wait": False,
+            "skip_source_age": False,
+            "skip_reuse_age": False,
+            "skip_stale_packet": False,
+        }
+        if not bool(apply_requested):
+            return decision
+        if not self._immersive_stable_present_policy_enabled():
+            return decision
+        queue_wait_ms = float(queue_wait_ms)
+        source_age_ms = float(source_age_ms)
+        static_scene_reuse_age_frames = float(static_scene_reuse_age_frames)
+        decision["skip_queue_wait"] = (
+            queue_wait_ms > float(self.IMMERSIVE_STABLE_PRESENT_TIMEWARP_MAX_QUEUE_WAIT_MS)
+        )
+        decision["skip_source_age"] = (
+            source_age_ms > float(self.IMMERSIVE_STABLE_PRESENT_TIMEWARP_MAX_SOURCE_AGE_MS)
+        )
+        decision["skip_reuse_age"] = (
+            static_scene_reuse_age_frames
+            > float(self.IMMERSIVE_STABLE_PRESENT_TIMEWARP_MAX_REUSE_AGE_FRAMES)
+        )
+        decision["skip_stale_packet"] = bool(stale_packet)
+        decision["skipped"] = bool(
+            decision["skip_queue_wait"]
+            or decision["skip_source_age"]
+            or decision["skip_reuse_age"]
+            or decision["skip_stale_packet"]
+        )
+        decision["apply"] = not bool(decision["skipped"])
+        return decision
+
+    def _record_immersive_scene_timewarp_skip_profile_metrics(
+        self,
+        render_profile_frame,
+        decision,
+    ):
+        if render_profile_frame is None:
+            return
+        render_profile_frame["scene_timewarp_skipped_ratio"] = (
+            1.0 if bool(decision.get("skipped", False)) else 0.0
+        )
+        render_profile_frame["scene_timewarp_skip_queue_wait_ratio"] = (
+            1.0 if bool(decision.get("skip_queue_wait", False)) else 0.0
+        )
+        render_profile_frame["scene_timewarp_skip_source_age_ratio"] = (
+            1.0 if bool(decision.get("skip_source_age", False)) else 0.0
+        )
+        render_profile_frame["scene_timewarp_skip_reuse_age_ratio"] = (
+            1.0 if bool(decision.get("skip_reuse_age", False)) else 0.0
+        )
+        render_profile_frame["scene_timewarp_skip_stale_packet_ratio"] = (
+            1.0 if bool(decision.get("skip_stale_packet", False)) else 0.0
+        )
+
+    def _resolve_and_apply_immersive_real_publish_state(
+        self,
+        immersive_bridge,
+        *,
+        left_eye_frame,
+        left_eye_frame_depth,
+        right_eye_frame,
+        right_eye_frame_depth,
+        scene_depth_reproject_enabled,
+        scene_source_sample_id,
+        scene_source_left_eye_pose_world,
+        scene_source_right_eye_pose_world,
+        scene_source_left_intrinsic,
+        scene_source_right_intrinsic,
+        default_left_overlay_eye_render_state,
+        default_right_overlay_eye_render_state,
+        live_head_alignment,
+        head_pose_state,
+        frame_index,
+        eye_width,
+        eye_height,
+        queue_wait_ms,
+        source_ready_wall_time_s,
+        static_scene_reuse_age_frames,
+        stale_packet,
+        reproject_caches,
+        render_profile_frame=None,
+        latewarp_render_profile_frame=None,
+        scene_source_received_monotonic_s=None,
+        publish_sample_override=None,
+        left_stream=None,
+        right_stream=None,
+        control_stream=None,
+        left_latewarp_eye_label="left",
+        right_latewarp_eye_label="right",
+    ):
+        publish_state = self._resolve_immersive_scene_publish_state(
+            immersive_bridge,
+            scene_depth_reproject_enabled=bool(scene_depth_reproject_enabled),
+            scene_source_sample_id=int(scene_source_sample_id),
+            scene_source_left_eye_pose_world=scene_source_left_eye_pose_world,
+            scene_source_right_eye_pose_world=scene_source_right_eye_pose_world,
+            scene_source_left_intrinsic=scene_source_left_intrinsic,
+            scene_source_right_intrinsic=scene_source_right_intrinsic,
+            default_left_overlay_eye_render_state=default_left_overlay_eye_render_state,
+            default_right_overlay_eye_render_state=default_right_overlay_eye_render_state,
+            live_head_alignment=live_head_alignment,
+            head_pose_state=head_pose_state,
+            frame_index=int(frame_index),
+            eye_width=int(eye_width),
+            eye_height=int(eye_height),
+            publish_sample_override=publish_sample_override,
+        )
+        publish_sample = publish_state["publish_sample"]
+        scene_pose_sample = publish_sample if publish_state["apply_timewarp"] else None
+        publish_sample_id = int(publish_state["publish_sample_id"])
+        left_overlay_eye_render_state = publish_state["left_overlay_eye_render_state"]
+        right_overlay_eye_render_state = publish_state["right_overlay_eye_render_state"]
+        scene_timewarp_applied = 0.0
+        scene_timewarp_fallback_left_used = 0.0
+        scene_timewarp_fallback_right_used = 0.0
+        scene_pose_received_monotonic_s = scene_source_received_monotonic_s
+        left_real_timewarp_validity = {
+            "eye_label": "left",
+            "accepted": False,
+            "reason": "not_requested",
+        }
+        right_real_timewarp_validity = {
+            "eye_label": "right",
+            "accepted": False,
+            "reason": "not_requested",
+        }
+
+        timewarp_source_age_ms = max(
+            0.0,
+            (time.perf_counter() - float(source_ready_wall_time_s)) * 1000.0,
+        )
+        timewarp_decision = self._evaluate_immersive_scene_timewarp_admission(
+            apply_requested=bool(publish_state["apply_timewarp"]),
+            queue_wait_ms=float(queue_wait_ms),
+            source_age_ms=timewarp_source_age_ms,
+            static_scene_reuse_age_frames=float(static_scene_reuse_age_frames),
+            stale_packet=bool(stale_packet),
+        )
+        self._record_immersive_scene_timewarp_skip_profile_metrics(
+            render_profile_frame,
+            timewarp_decision,
+        )
+
+        def _apply_eye_timewarp(
+            *,
+            eye_label,
+            latewarp_eye_label,
+            original_eye_frame,
+            original_eye_depth,
+            render_eye_pose_world,
+            publish_eye_pose_world,
+            render_intrinsic,
+            publish_intrinsic,
+            stats_out,
+        ):
+            try:
+                (
+                    warped_eye_frame,
+                    warped_eye_depth,
+                    warped_valid_mask,
+                ) = self._latewarp_immersive_scene_eye(
+                    original_eye_frame,
+                    original_eye_depth,
+                    render_eye_pose_world,
+                    publish_eye_pose_world,
+                    render_intrinsic,
+                    publish_intrinsic,
+                    eye_height,
+                    eye_width,
+                    latewarp_eye_label,
+                    reproject_caches=reproject_caches,
+                    render_profile_frame=latewarp_render_profile_frame,
+                    stats_out=stats_out,
+                )
+                (
+                    resolved_eye_frame,
+                    resolved_eye_depth,
+                    resolved_validity,
+                ) = self._evaluate_immersive_real_timewarp_eye_result(
+                    eye_label=eye_label,
+                    original_eye_frame=original_eye_frame,
+                    original_eye_depth=original_eye_depth,
+                    warped_eye_frame=warped_eye_frame,
+                    warped_eye_depth=warped_eye_depth,
+                    warped_valid_mask=warped_valid_mask,
+                    warped_stats=stats_out,
+                    target_height=eye_height,
+                    target_width=eye_width,
+                )
+                fallback_used = 0.0
+                if not bool(resolved_validity.get("accepted", False)):
+                    fallback_used = 1.0
+                return (
+                    resolved_eye_frame,
+                    resolved_eye_depth,
+                    fallback_used,
+                    resolved_validity,
+                )
+            except Exception as exc:
+                return (
+                    original_eye_frame,
+                    original_eye_depth,
+                    1.0,
+                    {
+                        "eye_label": str(eye_label),
+                        "accepted": False,
+                        "reason": f"exception:{type(exc).__name__}",
+                    },
+                )
+
+        if bool(timewarp_decision["apply"]):
+            publish_sample_id = int(publish_state["publish_sample_id"])
+            left_timewarp_stats = {}
+            right_timewarp_stats = {}
+            timewarp_span = None
+            if control_stream is None:
+                timewarp_span = self._render_profile_begin_cuda_span(
+                    render_profile_frame,
+                    "scene_timewarp_gpu_ms",
+                )
+            else:
+                with torch.cuda.stream(control_stream):
+                    timewarp_span = self._render_profile_begin_cuda_span(
+                        render_profile_frame,
+                        "scene_timewarp_gpu_ms",
+                    )
+
+            if left_stream is None:
+                (
+                    left_eye_frame,
+                    left_eye_frame_depth,
+                    scene_timewarp_fallback_left_used,
+                    left_real_timewarp_validity,
+                ) = _apply_eye_timewarp(
+                    eye_label="left",
+                    latewarp_eye_label=left_latewarp_eye_label,
+                    original_eye_frame=left_eye_frame,
+                    original_eye_depth=left_eye_frame_depth,
+                    render_eye_pose_world=scene_source_left_eye_pose_world,
+                    publish_eye_pose_world=publish_state["publish_left_eye_pose_world"],
+                    render_intrinsic=scene_source_left_intrinsic,
+                    publish_intrinsic=publish_state["publish_left_intrinsic"],
+                    stats_out=left_timewarp_stats,
+                )
+            else:
+                with torch.cuda.stream(left_stream):
+                    (
+                        left_eye_frame,
+                        left_eye_frame_depth,
+                        scene_timewarp_fallback_left_used,
+                        left_real_timewarp_validity,
+                    ) = _apply_eye_timewarp(
+                        eye_label="left",
+                        latewarp_eye_label=left_latewarp_eye_label,
+                        original_eye_frame=left_eye_frame,
+                        original_eye_depth=left_eye_frame_depth,
+                        render_eye_pose_world=scene_source_left_eye_pose_world,
+                        publish_eye_pose_world=publish_state["publish_left_eye_pose_world"],
+                        render_intrinsic=scene_source_left_intrinsic,
+                        publish_intrinsic=publish_state["publish_left_intrinsic"],
+                        stats_out=left_timewarp_stats,
+                    )
+
+            if right_stream is None:
+                (
+                    right_eye_frame,
+                    right_eye_frame_depth,
+                    scene_timewarp_fallback_right_used,
+                    right_real_timewarp_validity,
+                ) = _apply_eye_timewarp(
+                    eye_label="right",
+                    latewarp_eye_label=right_latewarp_eye_label,
+                    original_eye_frame=right_eye_frame,
+                    original_eye_depth=right_eye_frame_depth,
+                    render_eye_pose_world=scene_source_right_eye_pose_world,
+                    publish_eye_pose_world=publish_state["publish_right_eye_pose_world"],
+                    render_intrinsic=scene_source_right_intrinsic,
+                    publish_intrinsic=publish_state["publish_right_intrinsic"],
+                    stats_out=right_timewarp_stats,
+                )
+            else:
+                with torch.cuda.stream(right_stream):
+                    (
+                        right_eye_frame,
+                        right_eye_frame_depth,
+                        scene_timewarp_fallback_right_used,
+                        right_real_timewarp_validity,
+                    ) = _apply_eye_timewarp(
+                        eye_label="right",
+                        latewarp_eye_label=right_latewarp_eye_label,
+                        original_eye_frame=right_eye_frame,
+                        original_eye_depth=right_eye_frame_depth,
+                        render_eye_pose_world=scene_source_right_eye_pose_world,
+                        publish_eye_pose_world=publish_state["publish_right_eye_pose_world"],
+                        render_intrinsic=scene_source_right_intrinsic,
+                        publish_intrinsic=publish_state["publish_right_intrinsic"],
+                        stats_out=right_timewarp_stats,
+                    )
+
+            if control_stream is None:
+                self._render_profile_end_cuda_span(
+                    render_profile_frame,
+                    timewarp_span,
+                )
+            else:
+                with torch.cuda.stream(control_stream):
+                    if left_stream is not None:
+                        control_stream.wait_stream(left_stream)
+                    if right_stream is not None:
+                        control_stream.wait_stream(right_stream)
+                    self._render_profile_end_cuda_span(
+                        render_profile_frame,
+                        timewarp_span,
+                    )
+
+            if bool(left_real_timewarp_validity.get("accepted", False)) or bool(
+                right_real_timewarp_validity.get("accepted", False)
+            ):
+                scene_timewarp_applied = 1.0
+                if scene_pose_sample is not None:
+                    pose_received = self._sample_received_monotonic_s(scene_pose_sample)
+                    if pose_received is not None:
+                        scene_pose_received_monotonic_s = float(pose_received)
+            else:
+                publish_sample = None
+                scene_pose_sample = None
+                publish_sample_id = int(scene_source_sample_id)
+                left_overlay_eye_render_state = default_left_overlay_eye_render_state
+                right_overlay_eye_render_state = default_right_overlay_eye_render_state
+        else:
+            publish_sample = None
+            scene_pose_sample = None
+            publish_sample_id = int(scene_source_sample_id)
+            left_overlay_eye_render_state = default_left_overlay_eye_render_state
+            right_overlay_eye_render_state = default_right_overlay_eye_render_state
+
+        return {
+            "left_eye_frame": left_eye_frame,
+            "left_eye_frame_depth": left_eye_frame_depth,
+            "right_eye_frame": right_eye_frame,
+            "right_eye_frame_depth": right_eye_frame_depth,
+            "publish_state": publish_state,
+            "publish_sample": publish_sample,
+            "publish_sample_id": int(publish_sample_id),
+            "left_overlay_eye_render_state": left_overlay_eye_render_state,
+            "right_overlay_eye_render_state": right_overlay_eye_render_state,
+            "scene_timewarp_applied": float(scene_timewarp_applied),
+            "scene_timewarp_fallback_left_used": float(
+                scene_timewarp_fallback_left_used
+            ),
+            "scene_timewarp_fallback_right_used": float(
+                scene_timewarp_fallback_right_used
+            ),
+            "scene_pose_sample": scene_pose_sample,
+            "scene_pose_received_monotonic_s": scene_pose_received_monotonic_s,
+            "left_real_timewarp_validity": left_real_timewarp_validity,
+            "right_real_timewarp_validity": right_real_timewarp_validity,
+            "timewarp_decision": timewarp_decision,
+        }
+
+    def _build_immersive_static_scene_signature(self, render_plan):
+        if render_plan is None:
+            return None
+
+        def _roi_signature(bounds):
+            if bounds is None:
+                return None
+            return tuple(int(v) for v in bounds)
+
+        def _matrix_signature(matrix):
+            if matrix is None:
+                return None
+            matrix_np = np.asarray(matrix, dtype=np.float32)
+            return tuple(
+                round(float(v), 5) for v in matrix_np.reshape(-1).tolist()
+            )
+
+        def _eye_signature(eye_plan):
+            eye_plan = {} if eye_plan is None else eye_plan
+            return (
+                int(eye_plan.get("eye_width", 0)),
+                int(eye_plan.get("eye_height", 0)),
+                _matrix_signature(eye_plan.get("eye_intrinsic")),
+                _matrix_signature(eye_plan.get("base_scene_intrinsic")),
+                str(eye_plan.get("support_render_kind", "none")).strip().lower(),
+                _roi_signature(eye_plan.get("support_roi_bounds")),
+                bool(eye_plan.get("support_fullframe_fallback", False)),
+                _roi_signature(eye_plan.get("table_roi_bounds")),
+                bool(eye_plan.get("table_fullframe_fallback", False)),
+            )
+
+        active_support = render_plan.get("active_support") or {}
+        active_support_id = active_support.get("support_id")
+        if active_support_id is not None:
+            active_support_id = int(active_support_id)
+        render_preset = self._immersive_active_render_preset_name()
+        return (
+            str(
+                render_plan.get(
+                    "static_scene_mode",
+                    self.IMMERSIVE_STATIC_SCENE_MODE_BALANCED_FOCUS,
+                )
+            )
+            .strip()
+            .lower(),
+            int(render_plan.get("scene_width", 0)),
+            int(render_plan.get("scene_height", 0)),
+            render_preset,
+            active_support_id,
+            str(active_support.get("kind", "none")).strip().lower(),
+            _eye_signature(render_plan.get("left")),
+            _eye_signature(render_plan.get("right")),
+        )
+
+    def _build_immersive_static_scene_layer_signatures(self, render_plan):
+        if render_plan is None:
+            return {"left": {}, "right": {}}
+
+        def _roi_signature(bounds):
+            if bounds is None:
+                return None
+            return tuple(int(v) for v in bounds)
+
+        def _matrix_signature(matrix):
+            if matrix is None:
+                return None
+            matrix_np = np.asarray(matrix, dtype=np.float32)
+            return tuple(
+                round(float(v), 5) for v in matrix_np.reshape(-1).tolist()
+            )
+
+        static_scene_mode = str(
+            render_plan.get(
+                "static_scene_mode",
+                self.IMMERSIVE_STATIC_SCENE_MODE_BALANCED_FOCUS,
+            )
+        ).strip().lower()
+        active_support = render_plan.get("active_support") or {}
+        active_support_id = active_support.get("support_id")
+        if active_support_id is not None:
+            active_support_id = int(active_support_id)
+        render_preset = self._immersive_active_render_preset_name()
+
+        signatures = {"left": {}, "right": {}}
+        for eye_label in ("left", "right"):
+            eye_plan = render_plan.get(eye_label) or {}
+            eye_width = int(eye_plan.get("eye_width", 0))
+            eye_height = int(eye_plan.get("eye_height", 0))
+            base_intrinsic_signature = _matrix_signature(
+                eye_plan.get("base_scene_intrinsic")
+            )
+            eye_intrinsic_signature = _matrix_signature(eye_plan.get("eye_intrinsic"))
+            signatures[eye_label][
+                IMMERSIVE_BALANCED_LAYER_BACKGROUND_BASE
+            ] = (
+                static_scene_mode,
+                IMMERSIVE_BALANCED_LAYER_BACKGROUND_BASE,
+                int(render_plan.get("scene_width", 0)),
+                int(render_plan.get("scene_height", 0)),
+                render_preset,
+                base_intrinsic_signature,
+            )
+            signatures[eye_label][IMMERSIVE_BALANCED_LAYER_FULL_BASE] = (
+                static_scene_mode,
+                IMMERSIVE_BALANCED_LAYER_FULL_BASE,
+                int(render_plan.get("scene_width", 0)),
+                int(render_plan.get("scene_height", 0)),
+                render_preset,
+                base_intrinsic_signature,
+            )
+            signatures[eye_label][IMMERSIVE_BALANCED_LAYER_TABLE_BASE] = (
+                static_scene_mode,
+                IMMERSIVE_BALANCED_LAYER_TABLE_BASE,
+                int(render_plan.get("scene_width", 0)),
+                int(render_plan.get("scene_height", 0)),
+                render_preset,
+                base_intrinsic_signature,
+            )
+            if static_scene_mode == self.IMMERSIVE_STATIC_SCENE_MODE_BALANCED_FOCUS:
+                table_render_scale = float(
+                    render_plan.get("table_roi_render_scale", 1.0)
+                )
+                signatures[eye_label][
+                    IMMERSIVE_BALANCED_LAYER_TABLE_OVERLAY
+                ] = (
+                    static_scene_mode,
+                    IMMERSIVE_BALANCED_LAYER_TABLE_OVERLAY,
+                    eye_width,
+                    eye_height,
+                    render_preset,
+                    eye_intrinsic_signature,
+                    _roi_signature(eye_plan.get("table_roi_bounds")),
+                    bool(eye_plan.get("table_fullframe_fallback", False)),
+                    round(float(table_render_scale), 5),
+                )
+                continue
+
+            support_render_kind = str(
+                eye_plan.get("support_render_kind", "none")
+            ).strip().lower()
+            support_render_scale = float(
+                render_plan.get("support_roi_render_scale", 1.0)
+            )
+            signatures[eye_label][IMMERSIVE_BALANCED_LAYER_TABLE_OVERLAY] = (
+                static_scene_mode,
+                IMMERSIVE_BALANCED_LAYER_TABLE_OVERLAY,
+                eye_width,
+                eye_height,
+                render_preset,
+                eye_intrinsic_signature,
+                support_render_kind,
+                _roi_signature(eye_plan.get("support_roi_bounds")),
+                bool(eye_plan.get("support_fullframe_fallback", False)),
+                round(float(support_render_scale), 5),
+            )
+            signatures[eye_label][IMMERSIVE_BALANCED_LAYER_SUPPORT_OVERLAY] = (
+                static_scene_mode,
+                IMMERSIVE_BALANCED_LAYER_SUPPORT_OVERLAY,
+                eye_width,
+                eye_height,
+                render_preset,
+                eye_intrinsic_signature,
+                support_render_kind,
+                active_support_id,
+                str(active_support.get("kind", "none")).strip().lower(),
+                _roi_signature(eye_plan.get("support_roi_bounds")),
+                bool(eye_plan.get("support_fullframe_fallback", False)),
+                round(float(support_render_scale), 5),
+            )
+        return signatures
+
+    def _collect_immersive_balanced_required_layers(self, render_plan):
+        static_scene_mode = str(
+            render_plan.get(
+                "static_scene_mode",
+                self.IMMERSIVE_STATIC_SCENE_MODE_BALANCED_FOCUS,
+            )
+        ).strip().lower()
+        required_layers = {"left": [], "right": []}
+        for eye_label in ("left", "right"):
+            if static_scene_mode == self.IMMERSIVE_STATIC_SCENE_MODE_BALANCED_FOCUS:
+                required_layers[eye_label] = [
+                    IMMERSIVE_BALANCED_LAYER_BACKGROUND_BASE,
+                    IMMERSIVE_BALANCED_LAYER_TABLE_OVERLAY,
+                ]
+                continue
+            support_render_kind = str(
+                (render_plan.get(eye_label) or {}).get("support_render_kind", "none")
+            ).strip().lower()
+            if support_render_kind == "focus":
+                required_layers[eye_label] = [
+                    IMMERSIVE_BALANCED_LAYER_FULL_BASE,
+                    IMMERSIVE_BALANCED_LAYER_SUPPORT_OVERLAY,
+                ]
+            elif support_render_kind == "table":
+                required_layers[eye_label] = [
+                    IMMERSIVE_BALANCED_LAYER_BACKGROUND_BASE,
+                    IMMERSIVE_BALANCED_LAYER_TABLE_OVERLAY,
+                ]
+            else:
+                required_layers[eye_label] = [
+                    IMMERSIVE_BALANCED_LAYER_BACKGROUND_BASE,
+                    IMMERSIVE_BALANCED_LAYER_TABLE_BASE,
+                ]
+        return required_layers
+
+    def _immersive_eye_pose_translation_m(
+        self,
+        source_eye_pose_world,
+        target_eye_pose_world,
+    ):
+        if source_eye_pose_world is None or target_eye_pose_world is None:
+            return None
+        source_position = np.asarray(source_eye_pose_world[:3, 3], dtype=np.float32)
+        target_position = np.asarray(target_eye_pose_world[:3, 3], dtype=np.float32)
+        return float(np.linalg.norm(target_position - source_position))
+
+    def _record_immersive_static_scene_reuse_profile_metrics(
+        self,
+        render_profile_frame,
+        *,
+        fresh_render,
+        reason,
+        max_age_hit,
+        cache_invalidation_count,
+        signature_change_count,
+    ):
+        if render_profile_frame is None:
+            return
+        reason_metric_keys = {
+            "cache_miss": "static_scene_reuse_reason_cache_miss_ratio",
+            "signature_unavailable": "static_scene_reuse_reason_signature_unavailable_ratio",
+            "signature_change": "static_scene_reuse_reason_signature_change_ratio",
+            "age_limit": "static_scene_reuse_reason_age_limit_ratio",
+            "head_reset": "static_scene_reuse_reason_head_reset_ratio",
+            "translation_guard": "static_scene_reuse_reason_translation_guard_ratio",
+            "rotation_guard": "static_scene_reuse_reason_rotation_guard_ratio",
+            "invalid_eye_pose": "static_scene_reuse_reason_invalid_eye_pose_ratio",
+            "static_cadence": "static_scene_reuse_reason_static_cadence_ratio",
+            "adaptive_guardrails_passed": "static_scene_reuse_reason_adaptive_pass_ratio",
+            "worker_failure": "static_scene_reuse_reason_worker_failure_ratio",
+        }
+        render_profile_frame["static_scene_fresh_render_ratio"] = (
+            1.0 if fresh_render else 0.0
+        )
+        render_profile_frame["static_scene_reuse_max_age_hit_ratio"] = (
+            1.0 if max_age_hit else 0.0
+        )
+        render_profile_frame["static_scene_cache_invalidation_count"] = float(
+            cache_invalidation_count
+        )
+        render_profile_frame["static_scene_signature_change_count"] = float(
+            signature_change_count
+        )
+        for metric_key in reason_metric_keys.values():
+            render_profile_frame[metric_key] = 0.0
+        metric_key = reason_metric_keys.get(str(reason).strip().lower())
+        if metric_key is not None:
+            render_profile_frame[metric_key] = 1.0
+
+    def _record_immersive_static_scene_layer_reuse_profile_metrics(
+        self,
+        render_profile_frame,
+        *,
+        category,
+        refreshed,
+        reasons,
+        max_age_hit,
+        signature_change_count,
+    ):
+        if render_profile_frame is None:
+            return
+        category = str(category).strip().lower()
+        prefix = f"static_scene_{category}"
+        reason_metric_keys = {
+            "cache_miss": f"{prefix}_reuse_reason_cache_miss_ratio",
+            "signature_unavailable": f"{prefix}_reuse_reason_signature_unavailable_ratio",
+            "signature_change": f"{prefix}_reuse_reason_signature_change_ratio",
+            "age_limit": f"{prefix}_reuse_reason_age_limit_ratio",
+            "head_reset": f"{prefix}_reuse_reason_head_reset_ratio",
+            "translation_guard": f"{prefix}_reuse_reason_translation_guard_ratio",
+            "rotation_guard": f"{prefix}_reuse_reason_rotation_guard_ratio",
+            "invalid_eye_pose": f"{prefix}_reuse_reason_invalid_eye_pose_ratio",
+            "static_cadence": f"{prefix}_reuse_reason_static_cadence_ratio",
+            "adaptive_guardrails_passed": f"{prefix}_reuse_reason_adaptive_pass_ratio",
+            "worker_failure": f"{prefix}_reuse_reason_worker_failure_ratio",
+        }
+        render_profile_frame[f"{prefix}_refresh_ratio"] = 1.0 if refreshed else 0.0
+        render_profile_frame[f"{prefix}_reuse_max_age_hit_ratio"] = (
+            1.0 if max_age_hit else 0.0
+        )
+        render_profile_frame[f"{prefix}_signature_change_count"] = float(
+            signature_change_count
+        )
+        for metric_key in reason_metric_keys.values():
+            render_profile_frame[metric_key] = 0.0
+        for reason in reasons:
+            metric_key = reason_metric_keys.get(str(reason).strip().lower())
+            if metric_key is not None:
+                render_profile_frame[metric_key] = 1.0
+
+    def _evaluate_immersive_static_scene_layer_reuse(
+        self,
+        *,
+        framegen_mode,
+        layer_cache,
+        render_sample,
+        head_pose_state,
+        eye_pose_world,
+        layer_signature=None,
+    ):
+        decision = {
+            "reuse": False,
+            "reason": "off",
+            "reuse_age_frames": 0.0,
+            "translation_m": 0.0,
+            "rotation_deg": 0.0,
+            "signature_changed": False,
+            "max_age_hit": False,
+        }
+        mode = str(framegen_mode).strip().lower()
+        if mode not in {"static", "adaptive"}:
+            return decision
+        decision["reason"] = "cache_miss"
+        if layer_cache is None:
+            return decision
+        if layer_signature is None:
+            decision["reason"] = "signature_unavailable"
+            return decision
+        decision["reason"] = "invalid_eye_pose"
+        if (
+            render_sample is None
+            or not self._immersive_sample_has_valid_eye_pose(render_sample)
+            or eye_pose_world is None
+        ):
+            return decision
+        cached_signature = layer_cache.get("layer_signature")
+        if cached_signature != layer_signature:
+            decision["reason"] = "signature_change"
+            decision["signature_changed"] = True
+            return decision
+        next_age_frames = int(layer_cache.get("age_displayed_frames", 0)) + 1
+        decision["reuse_age_frames"] = float(next_age_frames)
+        max_age_frames = self._immersive_static_scene_framegen_max_age_frames(mode)
+        if next_age_frames > max_age_frames:
+            decision["reason"] = "age_limit"
+            decision["max_age_hit"] = True
+            return decision
+
+        translation_m = self._immersive_eye_pose_translation_m(
+            layer_cache.get("source_eye_pose_world"),
+            eye_pose_world,
+        )
+        if translation_m is not None:
+            decision["translation_m"] = float(translation_m)
+        rotation_deg = self._immersive_pose_rotation_delta_deg(
+            layer_cache.get("source_eye_pose_world"),
+            eye_pose_world,
+        )
+        if rotation_deg is not None:
+            decision["rotation_deg"] = float(rotation_deg)
+
+        if mode == "static":
+            decision["reuse"] = True
+            decision["reason"] = "static_cadence"
+            return decision
+
+        current_reset_frame_index = -1 if head_pose_state is None else int(
+            head_pose_state.get("last_reset_frame_index", -1)
+        )
+        if current_reset_frame_index != int(
+            layer_cache.get("head_pose_reset_frame_index", -1)
+        ):
+            decision["reason"] = "head_reset"
+            return decision
+        if decision["translation_m"] > self._immersive_framegen_translation_guard_m():
+            decision["reason"] = "translation_guard"
+            return decision
+        if decision["rotation_deg"] > self._immersive_framegen_rotation_guard_deg():
+            decision["reason"] = "rotation_guard"
+            return decision
+
+        decision["reuse"] = True
+        decision["reason"] = "adaptive_guardrails_passed"
+        return decision
+
+    def _empty_immersive_static_scene_layer_cache(self):
+        return {"left": {}, "right": {}}
+
+    def _update_immersive_static_scene_layer_cache(
+        self,
+        *,
+        layer_cache,
+        render_plan,
+        layer_outputs,
+        head_pose_state,
+    ):
+        if layer_cache is None:
+            layer_cache = self._empty_immersive_static_scene_layer_cache()
+        layer_signatures = self._build_immersive_static_scene_layer_signatures(
+            render_plan
+        )
+        fresh_layers_by_eye = {"left": set(), "right": set()}
+        for eye_label in ("left", "right"):
+            eye_plan = render_plan.get(eye_label) or {}
+            eye_layer_outputs = (
+                {} if layer_outputs is None else layer_outputs.get(eye_label, {})
+            )
+            for layer_name, layer_output in eye_layer_outputs.items():
+                normalized_layer_name = str(layer_name).strip().lower()
+                layer_cache.setdefault(eye_label, {})[normalized_layer_name] = (
+                    self._make_immersive_static_scene_layer_cache_entry(
+                        layer_name=normalized_layer_name,
+                        layer_output=layer_output,
+                        layer_signature=layer_signatures[eye_label].get(
+                            normalized_layer_name
+                        ),
+                        head_pose_state=head_pose_state,
+                        eye_pose_world=eye_plan.get("eye_pose_world"),
+                        eye_intrinsic=eye_plan.get("eye_intrinsic"),
+                    )
+                )
+                fresh_layers_by_eye[eye_label].add(normalized_layer_name)
+        return layer_cache, fresh_layers_by_eye
+
+    def _seed_immersive_static_scene_layer_cache(
+        self,
+        *,
+        renderer,
+        render_plan,
+        head_pose_state,
+        requested_layers_by_eye,
+    ):
+        if renderer is None or render_plan is None:
+            return self._empty_immersive_static_scene_layer_cache()
+        layer_request = _build_immersive_balanced_scene_layer_request(
+            render_plan,
+            requested_layers_by_eye,
+        )
+        layer_outputs = _execute_immersive_balanced_scene_render_layers(
+            renderer,
+            layer_request,
+        )
+        layer_cache, _ = self._update_immersive_static_scene_layer_cache(
+            layer_cache=self._empty_immersive_static_scene_layer_cache(),
+            render_plan=render_plan,
+            layer_outputs=layer_outputs,
+            head_pose_state=head_pose_state,
+        )
+        return layer_cache
+
+    def _mark_immersive_static_scene_layer_cache_usage(
+        self,
+        *,
+        layer_cache,
+        decisions_by_eye,
+    ):
+        if layer_cache is None:
+            return
+        for eye_label in ("left", "right"):
+            eye_decisions = decisions_by_eye.get(eye_label, {})
+            eye_cache = layer_cache.get(eye_label, {})
+            for layer_name, decision in eye_decisions.items():
+                if not bool(decision.get("reuse", False)):
+                    continue
+                layer_entry = eye_cache.get(layer_name)
+                if layer_entry is None:
+                    continue
+                layer_entry["age_displayed_frames"] = int(
+                    decision.get("reuse_age_frames", 0.0)
+                )
+
+    def _increment_immersive_static_scene_layer_cache_age(
+        self,
+        *,
+        layer_cache,
+        required_layers_by_eye,
+    ):
+        if layer_cache is None:
+            return
+        for eye_label in ("left", "right"):
+            eye_cache = layer_cache.get(eye_label, {})
+            for layer_name in required_layers_by_eye.get(eye_label, []):
+                layer_entry = eye_cache.get(layer_name)
+                if layer_entry is None:
+                    continue
+                layer_entry["age_displayed_frames"] = int(
+                    layer_entry.get("age_displayed_frames", 0)
+                ) + 1
+
+    def _evaluate_immersive_balanced_layer_refresh_plan(
+        self,
+        *,
+        framegen_mode,
+        layer_cache,
+        render_plan,
+        render_sample,
+        head_pose_state,
+    ):
+        required_layers_by_eye = self._collect_immersive_balanced_required_layers(
+            render_plan
+        )
+        layer_signatures = self._build_immersive_static_scene_layer_signatures(
+            render_plan
+        )
+        decisions_by_eye = {"left": {}, "right": {}}
+        requested_layers_by_eye = {"left": [], "right": []}
+        base_reasons = set()
+        overlay_reasons = set()
+        base_refresh_required = False
+        overlay_refresh_required = False
+        base_max_age_hit = False
+        overlay_max_age_hit = False
+        base_signature_changed = False
+        overlay_signature_changed = False
+        max_reuse_age_frames = 0.0
+
+        for eye_label in ("left", "right"):
+            eye_plan = render_plan.get(eye_label) or {}
+            eye_pose_world = eye_plan.get("eye_pose_world")
+            eye_cache = {} if layer_cache is None else layer_cache.get(eye_label, {})
+            for layer_name in required_layers_by_eye.get(eye_label, []):
+                decision = self._evaluate_immersive_static_scene_layer_reuse(
+                    framegen_mode=framegen_mode,
+                    layer_cache=None if eye_cache is None else eye_cache.get(layer_name),
+                    render_sample=render_sample,
+                    head_pose_state=head_pose_state,
+                    eye_pose_world=eye_pose_world,
+                    layer_signature=layer_signatures[eye_label].get(layer_name),
+                )
+                decisions_by_eye[eye_label][layer_name] = decision
+                if bool(decision.get("reuse", False)):
+                    max_reuse_age_frames = max(
+                        max_reuse_age_frames,
+                        float(decision.get("reuse_age_frames", 0.0)),
+                    )
+                    continue
+                requested_layers_by_eye[eye_label].append(layer_name)
+                if layer_name in IMMERSIVE_BALANCED_BASE_LAYER_NAMES:
+                    base_refresh_required = True
+                    base_reasons.add(str(decision.get("reason", "off")))
+                    base_max_age_hit = base_max_age_hit or bool(
+                        decision.get("max_age_hit", False)
+                    )
+                    base_signature_changed = base_signature_changed or bool(
+                        decision.get("signature_changed", False)
+                    )
+                else:
+                    overlay_refresh_required = True
+                    overlay_reasons.add(str(decision.get("reason", "off")))
+                    overlay_max_age_hit = overlay_max_age_hit or bool(
+                        decision.get("max_age_hit", False)
+                    )
+                    overlay_signature_changed = overlay_signature_changed or bool(
+                        decision.get("signature_changed", False)
+                    )
+
+        return {
+            "required_layers_by_eye": required_layers_by_eye,
+            "decisions_by_eye": decisions_by_eye,
+            "requested_layers_by_eye": requested_layers_by_eye,
+            "all_required_layers_reusable": not (
+                base_refresh_required or overlay_refresh_required
+            ),
+            "base_refresh_required": bool(base_refresh_required),
+            "overlay_refresh_required": bool(overlay_refresh_required),
+            "base_reasons": sorted(base_reasons),
+            "overlay_reasons": sorted(overlay_reasons),
+            "base_max_age_hit": bool(base_max_age_hit),
+            "overlay_max_age_hit": bool(overlay_max_age_hit),
+            "base_signature_changed": bool(base_signature_changed),
+            "overlay_signature_changed": bool(overlay_signature_changed),
+            "max_reuse_age_frames": float(max_reuse_age_frames),
+        }
+
     def _evaluate_immersive_static_scene_framegen_reuse(
         self,
         *,
@@ -6131,6 +14167,7 @@ class InvPhyTrainerWarp:
         head_pose_state,
         left_eye_pose_world,
         right_eye_pose_world,
+        render_plan_signature=None,
     ):
         decision = {
             "reuse": False,
@@ -6138,12 +14175,17 @@ class InvPhyTrainerWarp:
             "reuse_age_frames": 0.0,
             "translation_m": 0.0,
             "rotation_deg": 0.0,
+            "signature_changed": False,
+            "max_age_hit": False,
         }
         mode = str(framegen_mode).strip().lower()
         if mode not in {"static", "adaptive"}:
             return decision
         decision["reason"] = "cache_miss"
         if framegen_cache is None:
+            return decision
+        if render_plan_signature is None:
+            decision["reason"] = "signature_unavailable"
             return decision
         decision["reason"] = "invalid_eye_pose"
         if (
@@ -6153,10 +14195,17 @@ class InvPhyTrainerWarp:
             or right_eye_pose_world is None
         ):
             return decision
+        cached_signature = framegen_cache.get("static_scene_signature")
+        if cached_signature != render_plan_signature:
+            decision["reason"] = "signature_change"
+            decision["signature_changed"] = True
+            return decision
         next_age_frames = int(framegen_cache.get("age_displayed_frames", 0)) + 1
         decision["reuse_age_frames"] = float(next_age_frames)
-        if next_age_frames > 1:
+        max_age_frames = self._immersive_static_scene_framegen_max_age_frames(mode)
+        if next_age_frames > max_age_frames:
             decision["reason"] = "age_limit"
+            decision["max_age_hit"] = True
             return decision
 
         cached_center = self._immersive_eye_pair_center_world(
@@ -6199,10 +14248,10 @@ class InvPhyTrainerWarp:
         ):
             decision["reason"] = "head_reset"
             return decision
-        if decision["translation_m"] > 0.01:
+        if decision["translation_m"] > self._immersive_framegen_translation_guard_m():
             decision["reason"] = "translation_guard"
             return decision
-        if decision["rotation_deg"] > 1.0:
+        if decision["rotation_deg"] > self._immersive_framegen_rotation_guard_deg():
             decision["reason"] = "rotation_guard"
             return decision
 
@@ -6213,6 +14262,9 @@ class InvPhyTrainerWarp:
     def _build_immersive_balanced_scene_render_plan(
         self,
         scene_renderer,
+        object_bounds_min_world,
+        object_bounds_max_world,
+        object_support_center_world,
         left_eye_pose_world,
         right_eye_pose_world,
         left_intrinsic,
@@ -6221,6 +14273,7 @@ class InvPhyTrainerWarp:
         eye_height,
         scene_width,
         scene_height,
+        active_interaction=False,
         render_profile_frame=None,
     ):
         balanced_runtime_state = getattr(
@@ -6228,46 +14281,32 @@ class InvPhyTrainerWarp:
             "_immersive_balanced_runtime_state",
             None,
         )
-        if balanced_runtime_state is not None:
-            background_mode = str(
+        static_scene_mode = (
+            self.IMMERSIVE_STATIC_SCENE_MODE_BALANCED_FOCUS
+            if balanced_runtime_state is None
+            else str(
                 balanced_runtime_state.get(
-                    "background_mode",
-                    "per_eye_background",
+                    "static_scene_mode",
+                    self.IMMERSIVE_STATIC_SCENE_MODE_BALANCED_FOCUS,
                 )
             )
-            side_wall_mode = str(
-                balanced_runtime_state.get(
-                    "side_wall_mode",
-                    "disabled",
-                )
-            )
-            table_roi_state = balanced_runtime_state.setdefault(
-                "table_roi_state",
-                {"left": None, "right": None},
-            )
-            table_roi_render_scale = float(
-                balanced_runtime_state.get(
-                    "table_roi_render_scale",
-                    self.IMMERSIVE_BALANCED_TABLE_ROI_SUPERSAMPLE_SCALE,
-                )
-            )
-        else:
-            background_mode = "per_eye_background"
-            side_wall_mode = "disabled"
-            table_roi_state = {"left": None, "right": None}
-            table_roi_render_scale = float(
-                self.IMMERSIVE_BALANCED_TABLE_ROI_SUPERSAMPLE_SCALE
-            )
+        )
+        plan_scene_width = int(
+            scene_width
+            if balanced_runtime_state is None
+            else balanced_runtime_state.get("background_width", scene_width)
+        )
+        plan_scene_height = int(
+            scene_height
+            if balanced_runtime_state is None
+            else balanced_runtime_state.get("background_height", scene_height)
+        )
         self._initialize_immersive_balanced_render_profile_frame(render_profile_frame)
         render_plan = {
-            "scene_width": int(scene_width),
-            "scene_height": int(scene_height),
-            "background_mode": background_mode,
-            "side_wall_mode": side_wall_mode,
-            "table_roi_render_scale": float(table_roi_render_scale),
-            "center_eye_pose_world": None,
-            "center_intrinsic": None,
-            "center_scene_intrinsic": None,
+            "static_scene_mode": static_scene_mode,
+            "scene_width": int(plan_scene_width),
+            "scene_height": int(plan_scene_height),
+            "active_interaction": bool(active_interaction),
             "left": {
                 "eye_pose_world": np.asarray(
                     left_eye_pose_world,
@@ -6276,11 +14315,13 @@ class InvPhyTrainerWarp:
                 "eye_intrinsic": np.asarray(left_intrinsic, dtype=np.float32).copy(),
                 "eye_width": int(eye_width),
                 "eye_height": int(eye_height),
-                "background_scene_intrinsic": None,
-                "table_fullframe_fallback": True,
-                "table_roi_bounds": None,
-                "table_roi_ratio": 1.0,
-                "table_roi_render_scale": float(table_roi_render_scale),
+                "base_scene_intrinsic": self._scale_intrinsic_for_resolution(
+                    left_intrinsic,
+                    eye_width,
+                    eye_height,
+                    plan_scene_width,
+                    plan_scene_height,
+                ),
             },
             "right": {
                 "eye_pose_world": np.asarray(
@@ -6290,100 +14331,346 @@ class InvPhyTrainerWarp:
                 "eye_intrinsic": np.asarray(right_intrinsic, dtype=np.float32).copy(),
                 "eye_width": int(eye_width),
                 "eye_height": int(eye_height),
-                "background_scene_intrinsic": None,
-                "table_fullframe_fallback": True,
-                "table_roi_bounds": None,
-                "table_roi_ratio": 1.0,
-                "table_roi_render_scale": float(table_roi_render_scale),
+                "base_scene_intrinsic": self._scale_intrinsic_for_resolution(
+                    right_intrinsic,
+                    eye_width,
+                    eye_height,
+                    plan_scene_width,
+                    plan_scene_height,
+                ),
             },
         }
-        if background_mode == "per_eye_background":
-            render_plan["left"]["background_scene_intrinsic"] = (
-                self._scale_intrinsic_for_resolution(
-                    render_plan["left"]["eye_intrinsic"],
-                    eye_width,
-                    eye_height,
-                    scene_width,
-                    scene_height,
+
+        if static_scene_mode in {
+            self.IMMERSIVE_STATIC_SCENE_MODE_BALANCED_FOCUS,
+            self.IMMERSIVE_STATIC_SCENE_MODE_BALANCED_SUPPORT_FOCUS,
+        }:
+            table_world_bounds = (
+                None if scene_renderer is None else scene_renderer.table_world_bounds()
+            )
+            if static_scene_mode == self.IMMERSIVE_STATIC_SCENE_MODE_BALANCED_FOCUS:
+                render_plan["active_support"] = self._copy_immersive_support_entry(
+                    self._find_immersive_table_support_entry(scene_renderer)
+                )
+                table_roi_state = (
+                    {"left": None, "right": None}
+                    if balanced_runtime_state is None
+                    else balanced_runtime_state.setdefault(
+                        "table_roi_state",
+                        {"left": None, "right": None},
+                    )
+                )
+                table_roi_render_scale = (
+                    float(self.IMMERSIVE_BALANCED_TABLE_ROI_SUPERSAMPLE_SCALE)
+                    if balanced_runtime_state is None
+                    else float(
+                        balanced_runtime_state.get(
+                            "table_roi_render_scale",
+                            self.IMMERSIVE_BALANCED_TABLE_ROI_SUPERSAMPLE_SCALE,
+                        )
+                    )
+                )
+                render_plan["table_roi_render_scale"] = float(table_roi_render_scale)
+                for eye_label in ("left", "right"):
+                    eye_pose_world = render_plan[eye_label]["eye_pose_world"]
+                    eye_intrinsic = render_plan[eye_label]["eye_intrinsic"]
+                    eye_w2c_cv = self._camera_pose_world_to_cv_w2c(eye_pose_world)
+                    table_roi_bounds = None
+                    table_roi_ratio = 1.0
+                    table_fullframe_fallback = True
+                    if table_world_bounds is not None:
+                        (
+                            table_roi_bounds,
+                            table_roi_ratio,
+                            table_fullframe_fallback,
+                            _,
+                        ) = self._resolve_immersive_balanced_table_render_roi(
+                            table_world_bounds[0],
+                            table_world_bounds[1],
+                            eye_intrinsic,
+                            eye_w2c_cv,
+                            eye_width,
+                            eye_height,
+                            prev_bounds=table_roi_state.get(eye_label),
+                        )
+                    render_plan[eye_label]["table_fullframe_fallback"] = bool(
+                        table_fullframe_fallback
+                    )
+                    render_plan[eye_label]["table_roi_bounds"] = (
+                        None
+                        if table_fullframe_fallback or table_roi_bounds is None
+                        else tuple(int(v) for v in table_roi_bounds)
+                    )
+                    render_plan[eye_label]["table_roi_ratio"] = float(table_roi_ratio)
+                    table_roi_state[eye_label] = render_plan[eye_label]["table_roi_bounds"]
+                    if render_profile_frame is not None:
+                        render_profile_frame[
+                            f"scene_table_roi_{eye_label}_ratio"
+                        ] = float(table_roi_ratio)
+                        render_profile_frame[
+                            "scene_table_roi_supersample_scale"
+                        ] = float(table_roi_render_scale)
+                        render_profile_frame[
+                            f"scene_table_fullframe_fallback_{eye_label}_ratio"
+                        ] = 1.0 if table_fullframe_fallback else 0.0
+                return render_plan
+
+            support_roi_state = (
+                {"left": None, "right": None}
+                if balanced_runtime_state is None
+                else balanced_runtime_state.setdefault(
+                    "support_roi_state",
+                    {"left": None, "right": None},
                 )
             )
-            render_plan["right"]["background_scene_intrinsic"] = (
-                self._scale_intrinsic_for_resolution(
-                    render_plan["right"]["eye_intrinsic"],
-                    eye_width,
-                    eye_height,
-                    scene_width,
-                    scene_height,
+            support_roi_render_scale = (
+                float(self.IMMERSIVE_BALANCED_TABLE_ROI_SUPERSAMPLE_SCALE)
+                if balanced_runtime_state is None
+                else float(
+                    balanced_runtime_state.get(
+                        "support_roi_render_scale",
+                        self.IMMERSIVE_BALANCED_TABLE_ROI_SUPERSAMPLE_SCALE,
+                    )
                 )
             )
-        elif background_mode == "mono_center_background":
-            center_eye_pose_world, center_intrinsic = (
-                self._build_immersive_center_scene_view(
-                    render_plan["left"]["eye_pose_world"],
-                    render_plan["right"]["eye_pose_world"],
-                    render_plan["left"]["eye_intrinsic"],
-                    render_plan["right"]["eye_intrinsic"],
+            support_occlusion_state = (
+                {
+                    eye_label: {
+                        "suppressed": False,
+                        "candidate_suppress": None,
+                        "candidate_frames": 0,
+                        "support_id": None,
+                        "flip_count": 0,
+                    }
+                    for eye_label in ("left", "right")
+                }
+                if balanced_runtime_state is None
+                else balanced_runtime_state.setdefault(
+                    "support_occlusion_state",
+                    {
+                        eye_label: {
+                            "suppressed": False,
+                            "candidate_suppress": None,
+                            "candidate_frames": 0,
+                            "support_id": None,
+                            "flip_count": 0,
+                        }
+                        for eye_label in ("left", "right")
+                    },
                 )
             )
-            render_plan["center_eye_pose_world"] = center_eye_pose_world
-            render_plan["center_intrinsic"] = center_intrinsic
-            render_plan["center_scene_intrinsic"] = (
-                self._scale_intrinsic_for_resolution(
-                    center_intrinsic,
-                    eye_width,
-                    eye_height,
-                    scene_width,
-                    scene_height,
-                )
+            active_support_entry = self._select_immersive_active_support_entry(
+                scene_renderer,
+                object_support_center_world,
             )
-        else:
-            raise ValueError(
-                f"Unsupported immersive balanced background mode: {background_mode}"
+            table_support_entry = self._find_immersive_table_support_entry(
+                scene_renderer
             )
-        table_world_bounds = scene_renderer.table_world_bounds()
-        for eye_label in ("left", "right"):
-            eye_pose_world = render_plan[eye_label]["eye_pose_world"]
-            eye_intrinsic = render_plan[eye_label]["eye_intrinsic"]
-            table_roi_bounds = None
-            table_roi_ratio = 1.0
-            table_fullframe_fallback = True
-            if table_world_bounds is not None:
-                eye_w2c_cv = self._camera_pose_world_to_cv_w2c(eye_pose_world)
-                (
-                    table_roi_bounds,
-                    table_roi_ratio,
-                    table_fullframe_fallback,
-                    _,
-                ) = self._resolve_immersive_balanced_table_render_roi(
-                    table_world_bounds[0],
-                    table_world_bounds[1],
-                    eye_intrinsic,
-                    eye_w2c_cv,
-                    eye_width,
-                    eye_height,
-                    prev_bounds=table_roi_state.get(eye_label),
-                )
-            render_plan[eye_label]["table_fullframe_fallback"] = bool(
-                table_fullframe_fallback
+            render_plan["support_roi_render_scale"] = float(
+                support_roi_render_scale
             )
-            render_plan[eye_label]["table_roi_bounds"] = (
-                None
-                if table_fullframe_fallback or table_roi_bounds is None
-                else tuple(int(v) for v in table_roi_bounds)
+            render_plan["active_support"] = self._copy_immersive_support_entry(
+                active_support_entry
             )
-            render_plan[eye_label]["table_roi_ratio"] = float(table_roi_ratio)
-            table_roi_state[eye_label] = render_plan[eye_label]["table_roi_bounds"]
             if render_profile_frame is not None:
-                render_profile_frame[f"scene_table_roi_{eye_label}_ratio"] = float(
-                    table_roi_ratio
+                support_state = (
+                    {}
+                    if balanced_runtime_state is None
+                    else balanced_runtime_state.get("active_support_state", {})
                 )
-                render_profile_frame["scene_table_roi_supersample_scale"] = float(
-                    table_roi_render_scale
+                support_kind = (
+                    "none"
+                    if active_support_entry is None
+                    else str(active_support_entry.get("kind", "support"))
                 )
-                render_profile_frame[
-                    f"scene_table_fullframe_fallback_{eye_label}_ratio"
-                ] = 1.0 if table_fullframe_fallback else 0.0
-        return render_plan
+                render_profile_frame["scene_active_support_is_table_ratio"] = (
+                    1.0 if support_kind == "table" else 0.0
+                )
+                render_profile_frame["scene_active_support_other_ratio"] = (
+                    1.0 if support_kind == "support" else 0.0
+                )
+                render_profile_frame["scene_active_support_none_ratio"] = (
+                    1.0 if active_support_entry is None else 0.0
+                )
+                render_profile_frame["scene_active_support_switch_count"] = float(
+                    support_state.get("switch_count", 0)
+                )
+            for eye_label in ("left", "right"):
+                eye_pose_world = render_plan[eye_label]["eye_pose_world"]
+                eye_intrinsic = render_plan[eye_label]["eye_intrinsic"]
+                eye_w2c_cv = self._camera_pose_world_to_cv_w2c(eye_pose_world)
+                support_roi_bounds = None
+                support_roi_ratio = 0.0
+                support_fullframe_fallback = False
+                support_render_kind = "none"
+                occlusion_candidate_suppress = False
+                occlusion_suppressed = False
+                occlusion_flipped = False
+                occlusion_overlap_ratio = 0.0
+                occlusion_depth_gap_m = 0.0
+                if active_support_entry is not None:
+                    support_render_kind = (
+                        "table"
+                        if str(active_support_entry.get("kind", "support")) == "table"
+                        else "focus"
+                    )
+                    (
+                        support_roi_bounds,
+                        support_roi_ratio,
+                        support_fullframe_fallback,
+                        _,
+                    ) = self._resolve_immersive_balanced_support_render_roi(
+                        active_support_entry.get(
+                            "render_bounds_min",
+                            active_support_entry["bounds_min"],
+                        ),
+                        active_support_entry.get(
+                            "render_bounds_max",
+                            active_support_entry["bounds_max"],
+                        ),
+                        eye_intrinsic,
+                        eye_w2c_cv,
+                        eye_width,
+                        eye_height,
+                        prev_bounds=support_roi_state.get(eye_label),
+                    )
+                    if support_render_kind == "focus":
+                        (
+                            occlusion_candidate_suppress,
+                            occlusion_debug,
+                        ) = self._should_suppress_immersive_support_roi_for_eye(
+                            active_support_entry,
+                            table_support_entry,
+                            eye_intrinsic,
+                            eye_w2c_cv,
+                            eye_width,
+                            eye_height,
+                        )
+                        occlusion_overlap_ratio = float(
+                            occlusion_debug.get("overlap_ratio", 0.0)
+                        )
+                        occlusion_depth_gap_m = float(
+                            occlusion_debug.get("depth_gap_m", 0.0)
+                        )
+                        (
+                            occlusion_suppressed,
+                            occlusion_flipped,
+                        ) = self._update_immersive_support_occlusion_state_for_eye(
+                            support_occlusion_state.setdefault(
+                                eye_label,
+                                {
+                                    "suppressed": False,
+                                    "candidate_suppress": None,
+                                    "candidate_frames": 0,
+                                    "support_id": None,
+                                    "flip_count": 0,
+                                },
+                            ),
+                            int(active_support_entry["support_id"]),
+                            occlusion_candidate_suppress,
+                        )
+                        if occlusion_suppressed:
+                            support_render_kind = "none"
+                            support_roi_bounds = None
+                            support_roi_ratio = 0.0
+                            support_fullframe_fallback = False
+                    else:
+                        support_occlusion_state.setdefault(
+                            eye_label,
+                            {
+                                "suppressed": False,
+                                "candidate_suppress": None,
+                                "candidate_frames": 0,
+                                "support_id": None,
+                                "flip_count": 0,
+                            },
+                        )
+                        support_occlusion_state[eye_label]["suppressed"] = False
+                        support_occlusion_state[eye_label]["candidate_suppress"] = None
+                        support_occlusion_state[eye_label]["candidate_frames"] = 0
+                        support_occlusion_state[eye_label]["support_id"] = int(
+                            active_support_entry["support_id"]
+                        )
+                else:
+                    support_occlusion_state.setdefault(
+                        eye_label,
+                        {
+                            "suppressed": False,
+                            "candidate_suppress": None,
+                            "candidate_frames": 0,
+                            "support_id": None,
+                            "flip_count": 0,
+                        },
+                    )
+                    support_occlusion_state[eye_label]["suppressed"] = False
+                    support_occlusion_state[eye_label]["candidate_suppress"] = None
+                    support_occlusion_state[eye_label]["candidate_frames"] = 0
+                    support_occlusion_state[eye_label]["support_id"] = None
+                render_plan[eye_label]["support_render_kind"] = str(
+                    support_render_kind
+                )
+                render_plan[eye_label]["support_fullframe_fallback"] = bool(
+                    support_fullframe_fallback
+                )
+                render_plan[eye_label]["support_roi_bounds"] = (
+                    None
+                    if support_fullframe_fallback or support_roi_bounds is None
+                    else tuple(int(v) for v in support_roi_bounds)
+                )
+                render_plan[eye_label]["support_roi_ratio"] = float(
+                    support_roi_ratio
+                )
+                support_roi_state[eye_label] = render_plan[eye_label][
+                    "support_roi_bounds"
+                ]
+                if render_profile_frame is not None:
+                    render_profile_frame[
+                        f"scene_support_roi_{eye_label}_ratio"
+                    ] = float(support_roi_ratio)
+                    render_profile_frame[
+                        f"scene_support_fullframe_fallback_{eye_label}_ratio"
+                    ] = (
+                        1.0
+                        if active_support_entry is not None
+                        and support_fullframe_fallback
+                        else 0.0
+                    )
+                    render_profile_frame[
+                        f"scene_support_occlusion_candidate_{eye_label}_ratio"
+                    ] = 1.0 if occlusion_candidate_suppress else 0.0
+                    render_profile_frame[
+                        f"scene_support_occlusion_suppressed_{eye_label}_ratio"
+                    ] = 1.0 if occlusion_suppressed else 0.0
+                    render_profile_frame[
+                        f"scene_support_occlusion_flip_{eye_label}_ratio"
+                    ] = 1.0 if occlusion_flipped else 0.0
+                    render_profile_frame[
+                        f"scene_support_occlusion_overlap_{eye_label}_ratio"
+                    ] = float(occlusion_overlap_ratio)
+                    render_profile_frame[
+                        f"scene_support_occlusion_depth_gap_{eye_label}_m"
+                    ] = float(occlusion_depth_gap_m)
+                    render_profile_frame[
+                        f"scene_support_occlusion_flip_count_{eye_label}"
+                    ] = float(
+                        support_occlusion_state.get(eye_label, {}).get(
+                            "flip_count",
+                            0,
+                        )
+                    )
+                    if support_render_kind == "focus":
+                        render_profile_frame[
+                            f"scene_focus_roi_{eye_label}_ratio"
+                        ] = float(support_roi_ratio)
+                        render_profile_frame[
+                            "scene_focus_roi_supersample_scale"
+                        ] = float(support_roi_render_scale)
+                        render_profile_frame[
+                            f"scene_focus_fullframe_fallback_{eye_label}_ratio"
+                        ] = 1.0 if support_fullframe_fallback else 0.0
+            return render_plan
+
+        raise ValueError(f"Unsupported immersive static scene mode: {static_scene_mode}")
 
     def _record_immersive_balanced_scene_execute_profile(
         self,
@@ -6393,76 +14680,79 @@ class InvPhyTrainerWarp:
     ):
         if render_profile_frame is None or render_outputs is None:
             return
-        background_mode = str(render_plan["background_mode"])
-        if background_mode == "per_eye_background":
+        static_scene_mode = str(
+            render_plan.get("static_scene_mode", "balanced_focus")
+        ).strip().lower()
+        if static_scene_mode == self.IMMERSIVE_STATIC_SCENE_MODE_BALANCED_FOCUS:
             render_profile_frame["scene_render_left_wall"] = float(
                 render_outputs["left"].get("background_render_wall_s", 0.0)
             )
             render_profile_frame["scene_render_right_wall"] = float(
                 render_outputs["right"].get("background_render_wall_s", 0.0)
             )
-        elif background_mode == "mono_center_background":
-            shared_background = render_outputs.get("shared_background") or {}
-            render_profile_frame["scene_render_background_center_wall"] = float(
-                shared_background.get("render_wall_s", 0.0)
+            render_profile_frame["scene_render_table_left_wall"] = float(
+                render_outputs["left"].get("table_render_wall_s", 0.0)
             )
-        render_profile_frame["scene_render_table_left_wall"] = float(
-            render_outputs["left"].get("table_render_wall_s", 0.0)
-        )
-        render_profile_frame["scene_render_table_right_wall"] = float(
-            render_outputs["right"].get("table_render_wall_s", 0.0)
-        )
+            render_profile_frame["scene_render_table_right_wall"] = float(
+                render_outputs["right"].get("table_render_wall_s", 0.0)
+            )
+            return
+        if (
+            static_scene_mode
+            == self.IMMERSIVE_STATIC_SCENE_MODE_BALANCED_SUPPORT_FOCUS
+        ):
+            render_profile_frame["scene_render_left_wall"] = float(
+                render_outputs["left"].get("base_render_wall_s", 0.0)
+            )
+            render_profile_frame["scene_render_right_wall"] = float(
+                render_outputs["right"].get("base_render_wall_s", 0.0)
+            )
+            for eye_label in ("left", "right"):
+                support_render_kind = str(
+                    render_outputs[eye_label].get("support_render_kind", "none")
+                ).strip().lower()
+                base_table_render_wall_s = float(
+                    render_outputs[eye_label].get("base_table_render_wall_s", 0.0)
+                )
+                if support_render_kind == "none" and base_table_render_wall_s > 0.0:
+                    render_profile_frame[
+                        f"scene_render_table_base_{eye_label}_wall"
+                    ] = base_table_render_wall_s
+                support_render_wall_s = float(
+                    render_outputs[eye_label].get("support_render_wall_s", 0.0)
+                )
+                if support_render_kind == "table":
+                    render_profile_frame[
+                        f"scene_render_table_{eye_label}_wall"
+                    ] = support_render_wall_s
+                elif support_render_kind == "focus":
+                    render_profile_frame[
+                        f"scene_render_focus_{eye_label}_wall"
+                    ] = support_render_wall_s
+            return
+        raise ValueError(f"Unsupported immersive static scene mode: {static_scene_mode}")
 
-    def _assemble_immersive_balanced_scene_for_eye(
+    def _assemble_immersive_balanced_table_scene_for_eye(
         self,
-        scene_renderer,
         render_plan,
         render_outputs,
         eye_label,
         eye_height,
         eye_width,
-        background_color_t,
-        background_depth_t,
-        balanced_runtime_state,
-        reproject_caches,
-        render_profile_frame,
-        center_eye_pose_world,
-        center_intrinsic,
-        shared_background_source_data,
-        source_intrinsic_t,
-        source_c2w_cv_t,
         background_compose_cache=None,
+        render_profile_frame=None,
     ):
-        background_mode = str(render_plan["background_mode"])
         eye_plan = render_plan[eye_label]
         eye_outputs = render_outputs[eye_label]
-        eye_pose_world = eye_plan["eye_pose_world"]
-        eye_intrinsic = eye_plan["eye_intrinsic"]
-        if background_mode == "mono_center_background":
-            repaired_background_color_t, repaired_background_depth_t = (
-                self._repair_immersive_balanced_background_eye(
-                    scene_renderer,
-                    eye_label,
-                    eye_pose_world,
-                    eye_intrinsic,
-                    eye_width,
-                    eye_height,
-                    background_color_t,
-                    background_depth_t,
-                    center_eye_pose_world,
-                    center_intrinsic,
-                    balanced_runtime_state=balanced_runtime_state,
-                    reproject_caches=reproject_caches,
-                    render_profile_frame=render_profile_frame,
-                    shared_source_data=shared_background_source_data,
-                    source_intrinsic_t=source_intrinsic_t,
-                    source_c2w_cv_t=source_c2w_cv_t,
-                )
+        background_color_t, background_depth_t = (
+            self._prepare_immersive_scene_frame_for_compose(
+                eye_outputs["background_color"],
+                eye_outputs["background_depth"],
+                eye_height,
+                eye_width,
+                compose_cache=background_compose_cache,
             )
-        else:
-            repaired_background_color_t = background_color_t
-            repaired_background_depth_t = background_depth_t
-
+        )
         table_fullframe_fallback = bool(
             eye_plan.get("table_fullframe_fallback", True)
         )
@@ -6487,8 +14777,8 @@ class InvPhyTrainerWarp:
             f"scene_compose_table_{eye_label}_cuda",
         )
         scene_color_t, scene_depth_t = self._compose_immersive_scene_layers(
-            repaired_background_color_t,
-            repaired_background_depth_t,
+            background_color_t,
+            background_depth_t,
             table_color,
             table_depth,
             target_height=eye_height,
@@ -6500,6 +14790,193 @@ class InvPhyTrainerWarp:
         self._render_profile_end_cuda_span(
             render_profile_frame,
             table_compose_span,
+        )
+        return scene_color_t, scene_depth_t
+
+    def _assemble_immersive_balanced_scene_for_eye(
+        self,
+        scene_renderer,
+        render_plan,
+        render_outputs,
+        eye_label,
+        eye_height,
+        eye_width,
+        background_color_t,
+        background_depth_t,
+        balanced_runtime_state,
+        reproject_caches,
+        render_profile_frame,
+        center_eye_pose_world,
+        center_intrinsic,
+        shared_background_source_data,
+        source_intrinsic_t,
+        source_c2w_cv_t,
+        background_compose_cache=None,
+    ):
+        eye_plan = render_plan[eye_label]
+        eye_outputs = render_outputs[eye_label]
+        _ = scene_renderer
+        _ = background_color_t
+        _ = background_depth_t
+        _ = balanced_runtime_state
+        _ = reproject_caches
+        _ = render_profile_frame
+        _ = center_eye_pose_world
+        _ = center_intrinsic
+        _ = shared_background_source_data
+        _ = source_intrinsic_t
+        _ = source_c2w_cv_t
+
+        base_scene_color_t, base_scene_depth_t = (
+            self._prepare_immersive_scene_frame_for_compose(
+                eye_outputs["base_color"],
+                eye_outputs["base_depth"],
+                eye_height,
+                eye_width,
+                compose_cache=background_compose_cache,
+            )
+        )
+
+        focus_fullframe_fallback = bool(
+            eye_plan.get("focus_fullframe_fallback", True)
+        )
+        if focus_fullframe_fallback:
+            focus_color = eye_outputs["focus_color"]
+            focus_depth = eye_outputs["focus_depth"]
+            focus_roi_bounds = None
+            focus_coverage_mask = None
+        else:
+            focus_render_info = eye_outputs.get("focus_render_info") or {}
+            focus_color, focus_depth, focus_coverage_mask = (
+                self._downsample_immersive_supersampled_overlay_patch(
+                    eye_outputs["focus_color"],
+                    eye_outputs["focus_depth"],
+                    int(focus_render_info["roi_height"]),
+                    int(focus_render_info["roi_width"]),
+                )
+            )
+            focus_roi_bounds = tuple(int(v) for v in eye_plan["focus_roi_bounds"])
+        focus_compose_span = self._render_profile_begin_cuda_span(
+            render_profile_frame,
+            f"scene_compose_focus_{eye_label}_cuda",
+        )
+        scene_color_t, scene_depth_t = self._compose_immersive_scene_layers(
+            base_scene_color_t,
+            base_scene_depth_t,
+            focus_color,
+            focus_depth,
+            target_height=eye_height,
+            target_width=eye_width,
+            background_cache=background_compose_cache,
+            overlay_roi_bounds=focus_roi_bounds,
+            overlay_coverage_mask=focus_coverage_mask,
+            force_overlay_visible=True,
+        )
+        self._render_profile_end_cuda_span(
+            render_profile_frame,
+            focus_compose_span,
+        )
+        return scene_color_t, scene_depth_t
+
+    def _assemble_immersive_balanced_support_scene_for_eye(
+        self,
+        render_plan,
+        render_outputs,
+        eye_label,
+        eye_height,
+        eye_width,
+        background_compose_cache=None,
+        render_profile_frame=None,
+    ):
+        eye_plan = render_plan[eye_label]
+        eye_outputs = render_outputs[eye_label]
+        scene_color_t, scene_depth_t = self._prepare_immersive_scene_frame_for_compose(
+            eye_outputs["base_color"],
+            eye_outputs["base_depth"],
+            eye_height,
+            eye_width,
+            compose_cache=background_compose_cache,
+        )
+        base_table_color = eye_outputs.get("base_table_color")
+        base_table_depth = eye_outputs.get("base_table_depth")
+        if base_table_color is not None and base_table_depth is not None:
+            base_table_color_t, base_table_depth_t = (
+                self._prepare_immersive_scene_frame_for_compose(
+                    base_table_color,
+                    base_table_depth,
+                    eye_height,
+                    eye_width,
+                    compose_cache=background_compose_cache,
+                )
+            )
+            table_base_compose_span = self._render_profile_begin_cuda_span(
+                render_profile_frame,
+                f"scene_compose_table_base_{eye_label}_cuda",
+            )
+            scene_color_t, scene_depth_t = self._compose_immersive_scene_layers(
+                scene_color_t,
+                scene_depth_t,
+                base_table_color_t,
+                base_table_depth_t,
+                target_height=eye_height,
+                target_width=eye_width,
+                background_cache=background_compose_cache,
+            )
+            self._render_profile_end_cuda_span(
+                render_profile_frame,
+                table_base_compose_span,
+            )
+        support_render_kind = str(
+            eye_plan.get("support_render_kind", "none")
+        ).strip().lower()
+        if support_render_kind == "none" or eye_outputs.get("support_color") is None:
+            return scene_color_t, scene_depth_t
+
+        support_fullframe_fallback = bool(
+            eye_plan.get("support_fullframe_fallback", True)
+        )
+        overlay_key = (
+            f"scene_compose_table_{eye_label}_cuda"
+            if support_render_kind == "table"
+            else f"scene_compose_focus_{eye_label}_cuda"
+        )
+        overlay_compose_span = self._render_profile_begin_cuda_span(
+            render_profile_frame,
+            overlay_key,
+        )
+        if support_fullframe_fallback:
+            support_color = eye_outputs["support_color"]
+            support_depth = eye_outputs["support_depth"]
+            support_roi_bounds = None
+            support_coverage_mask = None
+        else:
+            support_render_info = eye_outputs.get("support_render_info") or {}
+            support_color, support_depth, support_coverage_mask = (
+                self._downsample_immersive_supersampled_overlay_patch(
+                    eye_outputs["support_color"],
+                    eye_outputs["support_depth"],
+                    int(support_render_info["roi_height"]),
+                    int(support_render_info["roi_width"]),
+                )
+            )
+            support_roi_bounds = tuple(
+                int(v) for v in eye_plan["support_roi_bounds"]
+            )
+        scene_color_t, scene_depth_t = self._compose_immersive_scene_layers(
+            scene_color_t,
+            scene_depth_t,
+            support_color,
+            support_depth,
+            target_height=eye_height,
+            target_width=eye_width,
+            background_cache=background_compose_cache,
+            overlay_roi_bounds=support_roi_bounds,
+            overlay_coverage_mask=support_coverage_mask,
+            force_overlay_visible=True,
+        )
+        self._render_profile_end_cuda_span(
+            render_profile_frame,
+            overlay_compose_span,
         )
         return scene_color_t, scene_depth_t
 
@@ -6519,188 +14996,86 @@ class InvPhyTrainerWarp:
             "_immersive_balanced_runtime_state",
             None,
         )
-        background_mode = str(render_plan["background_mode"])
-        side_wall_mode = str(render_plan.get("side_wall_mode", "disabled"))
         self._record_immersive_balanced_scene_execute_profile(
             render_profile_frame,
             render_plan,
             render_outputs,
         )
-        center_eye_pose_world = render_plan.get("center_eye_pose_world")
-        center_intrinsic = render_plan.get("center_intrinsic")
-        center_intrinsic_t = None
-        center_c2w_cv_t = None
-        shared_background_source_data = None
-        left_background_compose_cache = shared_scene_compose_cache
-        right_background_compose_cache = shared_scene_compose_cache
-        if background_mode == "per_eye_background":
-            per_eye_background_compose_caches = (
-                self._get_immersive_balanced_background_compose_caches(
-                    balanced_runtime_state
-                )
-            )
-            left_background_compose_cache = per_eye_background_compose_caches["left"]
-            right_background_compose_cache = per_eye_background_compose_caches["right"]
-            left_background_prepare_start = (
-                time.perf_counter() if render_profile_frame is not None else None
-            )
-            left_background_color_t, left_background_depth_t = (
-                self._prepare_immersive_scene_frame_for_compose(
-                    render_outputs["left"]["background_color"],
-                    render_outputs["left"]["background_depth"],
-                    eye_height,
-                    eye_width,
-                    compose_cache=left_background_compose_cache,
-                )
-            )
-            if left_background_prepare_start is not None:
-                self._render_profile_add_wall_time(
-                    render_profile_frame,
-                    "scene_prepare_background_eye_wall",
-                    time.perf_counter() - left_background_prepare_start,
-                )
-            right_background_prepare_start = (
-                time.perf_counter() if render_profile_frame is not None else None
-            )
-            right_background_color_t, right_background_depth_t = (
-                self._prepare_immersive_scene_frame_for_compose(
-                    render_outputs["right"]["background_color"],
-                    render_outputs["right"]["background_depth"],
-                    eye_height,
-                    eye_width,
-                    compose_cache=right_background_compose_cache,
-                )
-            )
-            if right_background_prepare_start is not None:
-                self._render_profile_add_wall_time(
-                    render_profile_frame,
-                    "scene_prepare_background_eye_wall",
-                    time.perf_counter() - right_background_prepare_start,
-                )
-        elif background_mode == "mono_center_background":
-            shared_background = render_outputs.get("shared_background") or {}
-            background_prepare_start = (
-                time.perf_counter() if render_profile_frame is not None else None
-            )
-            background_eye_color_t, background_eye_depth_t = (
-                self._prepare_immersive_scene_frame_for_compose(
-                    shared_background["color"],
-                    shared_background["depth"],
-                    eye_height,
-                    eye_width,
-                    compose_cache=shared_scene_compose_cache,
-                )
-            )
-            if background_prepare_start is not None:
-                self._render_profile_add_wall_time(
-                    render_profile_frame,
-                    "scene_prepare_background_eye_wall",
-                    time.perf_counter() - background_prepare_start,
-                )
-
-            warp_width_max = float(
-                self.IMMERSIVE_BALANCED_SIDE_WALL_STRIP_WARP_MAX_WIDTH_RATIO
-            )
-            should_prepare_shared_background_source = False
-            if side_wall_mode in {"edge_warp_roi", "warp_first_hybrid"}:
-                for probe_eye_label in ("left", "right"):
-                    probe_specs, _ = self._resolve_immersive_balanced_edge_repair_strips(
-                        scene_renderer,
-                        probe_eye_label,
-                        render_plan[probe_eye_label]["eye_pose_world"],
-                        render_plan[probe_eye_label]["eye_intrinsic"],
-                        eye_width,
-                        eye_height,
-                        balanced_runtime_state=balanced_runtime_state,
-                        update_state=False,
-                    )
-                    if any(
-                        spec["roi_bounds"] is not None
-                        and spec["anchor_edge"] in {"left", "right"}
-                        and (not spec["fullframe_fallback"])
-                        and float(spec["strip_width_ratio"]) <= warp_width_max
-                        for spec in probe_specs
-                    ):
-                        should_prepare_shared_background_source = True
-                        break
-            if should_prepare_shared_background_source:
-                center_intrinsic_t = torch.as_tensor(
-                    center_intrinsic,
-                    dtype=torch.float32,
-                    device=cfg.device,
-                )
-                center_w2c_cv_t = torch.as_tensor(
-                    self._camera_pose_world_to_cv_w2c(center_eye_pose_world),
-                    dtype=torch.float32,
-                    device=cfg.device,
-                )
-                center_c2w_cv_t = torch.linalg.inv(center_w2c_cv_t)
-                shared_background_source_data = (
-                    self._prepare_immersive_reproject_source_data(
-                        background_eye_color_t,
-                        background_eye_depth_t,
-                        center_intrinsic_t,
-                        source_cache=None
-                        if reproject_caches is None
-                        else reproject_caches.get("background_source"),
-                    )
-                )
-            left_background_color_t = background_eye_color_t
-            left_background_depth_t = background_eye_depth_t
-            right_background_color_t = background_eye_color_t
-            right_background_depth_t = background_eye_depth_t
-        else:
-            raise ValueError(
-                f"Unsupported immersive balanced background mode: {background_mode}"
-            )
-        left_scene_color_t, left_scene_depth_t = (
-            self._assemble_immersive_balanced_scene_for_eye(
-                scene_renderer,
-                render_plan,
-                render_outputs,
-                "left",
-                eye_height,
-                eye_width,
-                left_background_color_t,
-                left_background_depth_t,
-                balanced_runtime_state,
-                reproject_caches,
-                render_profile_frame,
-                center_eye_pose_world,
-                center_intrinsic,
-                shared_background_source_data,
-                center_intrinsic_t,
-                center_c2w_cv_t,
-                background_compose_cache=left_background_compose_cache,
+        per_eye_background_compose_caches = (
+            self._get_immersive_balanced_background_compose_caches(
+                balanced_runtime_state
             )
         )
-        right_scene_color_t, right_scene_depth_t = (
-            self._assemble_immersive_balanced_scene_for_eye(
-                scene_renderer,
-                render_plan,
-                render_outputs,
-                "right",
-                eye_height,
-                eye_width,
-                right_background_color_t,
-                right_background_depth_t,
-                balanced_runtime_state,
-                reproject_caches,
-                render_profile_frame,
-                center_eye_pose_world,
-                center_intrinsic,
-                shared_background_source_data,
-                center_intrinsic_t,
-                center_c2w_cv_t,
-                background_compose_cache=right_background_compose_cache,
+        left_background_compose_cache = per_eye_background_compose_caches["left"]
+        right_background_compose_cache = per_eye_background_compose_caches["right"]
+        static_scene_mode = str(
+            render_plan.get(
+                "static_scene_mode",
+                self.IMMERSIVE_STATIC_SCENE_MODE_BALANCED_FOCUS,
             )
-        )
-        return (
-            left_scene_color_t,
-            left_scene_depth_t,
-            right_scene_color_t,
-            right_scene_depth_t,
-        )
+        ).strip().lower()
+        if static_scene_mode == self.IMMERSIVE_STATIC_SCENE_MODE_BALANCED_FOCUS:
+            left_scene_color_t, left_scene_depth_t = (
+                self._assemble_immersive_balanced_table_scene_for_eye(
+                    render_plan,
+                    render_outputs,
+                    "left",
+                    eye_height,
+                    eye_width,
+                    background_compose_cache=left_background_compose_cache,
+                    render_profile_frame=render_profile_frame,
+                )
+            )
+            right_scene_color_t, right_scene_depth_t = (
+                self._assemble_immersive_balanced_table_scene_for_eye(
+                    render_plan,
+                    render_outputs,
+                    "right",
+                    eye_height,
+                    eye_width,
+                    background_compose_cache=right_background_compose_cache,
+                    render_profile_frame=render_profile_frame,
+                )
+            )
+            return (
+                left_scene_color_t,
+                left_scene_depth_t,
+                right_scene_color_t,
+                right_scene_depth_t,
+            )
+        if (
+            static_scene_mode
+            == self.IMMERSIVE_STATIC_SCENE_MODE_BALANCED_SUPPORT_FOCUS
+        ):
+            left_scene_color_t, left_scene_depth_t = (
+                self._assemble_immersive_balanced_support_scene_for_eye(
+                    render_plan,
+                    render_outputs,
+                    "left",
+                    eye_height,
+                    eye_width,
+                    background_compose_cache=left_background_compose_cache,
+                    render_profile_frame=render_profile_frame,
+                )
+            )
+            right_scene_color_t, right_scene_depth_t = (
+                self._assemble_immersive_balanced_support_scene_for_eye(
+                    render_plan,
+                    render_outputs,
+                    "right",
+                    eye_height,
+                    eye_width,
+                    background_compose_cache=right_background_compose_cache,
+                    render_profile_frame=render_profile_frame,
+                )
+            )
+            return (
+                left_scene_color_t,
+                left_scene_depth_t,
+                right_scene_color_t,
+                right_scene_depth_t,
+            )
+        raise ValueError(f"Unsupported immersive static scene mode: {static_scene_mode}")
 
     def _latewarp_immersive_scene_eye(
         self,
@@ -6715,6 +15090,7 @@ class InvPhyTrainerWarp:
         eye_label,
         reproject_caches=None,
         render_profile_frame=None,
+        stats_out=None,
     ):
         source_intrinsic_t = torch.as_tensor(
             render_intrinsic,
@@ -6770,8 +15146,84 @@ class InvPhyTrainerWarp:
             source_c2w_cv_t=torch.linalg.inv(render_w2c_cv_t),
             target_intrinsic_t=publish_intrinsic_t,
             target_w2c_cv_t=publish_w2c_cv_t,
+            repair_roi_bounds=(0, 0, int(target_width), int(target_height)),
             profile_key_prefix="scene_reproject_timewarp",
+            stats_out=stats_out,
         )
+
+    def _evaluate_immersive_real_timewarp_eye_result(
+        self,
+        *,
+        eye_label,
+        original_eye_frame,
+        original_eye_depth,
+        warped_eye_frame,
+        warped_eye_depth,
+        warped_valid_mask,
+        warped_stats,
+        target_height,
+        target_width,
+    ):
+        diagnostics = {
+            "eye_label": str(eye_label),
+            "accepted": False,
+            "reason": "invalid_tensor",
+            "valid_pre_ratio": 0.0,
+            "valid_post_ratio": 0.0,
+            "source_copy_ratio": 0.0,
+            "unresolved_invalid_ratio": 0.0,
+            "clear_color_ratio": 0.0,
+        }
+        if isinstance(warped_stats, dict):
+            diagnostics["valid_pre_ratio"] = float(
+                warped_stats.get("valid_pre_ratio", 0.0)
+            )
+            diagnostics["valid_post_ratio"] = float(
+                warped_stats.get("valid_post_ratio", 0.0)
+            )
+            diagnostics["source_copy_ratio"] = float(
+                warped_stats.get("source_copy_ratio", 0.0)
+            )
+            diagnostics["unresolved_invalid_ratio"] = float(
+                warped_stats.get("unresolved_invalid_ratio", 0.0)
+            )
+            diagnostics["clear_color_ratio"] = float(
+                warped_stats.get("clear_color_ratio", 0.0)
+            )
+        elif torch.is_tensor(warped_valid_mask):
+            diagnostics["valid_post_ratio"] = float(
+                warped_valid_mask.to(dtype=torch.float32).mean().item()
+            )
+
+        basic_valid = (
+            torch.is_tensor(warped_eye_frame)
+            and torch.is_tensor(warped_eye_depth)
+            and tuple(warped_eye_frame.shape)
+            == (int(target_height), int(target_width), 4)
+            and tuple(warped_eye_depth.shape)
+            == (int(target_height), int(target_width))
+            and self._is_finite_tensor(warped_eye_frame)
+            and self._is_finite_tensor(warped_eye_depth)
+        )
+        if not basic_valid:
+            return original_eye_frame, original_eye_depth, diagnostics
+
+        if diagnostics["unresolved_invalid_ratio"] > 0.02:
+            diagnostics["reason"] = "unresolved_invalid_ratio"
+            return original_eye_frame, original_eye_depth, diagnostics
+        if diagnostics["source_copy_ratio"] > 0.98:
+            diagnostics["reason"] = "source_copy_ratio"
+            return original_eye_frame, original_eye_depth, diagnostics
+        if diagnostics["valid_post_ratio"] < 0.02:
+            diagnostics["reason"] = "valid_post_ratio"
+            return original_eye_frame, original_eye_depth, diagnostics
+        if diagnostics["clear_color_ratio"] > 0.98:
+            diagnostics["reason"] = "clear_color_ratio"
+            return original_eye_frame, original_eye_depth, diagnostics
+
+        diagnostics["accepted"] = True
+        diagnostics["reason"] = "accepted"
+        return warped_eye_frame, warped_eye_depth, diagnostics
 
     def _convert_live_eye_to_world_pose(self, eye_sample: EyePoseSample, head_alignment):
         if head_alignment is None or not eye_sample.pose_valid:
@@ -7120,6 +15572,2297 @@ class InvPhyTrainerWarp:
         with open(metadata_path, "w") as metadata_file:
             json.dump(metadata, metadata_file, indent=2, sort_keys=True)
 
+    def _save_immersive_debug_json(self, output_path, metadata):
+        if not output_path:
+            return
+        output_dir = os.path.dirname(output_path)
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
+        with open(output_path, "w") as metadata_file:
+            json.dump(metadata, metadata_file, indent=2, sort_keys=True)
+
+    def _reset_immersive_compose_artifact_debug_state(
+        self,
+        output_dir,
+        *,
+        analysis_enabled,
+        summary_enabled,
+        capture_enabled,
+    ):
+        self._immersive_compose_artifact_debug_state = {
+            "enabled": bool(analysis_enabled),
+            "summary_enabled": bool(summary_enabled),
+            "capture_enabled": bool(capture_enabled),
+            "output_dir": output_dir if bool(capture_enabled) else None,
+            "cooldown_frames": 6,
+            "post_release_window_frames": int(
+                self.IMMERSIVE_COMPOSE_POST_RELEASE_WINDOW_FRAMES
+            ),
+            "history_maxlen": 6,
+            "max_bundle_captures": 4,
+            "next_entry_id": 1,
+            "bundle_capture_count": 0,
+            "analyzed_frame_count": 0,
+            "interaction_gated_analyzed_frame_count": 0,
+            "suspicious_frame_count": 0,
+            "depth_suppression_suspicious_count": 0,
+            "blue_scene_exposure_suspicious_count": 0,
+            "post_release_occluded_fall_suspicious_count": 0,
+            "gaussian_blue_source_suspicious_count": 0,
+            "pre_stabilization_candidate_count": 0,
+            "pre_stabilization_blue_scene_exposure_count": 0,
+            "pre_stabilization_post_release_occluded_fall_count": 0,
+            "pre_stabilization_depth_suppression_count": 0,
+            "stabilization_applied_count": 0,
+            "stabilization_prevented_blue_exposure_count": 0,
+            "stabilization_prevented_post_release_occluded_fall_count": 0,
+            "stabilization_prevented_depth_suppression_count": 0,
+            "stabilization_fallback_reject_count": 0,
+            "stabilization_wall_ms_total": 0.0,
+            "stabilization_wall_ms_count": 0,
+            "compose_metric_inconsistency_count": 0,
+            "compose_metric_inconsistency_reason_counts": {},
+            "compose_metric_inconsistency_capture_count": 0,
+            "compose_metric_inconsistency_max_captures": 2,
+            "last_interaction_frame_index": -1,
+            "last_interaction_sources": [],
+            "last_release_frame_index_by_source": {
+                "left": -1,
+                "right": -1,
+            },
+            "scalar_history_by_eye": {
+                "left": collections.deque(maxlen=6),
+                "right": collections.deque(maxlen=6),
+            },
+            "pending_trigger_by_eye": {
+                "left": None,
+                "right": None,
+            },
+            "lock": threading.Lock(),
+        }
+
+    def _get_immersive_compose_artifact_debug_state(self):
+        state = getattr(self, "_immersive_compose_artifact_debug_state", None)
+        if state is None:
+            self._reset_immersive_compose_artifact_debug_state(
+                output_dir=None,
+                analysis_enabled=False,
+                summary_enabled=False,
+                capture_enabled=False,
+            )
+            state = self._immersive_compose_artifact_debug_state
+        return state
+
+    def _record_immersive_compose_metric_inconsistency(
+        self,
+        *,
+        eye_label,
+        frame_index,
+        sample_id,
+        backend_kind,
+        path_kind,
+        compose_mode,
+        source_mask_metrics,
+    ):
+        state = self._get_immersive_compose_artifact_debug_state()
+        if not state.get("enabled", False):
+            return
+        summary_enabled = bool(state.get("summary_enabled", False))
+        capture_enabled = bool(state.get("capture_enabled", False))
+        if not summary_enabled and not capture_enabled:
+            return
+        reasons = [
+            str(reason)
+            for reason in source_mask_metrics.get("mask_metric_inconsistency_reasons", [])
+        ]
+        if not reasons:
+            return
+        capture_index = None
+        output_dir = None
+        with state["lock"]:
+            if summary_enabled:
+                state["compose_metric_inconsistency_count"] += 1
+                for reason in reasons:
+                    state["compose_metric_inconsistency_reason_counts"][reason] = (
+                        int(
+                            state["compose_metric_inconsistency_reason_counts"].get(
+                                reason, 0
+                            )
+                        )
+                        + 1
+                    )
+            if (
+                capture_enabled
+                and
+                int(state["compose_metric_inconsistency_capture_count"])
+                < int(state["compose_metric_inconsistency_max_captures"])
+            ):
+                state["compose_metric_inconsistency_capture_count"] += 1
+                capture_index = int(state["compose_metric_inconsistency_capture_count"])
+                output_dir = state.get("output_dir")
+        if capture_index is None or not output_dir:
+            return
+        metadata = {
+            "capture_index": int(capture_index),
+            "eye_label": str(eye_label),
+            "frame_index": int(frame_index),
+            "sample_id": None if sample_id is None else int(sample_id),
+            "backend_kind": str(backend_kind),
+            "path_kind": str(path_kind),
+            "compose_mode": str(compose_mode),
+            "reason_list": list(reasons),
+            "raw_mask_pixel_count": int(
+                source_mask_metrics.get("raw_mask_pixel_count", 0)
+            ),
+            "raw_mask_bbox_area_pixels": int(
+                source_mask_metrics.get("raw_mask_bbox_area_pixels", 0)
+            ),
+            "total_pixel_count": int(source_mask_metrics.get("total_pixel_count", 0)),
+            "reported_raw_pixel_count": source_mask_metrics.get(
+                "reported_raw_pixel_count"
+            ),
+            "reported_raw_coverage_ratio": source_mask_metrics.get(
+                "reported_raw_coverage_ratio"
+            ),
+            "raw_gaussian_coverage_ratio": float(
+                source_mask_metrics.get("raw_gaussian_coverage_ratio", 0.0)
+            ),
+            "raw_mask_bbox_xyxy": copy.deepcopy(
+                source_mask_metrics.get("raw_mask_bbox_xyxy")
+            ),
+        }
+        output_path = os.path.join(
+            output_dir,
+            "compose_artifact_debug",
+            "inconsistency_samples",
+            (
+                f"inconsistency_{capture_index:03d}_"
+                f"frame_{int(frame_index):06d}_"
+                f"sample_{int(sample_id) if sample_id is not None else -1:06d}_"
+                f"{str(eye_label)}.json"
+            ),
+        )
+        self._save_immersive_debug_json(output_path, metadata)
+
+    def _build_immersive_compose_artifact_interaction_context(
+        self,
+        frame_index,
+        controller_interaction_state,
+        current_live_left_controller=None,
+        current_live_right_controller=None,
+    ):
+        state = self._get_immersive_compose_artifact_debug_state()
+        active_sources = []
+        if controller_interaction_state is not None:
+            for source in ("left", "right"):
+                if controller_interaction_state.get(source) is not None:
+                    active_sources.append(source)
+        interaction_active = bool(active_sources)
+        live_controller_by_source = {
+            "left": current_live_left_controller,
+            "right": current_live_right_controller,
+        }
+        with state["lock"]:
+            if interaction_active:
+                state["last_interaction_frame_index"] = int(frame_index)
+                state["last_interaction_sources"] = list(active_sources)
+            for source, controller_world in live_controller_by_source.items():
+                if not controller_world:
+                    continue
+                select_release_ready = bool(
+                    controller_world.get("select_release_ready", False)
+                )
+                select_release_frames = int(
+                    controller_world.get("select_release_frames", 0)
+                )
+                if select_release_ready and select_release_frames == 1:
+                    state["last_release_frame_index_by_source"][source] = int(
+                        frame_index
+                    )
+            last_interaction_frame_index = int(
+                state.get("last_interaction_frame_index", -1)
+            )
+            last_interaction_sources = list(
+                state.get("last_interaction_sources", [])
+            )
+            cooldown_frames = int(state.get("cooldown_frames", 6))
+            post_release_window_frames = int(
+                state.get(
+                    "post_release_window_frames",
+                    self.IMMERSIVE_COMPOSE_POST_RELEASE_WINDOW_FRAMES,
+                )
+            )
+            last_release_frame_index_by_source = copy.deepcopy(
+                state.get("last_release_frame_index_by_source", {})
+            )
+        cooldown_active = bool(
+            (not interaction_active)
+            and last_interaction_frame_index >= 0
+            and (int(frame_index) - last_interaction_frame_index) <= cooldown_frames
+        )
+        recent_release_sources = []
+        recent_release_distances = []
+        for source in ("left", "right"):
+            last_release_frame_index = int(
+                last_release_frame_index_by_source.get(source, -1)
+            )
+            if last_release_frame_index < 0:
+                continue
+            release_frame_distance = int(frame_index) - last_release_frame_index
+            if 0 <= release_frame_distance <= post_release_window_frames:
+                recent_release_sources.append(source)
+                recent_release_distances.append(release_frame_distance)
+        post_release_window_active = bool(recent_release_sources)
+        last_release_frame_index = max(
+            (
+                int(last_release_frame_index_by_source.get(source, -1))
+                for source in recent_release_sources
+            ),
+            default=-1,
+        )
+        release_frame_distance = (
+            min(recent_release_distances) if recent_release_distances else None
+        )
+        return {
+            "interaction_active": interaction_active,
+            "interaction_window_active": bool(interaction_active or cooldown_active),
+            "cooldown_active": cooldown_active,
+            "active_sources": list(active_sources),
+            "last_active_sources": list(last_interaction_sources),
+            "right_interaction_active": "right" in active_sources,
+            "last_interaction_frame_index": last_interaction_frame_index,
+            "cooldown_frames": cooldown_frames,
+            "post_release_window_active": bool(post_release_window_active),
+            "recent_release_sources": list(recent_release_sources),
+            "last_release_frame_index": int(last_release_frame_index),
+            "release_frame_distance": (
+                None if release_frame_distance is None else int(release_frame_distance)
+            ),
+            "post_release_window_frames": int(post_release_window_frames),
+        }
+
+    def _immersive_debug_frame_to_u8_array(self, frame):
+        if frame is None:
+            return None
+        if torch.is_tensor(frame):
+            array = frame.detach().cpu().numpy()
+        else:
+            array = np.asarray(frame)
+        array = np.asarray(array)
+        if array.dtype != np.uint8:
+            if np.issubdtype(array.dtype, np.floating):
+                max_value = float(np.nanmax(array)) if array.size > 0 else 0.0
+                scale = 255.0 if max_value <= 1.0001 else 1.0
+                array = np.clip(array * scale, 0.0, 255.0).astype(np.uint8)
+            else:
+                array = np.clip(array, 0, 255).astype(np.uint8)
+        return np.ascontiguousarray(array)
+
+    @staticmethod
+    def _immersive_masked_mean_rgb(rgb_image, mask):
+        if not bool(mask.any().item()):
+            return [0.0, 0.0, 0.0]
+        rgb_values = rgb_image[mask]
+        return [
+            float(rgb_values[:, 0].mean().item()),
+            float(rgb_values[:, 1].mean().item()),
+            float(rgb_values[:, 2].mean().item()),
+        ]
+
+    @staticmethod
+    def _immersive_blue_excess(mean_rgb):
+        mean_rgb = [float(v) for v in mean_rgb]
+        return float(mean_rgb[2] - max(mean_rgb[0], mean_rgb[1]))
+
+    @staticmethod
+    def _immersive_mean_rgb_abs_delta(current_mean_rgb, previous_mean_rgb):
+        if previous_mean_rgb is None:
+            return 0.0
+        current = np.asarray(current_mean_rgb, dtype=np.float32)
+        previous = np.asarray(previous_mean_rgb, dtype=np.float32)
+        return float(np.mean(np.abs(current - previous)))
+
+    @torch.no_grad()
+    def _compute_runtime_compose_visible_alpha_debug_map(
+        self,
+        scene_depth,
+        gaussian_rgba,
+        gaussian_depth,
+        *,
+        compose_mode,
+    ):
+        raw_alpha = (
+            gaussian_rgba[3].detach().to(device=cfg.device, dtype=torch.float32).contiguous()
+        )
+        if compose_mode == "alpha_overlay":
+            return raw_alpha, raw_alpha.clone()
+        normalized_gaussian_depth = self._normalize_gaussian_depth(gaussian_depth)
+        if normalized_gaussian_depth is None:
+            return raw_alpha, raw_alpha.clone()
+        scene_depth_t = scene_depth
+        if not torch.is_tensor(scene_depth_t):
+            scene_depth_t = torch.as_tensor(
+                scene_depth_t,
+                device=cfg.device,
+                dtype=torch.float32,
+            )
+        else:
+            scene_depth_t = scene_depth_t.to(device=cfg.device, dtype=torch.float32)
+        scene_depth_t = scene_depth_t.squeeze()
+        scene_has_geometry = scene_depth_t > 0.0
+        object_has_depth = normalized_gaussian_depth > 0.0
+        visible_mask = object_has_depth & (
+            (~scene_has_geometry)
+            | (normalized_gaussian_depth <= (scene_depth_t + 5e-3))
+        )
+        visible_alpha = raw_alpha * visible_mask.to(dtype=raw_alpha.dtype)
+        return raw_alpha, visible_alpha
+
+    @torch.no_grad()
+    def _compute_immersive_gaussian_source_mask_metrics(
+        self,
+        gaussian_rgba,
+        gaussian_depth,
+        *,
+        reported_raw_coverage_ratio=None,
+    ):
+        raw_alpha = (
+            gaussian_rgba[3].detach().to(device=cfg.device, dtype=torch.float32).contiguous()
+        )
+        raw_mask = raw_alpha > float(self.IMMERSIVE_COMPOSE_ALPHA_EPS)
+        target_height, target_width = [int(v) for v in raw_mask.shape]
+        total_pixel_count = int(max(target_height * target_width, 0))
+        raw_mask_pixel_count = int(raw_mask.to(dtype=torch.int32).sum().item())
+        raw_gaussian_coverage_ratio = (
+            float(raw_mask_pixel_count) / max(float(total_pixel_count), 1.0)
+            if total_pixel_count > 0
+            else 0.0
+        )
+        mask_indices = torch.nonzero(raw_mask, as_tuple=False)
+        raw_mask_bbox_xyxy = None
+        raw_mask_bbox_area_pixels = 0
+        raw_mask_bbox_area_ratio = 0.0
+        raw_mask_row_span_ratio = 0.0
+        raw_mask_column_span_ratio = 0.0
+        if int(mask_indices.shape[0]) > 0:
+            y_min = int(mask_indices[:, 0].min().item())
+            y_max = int(mask_indices[:, 0].max().item())
+            x_min = int(mask_indices[:, 1].min().item())
+            x_max = int(mask_indices[:, 1].max().item())
+            raw_mask_bbox_xyxy = [x_min, y_min, x_max + 1, y_max + 1]
+            raw_mask_bbox_area_pixels = int((y_max - y_min + 1) * (x_max - x_min + 1))
+            raw_mask_row_span_ratio = float(
+                (y_max - y_min + 1) / max(float(target_height), 1.0)
+            )
+            raw_mask_column_span_ratio = float(
+                (x_max - x_min + 1) / max(float(target_width), 1.0)
+            )
+            raw_mask_bbox_area_ratio = float(
+                raw_mask_bbox_area_pixels / max(float(total_pixel_count), 1.0)
+            )
+        normalized_gaussian_depth = self._normalize_gaussian_depth(gaussian_depth)
+        gaussian_depth_positive_ratio = 0.0
+        if normalized_gaussian_depth is not None and bool(raw_mask.any().item()):
+            gaussian_depth_positive_ratio = float(
+                (
+                    normalized_gaussian_depth[raw_mask]
+                    > float(self.IMMERSIVE_STARTUP_DEPTH_EPS)
+                )
+                .to(dtype=torch.float32)
+                .mean()
+                .item()
+            )
+        metric_inconsistency_reasons = []
+        if (
+            raw_mask_pixel_count > 0
+            and raw_mask_bbox_area_pixels > 0
+            and raw_mask_pixel_count > raw_mask_bbox_area_pixels
+        ):
+            metric_inconsistency_reasons.append("coverage_exceeds_bbox_area")
+        reported_raw_pixel_count = None
+        if (
+            reported_raw_coverage_ratio is not None
+            and total_pixel_count > 0
+        ):
+            reported_raw_pixel_count = int(
+                round(float(reported_raw_coverage_ratio) * float(total_pixel_count))
+            )
+            if abs(int(reported_raw_pixel_count) - int(raw_mask_pixel_count)) > 1:
+                metric_inconsistency_reasons.append(
+                    "reported_raw_coverage_mismatch"
+                )
+        metrics = {
+            "raw_gaussian_coverage_ratio": float(raw_gaussian_coverage_ratio),
+            "reported_raw_coverage_ratio": (
+                None
+                if reported_raw_coverage_ratio is None
+                else float(reported_raw_coverage_ratio)
+            ),
+            "raw_mask_pixel_count": int(raw_mask_pixel_count),
+            "raw_mask_bbox_area_pixels": int(raw_mask_bbox_area_pixels),
+            "total_pixel_count": int(total_pixel_count),
+            "reported_raw_pixel_count": (
+                None if reported_raw_pixel_count is None else int(reported_raw_pixel_count)
+            ),
+            "raw_mask_bbox_xyxy": raw_mask_bbox_xyxy,
+            "raw_mask_bbox_area_ratio": float(raw_mask_bbox_area_ratio),
+            "raw_mask_row_span_ratio": float(raw_mask_row_span_ratio),
+            "raw_mask_column_span_ratio": float(raw_mask_column_span_ratio),
+            "gaussian_depth_positive_ratio": float(gaussian_depth_positive_ratio),
+            "mask_metric_inconsistent": bool(metric_inconsistency_reasons),
+            "mask_metric_inconsistency_reasons": list(
+                metric_inconsistency_reasons
+            ),
+            "bbox_span_diagnostic_only": bool(metric_inconsistency_reasons),
+        }
+        return metrics, raw_alpha, raw_mask, normalized_gaussian_depth
+
+    def _save_immersive_compose_artifact_debug_bundle(
+        self,
+        output_dir,
+        *,
+        frames,
+        metadata,
+    ):
+        if not output_dir:
+            return
+        self._save_immersive_startup_debug_images(output_dir, frames)
+        os.makedirs(output_dir, exist_ok=True)
+        metadata_path = os.path.join(output_dir, "compose_artifact_debug.json")
+        with open(metadata_path, "w") as metadata_file:
+            json.dump(metadata, metadata_file, indent=2, sort_keys=True)
+
+    @torch.no_grad()
+    def _analyze_immersive_runtime_compose_artifact(
+        self,
+        *,
+        eye_label,
+        frame_index,
+        sample_id,
+        backend_kind,
+        path_kind,
+        compose_mode,
+        scene_color,
+        scene_depth,
+        gaussian_rgba,
+        gaussian_depth,
+        composed_pre_overlay,
+        compose_metrics,
+        interaction_context=None,
+        return_full=False,
+        count_summary=True,
+        update_history=True,
+        record_trigger=True,
+    ):
+        state = self._get_immersive_compose_artifact_debug_state()
+        if interaction_context is None:
+            interaction_context = {}
+        analysis_result = {
+            "artifact_token": None,
+            "eye_label": str(eye_label),
+            "frame_index": int(frame_index),
+            "sample_id": int(sample_id) if sample_id is not None else None,
+            "backend_kind": str(backend_kind),
+            "path_kind": str(path_kind),
+            "compose_mode": str(compose_mode),
+            "trigger_reasons": [],
+            "scene_depth_suppressed": False,
+            "gaussian_blue_source_evidence": False,
+            "blue_scene_exposure_evidence": False,
+            "interaction_context": copy.deepcopy(interaction_context),
+            "current_scalar_metrics": None,
+            "previous_scalar_metrics": None,
+            "delta_metrics": {},
+        }
+        if not state.get("enabled", False):
+            return analysis_result if return_full else None
+        with state["lock"]:
+            previous_metrics = (
+                copy.deepcopy(state["scalar_history_by_eye"][str(eye_label)][-1])
+                if state["scalar_history_by_eye"][str(eye_label)]
+                else None
+            )
+        interaction_active = bool(interaction_context.get("interaction_active", False))
+        interaction_window_active = bool(
+            interaction_context.get("interaction_window_active", False)
+        )
+        post_release_window_active = bool(
+            interaction_context.get("post_release_window_active", False)
+        )
+        if not (interaction_window_active or post_release_window_active):
+            if count_summary or update_history or record_trigger:
+                analysis_result = self._commit_immersive_runtime_compose_artifact_analysis(
+                    analysis_result,
+                    count_summary=count_summary,
+                    update_history=update_history,
+                    record_trigger=record_trigger,
+                )
+            return analysis_result if return_full else None
+
+        source_mask_metrics, raw_alpha, raw_mask, normalized_gaussian_depth = (
+            self._compute_immersive_gaussian_source_mask_metrics(
+                gaussian_rgba,
+                gaussian_depth,
+                reported_raw_coverage_ratio=compose_metrics.get(
+                    "raw_gaussian_coverage_ratio"
+                ),
+            )
+        )
+        if bool(source_mask_metrics.get("mask_metric_inconsistent", False)):
+            self._record_immersive_compose_metric_inconsistency(
+                eye_label=eye_label,
+                frame_index=frame_index,
+                sample_id=sample_id,
+                backend_kind=backend_kind,
+                path_kind=path_kind,
+                compose_mode=compose_mode,
+                source_mask_metrics=source_mask_metrics,
+            )
+        raw_coverage_ratio = float(
+            source_mask_metrics.get("raw_gaussian_coverage_ratio", 0.0)
+        )
+        analysis_min_raw_coverage_ratio = 0.001
+        if post_release_window_active and not interaction_active:
+            analysis_min_raw_coverage_ratio = float(
+                self.IMMERSIVE_COMPOSE_POST_RELEASE_RAW_MIN_COVERAGE_RATIO
+            )
+        if raw_coverage_ratio < float(analysis_min_raw_coverage_ratio):
+            if count_summary or update_history or record_trigger:
+                analysis_result = self._commit_immersive_runtime_compose_artifact_analysis(
+                    analysis_result,
+                    count_summary=count_summary,
+                    update_history=update_history,
+                    record_trigger=record_trigger,
+                )
+            return analysis_result if return_full else None
+        visible_coverage_ratio = float(
+            compose_metrics.get("visible_gaussian_coverage_ratio", 0.0)
+        )
+        visible_retention_ratio = float(
+            compose_metrics.get(
+                "visible_retention_ratio",
+                visible_coverage_ratio / max(raw_coverage_ratio, 1e-6),
+            )
+        )
+        scene_depth_invalid = bool(compose_metrics.get("scene_depth_invalid", False))
+        scene_depth_suppressed = bool(compose_metrics.get("scene_depth_suppressed", False))
+
+        scene_rgb = scene_color[..., :3].detach().to(dtype=torch.float32)
+        gaussian_rgb = (
+            gaussian_rgba[:3]
+            .detach()
+            .permute(1, 2, 0)
+            .contiguous()
+            .to(dtype=torch.float32)
+            * 255.0
+        )
+        composed_rgb = composed_pre_overlay[..., :3].detach().to(dtype=torch.float32)
+        gaussian_mean_rgb = self._immersive_masked_mean_rgb(gaussian_rgb, raw_mask)
+        scene_under_mask_mean_rgb = self._immersive_masked_mean_rgb(scene_rgb, raw_mask)
+        composed_under_mask_mean_rgb = self._immersive_masked_mean_rgb(
+            composed_rgb,
+            raw_mask,
+        )
+        gaussian_depth_positive_ratio = float(
+            source_mask_metrics.get("gaussian_depth_positive_ratio", 0.0)
+        )
+
+        gaussian_blue_excess = self._immersive_blue_excess(gaussian_mean_rgb)
+        scene_blue_excess = self._immersive_blue_excess(scene_under_mask_mean_rgb)
+        composed_blue_excess = self._immersive_blue_excess(composed_under_mask_mean_rgb)
+        previous_visible_retention_ratio = (
+            None
+            if previous_metrics is None
+            else float(previous_metrics.get("visible_retention_ratio", 0.0))
+        )
+        visible_retention_change = (
+            0.0
+            if previous_visible_retention_ratio is None
+            else float(visible_retention_ratio - previous_visible_retention_ratio)
+        )
+        previous_gaussian_mean_rgb = (
+            None if previous_metrics is None else previous_metrics.get("gaussian_mean_rgb")
+        )
+        previous_composed_mean_rgb = (
+            None
+            if previous_metrics is None
+            else previous_metrics.get("composed_under_mask_mean_rgb")
+        )
+        previous_gaussian_blue_excess = (
+            0.0
+            if previous_metrics is None
+            else float(previous_metrics.get("gaussian_blue_excess", 0.0))
+        )
+        previous_composed_blue_excess = (
+            0.0
+            if previous_metrics is None
+            else float(previous_metrics.get("composed_blue_excess", 0.0))
+        )
+        gaussian_rgb_change = self._immersive_mean_rgb_abs_delta(
+            gaussian_mean_rgb,
+            previous_gaussian_mean_rgb,
+        )
+        composed_rgb_change = self._immersive_mean_rgb_abs_delta(
+            composed_under_mask_mean_rgb,
+            previous_composed_mean_rgb,
+        )
+        gaussian_blue_excess_change = float(
+            gaussian_blue_excess - previous_gaussian_blue_excess
+        )
+        composed_blue_excess_change = float(
+            composed_blue_excess - previous_composed_blue_excess
+        )
+
+        trigger_reasons = []
+        if scene_depth_suppressed:
+            trigger_reasons.append("scene_depth_suppressed")
+        if (
+            previous_metrics is not None
+            and visible_retention_ratio < 0.70
+            and visible_retention_change <= -0.20
+        ):
+            trigger_reasons.append("low_visible_retention_drop")
+        if (
+            composed_blue_excess >= max(24.0, gaussian_blue_excess + 12.0)
+            and (
+                previous_metrics is None
+                or (
+                    composed_blue_excess_change >= 12.0
+                    and composed_rgb_change >= 24.0
+                )
+            )
+        ):
+            trigger_reasons.append("blue_scene_exposure")
+        if (
+            gaussian_blue_excess >= 24.0
+            and (
+                previous_metrics is None
+                or (
+                    gaussian_blue_excess_change >= 12.0
+                    and gaussian_rgb_change >= 24.0
+                )
+            )
+        ):
+            trigger_reasons.append("gaussian_blue_source")
+        if (
+            previous_metrics is not None
+            and composed_rgb_change >= 24.0
+            and composed_blue_excess_change >= 10.0
+            and composed_blue_excess >= (gaussian_blue_excess + 8.0)
+        ):
+            if "blue_scene_exposure" not in trigger_reasons:
+                trigger_reasons.append("blue_scene_exposure")
+        recent_release_sources = list(
+            interaction_context.get("recent_release_sources", [])
+        )
+        if (
+            post_release_window_active
+            and not interaction_active
+            and "right" in recent_release_sources
+            and raw_coverage_ratio
+            >= float(self.IMMERSIVE_COMPOSE_POST_RELEASE_RAW_MIN_COVERAGE_RATIO)
+            and gaussian_depth_positive_ratio >= 0.95
+            and not scene_depth_invalid
+            and "gaussian_blue_source" not in trigger_reasons
+            and (
+                (
+                    previous_metrics is not None
+                    and visible_retention_ratio < 0.60
+                    and visible_retention_change <= -0.15
+                )
+                or (
+                    composed_blue_excess >= (gaussian_blue_excess + 6.0)
+                    and (
+                        previous_metrics is None
+                        or composed_blue_excess_change >= 8.0
+                    )
+                )
+            )
+        ):
+            trigger_reasons.append("post_release_occluded_fall_blue_exposure")
+
+        gaussian_blue_source_evidence = "gaussian_blue_source" in trigger_reasons
+        blue_scene_exposure_evidence = "blue_scene_exposure" in trigger_reasons
+        current_scalar_metrics = {
+            "frame_index": int(frame_index),
+            "sample_id": None if sample_id is None else int(sample_id),
+            "interaction_active": bool(interaction_active),
+            "interaction_window_active": bool(interaction_window_active),
+            "post_release_window_active": bool(post_release_window_active),
+            "cooldown_active": bool(interaction_context.get("cooldown_active", False)),
+            "active_sources": list(interaction_context.get("active_sources", [])),
+            "recent_release_sources": list(recent_release_sources),
+            "right_interaction_active": bool(
+                interaction_context.get("right_interaction_active", False)
+            ),
+            "last_release_frame_index": interaction_context.get(
+                "last_release_frame_index", -1
+            ),
+            "release_frame_distance": interaction_context.get(
+                "release_frame_distance"
+            ),
+            "post_release_window_frames": int(
+                interaction_context.get(
+                    "post_release_window_frames",
+                    self.IMMERSIVE_COMPOSE_POST_RELEASE_WINDOW_FRAMES,
+                )
+            ),
+            "analysis_min_raw_coverage_ratio": float(
+                analysis_min_raw_coverage_ratio
+            ),
+            "raw_gaussian_coverage_ratio": raw_coverage_ratio,
+            "visible_gaussian_coverage_ratio": visible_coverage_ratio,
+            "visible_retention_ratio": visible_retention_ratio,
+            "scene_depth_invalid": scene_depth_invalid,
+            "scene_depth_suppressed": scene_depth_suppressed,
+            "gaussian_mean_rgb": list(gaussian_mean_rgb),
+            "scene_under_mask_mean_rgb": list(scene_under_mask_mean_rgb),
+            "composed_under_mask_mean_rgb": list(composed_under_mask_mean_rgb),
+            "gaussian_blue_excess": gaussian_blue_excess,
+            "scene_blue_excess": scene_blue_excess,
+            "composed_blue_excess": composed_blue_excess,
+            "gaussian_depth_positive_ratio": gaussian_depth_positive_ratio,
+            "raw_mask_bbox_xyxy": source_mask_metrics.get("raw_mask_bbox_xyxy"),
+            "raw_mask_bbox_area_ratio": float(
+                source_mask_metrics.get("raw_mask_bbox_area_ratio", 0.0)
+            ),
+            "raw_mask_row_span_ratio": float(
+                source_mask_metrics.get("raw_mask_row_span_ratio", 0.0)
+            ),
+            "raw_mask_column_span_ratio": float(
+                source_mask_metrics.get("raw_mask_column_span_ratio", 0.0)
+            ),
+            "mask_metric_inconsistent": bool(
+                source_mask_metrics.get("mask_metric_inconsistent", False)
+            ),
+            "mask_metric_inconsistency_reasons": list(
+                source_mask_metrics.get("mask_metric_inconsistency_reasons", [])
+            ),
+            "bbox_span_diagnostic_only": bool(
+                source_mask_metrics.get("bbox_span_diagnostic_only", False)
+            ),
+        }
+        delta_metrics = {
+            "visible_retention_change": visible_retention_change,
+            "gaussian_rgb_change": gaussian_rgb_change,
+            "composed_rgb_change": composed_rgb_change,
+            "gaussian_blue_excess_change": gaussian_blue_excess_change,
+            "composed_blue_excess_change": composed_blue_excess_change,
+        }
+        analysis_result.update(
+            {
+                "trigger_reasons": list(trigger_reasons),
+                "scene_depth_suppressed": bool(scene_depth_suppressed),
+                "gaussian_blue_source_evidence": bool(
+                    gaussian_blue_source_evidence
+                ),
+                "blue_scene_exposure_evidence": bool(
+                    blue_scene_exposure_evidence
+                ),
+                "interaction_context": {
+                    "interaction_active": bool(interaction_active),
+                    "interaction_window_active": bool(interaction_window_active),
+                    "post_release_window_active": bool(post_release_window_active),
+                    "cooldown_active": bool(
+                        interaction_context.get("cooldown_active", False)
+                    ),
+                    "active_sources": list(
+                        interaction_context.get("active_sources", [])
+                    ),
+                    "last_active_sources": list(
+                        interaction_context.get("last_active_sources", [])
+                    ),
+                    "right_interaction_active": bool(
+                        interaction_context.get("right_interaction_active", False)
+                    ),
+                    "last_interaction_frame_index": interaction_context.get(
+                        "last_interaction_frame_index", -1
+                    ),
+                    "recent_release_sources": list(recent_release_sources),
+                    "last_release_frame_index": interaction_context.get(
+                        "last_release_frame_index", -1
+                    ),
+                    "release_frame_distance": interaction_context.get(
+                        "release_frame_distance"
+                    ),
+                    "post_release_window_frames": int(
+                        interaction_context.get(
+                            "post_release_window_frames",
+                            self.IMMERSIVE_COMPOSE_POST_RELEASE_WINDOW_FRAMES,
+                        )
+                    ),
+                },
+                "current_scalar_metrics": copy.deepcopy(current_scalar_metrics),
+                "previous_scalar_metrics": copy.deepcopy(previous_metrics),
+                "delta_metrics": dict(delta_metrics),
+            }
+        )
+        if count_summary or update_history or record_trigger:
+            analysis_result = self._commit_immersive_runtime_compose_artifact_analysis(
+                analysis_result,
+                count_summary=count_summary,
+                update_history=update_history,
+                record_trigger=record_trigger,
+            )
+        if return_full:
+            return analysis_result
+        if analysis_result.get("trigger_reasons"):
+            return analysis_result.get("artifact_token")
+        return None
+
+    def _commit_immersive_runtime_compose_artifact_analysis(
+        self,
+        analysis_result,
+        *,
+        count_summary=True,
+        update_history=True,
+        record_trigger=True,
+    ):
+        if analysis_result is None:
+            return None
+        state = self._get_immersive_compose_artifact_debug_state()
+        if not state.get("enabled", False):
+            return analysis_result
+        eye_label = str(analysis_result.get("eye_label", "unknown"))
+        interaction_context = analysis_result.get("interaction_context") or {}
+        interaction_window_active = bool(
+            interaction_context.get("interaction_window_active", False)
+        ) or bool(interaction_context.get("post_release_window_active", False))
+        current_scalar_metrics = analysis_result.get("current_scalar_metrics")
+        trigger_reasons = list(analysis_result.get("trigger_reasons") or [])
+        summary_enabled = bool(state.get("summary_enabled", False))
+        capture_enabled = bool(state.get("capture_enabled", False))
+        with state["lock"]:
+            if count_summary and summary_enabled:
+                state["analyzed_frame_count"] += 1
+                if interaction_window_active:
+                    state["interaction_gated_analyzed_frame_count"] += 1
+            if update_history and current_scalar_metrics is not None:
+                state["scalar_history_by_eye"][eye_label].append(
+                    copy.deepcopy(current_scalar_metrics)
+                )
+            if (
+                record_trigger
+                and capture_enabled
+                and current_scalar_metrics is not None
+                and trigger_reasons
+            ):
+                entry_id = int(state["next_entry_id"])
+                state["next_entry_id"] += 1
+                entry = {
+                    "entry_id": entry_id,
+                    "eye_label": eye_label,
+                    "frame_index": int(analysis_result.get("frame_index", -1)),
+                    "sample_id": analysis_result.get("sample_id"),
+                    "backend_kind": str(analysis_result.get("backend_kind", "")),
+                    "path_kind": str(analysis_result.get("path_kind", "")),
+                    "compose_mode": str(analysis_result.get("compose_mode", "")),
+                    "trigger_reasons": list(trigger_reasons),
+                    "scene_depth_suppressed": bool(
+                        analysis_result.get("scene_depth_suppressed", False)
+                    ),
+                    "gaussian_blue_source_evidence": bool(
+                        analysis_result.get("gaussian_blue_source_evidence", False)
+                    ),
+                    "blue_scene_exposure_evidence": bool(
+                        analysis_result.get("blue_scene_exposure_evidence", False)
+                    ),
+                    "interaction_context": copy.deepcopy(interaction_context),
+                    "current_scalar_metrics": copy.deepcopy(current_scalar_metrics),
+                    "previous_scalar_metrics": copy.deepcopy(
+                        analysis_result.get("previous_scalar_metrics")
+                    ),
+                    "delta_metrics": copy.deepcopy(
+                        analysis_result.get("delta_metrics")
+                    ),
+                }
+                state["pending_trigger_by_eye"][eye_label] = entry
+                analysis_result["artifact_token"] = (eye_label, entry_id)
+        return analysis_result
+
+    def _record_immersive_stable_compose_stabilization_outcome(
+        self,
+        *,
+        pre_analysis,
+        stabilization_result,
+        final_analysis,
+    ):
+        if pre_analysis is None or stabilization_result is None:
+            return
+        if not bool(stabilization_result.get("candidate", False)):
+            return
+        state = self._get_immersive_compose_artifact_debug_state()
+        if not state.get("enabled", False) or not state.get("summary_enabled", False):
+            return
+        pre_reasons = set(pre_analysis.get("trigger_reasons") or [])
+        final_reasons = set((final_analysis or {}).get("trigger_reasons") or [])
+        with state["lock"]:
+            state["pre_stabilization_candidate_count"] += 1
+            if "blue_scene_exposure" in pre_reasons:
+                state["pre_stabilization_blue_scene_exposure_count"] += 1
+            if "post_release_occluded_fall_blue_exposure" in pre_reasons:
+                state["pre_stabilization_post_release_occluded_fall_count"] += 1
+            if bool(pre_analysis.get("scene_depth_suppressed", False)):
+                state["pre_stabilization_depth_suppression_count"] += 1
+            if bool(stabilization_result.get("applied", False)):
+                state["stabilization_applied_count"] += 1
+                state["stabilization_wall_ms_total"] += float(
+                    stabilization_result.get("repair_wall_ms", 0.0)
+                )
+                state["stabilization_wall_ms_count"] += 1
+                if (
+                    "blue_scene_exposure" in pre_reasons
+                    and "blue_scene_exposure" not in final_reasons
+                ):
+                    state["stabilization_prevented_blue_exposure_count"] += 1
+                if (
+                    "post_release_occluded_fall_blue_exposure" in pre_reasons
+                    and "post_release_occluded_fall_blue_exposure"
+                    not in final_reasons
+                ):
+                    state[
+                        "stabilization_prevented_post_release_occluded_fall_count"
+                    ] += 1
+                if bool(pre_analysis.get("scene_depth_suppressed", False)) and not bool(
+                    (final_analysis or {}).get("scene_depth_suppressed", False)
+                ):
+                    state["stabilization_prevented_depth_suppression_count"] += 1
+
+    def _record_immersive_stable_compose_stabilization_fallback_reject(
+        self,
+        *analyses,
+    ):
+        state = self._get_immersive_compose_artifact_debug_state()
+        if not state.get("enabled", False) or not state.get("summary_enabled", False):
+            return
+        increment = 0
+        for analysis in analyses:
+            if not analysis:
+                continue
+            stabilization = analysis.get("stabilization") or {}
+            if bool(stabilization.get("applied", False)):
+                increment += 1
+        if increment <= 0:
+            return
+        with state["lock"]:
+            state["stabilization_fallback_reject_count"] += int(increment)
+
+    def _maybe_apply_immersive_stable_compose_stabilization(
+        self,
+        *,
+        compose_mode,
+        scene_color_rgba,
+        scene_depth,
+        gaussian_rgba,
+        gaussian_depth,
+        composed_pre_overlay,
+        composed_pre_overlay_depth,
+        first_pass_analysis,
+        first_pass_compose_metrics,
+    ):
+        result = {
+            "candidate": False,
+            "applied": False,
+            "repair_reason": "not_candidate",
+            "repair_trigger_reasons": list(
+                (first_pass_analysis or {}).get("trigger_reasons") or []
+            ),
+            "repaired_roi_ratio": 0.0,
+            "repaired_pixel_ratio": 0.0,
+            "repair_wall_ms": 0.0,
+            "composed_pre_overlay": composed_pre_overlay,
+            "composed_pre_overlay_depth": composed_pre_overlay_depth,
+            "compose_metrics": copy.deepcopy(first_pass_compose_metrics or {}),
+        }
+        if (
+            first_pass_analysis is None
+            or str(compose_mode).strip().lower() != "depth_aware"
+        ):
+            result["repair_reason"] = "compose_mode_ineligible"
+            return result
+        interaction_context = first_pass_analysis.get("interaction_context") or {}
+        trigger_reasons = set(first_pass_analysis.get("trigger_reasons") or [])
+        active_interaction_sources = list(interaction_context.get("active_sources", []))
+        if not active_interaction_sources:
+            active_interaction_sources = list(
+                interaction_context.get("last_active_sources", [])
+            )
+        recent_release_sources = list(
+            interaction_context.get("recent_release_sources", [])
+        )
+        post_release_window_active = bool(
+            interaction_context.get("post_release_window_active", False)
+        )
+        interaction_active = bool(interaction_context.get("interaction_active", False))
+        active_grab_candidate = bool(
+            "right" in active_interaction_sources
+            and (
+                "blue_scene_exposure" in trigger_reasons
+                or "scene_depth_suppressed" in trigger_reasons
+            )
+        )
+        post_release_candidate = bool(
+            post_release_window_active
+            and not interaction_active
+            and "right" in recent_release_sources
+            and (
+                "post_release_occluded_fall_blue_exposure" in trigger_reasons
+                or "scene_depth_suppressed" in trigger_reasons
+            )
+        )
+        if not (active_grab_candidate or post_release_candidate):
+            result["repair_reason"] = "non_right_interaction_window"
+            return result
+        if not (
+            "blue_scene_exposure" in trigger_reasons
+            or "post_release_occluded_fall_blue_exposure" in trigger_reasons
+            or "scene_depth_suppressed" in trigger_reasons
+        ):
+            result["repair_reason"] = "no_residual_failure_signature"
+            return result
+        if "gaussian_blue_source" in trigger_reasons:
+            result["repair_reason"] = "gaussian_blue_source"
+            return result
+        current_metrics = first_pass_analysis.get("current_scalar_metrics") or {}
+        raw_coverage_ratio = float(
+            current_metrics.get("raw_gaussian_coverage_ratio", 0.0)
+        )
+        min_raw_coverage_ratio = float(
+            self.IMMERSIVE_STABLE_COMPOSE_STABILIZATION_RAW_MIN_COVERAGE_RATIO
+        )
+        if post_release_candidate:
+            min_raw_coverage_ratio = float(
+                self.IMMERSIVE_COMPOSE_POST_RELEASE_RAW_MIN_COVERAGE_RATIO
+            )
+        if raw_coverage_ratio < float(min_raw_coverage_ratio) or raw_coverage_ratio > float(
+            self.IMMERSIVE_STABLE_COMPOSE_STABILIZATION_RAW_MAX_COVERAGE_RATIO
+        ):
+            result["repair_reason"] = "raw_coverage_out_of_band"
+            return result
+        gaussian_depth_positive_ratio = float(
+            current_metrics.get("gaussian_depth_positive_ratio", 0.0)
+        )
+        if gaussian_depth_positive_ratio < float(
+            self.IMMERSIVE_STABLE_COMPOSE_STABILIZATION_MIN_DEPTH_POSITIVE_RATIO
+        ):
+            result["repair_reason"] = "gaussian_depth_not_confident"
+            return result
+        result["candidate"] = True
+        repair_start = time.perf_counter()
+        target_height = int(composed_pre_overlay.shape[0])
+        target_width = int(composed_pre_overlay.shape[1])
+        scene_color_t, scene_depth_t = self._prepare_immersive_scene_frame_for_compose(
+            scene_color_rgba,
+            scene_depth,
+            target_height,
+            target_width,
+            compose_cache=None,
+        )
+        gaussian_depth_t = self._normalize_gaussian_depth(gaussian_depth)
+        if gaussian_depth_t is None:
+            result["repair_reason"] = "missing_gaussian_depth"
+            return result
+        source_mask_metrics, _, raw_mask, _ = (
+            self._compute_immersive_gaussian_source_mask_metrics(
+                gaussian_rgba,
+                gaussian_depth_t,
+                reported_raw_coverage_ratio=current_metrics.get(
+                    "raw_gaussian_coverage_ratio"
+                ),
+            )
+        )
+        bbox_xyxy = source_mask_metrics.get("raw_mask_bbox_xyxy")
+        if not bbox_xyxy or len(bbox_xyxy) != 4:
+            result["repair_reason"] = "missing_raw_mask_bbox"
+            return result
+        padding = int(self.IMMERSIVE_STABLE_COMPOSE_STABILIZATION_ROI_PADDING)
+        x0 = max(0, int(bbox_xyxy[0]) - padding)
+        y0 = max(0, int(bbox_xyxy[1]) - padding)
+        x1 = min(target_width, int(bbox_xyxy[2]) + padding)
+        y1 = min(target_height, int(bbox_xyxy[3]) + padding)
+        if x1 <= x0 or y1 <= y0:
+            result["repair_reason"] = "empty_repair_roi"
+            return result
+        object_rgba = gaussian_rgba.detach().permute(1, 2, 0).contiguous().clamp(
+            0.0, 1.0
+        )
+        raw_alpha = object_rgba[..., 3]
+        scene_has_geometry = scene_depth_t > 0.0
+        object_has_depth = gaussian_depth_t > 0.0
+        visible_mask = object_has_depth & (
+            (~scene_has_geometry) | (gaussian_depth_t <= (scene_depth_t + 5e-3))
+        )
+        repair_mask = raw_mask[y0:y1, x0:x1] & object_has_depth[y0:y1, x0:x1]
+        if not bool(repair_mask.any().item()):
+            result["repair_reason"] = "repair_mask_empty"
+            return result
+        repaired_rgb = composed_pre_overlay[..., :3].detach().to(
+            dtype=torch.float32
+        ).clone()
+        repaired_depth = composed_pre_overlay_depth.detach().clone()
+        raw_alpha_roi = raw_alpha[y0:y1, x0:x1].unsqueeze(-1)
+        scene_rgb_roi = scene_color_t[y0:y1, x0:x1, :3].to(dtype=torch.float32)
+        gaussian_rgb_roi = object_rgba[y0:y1, x0:x1, :3].to(dtype=torch.float32) * 255.0
+        repaired_rgb_roi = scene_rgb_roi * (1.0 - raw_alpha_roi) + (
+            gaussian_rgb_roi * raw_alpha_roi
+        )
+        repaired_rgb_view = repaired_rgb[y0:y1, x0:x1]
+        repaired_rgb_view[repair_mask] = repaired_rgb_roi[repair_mask]
+        repaired_depth_view = repaired_depth[y0:y1, x0:x1]
+        repaired_depth_view[repair_mask] = gaussian_depth_t[y0:y1, x0:x1][repair_mask]
+        repaired_frame = composed_pre_overlay.clone()
+        if repaired_frame.dtype == torch.uint8:
+            repaired_frame[..., :3] = repaired_rgb.clamp(0.0, 255.0).to(torch.uint8)
+        else:
+            repaired_frame[..., :3] = repaired_rgb.clamp(0.0, 255.0).to(
+                repaired_frame.dtype
+            )
+        repaired_visible_mask = visible_mask.clone()
+        repaired_visible_mask[y0:y1, x0:x1] = (
+            repaired_visible_mask[y0:y1, x0:x1] | repair_mask
+        )
+        visible_gaussian_coverage_ratio = float(
+            repaired_visible_mask.to(dtype=torch.float32).mean().item()
+        )
+        visible_retention_ratio = (
+            visible_gaussian_coverage_ratio / max(raw_coverage_ratio, 1e-6)
+            if raw_coverage_ratio > 0.0
+            else 1.0
+        )
+        repaired_compose_metrics = copy.deepcopy(first_pass_compose_metrics or {})
+        repaired_compose_metrics["visible_gaussian_coverage_ratio"] = float(
+            visible_gaussian_coverage_ratio
+        )
+        repaired_compose_metrics["visible_retention_ratio"] = float(
+            visible_retention_ratio
+        )
+        repaired_compose_metrics["scene_depth_suppressed"] = bool(
+            compose_mode == "depth_aware"
+            and raw_coverage_ratio >= float(self.IMMERSIVE_COMPOSE_RAW_MIN_COVERAGE_RATIO)
+            and visible_gaussian_coverage_ratio
+            <= float(self.IMMERSIVE_COMPOSE_VISIBLE_MIN_COVERAGE_RATIO)
+            and visible_retention_ratio
+            < float(self.IMMERSIVE_COMPOSE_MIN_RETENTION_RATIO)
+        )
+        result.update(
+            {
+                "applied": True,
+                "repair_reason": (
+                    "post_release_local_depth_bypass"
+                    if post_release_candidate
+                    else "interaction_local_depth_bypass"
+                ),
+                "repaired_roi_ratio": float(
+                    ((x1 - x0) * (y1 - y0))
+                    / max(float(target_height * target_width), 1.0)
+                ),
+                "repaired_pixel_ratio": float(
+                    repair_mask.to(dtype=torch.float32).sum().item()
+                    / max(float(target_height * target_width), 1.0)
+                ),
+                "repair_wall_ms": float((time.perf_counter() - repair_start) * 1000.0),
+                "composed_pre_overlay": repaired_frame,
+                "composed_pre_overlay_depth": repaired_depth,
+                "compose_metrics": repaired_compose_metrics,
+            }
+        )
+        return result
+
+    def _stabilize_immersive_stable_compose_eye(
+        self,
+        *,
+        eye_label,
+        frame_index,
+        sample_id,
+        backend_kind,
+        path_kind,
+        compose_mode,
+        scene_color,
+        scene_depth,
+        gaussian_rgba,
+        gaussian_depth,
+        composed_pre_overlay,
+        composed_pre_overlay_depth,
+        compose_metrics,
+        interaction_context,
+    ):
+        first_pass_analysis = self._analyze_immersive_runtime_compose_artifact(
+            eye_label=eye_label,
+            frame_index=frame_index,
+            sample_id=sample_id,
+            backend_kind=backend_kind,
+            path_kind=path_kind,
+            compose_mode=compose_mode,
+            scene_color=scene_color,
+            scene_depth=scene_depth,
+            gaussian_rgba=gaussian_rgba,
+            gaussian_depth=gaussian_depth,
+            composed_pre_overlay=composed_pre_overlay,
+            compose_metrics=compose_metrics or {},
+            interaction_context=interaction_context,
+            return_full=True,
+            count_summary=False,
+            update_history=False,
+            record_trigger=False,
+        )
+        stabilization_result = self._maybe_apply_immersive_stable_compose_stabilization(
+            compose_mode=compose_mode,
+            scene_color_rgba=scene_color,
+            scene_depth=scene_depth,
+            gaussian_rgba=gaussian_rgba,
+            gaussian_depth=gaussian_depth,
+            composed_pre_overlay=composed_pre_overlay,
+            composed_pre_overlay_depth=composed_pre_overlay_depth,
+            first_pass_analysis=first_pass_analysis,
+            first_pass_compose_metrics=compose_metrics or {},
+        )
+        if bool(stabilization_result.get("applied", False)):
+            final_analysis = self._analyze_immersive_runtime_compose_artifact(
+                eye_label=eye_label,
+                frame_index=frame_index,
+                sample_id=sample_id,
+                backend_kind=backend_kind,
+                path_kind=path_kind,
+                compose_mode=compose_mode,
+                scene_color=scene_color,
+                scene_depth=scene_depth,
+                gaussian_rgba=gaussian_rgba,
+                gaussian_depth=gaussian_depth,
+                composed_pre_overlay=stabilization_result["composed_pre_overlay"],
+                compose_metrics=stabilization_result["compose_metrics"] or {},
+                interaction_context=interaction_context,
+                return_full=True,
+            )
+        else:
+            final_analysis = self._commit_immersive_runtime_compose_artifact_analysis(
+                copy.deepcopy(first_pass_analysis),
+                count_summary=True,
+                update_history=True,
+                record_trigger=True,
+            )
+        if final_analysis is None:
+            final_analysis = {}
+        final_analysis["stabilization"] = {
+            "candidate": bool(stabilization_result.get("candidate", False)),
+            "applied": bool(stabilization_result.get("applied", False)),
+            "repair_reason": str(stabilization_result.get("repair_reason", "")),
+            "repair_trigger_reasons": list(
+                stabilization_result.get("repair_trigger_reasons", [])
+            ),
+            "repaired_roi_ratio": float(
+                stabilization_result.get("repaired_roi_ratio", 0.0)
+            ),
+            "repaired_pixel_ratio": float(
+                stabilization_result.get("repaired_pixel_ratio", 0.0)
+            ),
+            "repair_wall_ms": float(
+                stabilization_result.get("repair_wall_ms", 0.0)
+            ),
+        }
+        final_analysis["pre_stabilization"] = {
+            "trigger_reasons": list(first_pass_analysis.get("trigger_reasons") or []),
+            "scene_depth_suppressed": bool(
+                first_pass_analysis.get("scene_depth_suppressed", False)
+            ),
+            "blue_scene_exposure_evidence": bool(
+                first_pass_analysis.get("blue_scene_exposure_evidence", False)
+            ),
+            "gaussian_blue_source_evidence": bool(
+                first_pass_analysis.get("gaussian_blue_source_evidence", False)
+            ),
+            "current_scalar_metrics": copy.deepcopy(
+                first_pass_analysis.get("current_scalar_metrics")
+            ),
+            "delta_metrics": copy.deepcopy(first_pass_analysis.get("delta_metrics")),
+        }
+        self._record_immersive_stable_compose_stabilization_outcome(
+            pre_analysis=first_pass_analysis,
+            stabilization_result=stabilization_result,
+            final_analysis=final_analysis,
+        )
+        return {
+            "final_eye_frame": stabilization_result.get(
+                "composed_pre_overlay", composed_pre_overlay
+            ),
+            "final_eye_frame_depth": stabilization_result.get(
+                "composed_pre_overlay_depth", composed_pre_overlay_depth
+            ),
+            "final_compose_metrics": stabilization_result.get(
+                "compose_metrics", compose_metrics
+            ),
+            "final_analysis": final_analysis,
+            "artifact_token": final_analysis.get("artifact_token"),
+            "pre_stabilization_frame": (
+                composed_pre_overlay.clone()
+                if bool(stabilization_result.get("applied", False))
+                else None
+            ),
+        }
+
+    def _evaluate_immersive_stable_compose_safety_gate(
+        self,
+        *,
+        left_analysis,
+        right_analysis,
+    ):
+        reject_publish = False
+        trigger_reasons = []
+        affected_sources = []
+        per_eye_metrics = {}
+        rejected_eyes = []
+        blue_scene_exposure_reject = False
+        gaussian_blue_source_reject = False
+        for eye_label, analysis in (
+            ("left", left_analysis),
+            ("right", right_analysis),
+        ):
+            if not analysis:
+                continue
+            interaction_context = analysis.get("interaction_context") or {}
+            if not (
+                bool(interaction_context.get("interaction_window_active", False))
+                or bool(interaction_context.get("post_release_window_active", False))
+            ):
+                continue
+            eye_reasons = [
+                str(reason)
+                for reason in (analysis.get("trigger_reasons") or [])
+                if str(reason)
+                in {
+                    "blue_scene_exposure",
+                    "post_release_occluded_fall_blue_exposure",
+                    "gaussian_blue_source",
+                }
+            ]
+            if not eye_reasons:
+                continue
+            reject_publish = True
+            rejected_eyes.append(str(eye_label))
+            blue_scene_exposure_reject = blue_scene_exposure_reject or bool(
+                analysis.get("blue_scene_exposure_evidence", False)
+                or "post_release_occluded_fall_blue_exposure" in eye_reasons
+            )
+            gaussian_blue_source_reject = (
+                gaussian_blue_source_reject
+                or bool(analysis.get("gaussian_blue_source_evidence", False))
+            )
+            for reason in eye_reasons:
+                if reason not in trigger_reasons:
+                    trigger_reasons.append(reason)
+            interaction_sources = list(interaction_context.get("active_sources", []))
+            if not interaction_sources:
+                interaction_sources = list(
+                    interaction_context.get("last_active_sources", [])
+                )
+            for source in interaction_context.get("recent_release_sources", []) or []:
+                normalized_source = str(source).strip().lower()
+                if normalized_source in {"left", "right"}:
+                    interaction_sources.append(normalized_source)
+            for source in interaction_sources:
+                normalized_source = str(source).strip().lower()
+                if normalized_source in {"left", "right"} and normalized_source not in affected_sources:
+                    affected_sources.append(normalized_source)
+            per_eye_metrics[str(eye_label)] = {
+                "trigger_reasons": list(eye_reasons),
+                "current_scalar_metrics": copy.deepcopy(
+                    analysis.get("current_scalar_metrics")
+                ),
+                "previous_scalar_metrics": copy.deepcopy(
+                    analysis.get("previous_scalar_metrics")
+                ),
+                "delta_metrics": copy.deepcopy(analysis.get("delta_metrics")),
+                "pre_stabilization": copy.deepcopy(
+                    analysis.get("pre_stabilization")
+                ),
+                "stabilization": copy.deepcopy(analysis.get("stabilization")),
+            }
+        return {
+            "reject_publish": bool(reject_publish),
+            "trigger_reasons": list(trigger_reasons),
+            "affected_sources": list(affected_sources),
+            "rejected_eyes": list(rejected_eyes),
+            "blue_scene_exposure_reject": bool(blue_scene_exposure_reject),
+            "gaussian_blue_source_reject": bool(
+                gaussian_blue_source_reject
+            ),
+            "per_eye_metrics": per_eye_metrics,
+        }
+
+    def _finalize_immersive_runtime_compose_artifact(
+        self,
+        artifact_token,
+        *,
+        scene_color,
+        scene_depth,
+        gaussian_rgba,
+        gaussian_depth,
+        composed_pre_overlay,
+        final_post_overlay,
+        compose_mode,
+        pre_stabilization_composed_pre_overlay=None,
+        extra_metadata=None,
+    ):
+        if artifact_token is None:
+            return
+        state = self._get_immersive_compose_artifact_debug_state()
+        if not state.get("enabled", False):
+            return
+        summary_enabled = bool(state.get("summary_enabled", False))
+        capture_enabled = bool(state.get("capture_enabled", False))
+        output_dir = state.get("output_dir")
+        eye_label = str(artifact_token[0])
+        with state["lock"]:
+            entry = state["pending_trigger_by_eye"].get(eye_label)
+            if entry is None or int(entry.get("entry_id", -1)) != int(artifact_token[1]):
+                return
+            state["pending_trigger_by_eye"][eye_label] = None
+            if summary_enabled:
+                state["suspicious_frame_count"] += 1
+                if entry.get("scene_depth_suppressed", False):
+                    state["depth_suppression_suspicious_count"] += 1
+                if entry.get("blue_scene_exposure_evidence", False):
+                    state["blue_scene_exposure_suspicious_count"] += 1
+                if "post_release_occluded_fall_blue_exposure" in (
+                    entry.get("trigger_reasons") or []
+                ):
+                    state["post_release_occluded_fall_suspicious_count"] = int(
+                        state.get("post_release_occluded_fall_suspicious_count", 0)
+                    ) + 1
+                if entry.get("gaussian_blue_source_evidence", False):
+                    state["gaussian_blue_source_suspicious_count"] += 1
+            if (
+                not capture_enabled
+                or int(state["bundle_capture_count"]) >= int(state["max_bundle_captures"])
+            ):
+                return
+            state["bundle_capture_count"] += 1
+            capture_index = int(state["bundle_capture_count"])
+
+        if not output_dir:
+            return
+        raw_alpha, visible_alpha = self._compute_runtime_compose_visible_alpha_debug_map(
+            scene_depth,
+            gaussian_rgba,
+            gaussian_depth,
+            compose_mode=compose_mode,
+        )
+        gaussian_rgb = (
+            gaussian_rgba[:3]
+            .detach()
+            .permute(1, 2, 0)
+            .contiguous()
+            .to(dtype=torch.float32)
+            * 255.0
+        )
+        normalized_gaussian_depth = self._normalize_gaussian_depth(gaussian_depth)
+        frames = {
+            "scene_color": self._immersive_debug_frame_to_u8_array(scene_color),
+            "scene_depth_vis": self._visualize_immersive_depth_debug_image(scene_depth),
+            "gaussian_rgba_rgb": self._immersive_debug_frame_to_u8_array(
+                gaussian_rgb.to(torch.uint8)
+            ),
+            "gaussian_depth_vis": self._visualize_immersive_depth_debug_image(
+                normalized_gaussian_depth
+            ),
+            "gaussian_raw_alpha": self._visualize_immersive_alpha_debug_image(raw_alpha),
+            "gaussian_visible_alpha": self._visualize_immersive_alpha_debug_image(
+                visible_alpha
+            ),
+            "composed_pre_overlay": self._immersive_debug_frame_to_u8_array(
+                composed_pre_overlay
+            ),
+            "final_post_overlay": self._immersive_debug_frame_to_u8_array(
+                final_post_overlay
+            ),
+        }
+        if pre_stabilization_composed_pre_overlay is not None:
+            frames["composed_pre_stabilization"] = (
+                self._immersive_debug_frame_to_u8_array(
+                    pre_stabilization_composed_pre_overlay
+                )
+            )
+        bundle_dir = os.path.join(
+            output_dir,
+            "compose_artifact_debug",
+            (
+                f"capture_{capture_index:03d}_"
+                f"frame_{int(entry['frame_index']):06d}_"
+                f"sample_{int(entry['sample_id'] if entry['sample_id'] is not None else -1):06d}_"
+                f"{eye_label}"
+            ),
+        )
+        os.makedirs(bundle_dir, exist_ok=True)
+        metadata = {
+            "capture_index": capture_index,
+            "trigger_entry_id": int(entry["entry_id"]),
+            "eye_label": eye_label,
+            "backend_kind": entry["backend_kind"],
+            "path_kind": entry["path_kind"],
+            "compose_mode": entry["compose_mode"],
+            "trigger_reasons": list(entry["trigger_reasons"]),
+            "interaction_context": dict(entry["interaction_context"]),
+            "current_scalar_metrics": dict(entry["current_scalar_metrics"]),
+            "previous_scalar_metrics": entry["previous_scalar_metrics"],
+            "delta_metrics": dict(entry["delta_metrics"]),
+            "gaussian_blue_source_evidence": bool(
+                entry.get("gaussian_blue_source_evidence", False)
+            ),
+            "blue_scene_exposure_evidence": bool(
+                entry.get("blue_scene_exposure_evidence", False)
+            ),
+            "scene_depth_suppressed": bool(entry.get("scene_depth_suppressed", False)),
+        }
+        if extra_metadata:
+            metadata.update(copy.deepcopy(extra_metadata))
+        self._save_immersive_compose_artifact_debug_bundle(
+            bundle_dir,
+            frames=frames,
+            metadata=metadata,
+        )
+
+    def _summarize_immersive_compose_artifact_debug_state(self):
+        state = self._get_immersive_compose_artifact_debug_state()
+        with state["lock"]:
+            return {
+                "enabled": bool(state.get("summary_enabled", False)),
+                "analyzed_frame_count": int(state.get("analyzed_frame_count", 0)),
+                "interaction_gated_analyzed_frame_count": int(
+                    state.get("interaction_gated_analyzed_frame_count", 0)
+                ),
+                "bundle_capture_count": int(state.get("bundle_capture_count", 0)),
+                "suspicious_frame_count": int(state.get("suspicious_frame_count", 0)),
+                "depth_suppression_suspicious_count": int(
+                    state.get("depth_suppression_suspicious_count", 0)
+                ),
+                "blue_scene_exposure_suspicious_count": int(
+                    state.get("blue_scene_exposure_suspicious_count", 0)
+                ),
+                "post_release_occluded_fall_suspicious_count": int(
+                    state.get("post_release_occluded_fall_suspicious_count", 0)
+                ),
+                "gaussian_blue_source_suspicious_count": int(
+                    state.get("gaussian_blue_source_suspicious_count", 0)
+                ),
+                "pre_stabilization_candidate_count": int(
+                    state.get("pre_stabilization_candidate_count", 0)
+                ),
+                "pre_stabilization_blue_scene_exposure_count": int(
+                    state.get("pre_stabilization_blue_scene_exposure_count", 0)
+                ),
+                "pre_stabilization_post_release_occluded_fall_count": int(
+                    state.get(
+                        "pre_stabilization_post_release_occluded_fall_count",
+                        0,
+                    )
+                ),
+                "pre_stabilization_depth_suppression_count": int(
+                    state.get("pre_stabilization_depth_suppression_count", 0)
+                ),
+                "stabilization_applied_count": int(
+                    state.get("stabilization_applied_count", 0)
+                ),
+                "stabilization_prevented_blue_exposure_count": int(
+                    state.get("stabilization_prevented_blue_exposure_count", 0)
+                ),
+                "stabilization_prevented_post_release_occluded_fall_count": int(
+                    state.get(
+                        "stabilization_prevented_post_release_occluded_fall_count",
+                        0,
+                    )
+                ),
+                "stabilization_prevented_depth_suppression_count": int(
+                    state.get("stabilization_prevented_depth_suppression_count", 0)
+                ),
+                "stabilization_fallback_reject_count": int(
+                    state.get("stabilization_fallback_reject_count", 0)
+                ),
+                "stabilization_avg_ms": (
+                    float(state.get("stabilization_wall_ms_total", 0.0))
+                    / max(float(state.get("stabilization_wall_ms_count", 0)), 1.0)
+                    if int(state.get("stabilization_wall_ms_count", 0)) > 0
+                    else 0.0
+                ),
+                "compose_metric_inconsistency_count": int(
+                    state.get("compose_metric_inconsistency_count", 0)
+                ),
+                "compose_metric_inconsistency_reason_counts": copy.deepcopy(
+                    state.get("compose_metric_inconsistency_reason_counts", {})
+                ),
+                "compose_metric_inconsistency_capture_count": int(
+                    state.get("compose_metric_inconsistency_capture_count", 0)
+                ),
+                "output_dir": state.get("output_dir"),
+            }
+
+    def _reset_immersive_gaussian_source_debug_state(
+        self,
+        output_dir,
+        *,
+        analysis_enabled,
+        summary_enabled,
+        capture_enabled,
+    ):
+        session_output_dir = None
+        if output_dir is not None and bool(capture_enabled):
+            session_output_dir = os.path.join(
+                output_dir,
+                "gaussian_source_debug",
+                f"run_{time.strftime('%Y%m%d_%H%M%S')}",
+            )
+        self._immersive_gaussian_source_debug_state = {
+            "enabled": bool(analysis_enabled),
+            "summary_enabled": bool(summary_enabled),
+            "capture_enabled": bool(capture_enabled),
+            "output_dir": session_output_dir,
+            "cooldown_frames": int(
+                self.IMMERSIVE_GAUSSIAN_SOURCE_INTERACTION_COOLDOWN_FRAMES
+            ),
+            "max_bundle_captures": int(self.IMMERSIVE_GAUSSIAN_SOURCE_DEBUG_MAX_BUNDLES),
+            "bundle_capture_count": 0,
+            "rollback_count": 0,
+            "coverage_jump_count": 0,
+            "interaction_corruption_metric_inconsistency_count": 0,
+            "interaction_corruption_metric_inconsistency_reason_counts": {},
+            "interaction_corruption_metric_inconsistency_capture_count": 0,
+            "interaction_corruption_metric_inconsistency_max_captures": 2,
+            "last_interaction_frame_index": -1,
+            "last_interaction_sources": [],
+            "last_interaction_details_by_source": {
+                "left": None,
+                "right": None,
+            },
+            "last_valid_by_eye": {
+                "left": None,
+                "right": None,
+            },
+            "lock": threading.Lock(),
+        }
+
+    def _get_immersive_gaussian_source_debug_state(self):
+        state = getattr(self, "_immersive_gaussian_source_debug_state", None)
+        if state is None:
+            self._reset_immersive_gaussian_source_debug_state(
+                output_dir=None,
+                analysis_enabled=False,
+                summary_enabled=False,
+                capture_enabled=False,
+            )
+            state = self._immersive_gaussian_source_debug_state
+        return state
+
+    def _reset_live_controller_active_overlay_state(self):
+        self._live_controller_active_overlay_state = {
+            "hold_frames": int(self.LIVE_CONTROLLER_ACTIVE_OVERLAY_HOLD_FRAMES),
+            "hold_by_eye_source": {},
+            "active_overlay_total_count": 0,
+            "active_overlay_tracked_contact_count": 0,
+            "active_overlay_fallback_count": 0,
+            "active_overlay_held_marker_count": 0,
+            "active_overlay_hold_expired_count": 0,
+            "lock": threading.Lock(),
+        }
+
+    def _get_live_controller_active_overlay_state(self):
+        state = getattr(self, "_live_controller_active_overlay_state", None)
+        if state is None:
+            self._reset_live_controller_active_overlay_state()
+            state = self._live_controller_active_overlay_state
+        return state
+
+    def _clear_live_controller_active_overlay_hold(
+        self,
+        source,
+        *,
+        eye_label=None,
+    ):
+        state = self._get_live_controller_active_overlay_state()
+        source = str(source)
+        with state["lock"]:
+            hold_by_eye_source = state["hold_by_eye_source"]
+            if eye_label is None:
+                stale_keys = [
+                    key for key in hold_by_eye_source.keys() if key[0] == source
+                ]
+                for key in stale_keys:
+                    hold_by_eye_source.pop(key, None)
+            else:
+                hold_by_eye_source.pop((source, str(eye_label)), None)
+
+    def _summarize_live_controller_active_overlay_state(self):
+        state = self._get_live_controller_active_overlay_state()
+        with state["lock"]:
+            active_overlay_total_count = int(state["active_overlay_total_count"])
+            active_overlay_tracked_contact_count = int(
+                state["active_overlay_tracked_contact_count"]
+            )
+            active_overlay_fallback_count = int(
+                state["active_overlay_fallback_count"]
+            )
+            active_overlay_held_marker_count = int(
+                state["active_overlay_held_marker_count"]
+            )
+            active_overlay_hold_expired_count = int(
+                state["active_overlay_hold_expired_count"]
+            )
+        tracked_contact_ratio = None
+        if active_overlay_total_count > 0:
+            tracked_contact_ratio = float(
+                active_overlay_tracked_contact_count
+                / max(float(active_overlay_total_count), 1.0)
+            )
+        return {
+            "active_overlay_total_count": active_overlay_total_count,
+            "active_overlay_tracked_contact_count": (
+                active_overlay_tracked_contact_count
+            ),
+            "active_overlay_fallback_count": active_overlay_fallback_count,
+            "active_overlay_held_marker_count": active_overlay_held_marker_count,
+            "active_overlay_hold_expired_count": (
+                active_overlay_hold_expired_count
+            ),
+            "tracked_contact_ratio": tracked_contact_ratio,
+        }
+
+    @staticmethod
+    def _count_immersive_selected_object_indices(selected_object_indices):
+        if selected_object_indices is None:
+            return 0
+        if torch.is_tensor(selected_object_indices):
+            return int(selected_object_indices.numel())
+        if isinstance(selected_object_indices, np.ndarray):
+            return int(selected_object_indices.size)
+        if isinstance(selected_object_indices, (list, tuple, set)):
+            return int(len(selected_object_indices))
+        return 0
+
+    def _build_immersive_gaussian_source_interaction_details(self, interaction_state):
+        if interaction_state is None:
+            return None
+        selected_object_count = self._count_immersive_selected_object_indices(
+            interaction_state.get("selected_object_indices")
+        )
+        attach_node_count = int(
+            interaction_state.get("attach_node_count", selected_object_count)
+        )
+        anchor_name = (
+            interaction_state.get("anchor_name")
+            or interaction_state.get("preview_anchor_name")
+        )
+        return {
+            "anchor_name": anchor_name,
+            "attach_node_count": attach_node_count,
+            "attach_radius": float(interaction_state.get("attach_radius", 0.0)),
+            "selected_object_count": int(selected_object_count),
+        }
+
+    def _build_immersive_gaussian_source_interaction_context(
+        self,
+        frame_index,
+        controller_interaction_state,
+    ):
+        state = self._get_immersive_gaussian_source_debug_state()
+        active_sources = []
+        active_details = {}
+        if controller_interaction_state is not None:
+            for source in ("left", "right"):
+                interaction_state = controller_interaction_state.get(source)
+                if interaction_state is None:
+                    continue
+                active_sources.append(source)
+                active_details[source] = (
+                    self._build_immersive_gaussian_source_interaction_details(
+                        interaction_state
+                    )
+                )
+        with state["lock"]:
+            if active_sources:
+                state["last_interaction_frame_index"] = int(frame_index)
+                state["last_interaction_sources"] = list(active_sources)
+                for source, details in active_details.items():
+                    state["last_interaction_details_by_source"][source] = copy.deepcopy(
+                        details
+                    )
+            last_interaction_frame_index = int(
+                state.get("last_interaction_frame_index", -1)
+            )
+            last_interaction_sources = list(state.get("last_interaction_sources", []))
+            last_interaction_details_by_source = copy.deepcopy(
+                state.get("last_interaction_details_by_source", {})
+            )
+            cooldown_frames = int(state.get("cooldown_frames", 0))
+        cooldown_active = bool(
+            (not active_sources)
+            and last_interaction_frame_index >= 0
+            and (int(frame_index) - last_interaction_frame_index) <= cooldown_frames
+        )
+        effective_sources = list(active_sources) if active_sources else []
+        if not effective_sources and cooldown_active:
+            effective_sources = list(last_interaction_sources)
+        source_details = {}
+        for source in effective_sources:
+            if source in active_details:
+                source_details[source] = copy.deepcopy(active_details[source])
+            else:
+                source_details[source] = copy.deepcopy(
+                    last_interaction_details_by_source.get(source)
+                )
+        return {
+            "interaction_active": bool(active_sources),
+            "interaction_window_active": bool(active_sources or cooldown_active),
+            "cooldown_active": bool(cooldown_active),
+            "active_sources": list(active_sources),
+            "effective_sources": list(effective_sources),
+            "source_details": source_details,
+            "right_interaction_active": "right" in effective_sources,
+            "last_interaction_frame_index": int(last_interaction_frame_index),
+            "cooldown_frames": int(cooldown_frames),
+        }
+
+    def _save_immersive_gaussian_source_debug_bundle(
+        self,
+        output_dir,
+        *,
+        frames,
+        metadata,
+    ):
+        if not output_dir:
+            return
+        self._save_immersive_startup_debug_images(output_dir, frames)
+        os.makedirs(output_dir, exist_ok=True)
+        metadata_path = os.path.join(output_dir, "gaussian_source_debug.json")
+        with open(metadata_path, "w") as metadata_file:
+            json.dump(metadata, metadata_file, indent=2, sort_keys=True)
+
+    def _record_immersive_gaussian_source_metric_inconsistency(
+        self,
+        *,
+        eye_label,
+        frame_index,
+        sample_id,
+        backend_kind,
+        path_kind,
+        source_mask_metrics,
+    ):
+        state = self._get_immersive_gaussian_source_debug_state()
+        if not state.get("enabled", False):
+            return
+        summary_enabled = bool(state.get("summary_enabled", False))
+        capture_enabled = bool(state.get("capture_enabled", False))
+        if not summary_enabled and not capture_enabled:
+            return
+        reasons = [
+            str(reason)
+            for reason in source_mask_metrics.get("mask_metric_inconsistency_reasons", [])
+        ]
+        if not reasons:
+            return
+        capture_index = None
+        output_dir = None
+        with state["lock"]:
+            if summary_enabled:
+                state["interaction_corruption_metric_inconsistency_count"] += 1
+                for reason in reasons:
+                    state["interaction_corruption_metric_inconsistency_reason_counts"][reason] = (
+                        int(
+                            state["interaction_corruption_metric_inconsistency_reason_counts"].get(
+                                reason, 0
+                            )
+                        )
+                        + 1
+                    )
+            if (
+                capture_enabled
+                and
+                int(state["interaction_corruption_metric_inconsistency_capture_count"])
+                < int(
+                    state[
+                        "interaction_corruption_metric_inconsistency_max_captures"
+                    ]
+                )
+            ):
+                state["interaction_corruption_metric_inconsistency_capture_count"] += 1
+                capture_index = int(
+                    state["interaction_corruption_metric_inconsistency_capture_count"]
+                )
+                output_dir = state.get("output_dir")
+        if capture_index is None or not output_dir:
+            return
+        metadata = {
+            "capture_index": int(capture_index),
+            "eye_label": str(eye_label),
+            "frame_index": int(frame_index),
+            "sample_id": None if sample_id is None else int(sample_id),
+            "backend_kind": str(backend_kind),
+            "path_kind": str(path_kind),
+            "reason_list": list(reasons),
+            "raw_mask_pixel_count": int(
+                source_mask_metrics.get("raw_mask_pixel_count", 0)
+            ),
+            "raw_mask_bbox_area_pixels": int(
+                source_mask_metrics.get("raw_mask_bbox_area_pixels", 0)
+            ),
+            "total_pixel_count": int(source_mask_metrics.get("total_pixel_count", 0)),
+            "reported_raw_pixel_count": source_mask_metrics.get(
+                "reported_raw_pixel_count"
+            ),
+            "reported_raw_coverage_ratio": source_mask_metrics.get(
+                "reported_raw_coverage_ratio"
+            ),
+            "raw_gaussian_coverage_ratio": float(
+                source_mask_metrics.get("raw_gaussian_coverage_ratio", 0.0)
+            ),
+            "raw_mask_bbox_xyxy": copy.deepcopy(
+                source_mask_metrics.get("raw_mask_bbox_xyxy")
+            ),
+        }
+        output_path = os.path.join(
+            output_dir,
+            "inconsistency_samples",
+            (
+                f"inconsistency_{capture_index:03d}_"
+                f"frame_{int(frame_index):06d}_"
+                f"sample_{int(sample_id) if sample_id is not None else -1:06d}_"
+                f"{str(eye_label)}.json"
+            ),
+        )
+        self._save_immersive_debug_json(output_path, metadata)
+
+    @torch.no_grad()
+    def _capture_immersive_gaussian_source_debug_bundle(
+        self,
+        *,
+        eye_label,
+        frame_index,
+        sample_id,
+        backend_kind,
+        path_kind,
+        current_metrics,
+        previous_entry,
+        interaction_context,
+        current_gaussian_rgba,
+        current_gaussian_depth,
+        capture_index,
+    ):
+        state = self._get_immersive_gaussian_source_debug_state()
+        output_dir = state.get("output_dir")
+        if not output_dir:
+            return
+        current_raw_alpha = (
+            current_gaussian_rgba[3]
+            .detach()
+            .to(device=cfg.device, dtype=torch.float32)
+            .contiguous()
+        )
+        current_normalized_depth = self._normalize_gaussian_depth(current_gaussian_depth)
+        current_gaussian_rgb = (
+            current_gaussian_rgba[:3]
+            .detach()
+            .permute(1, 2, 0)
+            .contiguous()
+            .to(dtype=torch.float32)
+            * 255.0
+        )
+        previous_gaussian_rgba = None if previous_entry is None else previous_entry.get(
+            "gaussian_rgba"
+        )
+        previous_gaussian_depth = None if previous_entry is None else previous_entry.get(
+            "gaussian_depth"
+        )
+        previous_metrics = None if previous_entry is None else previous_entry.get("metrics")
+        previous_frame_index = (
+            None if previous_entry is None else previous_entry.get("frame_index")
+        )
+        previous_sample_id = (
+            None if previous_entry is None else previous_entry.get("sample_id")
+        )
+        frames = {
+            "current_gaussian_rgb": self._immersive_debug_frame_to_u8_array(
+                current_gaussian_rgb.to(torch.uint8)
+            ),
+            "current_gaussian_raw_alpha": self._visualize_immersive_alpha_debug_image(
+                current_raw_alpha
+            ),
+            "current_gaussian_depth_vis": self._visualize_immersive_depth_debug_image(
+                current_normalized_depth
+            ),
+        }
+        if previous_gaussian_rgba is not None:
+            previous_raw_alpha = (
+                previous_gaussian_rgba[3]
+                .detach()
+                .to(device=cfg.device, dtype=torch.float32)
+                .contiguous()
+            )
+            previous_gaussian_rgb = (
+                previous_gaussian_rgba[:3]
+                .detach()
+                .permute(1, 2, 0)
+                .contiguous()
+                .to(dtype=torch.float32)
+                * 255.0
+            )
+            previous_normalized_depth = self._normalize_gaussian_depth(
+                previous_gaussian_depth
+            )
+            frames["last_valid_gaussian_rgb"] = self._immersive_debug_frame_to_u8_array(
+                previous_gaussian_rgb.to(torch.uint8)
+            )
+            frames["last_valid_gaussian_raw_alpha"] = (
+                self._visualize_immersive_alpha_debug_image(previous_raw_alpha)
+            )
+            frames["last_valid_gaussian_depth_vis"] = (
+                self._visualize_immersive_depth_debug_image(previous_normalized_depth)
+            )
+        bundle_dir = os.path.join(
+            output_dir,
+            (
+                f"capture_{int(capture_index):03d}_"
+                f"frame_{int(frame_index):06d}_"
+                f"sample_{int(sample_id) if sample_id is not None else -1:06d}_"
+                f"{str(eye_label)}"
+            ),
+        )
+        os.makedirs(bundle_dir, exist_ok=True)
+        metadata = {
+            "capture_index": int(capture_index),
+            "eye_label": str(eye_label),
+            "backend_kind": str(backend_kind),
+            "path_kind": str(path_kind),
+            "trigger_reason": "raw_coverage_jump_interaction_corruption",
+            "frame_index": int(frame_index),
+            "sample_id": None if sample_id is None else int(sample_id),
+            "current_metrics": copy.deepcopy(current_metrics),
+            "previous_metrics": copy.deepcopy(previous_metrics),
+            "previous_frame_index": None
+            if previous_frame_index is None
+            else int(previous_frame_index),
+            "previous_sample_id": None
+            if previous_sample_id is None
+            else int(previous_sample_id),
+            "interaction_context": copy.deepcopy(interaction_context),
+        }
+        self._save_immersive_gaussian_source_debug_bundle(
+            bundle_dir,
+            frames=frames,
+            metadata=metadata,
+        )
+
+    @torch.no_grad()
+    def _analyze_immersive_gaussian_source_corruption(
+        self,
+        *,
+        frame_index,
+        sample_id,
+        backend_kind,
+        path_kind,
+        controller_interaction_state,
+        left_gaussian_rgba,
+        left_gaussian_depth,
+        right_gaussian_rgba,
+        right_gaussian_depth,
+    ):
+        state = self._get_immersive_gaussian_source_debug_state()
+        if not state.get("enabled", False):
+            return {"enabled": False}
+        interaction_context = (
+            self._build_immersive_gaussian_source_interaction_context(
+                int(frame_index),
+                controller_interaction_state,
+            )
+        )
+        metrics_by_eye = {
+            "left": self._compute_immersive_gaussian_source_mask_metrics(
+                left_gaussian_rgba,
+                left_gaussian_depth,
+            )[0],
+            "right": self._compute_immersive_gaussian_source_mask_metrics(
+                right_gaussian_rgba,
+                right_gaussian_depth,
+            )[0],
+        }
+        last_valid_metrics_by_eye = {}
+        last_valid_entries_by_eye = {}
+        with state["lock"]:
+            for eye_label in ("left", "right"):
+                previous_entry = state.get("last_valid_by_eye", {}).get(eye_label)
+                last_valid_entries_by_eye[eye_label] = previous_entry
+                last_valid_metrics_by_eye[eye_label] = (
+                    None
+                    if previous_entry is None
+                    else copy.deepcopy(previous_entry.get("metrics"))
+                )
+        corrupted_eyes = []
+        debug_by_eye = {}
+        if interaction_context.get("interaction_window_active", False):
+            for eye_label in ("left", "right"):
+                current_metrics = metrics_by_eye[eye_label]
+                previous_metrics = last_valid_metrics_by_eye.get(eye_label)
+                if previous_metrics is None:
+                    continue
+                current_coverage = float(
+                    current_metrics.get("raw_gaussian_coverage_ratio", 0.0)
+                )
+                previous_coverage = float(
+                    previous_metrics.get("raw_gaussian_coverage_ratio", 0.0)
+                )
+                coverage_jump_ratio = (
+                    current_coverage / max(previous_coverage, 1e-6)
+                    if current_coverage > 0.0
+                    else 0.0
+                )
+                if bool(current_metrics.get("mask_metric_inconsistent", False)):
+                    self._record_immersive_gaussian_source_metric_inconsistency(
+                        eye_label=eye_label,
+                        frame_index=frame_index,
+                        sample_id=sample_id,
+                        backend_kind=backend_kind,
+                        path_kind=path_kind,
+                        source_mask_metrics=current_metrics,
+                    )
+                gaussian_depth_positive_ratio = float(
+                    current_metrics.get("gaussian_depth_positive_ratio", 0.0)
+                )
+                is_corrupted = bool(
+                    current_coverage
+                    >= float(self.IMMERSIVE_GAUSSIAN_SOURCE_CORRUPTION_RAW_COVERAGE_MIN)
+                    and coverage_jump_ratio
+                    >= float(
+                        self.IMMERSIVE_GAUSSIAN_SOURCE_CORRUPTION_COVERAGE_JUMP_RATIO
+                    )
+                    and previous_coverage
+                    <= float(
+                        self.IMMERSIVE_GAUSSIAN_SOURCE_CORRUPTION_PREV_RAW_COVERAGE_MAX
+                    )
+                    and gaussian_depth_positive_ratio
+                    >= float(
+                        self.IMMERSIVE_GAUSSIAN_SOURCE_CORRUPTION_DEPTH_POSITIVE_MIN
+                    )
+                )
+                debug_by_eye[eye_label] = {
+                    "current_metrics": copy.deepcopy(current_metrics),
+                    "previous_metrics": copy.deepcopy(previous_metrics),
+                    "coverage_jump_ratio": float(coverage_jump_ratio),
+                    "corrupted": bool(is_corrupted),
+                }
+                if is_corrupted:
+                    corrupted_eyes.append(eye_label)
+        if not corrupted_eyes:
+            return {
+                "enabled": True,
+                "interaction_context": interaction_context,
+                "metrics_by_eye": metrics_by_eye,
+                "corrupted": False,
+            }
+        capture_requests = []
+        summary_enabled = bool(state.get("summary_enabled", False))
+        capture_enabled = bool(state.get("capture_enabled", False))
+        with state["lock"]:
+            if summary_enabled:
+                state["rollback_count"] += 1
+                state["coverage_jump_count"] += 1
+            if capture_enabled:
+                for eye_label in corrupted_eyes:
+                    if int(state["bundle_capture_count"]) >= int(
+                        state["max_bundle_captures"]
+                    ):
+                        break
+                    state["bundle_capture_count"] += 1
+                    capture_requests.append(
+                        (
+                            eye_label,
+                            int(state["bundle_capture_count"]),
+                        )
+                    )
+        for eye_label, capture_index in capture_requests:
+            self._capture_immersive_gaussian_source_debug_bundle(
+                eye_label=eye_label,
+                frame_index=int(frame_index),
+                sample_id=sample_id,
+                backend_kind=backend_kind,
+                path_kind=path_kind,
+                current_metrics=debug_by_eye[eye_label]["current_metrics"],
+                previous_entry=last_valid_entries_by_eye.get(eye_label),
+                interaction_context=interaction_context,
+                current_gaussian_rgba=(
+                    left_gaussian_rgba if eye_label == "left" else right_gaussian_rgba
+                ),
+                current_gaussian_depth=(
+                    left_gaussian_depth if eye_label == "left" else right_gaussian_depth
+                ),
+                capture_index=capture_index,
+            )
+        return {
+            "enabled": True,
+            "interaction_context": interaction_context,
+            "metrics_by_eye": metrics_by_eye,
+            "corrupted": True,
+            "corrupted_eyes": list(corrupted_eyes),
+            "affected_sources": list(interaction_context.get("effective_sources", [])),
+            "debug_by_eye": debug_by_eye,
+        }
+
+    @torch.no_grad()
+    def _commit_immersive_gaussian_source_valid_frame(
+        self,
+        *,
+        frame_index,
+        sample_id,
+        metrics_by_eye,
+        left_gaussian_rgba,
+        left_gaussian_depth,
+        right_gaussian_rgba,
+        right_gaussian_depth,
+    ):
+        state = self._get_immersive_gaussian_source_debug_state()
+        if not state.get("enabled", False):
+            return
+        output_dir = state.get("output_dir")
+        next_last_valid_by_eye = {}
+        for eye_label, gaussian_rgba, gaussian_depth in (
+            ("left", left_gaussian_rgba, left_gaussian_depth),
+            ("right", right_gaussian_rgba, right_gaussian_depth),
+        ):
+            next_last_valid_by_eye[eye_label] = {
+                "frame_index": int(frame_index),
+                "sample_id": None if sample_id is None else int(sample_id),
+                "metrics": copy.deepcopy(metrics_by_eye.get(eye_label, {})),
+                "gaussian_rgba": None
+                if output_dir is None or gaussian_rgba is None
+                else gaussian_rgba.detach().clone(),
+                "gaussian_depth": None
+                if output_dir is None or gaussian_depth is None
+                else gaussian_depth.detach().clone(),
+            }
+        with state["lock"]:
+            for eye_label, entry in next_last_valid_by_eye.items():
+                state["last_valid_by_eye"][eye_label] = entry
+
+    def _summarize_immersive_gaussian_source_debug_state(self):
+        state = self._get_immersive_gaussian_source_debug_state()
+        with state["lock"]:
+            return {
+                "enabled": bool(state.get("summary_enabled", False)),
+                "rollback_count": int(state.get("rollback_count", 0)),
+                "coverage_jump_count": int(state.get("coverage_jump_count", 0)),
+                "interaction_corruption_metric_inconsistency_count": int(
+                    state.get("interaction_corruption_metric_inconsistency_count", 0)
+                ),
+                "interaction_corruption_metric_inconsistency_reason_counts": copy.deepcopy(
+                    state.get(
+                        "interaction_corruption_metric_inconsistency_reason_counts",
+                        {},
+                    )
+                ),
+                "interaction_corruption_metric_inconsistency_capture_count": int(
+                    state.get(
+                        "interaction_corruption_metric_inconsistency_capture_count",
+                        0,
+                    )
+                ),
+                "bundle_capture_count": int(state.get("bundle_capture_count", 0)),
+                "output_dir": state.get("output_dir"),
+            }
+
     def _visualize_immersive_depth_debug_image(self, depth_map):
         if torch.is_tensor(depth_map):
             depth_np = depth_map.detach().cpu().numpy()
@@ -7176,6 +17919,7 @@ class InvPhyTrainerWarp:
         head_alignment,
         layout,
         scene_renderer,
+        scene_execute_renderer,
         left_eye_sample,
         right_eye_sample,
         left_eye_pose_world,
@@ -7246,6 +17990,16 @@ class InvPhyTrainerWarp:
             "_immersive_balanced_runtime_state",
             None,
         )
+        balanced_static_scene_mode = (
+            self.IMMERSIVE_STATIC_SCENE_MODE_BALANCED_FOCUS
+            if balanced_runtime_state is None
+            else str(
+                balanced_runtime_state.get(
+                    "static_scene_mode",
+                    self.IMMERSIVE_STATIC_SCENE_MODE_BALANCED_FOCUS,
+                )
+            )
+        )
         balanced_center_eye_pose_world = None
         balanced_background_intrinsic = None
         balanced_near_reference_depth_m = None
@@ -7255,12 +18009,12 @@ class InvPhyTrainerWarp:
             if balanced_table_world_bounds is not None:
                 table_world_bounds = balanced_table_world_bounds
             startup_debug["balanced_background_mode"] = (
-                "per_eye_background"
+                "per_eye_full_scene"
                 if balanced_runtime_state is None
                 else str(
                     balanced_runtime_state.get(
                         "background_mode",
-                        "per_eye_background",
+                        "per_eye_full_scene",
                     )
                 )
             )
@@ -7274,10 +18028,37 @@ class InvPhyTrainerWarp:
                     )
                 )
             )
-            startup_debug["balanced_table_mode"] = "roi_per_eye"
-            startup_debug["balanced_table_roi_render_scale"] = float(
-                self.IMMERSIVE_BALANCED_TABLE_ROI_SUPERSAMPLE_SCALE
-            )
+            startup_debug["balanced_static_scene_mode"] = balanced_static_scene_mode
+            if (
+                balanced_static_scene_mode
+                == self.IMMERSIVE_STATIC_SCENE_MODE_BALANCED_FOCUS
+            ):
+                startup_debug["balanced_focus_mode"] = "table_roi"
+                startup_debug["balanced_table_roi_render_scale"] = float(
+                    self.IMMERSIVE_BALANCED_TABLE_ROI_SUPERSAMPLE_SCALE
+                    if balanced_runtime_state is None
+                    else balanced_runtime_state.get(
+                        "table_roi_render_scale",
+                        self.IMMERSIVE_BALANCED_TABLE_ROI_SUPERSAMPLE_SCALE,
+                    )
+                )
+            elif (
+                balanced_static_scene_mode
+                == self.IMMERSIVE_STATIC_SCENE_MODE_BALANCED_SUPPORT_FOCUS
+            ):
+                startup_debug["balanced_focus_mode"] = "support_roi"
+                startup_debug["balanced_support_roi_render_scale"] = float(
+                    self.IMMERSIVE_BALANCED_TABLE_ROI_SUPERSAMPLE_SCALE
+                    if balanced_runtime_state is None
+                    else balanced_runtime_state.get(
+                        "support_roi_render_scale",
+                        self.IMMERSIVE_BALANCED_TABLE_ROI_SUPERSAMPLE_SCALE,
+                    )
+                )
+            else:
+                raise ValueError(
+                    f"Unsupported immersive static scene mode: {balanced_static_scene_mode}"
+                )
             if balanced_runtime_state is not None:
                 balanced_near_reference_depth_m = float(
                     balanced_runtime_state.get("near_reference_depth_m", 0.0)
@@ -7349,11 +18130,13 @@ class InvPhyTrainerWarp:
                 right_scene_depth,
             ) = self._render_immersive_scene_frames_for_mode(
                 scene_renderer,
+                scene_execute_renderer,
                 scene_stereo_mode,
                 layout,
                 object_support_center,
                 object_bounds_min,
                 object_bounds_max,
+                False,
                 left_eye_pose_world,
                 right_eye_pose_world,
                 left_intrinsic,
@@ -7412,18 +18195,19 @@ class InvPhyTrainerWarp:
                 else object_projection["pixel"].astype(np.float32).tolist(),
                 "in_bounds": bool(object_projection["in_bounds"]),
             }
-            if (
-                scene_stereo_mode == self.IMMERSIVE_BALANCED_INTERNAL_STEREO_MODE
-                and table_world_bounds is not None
-            ):
-                (
-                    table_roi_bounds,
-                    table_roi_ratio,
-                    table_fullframe_fallback,
-                    table_hysteresis_bounds,
-                ) = self._resolve_immersive_balanced_table_render_roi(
-                        table_world_bounds[0],
-                        table_world_bounds[1],
+            if scene_stereo_mode == self.IMMERSIVE_BALANCED_INTERNAL_STEREO_MODE:
+                if (
+                    balanced_static_scene_mode
+                    == self.IMMERSIVE_STATIC_SCENE_MODE_BALANCED_FOCUS
+                ):
+                    (
+                        table_roi_bounds,
+                        table_roi_ratio,
+                        table_fullframe_fallback,
+                        table_hysteresis_bounds,
+                    ) = self._resolve_immersive_balanced_table_render_roi(
+                        table_world_bounds[0] if table_world_bounds is not None else None,
+                        table_world_bounds[1] if table_world_bounds is not None else None,
                         intrinsic,
                         w2c_cv,
                         eye_width,
@@ -7433,21 +18217,72 @@ class InvPhyTrainerWarp:
                             if balanced_runtime_state is not None
                             else None
                         ),
-                )
-                startup_debug[f"{eye_name}_table_roi_ratio"] = float(table_roi_ratio)
-                startup_debug[f"{eye_name}_table_fullframe_fallback"] = bool(
-                    table_fullframe_fallback
-                )
-                startup_debug[f"{eye_name}_table_roi_bounds"] = (
-                    None
-                    if table_roi_bounds is None
-                    else [int(v) for v in table_roi_bounds]
-                )
-                startup_debug[f"{eye_name}_table_roi_hysteresis_bounds"] = (
-                    None
-                    if table_hysteresis_bounds is None
-                    else [int(v) for v in table_hysteresis_bounds]
-                )
+                    )
+                    startup_debug[f"{eye_name}_table_roi_ratio"] = float(table_roi_ratio)
+                    startup_debug[f"{eye_name}_table_fullframe_fallback"] = bool(
+                        table_fullframe_fallback
+                    )
+                    startup_debug[f"{eye_name}_table_roi_bounds"] = (
+                        None
+                        if table_roi_bounds is None
+                        else [int(v) for v in table_roi_bounds]
+                    )
+                    startup_debug[f"{eye_name}_table_roi_hysteresis_bounds"] = (
+                        None
+                        if table_hysteresis_bounds is None
+                        else [int(v) for v in table_hysteresis_bounds]
+                    )
+                elif (
+                    balanced_static_scene_mode
+                    == self.IMMERSIVE_STATIC_SCENE_MODE_BALANCED_SUPPORT_FOCUS
+                ):
+                    startup_debug[f"{eye_name}_support_roi_ratio"] = 0.0
+                    startup_debug[f"{eye_name}_support_fullframe_fallback"] = False
+                    startup_debug[f"{eye_name}_support_roi_bounds"] = None
+                else:
+                    (
+                        focus_roi_bounds,
+                        focus_roi_ratio,
+                        focus_fullframe_fallback,
+                        focus_debug,
+                    ) = self._resolve_immersive_balanced_focus_render_roi(
+                        object_bounds_min,
+                        object_bounds_max,
+                        intrinsic,
+                        w2c_cv,
+                        eye_width,
+                        eye_height,
+                        active_interaction=False,
+                        prev_bounds=(
+                            balanced_runtime_state.get("focus_roi_state", {}).get(eye_name)
+                            if balanced_runtime_state is not None
+                            else None
+                        ),
+                    )
+                    startup_debug[f"{eye_name}_focus_roi_ratio"] = float(focus_roi_ratio)
+                    startup_debug[f"{eye_name}_focus_fullframe_fallback"] = bool(
+                        focus_fullframe_fallback
+                    )
+                    startup_debug[f"{eye_name}_focus_roi_bounds"] = (
+                        None
+                        if focus_roi_bounds is None
+                        else [int(v) for v in focus_roi_bounds]
+                    )
+                    startup_debug[f"{eye_name}_focus_roi_hysteresis_bounds"] = (
+                        None
+                        if focus_debug.get("hysteresis_bounds") is None
+                        else [int(v) for v in focus_debug["hysteresis_bounds"]]
+                    )
+                    startup_debug[f"{eye_name}_focus_center_roi_bounds"] = (
+                        None
+                        if focus_debug.get("center_roi_bounds") is None
+                        else [int(v) for v in focus_debug["center_roi_bounds"]]
+                    )
+                    startup_debug[f"{eye_name}_focus_object_roi_bounds"] = (
+                        None
+                        if focus_debug.get("object_roi_bounds") is None
+                        else [int(v) for v in focus_debug["object_roi_bounds"]]
+                    )
                 if (
                     balanced_runtime_state is not None
                     and balanced_runtime_state.get("side_wall_mode")
@@ -7985,6 +18820,89 @@ class InvPhyTrainerWarp:
         self.simulator.set_controller_interactive(restored_target, restored_target)
         return restored_target
 
+    def _capture_immersive_stable_interaction_snapshot(
+        self,
+        controller_interaction_state,
+        controller_anchor_preview_state,
+    ):
+        snapshot = {}
+        for source in ("left", "right"):
+            interaction_state = controller_interaction_state.get(source)
+            snapshot[source] = {
+                "active": bool(interaction_state is not None),
+                "interaction_start_frame_index": None
+                if interaction_state is None
+                else interaction_state.get("interaction_start_frame_index"),
+                "preview_state": copy.deepcopy(
+                    controller_anchor_preview_state.get(source)
+                ),
+            }
+        return snapshot
+
+    def _rollback_immersive_stable_visual_reject(
+        self,
+        controller_interaction_state,
+        controller_anchor_preview_state,
+        controller_attachment_metadata,
+        rollback_sim_state,
+        rollback_target,
+        gaussians,
+        rollback_gaussian_state,
+        committed_interaction_snapshot,
+    ):
+        preserved_sources = []
+        released_sources = []
+        for source in ("left", "right"):
+            interaction_state = controller_interaction_state.get(source)
+            committed_source_snapshot = (
+                {}
+                if committed_interaction_snapshot is None
+                else committed_interaction_snapshot.get(source, {})
+            )
+            current_interaction_id = (
+                None
+                if interaction_state is None
+                else interaction_state.get("interaction_start_frame_index")
+            )
+            committed_interaction_id = committed_source_snapshot.get(
+                "interaction_start_frame_index"
+            )
+            preserve_interaction = bool(
+                interaction_state is not None
+                and bool(committed_source_snapshot.get("active", False))
+                and committed_interaction_id is not None
+                and current_interaction_id == committed_interaction_id
+            )
+            if preserve_interaction:
+                preserved_sources.append(source)
+                preview_state = committed_source_snapshot.get("preview_state")
+                if preview_state is not None:
+                    controller_anchor_preview_state[source] = copy.deepcopy(
+                        preview_state
+                    )
+                continue
+            if interaction_state is not None:
+                self._clear_live_controller_interaction(
+                    source,
+                    controller_interaction_state,
+                    controller_attachment_metadata,
+                    reason="stable_reject_rollback",
+                )
+                released_sources.append(source)
+                self._reset_controller_anchor_preview_state(
+                    controller_anchor_preview_state,
+                    source,
+                )
+        self._restore_sim_state(rollback_sim_state)
+        self._restore_gaussian_runtime_state(gaussians, rollback_gaussian_state)
+        restored_target = rollback_target.clone()
+        self.simulator.set_controller_interactive(restored_target, restored_target)
+        return {
+            "restored_target": restored_target,
+            "preserved_sources": list(preserved_sources),
+            "released_sources": list(released_sources),
+        }
+
     def _compute_scene_spawn_shift(self, object_points, table_top_center_world):
         support_center = self._object_support_patch_center(object_points)
         target = torch.as_tensor(
@@ -8438,6 +19356,7 @@ class InvPhyTrainerWarp:
         target_anchor_world,
         controller_source_anchor_centers,
         translation_only=False,
+        interaction_start_frame_index=None,
     ):
         source_index = self._controller_source_index(source)
         controller_position_world = controller_world["position"]
@@ -8470,6 +19389,9 @@ class InvPhyTrainerWarp:
             "target_delta": float(target_delta.item()),
             "projected_anchor_distance": projected_anchor_distance,
             "just_started": True,
+            "interaction_start_frame_index": None
+            if interaction_start_frame_index is None
+            else int(interaction_start_frame_index),
             "start_controller_position_world": controller_position_world.clone(),
             "start_anchor_world": target_anchor_world.clone(),
         }
@@ -8518,6 +19440,125 @@ class InvPhyTrainerWarp:
             return attach_center_world
         return attach_center_world + (current_anchor - attach_anchor_world)
 
+    def _contact_object_indices_from_remap_candidate(self, remap_candidate):
+        if remap_candidate is None:
+            return None
+        springs = remap_candidate.get("springs")
+        if springs is None:
+            return None
+        springs = torch.as_tensor(
+            springs,
+            dtype=torch.long,
+            device=cfg.device,
+        )
+        if springs.ndim != 2 or springs.shape[1] != 2 or int(springs.shape[0]) <= 0:
+            return None
+        endpoint0 = springs[:, 0]
+        endpoint1 = springs[:, 1]
+        object_indices = torch.cat(
+            [
+                endpoint0[endpoint0 < int(self.num_all_points)],
+                endpoint1[endpoint1 < int(self.num_all_points)],
+            ],
+            dim=0,
+        )
+        if int(object_indices.numel()) <= 0:
+            return None
+        return torch.unique(object_indices)
+
+    def _current_live_controller_grabbed_contact_world(
+        self,
+        interaction_state,
+        object_points,
+        current_anchor=None,
+    ):
+        if interaction_state is None:
+            return None
+        contact_object_indices = interaction_state.get("contact_object_indices")
+        if object_points is not None and contact_object_indices is not None:
+            contact_object_indices = torch.as_tensor(
+                contact_object_indices,
+                dtype=torch.long,
+                device=object_points.device,
+            )
+            if int(contact_object_indices.numel()) > 0:
+                return object_points[contact_object_indices].mean(dim=0)
+        return self._current_controller_attach_center_world(
+            interaction_state,
+            current_anchor,
+        )
+
+    def _resolve_live_controller_active_overlay_world(
+        self,
+        interaction_state,
+        object_points,
+        current_anchor=None,
+    ):
+        if interaction_state is None:
+            return {
+                "active_overlay_world": None,
+                "active_overlay_fallback_world": None,
+                "active_overlay_source": None,
+                "active_overlay_interaction_id": None,
+            }
+        tracked_contact_world = self._current_live_controller_grabbed_contact_world(
+            interaction_state,
+            object_points,
+            current_anchor,
+        )
+        active_overlay_world = tracked_contact_world
+        active_overlay_source = "tracked_contact"
+        if active_overlay_world is None and current_anchor is not None:
+            active_overlay_world = current_anchor
+            active_overlay_source = "interaction_anchor"
+        if active_overlay_world is None:
+            active_overlay_source = None
+        return {
+            "active_overlay_world": active_overlay_world,
+            "active_overlay_fallback_world": current_anchor,
+            "active_overlay_source": active_overlay_source,
+            "active_overlay_interaction_id": interaction_state.get(
+                "interaction_start_frame_index"
+            ),
+        }
+
+    def _resolve_live_controller_preview_context(
+        self,
+        source,
+        controller_world,
+        object_points,
+        object_bounds_min,
+        object_bounds_max,
+    ):
+        if controller_world is None:
+            return None
+
+        raw_origin_world, raw_direction_world = self._controller_world_ray_pose(
+            controller_world
+        )
+        if raw_origin_world is None or raw_direction_world is None:
+            return None
+        raw_hit_world = self._ray_object_intersection(
+            raw_origin_world,
+            raw_direction_world,
+            object_points,
+            object_bounds_min,
+            object_bounds_max,
+        )
+        raw_ray_end_world = (
+            raw_hit_world
+            if raw_hit_world is not None
+            else raw_origin_world + raw_direction_world * self.LIVE_CONTROLLER_RAY_LENGTH
+        )
+        raw_context = {
+            "mode": "raw_preview",
+            "origin_world": raw_origin_world,
+            "direction_world": raw_direction_world,
+            "hit_world": raw_hit_world,
+            "ray_end_world": raw_ray_end_world,
+        }
+        return raw_context
+
     def _clear_live_controller_interaction(
         self,
         source,
@@ -8550,6 +19591,7 @@ class InvPhyTrainerWarp:
         controller_predefined_anchor_states,
         controller_anchor_preview_state,
         object_points,
+        frame_index=0,
         allow_implicit_fallback_start=True,
         post_select_translation_only=False,
     ):
@@ -8590,6 +19632,7 @@ class InvPhyTrainerWarp:
                     controller_attachment_metadata,
                     reason="released",
                 )
+                self._clear_live_controller_active_overlay_hold(source)
                 interaction_state = None
             if interaction_state is None and select_start_edge:
                 overlay = controller_overlay_by_source.get(source)
@@ -8611,9 +19654,16 @@ class InvPhyTrainerWarp:
                 if selected_preview_anchor_occupied:
                     selected_preview_anchor = None
                 hit_world = None if overlay is None else overlay.get("hit_world")
-                ray_origin_world, ray_direction_world = self._controller_world_ray_pose(
-                    controller_world
+                ray_origin_world = None if overlay is None else overlay.get(
+                    "origin_world"
                 )
+                ray_direction_world = None if overlay is None else overlay.get(
+                    "direction_world"
+                )
+                if ray_origin_world is None or ray_direction_world is None:
+                    ray_origin_world, ray_direction_world = self._controller_world_ray_pose(
+                        controller_world
+                    )
                 grab_start_mode = "cycled_locked" if cycle_locked else "nearest"
                 snapped_anchor = selected_preview_anchor
                 if snapped_anchor is None:
@@ -8649,12 +19699,14 @@ class InvPhyTrainerWarp:
                     continue
                 preview_anchor_visible = True
                 preview_anchor_resolved = True
-                remap_candidate = self._instantiate_predefined_controller_anchor_template(
-                    source,
-                    snapped_anchor,
-                    object_points,
-                    controller_anchor_templates,
-                    controller_attachment_metadata,
+                remap_candidate = (
+                    self._instantiate_predefined_controller_anchor_template(
+                        source,
+                        snapped_anchor,
+                        object_points,
+                        controller_anchor_templates,
+                        controller_attachment_metadata,
+                    )
                 )
                 if remap_candidate is None:
                     preview_interaction_state = {
@@ -8668,7 +19720,9 @@ class InvPhyTrainerWarp:
                         ),
                     }
                     reason = (
-                        f"selected_preview_anchor_template_missing(name={preview_anchor_name})"
+                        "selected_preview_anchor_candidate_missing("
+                        f"name={preview_anchor_name}, "
+                        "mode=predefined_template)"
                     )
                     self._log_controller_interaction_start_attempt(
                         source,
@@ -8690,6 +19744,7 @@ class InvPhyTrainerWarp:
                     remap_candidate["attach_anchor_world"].clone(),
                     controller_source_anchor_centers,
                     translation_only=bool(post_select_translation_only),
+                    interaction_start_frame_index=int(frame_index),
                 )
                 interaction_state.update(
                     {
@@ -8746,6 +19801,10 @@ class InvPhyTrainerWarp:
                 controller_anchor_preview_state[source]["selected_anchor_name"] = (
                     remap_candidate["anchor_name"]
                 )
+                selected_object_indices = remap_candidate.get("selected_object_indices")
+                contact_object_indices = self._contact_object_indices_from_remap_candidate(
+                    remap_candidate
+                )
                 interaction_state.update(
                     {
                         "kinematic_only": False,
@@ -8756,7 +19815,8 @@ class InvPhyTrainerWarp:
                         "attach_radius": remap_candidate["attach_radius"],
                         "attach_anchor_world": remap_candidate["attach_anchor_world"],
                         "source_template_offsets": remap_candidate["source_template_offsets"],
-                        "selected_object_indices": remap_candidate["selected_object_indices"],
+                        "selected_object_indices": selected_object_indices,
+                        "contact_object_indices": contact_object_indices,
                         "target_point_indices": remap_candidate.get("target_point_indices"),
                         "multi_points_debug": remap_candidate.get("multi_points_debug"),
                         "hit_to_anchor_distance": remap_candidate.get("hit_to_anchor_distance"),
@@ -8836,25 +19896,29 @@ class InvPhyTrainerWarp:
             active_pixel = overlay.get("attach_active_pixel")
             attach_candidate = overlay.get("attach_candidate", False)
             attachment_active = overlay.get("attachment_active", False)
+            active_contact_only = bool(overlay.get("active_contact_only", False))
             anchor_preview_entries = overlay.get("anchor_preview_entries", [])
 
-            self._draw_marker_line(
-                frame,
-                origin_pixel,
-                end_pixel,
-                color,
-                radius=1,
-                blend=0.68 if attachment_active else (0.52 if hit_pixel is not None else 0.34),
-            )
-            self._blend_marker(
-                frame,
-                origin_pixel,
-                color,
-                radius=self.LIVE_CONTROLLER_ORIGIN_RADIUS,
-                blend=0.85,
-            )
+            if not active_contact_only:
+                self._draw_marker_line(
+                    frame,
+                    origin_pixel,
+                    end_pixel,
+                    color,
+                    radius=1,
+                    blend=0.68
+                    if attachment_active
+                    else (0.52 if hit_pixel is not None else 0.34),
+                )
+                self._blend_marker(
+                    frame,
+                    origin_pixel,
+                    color,
+                    radius=self.LIVE_CONTROLLER_ORIGIN_RADIUS,
+                    blend=0.85,
+                )
 
-            if attach_candidate and candidate_pixel is not None:
+            if not active_contact_only and attach_candidate and candidate_pixel is not None:
                 self._blend_square_marker(
                     frame,
                     candidate_pixel,
@@ -8870,43 +19934,46 @@ class InvPhyTrainerWarp:
                     blend=0.98,
                 )
 
-            for preview_entry in anchor_preview_entries:
-                preview_pixel = preview_entry["pixel"]
-                preview_selected = preview_entry["selected"]
-                preview_active = preview_entry["active"]
-                preview_occupied = bool(preview_entry.get("occupied", False))
-                preview_color = (
-                    self.LIVE_CONTROLLER_ATTACH_ACTIVE_COLOR
-                    if preview_active
-                    else (
-                        self.LIVE_CONTROLLER_PREVIEW_OCCUPIED_COLOR
-                        if preview_occupied
-                        else color
+            if not active_contact_only:
+                for preview_entry in anchor_preview_entries:
+                    preview_pixel = preview_entry["pixel"]
+                    preview_selected = preview_entry["selected"]
+                    preview_active = preview_entry["active"]
+                    preview_occupied = bool(preview_entry.get("occupied", False))
+                    preview_color = (
+                        self.LIVE_CONTROLLER_ATTACH_ACTIVE_COLOR
+                        if preview_active
+                        else (
+                            self.LIVE_CONTROLLER_PREVIEW_OCCUPIED_COLOR
+                            if preview_occupied
+                            else color
+                        )
                     )
-                )
-                preview_radius = (
-                    self.LIVE_CONTROLLER_PREVIEW_SELECTED_RADIUS
-                    if preview_selected
-                    else self.LIVE_CONTROLLER_PREVIEW_RADIUS
-                )
-                preview_blend = 0.78 if preview_selected else (0.42 if preview_occupied else 0.32)
-                self._blend_marker(
-                    frame,
-                    preview_pixel,
-                    preview_color,
-                    radius=preview_radius,
-                    blend=preview_blend,
-                )
-                if preview_selected:
+                    preview_radius = (
+                        self.LIVE_CONTROLLER_PREVIEW_SELECTED_RADIUS
+                        if preview_selected
+                        else self.LIVE_CONTROLLER_PREVIEW_RADIUS
+                    )
+                    preview_blend = (
+                        0.78 if preview_selected else (0.42 if preview_occupied else 0.32)
+                    )
                     self._blend_marker(
                         frame,
                         preview_pixel,
-                        self.LIVE_CONTROLLER_SELECT_COLOR,
-                        radius=1,
-                        blend=0.96,
+                        preview_color,
+                        radius=preview_radius,
+                        blend=preview_blend,
                     )
+                    if preview_selected:
+                        self._blend_marker(
+                            frame,
+                            preview_pixel,
+                            self.LIVE_CONTROLLER_SELECT_COLOR,
+                            radius=1,
+                            blend=0.96,
+                        )
 
-            if overlay["select_available"]:
+            if not active_contact_only and overlay["select_available"]:
                 indicator_pixel = origin_pixel + frame.new_tensor([0.0, -10.0])
                 indicator_color = (
                     self.LIVE_CONTROLLER_SELECT_COLOR
@@ -9505,6 +20572,8 @@ class InvPhyTrainerWarp:
     def _get_immersive_gaussian_render_streams(self):
         stream_store = getattr(self, "_immersive_gaussian_render_streams", None)
         if stream_store is None:
+            # Gaussian left/right eye work always stays on main-thread-owned CUDA
+            # streams; the static-scene worker owns separate GL/CUDA/readback state.
             stream_store = {
                 "left": torch.cuda.Stream(),
                 "right": torch.cuda.Stream(),
@@ -9677,12 +20746,13 @@ class InvPhyTrainerWarp:
         compose_roi_padding,
         render_profile_frame=None,
         output_dtype=torch.float32,
+        collect_compose_metrics=False,
     ):
         left_compose_span = self._render_profile_begin_cuda_span(
             render_profile_frame,
             "compose_left_cuda",
         )
-        if render_profile_frame is not None:
+        if render_profile_frame is not None or collect_compose_metrics:
             (
                 left_eye_frame,
                 left_eye_frame_depth,
@@ -9724,7 +20794,7 @@ class InvPhyTrainerWarp:
             render_profile_frame,
             "compose_right_cuda",
         )
-        if render_profile_frame is not None:
+        if render_profile_frame is not None or collect_compose_metrics:
             (
                 right_eye_frame,
                 right_eye_frame_depth,
@@ -9888,31 +20958,53 @@ class InvPhyTrainerWarp:
         object_points,
         object_bounds_min,
         object_bounds_max,
+        preview_context=None,
     ):
         if controller_world is None:
             return None
 
-        origin_world, direction_world = self._controller_world_ray_pose(controller_world)
-        if origin_world is None or direction_world is None:
-            return None
-        hit_world = self._ray_object_intersection(
-            origin_world,
-            direction_world,
-            object_points,
-            object_bounds_min,
-            object_bounds_max,
-        )
-        ray_end_world = (
-            hit_world
-            if hit_world is not None
-            else origin_world + direction_world * self.LIVE_CONTROLLER_RAY_LENGTH
-        )
+        if preview_context is None:
+            origin_world, direction_world = self._controller_world_ray_pose(
+                controller_world
+            )
+            if origin_world is None or direction_world is None:
+                return None
+            hit_world = self._ray_object_intersection(
+                origin_world,
+                direction_world,
+                object_points,
+                object_bounds_min,
+                object_bounds_max,
+            )
+            ray_end_world = (
+                hit_world
+                if hit_world is not None
+                else origin_world + direction_world * self.LIVE_CONTROLLER_RAY_LENGTH
+            )
+            preview_context_mode = "raw_preview"
+        else:
+            origin_world = preview_context.get("origin_world")
+            direction_world = preview_context.get("direction_world")
+            hit_world = preview_context.get("hit_world")
+            ray_end_world = preview_context.get("ray_end_world")
+            preview_context_mode = str(
+                preview_context.get("mode", "raw_preview")
+            )
+            if origin_world is None or direction_world is None or ray_end_world is None:
+                return None
         return {
             "source": source,
             "origin_world": origin_world,
             "direction_world": direction_world,
             "hit_world": hit_world,
             "ray_end_world": ray_end_world,
+            "preview_context_mode": preview_context_mode,
+            "attach_candidate_world": None,
+            "attach_active_world": None,
+            "active_overlay_world": None,
+            "active_overlay_fallback_world": None,
+            "active_overlay_source": None,
+            "active_overlay_interaction_id": None,
             "color": (
                 self.LIVE_CONTROLLER_LEFT_COLOR
                 if source == "left"
@@ -9933,6 +21025,79 @@ class InvPhyTrainerWarp:
             "snap_assist_source": controller_world["snap_assist_source"],
         }
 
+    def _resolve_live_controller_active_overlay_pixels(
+        self,
+        overlay_world,
+        projected_fields,
+        *,
+        eye_label,
+    ):
+        source = overlay_world.get("source")
+        if source is None:
+            return None, None, None
+        source = str(source)
+        eye_label = str(eye_label)
+        attachment_active = bool(overlay_world.get("attachment_active", False))
+        state = self._get_live_controller_active_overlay_state()
+        with state["lock"]:
+            hold_by_eye_source = state["hold_by_eye_source"]
+            cache_key = (source, eye_label)
+            if not attachment_active:
+                hold_by_eye_source.pop(cache_key, None)
+                return None, None, None
+
+            state["active_overlay_total_count"] += 1
+            if str(overlay_world.get("active_overlay_source", "")).strip().lower() == "tracked_contact":
+                state["active_overlay_tracked_contact_count"] += 1
+
+            interaction_id = overlay_world.get("active_overlay_interaction_id")
+            cache_entry = hold_by_eye_source.get(cache_key)
+            if (
+                cache_entry is not None
+                and cache_entry.get("interaction_id") != interaction_id
+            ):
+                hold_by_eye_source.pop(cache_key, None)
+                cache_entry = None
+
+            active_pixel = projected_fields.get("active_overlay_world")
+            fallback_pixel = projected_fields.get("active_overlay_fallback_world")
+            resolved_source = str(
+                overlay_world.get("active_overlay_source", "")
+            ).strip().lower()
+            refresh_hold_from_current_projection = False
+
+            if active_pixel is not None:
+                refresh_hold_from_current_projection = True
+            elif fallback_pixel is not None:
+                active_pixel = fallback_pixel
+                resolved_source = "interaction_anchor"
+                refresh_hold_from_current_projection = True
+                state["active_overlay_fallback_count"] += 1
+            elif (
+                cache_entry is not None
+                and int(cache_entry.get("remaining_frames", 0)) > 0
+            ):
+                active_pixel = cache_entry["pixel"].clone()
+                cache_entry["remaining_frames"] = int(
+                    cache_entry["remaining_frames"]
+                ) - 1
+                resolved_source = "held_last_valid"
+                state["active_overlay_held_marker_count"] += 1
+                hold_by_eye_source[cache_key] = cache_entry
+            else:
+                if cache_entry is not None:
+                    state["active_overlay_hold_expired_count"] += 1
+                    hold_by_eye_source.pop(cache_key, None)
+
+            if refresh_hold_from_current_projection and active_pixel is not None:
+                hold_by_eye_source[cache_key] = {
+                    "pixel": active_pixel.detach().clone(),
+                    "remaining_frames": int(state["hold_frames"]),
+                    "interaction_id": interaction_id,
+                }
+
+            return active_pixel, active_pixel, resolved_source
+
     def _project_live_controller_world_overlay(
         self,
         overlay_world,
@@ -9944,20 +21109,64 @@ class InvPhyTrainerWarp:
         if overlay_world is None:
             return None
 
-        origin_pixel = self._project_world_point_to_pixel(
-            overlay_world.get("origin_world"),
-            intrinsic,
-            w2c,
-            height,
-            width,
-        )
-        end_pixel = self._project_world_point_to_pixel(
-            overlay_world.get("ray_end_world"),
-            intrinsic,
-            w2c,
-            height,
-            width,
-        )
+        projected_fields = {
+            "origin_world": self._project_world_point_to_pixel(
+                overlay_world.get("origin_world"),
+                intrinsic,
+                w2c,
+                height,
+                width,
+            ),
+            "ray_end_world": self._project_world_point_to_pixel(
+                overlay_world.get("ray_end_world"),
+                intrinsic,
+                w2c,
+                height,
+                width,
+            ),
+            "hit_world": self._project_world_point_to_pixel(
+                overlay_world.get("hit_world"),
+                intrinsic,
+                w2c,
+                height,
+                width,
+            ),
+            "attach_candidate_world": self._project_world_point_to_pixel(
+                overlay_world.get("attach_candidate_world"),
+                intrinsic,
+                w2c,
+                height,
+                width,
+            ),
+            "active_overlay_world": self._project_world_point_to_pixel(
+                overlay_world.get("active_overlay_world"),
+                intrinsic,
+                w2c,
+                height,
+                width,
+            ),
+            "active_overlay_fallback_world": self._project_world_point_to_pixel(
+                overlay_world.get("active_overlay_fallback_world"),
+                intrinsic,
+                w2c,
+                height,
+                width,
+            ),
+        }
+        origin_pixel = projected_fields.get("origin_world")
+        end_pixel = projected_fields.get("ray_end_world")
+        attach_active_pixel = None
+        resolved_active_overlay_source = None
+        if bool(overlay_world.get("attachment_active", False)):
+            (
+                end_pixel,
+                attach_active_pixel,
+                resolved_active_overlay_source,
+            ) = self._resolve_live_controller_active_overlay_pixels(
+                overlay_world,
+                projected_fields,
+                eye_label="single",
+            )
         if origin_pixel is None or end_pixel is None:
             return None
 
@@ -9965,29 +21174,15 @@ class InvPhyTrainerWarp:
             "source": overlay_world["source"],
             "origin_pixel": origin_pixel,
             "end_pixel": end_pixel,
-            "hit_pixel": self._project_world_point_to_pixel(
-                overlay_world.get("hit_world"),
-                intrinsic,
-                w2c,
-                height,
-                width,
-            ),
-            "attach_candidate_pixel": self._project_world_point_to_pixel(
-                overlay_world.get("attach_candidate_world"),
-                intrinsic,
-                w2c,
-                height,
-                width,
-            ),
-            "attach_active_pixel": self._project_world_point_to_pixel(
-                overlay_world.get("attach_active_world"),
-                intrinsic,
-                w2c,
-                height,
-                width,
-            ),
+            "hit_pixel": projected_fields.get("hit_world"),
+            "attach_candidate_pixel": projected_fields.get("attach_candidate_world"),
+            "attach_active_pixel": attach_active_pixel,
             "attach_candidate": bool(overlay_world.get("attach_candidate", False)),
             "attachment_active": bool(overlay_world.get("attachment_active", False)),
+            "active_contact_only": bool(
+                overlay_world.get("active_contact_only", False)
+            ),
+            "active_overlay_source_resolved": resolved_active_overlay_source,
             "color": overlay_world["color"],
             "select_available": overlay_world["select_available"],
             "select_pressed": overlay_world["select_pressed"],
@@ -10044,7 +21239,8 @@ class InvPhyTrainerWarp:
                 "ray_end_world",
                 "hit_world",
                 "attach_candidate_world",
-                "attach_active_world",
+                "active_overlay_world",
+                "active_overlay_fallback_world",
             ):
                 world_point = overlay_world.get(field_name)
                 if world_point is None:
@@ -10122,6 +21318,18 @@ class InvPhyTrainerWarp:
                 projected_fields = projected_field_by_eye[eye_idx][overlay_idx]
                 origin_pixel = projected_fields.get("origin_world")
                 end_pixel = projected_fields.get("ray_end_world")
+                attach_active_pixel = None
+                resolved_active_overlay_source = None
+                if bool(overlay_world.get("attachment_active", False)):
+                    (
+                        end_pixel,
+                        attach_active_pixel,
+                        resolved_active_overlay_source,
+                    ) = self._resolve_live_controller_active_overlay_pixels(
+                        overlay_world,
+                        projected_fields,
+                        eye_label=eye_label,
+                    )
                 if origin_pixel is None or end_pixel is None:
                     continue
                 projected = {
@@ -10132,11 +21340,15 @@ class InvPhyTrainerWarp:
                     "attach_candidate_pixel": projected_fields.get(
                         "attach_candidate_world"
                     ),
-                    "attach_active_pixel": projected_fields.get("attach_active_world"),
+                    "attach_active_pixel": attach_active_pixel,
                     "attach_candidate": bool(overlay_world.get("attach_candidate", False)),
                     "attachment_active": bool(
                         overlay_world.get("attachment_active", False)
                     ),
+                    "active_contact_only": bool(
+                        overlay_world.get("active_contact_only", False)
+                    ),
+                    "active_overlay_source_resolved": resolved_active_overlay_source,
                     "color": overlay_world["color"],
                     "select_available": overlay_world["select_available"],
                     "select_pressed": overlay_world["select_pressed"],
@@ -11033,13 +22245,30 @@ class InvPhyTrainerWarp:
         cuda_ctx,
         interactive_window_mode,
         scene_assets_root,
-        render_profile=False,
-        render_profile_every=30,
+        profile=False,
+        profile_freq=30,
         immersive_timewarp="off",
-        immersive_static_scene_overlap="off",
+        immersive_static_scene_overlap="on",
+        immersive_static_scene_mode="balanced_support_focus",
+        immersive_support_entry_overlay=False,
         immersive_framegen="off",
-        immersive_gaussian_render="serial",
+        immersive_gaussian_render="stereo_parallel",
+        immersive_present_pipeline=True,
+        immersive_controller_translation_scale=1.2,
     ):
+        immersive_controller_translation_scale = float(
+            immersive_controller_translation_scale
+        )
+        if (
+            not np.isfinite(immersive_controller_translation_scale)
+            or immersive_controller_translation_scale <= 0.0
+        ):
+            raise ValueError(
+                "--immersive_controller_translation_scale must be a finite positive multiplier."
+            )
+        self._immersive_controller_translation_scale_multiplier = float(
+            immersive_controller_translation_scale
+        )
         logger.info(f"Load model from {model_path}")
         checkpoint = torch.load(model_path, map_location=cfg.device)
 
@@ -11190,7 +22419,11 @@ class InvPhyTrainerWarp:
         active_scene_stereo_mode = immersive_render_options["scene_stereo_mode"]
         immersive_bridge = None
         scene_renderer = None
+        scene_execute_renderer = None
         static_scene_worker = None
+        presentation_worker = None
+        balanced_eye_workers = {}
+        balanced_eye_parallel_enabled = False
         preview_tex = None
         preview_uploader = None
         preview_prog = None
@@ -11243,6 +22476,8 @@ class InvPhyTrainerWarp:
         startup_keepalive_state = None
         first_real_publish_done = False
         self._immersive_balanced_runtime_state = None
+        self._immersive_stable_present_policy_active = False
+        self._immersive_active_render_preset_name_value = "balanced"
         immersive_timewarp_mode = str(immersive_timewarp).strip().lower()
         if immersive_timewarp_mode not in {"off", "scene_depth_reproject"}:
             raise ValueError(
@@ -11257,6 +22492,20 @@ class InvPhyTrainerWarp:
                 "immersive_static_scene_overlap must be one of "
                 "{'off', 'on'}"
             )
+        immersive_static_scene_mode = str(
+            immersive_static_scene_mode
+        ).strip().lower()
+        if immersive_static_scene_mode not in {
+            self.IMMERSIVE_STATIC_SCENE_MODE_BALANCED_FOCUS,
+            self.IMMERSIVE_STATIC_SCENE_MODE_BALANCED_SUPPORT_FOCUS,
+        }:
+            raise ValueError(
+                "immersive_static_scene_mode must be one of "
+                "{'balanced_focus', 'balanced_support_focus'}"
+            )
+        immersive_support_entry_overlay_enabled = bool(
+            immersive_support_entry_overlay
+        )
         immersive_framegen_mode = str(immersive_framegen).strip().lower()
         if immersive_framegen_mode not in {"off", "static", "adaptive"}:
             raise ValueError(
@@ -11273,6 +22522,7 @@ class InvPhyTrainerWarp:
                 "immersive_gaussian_render must be one of "
                 "{'serial', 'stereo_parallel', 'stereo_batched'}"
             )
+        immersive_present_pipeline_enabled = bool(immersive_present_pipeline)
         scene_depth_reproject_requested = (
             immersive_timewarp_mode == "scene_depth_reproject"
         )
@@ -11282,6 +22532,32 @@ class InvPhyTrainerWarp:
             == self.IMMERSIVE_BALANCED_INTERNAL_STEREO_MODE
         )
         framegen_requested = immersive_framegen_mode in {"static", "adaptive"}
+        profile_enabled = bool(profile)
+        diagnostic_collection_enabled = bool(profile_enabled)
+        profile_freq = int(profile_freq)
+        stable_compose_safety_enabled = bool(
+            self._is_rope_family_case()
+            and immersive_timewarp_mode == "off"
+            and immersive_framegen_mode == "off"
+        )
+        stable_compose_diagnostics_enabled = bool(
+            diagnostic_collection_enabled and stable_compose_safety_enabled
+        )
+        stable_rope_contact_only_active_overlay_enabled = bool(
+            self._is_rope_family_case()
+            and immersive_timewarp_mode == "off"
+            and immersive_framegen_mode == "off"
+        )
+        stable_compose_safety_gate_enabled = bool(stable_compose_safety_enabled)
+        stable_gaussian_source_validation_enabled = bool(
+            immersive_timewarp_mode == "off"
+            and immersive_framegen_mode == "off"
+            and self._is_rope_family_case()
+        )
+        stable_gaussian_source_diagnostics_enabled = bool(
+            diagnostic_collection_enabled
+            and stable_gaussian_source_validation_enabled
+        )
         if scene_depth_reproject_requested and not static_scene_overlap_requested:
             raise ValueError(
                 "immersive_timewarp scene_depth_reproject requires "
@@ -11292,26 +22568,185 @@ class InvPhyTrainerWarp:
                 "immersive_framegen static|adaptive requires "
                 "--immersive_static_scene_overlap on"
             )
-        if framegen_requested and scene_depth_reproject_requested:
+        if framegen_requested and not scene_depth_reproject_requested:
             raise ValueError(
                 "immersive_framegen static|adaptive requires "
-                "--immersive_timewarp off"
+                "--immersive_timewarp scene_depth_reproject"
             )
-        if immersive_gaussian_render_mode in {"stereo_parallel", "stereo_batched"} and (
+        if immersive_gaussian_render_mode == "stereo_batched" and (
             immersive_static_scene_overlap_mode != "off"
             or immersive_timewarp_mode != "off"
         ):
             raise ValueError(
-                f"immersive_gaussian_render {immersive_gaussian_render_mode} requires "
+                "immersive_gaussian_render stereo_batched requires "
                 "--immersive_static_scene_overlap off and --immersive_timewarp off"
             )
+        if immersive_gaussian_render_mode == "stereo_parallel":
+            overlap_framegen_stereo_parallel_allowed = bool(
+                static_scene_overlap_requested
+                and framegen_requested
+                and scene_depth_reproject_requested
+            )
+            overlap_stable_present_stereo_parallel_allowed = bool(
+                static_scene_overlap_requested
+                and immersive_present_pipeline_enabled
+                and not framegen_requested
+                and immersive_timewarp_mode == "off"
+            )
+            if immersive_timewarp_mode != "off" and not overlap_framegen_stereo_parallel_allowed:
+                raise ValueError(
+                    "immersive_gaussian_render stereo_parallel requires "
+                    "--immersive_timewarp off, except for the supported "
+                    "framegen overlap path"
+                )
+            if immersive_static_scene_overlap_mode == "on" and (
+                immersive_present_pipeline_enabled
+                and not (
+                    overlap_framegen_stereo_parallel_allowed
+                    or overlap_stable_present_stereo_parallel_allowed
+                )
+            ):
+                raise ValueError(
+                    "immersive_gaussian_render stereo_parallel with "
+                    "--immersive_static_scene_overlap on currently supports "
+                    "either the stable present-pipeline path "
+                    "(--immersive_present_pipeline with --immersive_timewarp off "
+                    "and --immersive_framegen off) or the framegen overlap path "
+                    "(--immersive_framegen static|adaptive with "
+                    "--immersive_timewarp scene_depth_reproject)"
+                )
+        if immersive_present_pipeline_enabled and not static_scene_overlap_requested:
+            raise ValueError(
+                "immersive_present_pipeline requires --immersive_static_scene_overlap on"
+            )
+        presentation_backend_enabled = bool(
+            immersive_present_pipeline_enabled or framegen_requested
+        )
+        presentation_backend_kind = None
+        if presentation_backend_enabled:
+            if (
+                immersive_present_pipeline_enabled
+                and not framegen_requested
+                and immersive_timewarp_mode == "off"
+            ):
+                presentation_backend_kind = "legacy_single_worker"
+            else:
+                presentation_backend_kind = "split_experimental"
+        immersive_stable_present_policy_enabled = bool(
+            immersive_present_pipeline_enabled
+            and scene_depth_reproject_requested
+            and framegen_requested
+            and static_scene_overlap_requested
+        )
+        self._immersive_stable_present_policy_active = (
+            immersive_stable_present_policy_enabled
+        )
+        self._immersive_active_render_preset_name_value = (
+            "quality" if immersive_stable_present_policy_enabled else "balanced"
+        )
+        immersive_render_options = self._resolve_immersive_render_options(
+            immersive_render_preset=self._immersive_active_render_preset_name(),
+            immersive_scene_render_scale=None,
+            immersive_scene_stereo_mode=self.IMMERSIVE_BALANCED_INTERNAL_STEREO_MODE,
+            immersive_overlay_mode="minimal",
+        )
+        scene_width, scene_height = self._resolve_immersive_scene_resolution(
+            eye_width,
+            eye_height,
+            immersive_render_options["scene_render_scale"],
+        )
+        active_scene_stereo_mode = immersive_render_options["scene_stereo_mode"]
         scene_depth_reproject_enabled = scene_depth_reproject_requested
         static_scene_overlap_enabled = False
         static_scene_overlap_failure_logged = False
+        static_scene_overlap_cache_miss_logged = False
+        balanced_eye_parallel_failure_logged = False
         gaussian_render_failure_logged = False
-        static_scene_framegen_cache = None
+        static_scene_reuse_cache = None
+        static_scene_layer_cache = None
+        balanced_scene_input_cache = {
+            "last_object_bounds_min_world": None,
+            "last_object_bounds_max_world": None,
+            "last_object_support_center_world": None,
+        }
         scene_pose_staleness_ms_samples = []
         static_scene_reuse_applied_samples = []
+        static_scene_fresh_render_samples = []
+        static_scene_reuse_max_age_hit_samples = []
+        static_scene_base_refresh_samples = []
+        static_scene_overlay_refresh_samples = []
+        static_scene_base_reuse_max_age_hit_samples = []
+        static_scene_overlay_reuse_max_age_hit_samples = []
+        static_scene_cache_invalidation_count = 0
+        static_scene_signature_change_count = 0
+        static_scene_base_signature_change_count = 0
+        static_scene_overlay_signature_change_count = 0
+        static_scene_reuse_reason_counts = {}
+        static_scene_base_reuse_reason_counts = {}
+        static_scene_overlay_reuse_reason_counts = {}
+        presentation_submit_ms_samples = []
+        presentation_queue_wait_ms_samples = []
+        presentation_worker_ms_samples = []
+        presentation_compose_ms_samples = []
+        presentation_compose_left_ms_samples = []
+        presentation_compose_right_ms_samples = []
+        presentation_overlay_ms_samples = []
+        presentation_overlay_left_ms_samples = []
+        presentation_overlay_right_ms_samples = []
+        presentation_parallel_wait_ms_samples = []
+        presentation_publish_ms_samples = []
+        presentation_preview_ms_samples = []
+        presentation_source_age_ms_samples = []
+        presentation_drop_ratio_samples = []
+        presentation_completed_frame_count = 0
+        synthetic_framegen_resolved_samples = []
+        synthetic_framegen_source_age_ms_samples = []
+        synthetic_framegen_total_scene_age_ms_samples = []
+        synthetic_framegen_handoff_delay_ms_samples = []
+        synthetic_framegen_translation_m_samples = []
+        synthetic_framegen_rotation_deg_samples = []
+        synthetic_framegen_skip_no_new_sample_samples = []
+        synthetic_framegen_skip_source_age_samples = []
+        synthetic_framegen_skip_translation_samples = []
+        synthetic_framegen_skip_rotation_samples = []
+        synthetic_framegen_skip_stale_packet_samples = []
+        synthetic_framegen_skip_invalid_pose_samples = []
+        synthetic_framegen_skip_latewarp_failure_samples = []
+        synthetic_framegen_skip_pending_real_yield_samples = []
+        synthetic_framegen_skip_real_source_inconsistent_samples = []
+        synthetic_framegen_pending_real_at_launch_samples = []
+        synthetic_framegen_immediate_sample_hit_samples = []
+        synthetic_source_real_timewarp_applied_samples = []
+        synthetic_source_real_timewarp_fallback_left_samples = []
+        synthetic_source_real_timewarp_fallback_right_samples = []
+        synthetic_source_consistent_samples = []
+        synthetic_framegen_launch_count = 0
+        synthetic_framegen_published_count = 0
+        present_arbiter_real_publish_count = 0
+        present_arbiter_synthetic_publish_count = 0
+        present_arbiter_synthetic_dropped_by_real_count = 0
+        presentation_dropped_count = 0
+        presentation_pending_profile_frames = {}
+        presentation_pending_safe_snapshots = {}
+        latest_preview_completion = None
+        stable_compose_reject_count = 0
+        stable_compose_reject_blue_scene_exposure_count = 0
+        stable_compose_reject_gaussian_blue_source_count = 0
+        stable_compose_reject_rollback_count = 0
+        stable_cover_publish_count = 0
+        stable_cover_publish_compose_reject_count = 0
+        stable_cover_publish_source_corruption_count = 0
+        stable_cover_publish_missing_cache_count = 0
+        stable_cover_publish_ms_samples = []
+        stable_rollback_preserved_interaction_count = 0
+        stable_rollback_released_new_grab_count = 0
+        stable_rollback_preserved_left_count = 0
+        stable_rollback_preserved_right_count = 0
+        interaction_contact_gap_mm_samples = []
+        interaction_contact_tracked_frames = 0
+        steady_state_metrics_epoch_armed = False
+        steady_state_scalar_count_baselines = {}
+        steady_state_reason_count_baselines = {}
 
         diagnostic_output_path = output_dir
         diagnostic_view_render_path = None
@@ -11321,6 +22756,19 @@ class InvPhyTrainerWarp:
                 "immersive_output",
             )
             os.makedirs(diagnostic_view_render_path, exist_ok=True)
+        self._reset_immersive_compose_artifact_debug_state(
+            diagnostic_output_path,
+            analysis_enabled=stable_compose_safety_enabled,
+            summary_enabled=stable_compose_diagnostics_enabled,
+            capture_enabled=stable_compose_diagnostics_enabled,
+        )
+        self._reset_immersive_gaussian_source_debug_state(
+            diagnostic_output_path,
+            analysis_enabled=stable_gaussian_source_validation_enabled,
+            summary_enabled=stable_gaussian_source_diagnostics_enabled,
+            capture_enabled=stable_gaussian_source_diagnostics_enabled,
+        )
+        self._reset_live_controller_active_overlay_state()
 
         sim_timer = Timer("Immersive Simulator")
         interp_timer = Timer("Immersive Interpolation")
@@ -11333,6 +22781,8 @@ class InvPhyTrainerWarp:
             "total": [],
         }
         render_stage_times = {
+            "static_scene_branch_full_ms": [],
+            "compose_join_full_ms": [],
             "simulation_lbs_wall_ms": [],
             "static_scene_render_ms": [],
             "gaussian_render_wall_ms": [],
@@ -11340,10 +22790,46 @@ class InvPhyTrainerWarp:
             "pre_compose_ready_ms": [],
             "compositing_ms": [],
             "overlay_publish_ms": [],
+            "scene_present_worker_ms": [],
+            "scene_present_queue_wait_ms": [],
+            "scene_present_submit_ms": [],
+            "scene_present_compose_left_ms": [],
+            "scene_present_compose_right_ms": [],
+            "scene_present_overlay_left_ms": [],
+            "scene_present_overlay_right_ms": [],
+            "scene_present_parallel_wait_ms": [],
+            "scene_present_preview_ms": [],
+            "scene_present_source_age_ms": [],
         }
         immersive_render_profile_keys = [
             "rendering",
+            "static_scene_execute_wall_ms",
+            "static_scene_assemble_wall_ms",
             "render_eye_intrinsics_setup_wall",
+            "scene_render_eye_left_total_ms",
+            "scene_render_eye_right_total_ms",
+            "scene_render_eye_left_dispatch_ms",
+            "scene_render_eye_right_dispatch_ms",
+            "scene_render_eye_left_queue_wait_ms",
+            "scene_render_eye_right_queue_wait_ms",
+            "scene_render_parallel_dispatch_ms",
+            "scene_render_parallel_wait_ms",
+            "scene_render_parallel_join_overhead_ms",
+            "scene_present_submit_ms",
+            "scene_present_queue_wait_ms",
+            "scene_present_worker_ms",
+            "scene_present_compose_ms",
+            "scene_present_compose_left_ms",
+            "scene_present_compose_right_ms",
+            "scene_present_overlay_ms",
+            "scene_present_overlay_left_ms",
+            "scene_present_overlay_right_ms",
+            "scene_present_parallel_wait_ms",
+            "scene_present_publish_ms",
+            "scene_present_preview_ms",
+            "scene_present_source_age_ms",
+            "scene_present_drop_count",
+            "scene_present_drop_ratio",
             "scene_render_center_wall",
             "scene_render_background_center_wall",
             "scene_prepare_background_eye_wall",
@@ -11351,6 +22837,42 @@ class InvPhyTrainerWarp:
             "scene_render_near_center_wall",
             "scene_render_side_left_wall",
             "scene_render_side_right_wall",
+            "scene_render_table_base_left_wall",
+            "scene_render_table_base_right_wall",
+            "scene_render_table_left_wall",
+            "scene_render_table_right_wall",
+            "scene_render_focus_left_wall",
+            "scene_render_focus_right_wall",
+            "scene_table_roi_left_ratio",
+            "scene_table_roi_right_ratio",
+            "scene_table_roi_supersample_scale",
+            "scene_table_fullframe_fallback_left_ratio",
+            "scene_table_fullframe_fallback_right_ratio",
+            "scene_focus_roi_left_ratio",
+            "scene_focus_roi_right_ratio",
+            "scene_focus_roi_supersample_scale",
+            "scene_focus_fullframe_fallback_left_ratio",
+            "scene_focus_fullframe_fallback_right_ratio",
+            "scene_support_roi_left_ratio",
+            "scene_support_roi_right_ratio",
+            "scene_support_fullframe_fallback_left_ratio",
+            "scene_support_fullframe_fallback_right_ratio",
+            "scene_support_occlusion_candidate_left_ratio",
+            "scene_support_occlusion_candidate_right_ratio",
+            "scene_support_occlusion_suppressed_left_ratio",
+            "scene_support_occlusion_suppressed_right_ratio",
+            "scene_support_occlusion_flip_left_ratio",
+            "scene_support_occlusion_flip_right_ratio",
+            "scene_support_occlusion_overlap_left_ratio",
+            "scene_support_occlusion_overlap_right_ratio",
+            "scene_support_occlusion_depth_gap_left_m",
+            "scene_support_occlusion_depth_gap_right_m",
+            "scene_support_occlusion_flip_count_left",
+            "scene_support_occlusion_flip_count_right",
+            "scene_active_support_is_table_ratio",
+            "scene_active_support_other_ratio",
+            "scene_active_support_none_ratio",
+            "scene_active_support_switch_count",
             "scene_side_roi_left_ratio",
             "scene_side_roi_right_ratio",
             "scene_side_strip_left_width_ratio",
@@ -11359,13 +22881,6 @@ class InvPhyTrainerWarp:
             "scene_side_fullframe_fallback_right_ratio",
             "scene_render_left_wall",
             "scene_render_right_wall",
-            "scene_render_table_left_wall",
-            "scene_render_table_right_wall",
-            "scene_table_roi_left_ratio",
-            "scene_table_roi_right_ratio",
-            "scene_table_roi_supersample_scale",
-            "scene_table_fullframe_fallback_left_ratio",
-            "scene_table_fullframe_fallback_right_ratio",
             "gaussian_raw_left_ratio",
             "gaussian_visible_left_ratio",
             "gaussian_retention_left_ratio",
@@ -11416,8 +22931,12 @@ class InvPhyTrainerWarp:
             "gaussian_render_left_cuda",
             "gaussian_render_right_cuda",
             "gaussian_render_stereo_batched_cuda",
+            "scene_compose_table_base_left_cuda",
+            "scene_compose_table_base_right_cuda",
             "scene_compose_table_left_cuda",
             "scene_compose_table_right_cuda",
+            "scene_compose_focus_left_cuda",
+            "scene_compose_focus_right_cuda",
             "compose_left_cuda",
             "compose_right_cuda",
             "overlay_projection_wall",
@@ -11437,6 +22956,11 @@ class InvPhyTrainerWarp:
             "render_sample_id",
             "publish_sample_id",
             "scene_timewarp_applied",
+            "scene_timewarp_skipped_ratio",
+            "scene_timewarp_skip_queue_wait_ratio",
+            "scene_timewarp_skip_source_age_ratio",
+            "scene_timewarp_skip_reuse_age_ratio",
+            "scene_timewarp_skip_stale_packet_ratio",
             "scene_timewarp_fallback_left_used",
             "scene_timewarp_fallback_right_used",
             "scene_timewarp_gpu_ms",
@@ -11450,10 +22974,53 @@ class InvPhyTrainerWarp:
             "compositing_ms",
             "overlay_publish_ms",
             "static_scene_reuse_applied",
+            "static_scene_fresh_render_ratio",
+            "static_scene_base_refresh_ratio",
+            "static_scene_overlay_refresh_ratio",
             "static_scene_reuse_age_frames",
             "static_scene_framegen_forced_render",
             "static_scene_reuse_translation_m",
             "static_scene_reuse_rotation_deg",
+            "static_scene_reuse_max_age_hit_ratio",
+            "static_scene_cache_invalidation_count",
+            "static_scene_signature_change_count",
+            "static_scene_base_signature_change_count",
+            "static_scene_overlay_signature_change_count",
+            "static_scene_base_reuse_max_age_hit_ratio",
+            "static_scene_overlay_reuse_max_age_hit_ratio",
+            "static_scene_reuse_reason_cache_miss_ratio",
+            "static_scene_reuse_reason_signature_unavailable_ratio",
+            "static_scene_reuse_reason_signature_change_ratio",
+            "static_scene_reuse_reason_age_limit_ratio",
+            "static_scene_reuse_reason_head_reset_ratio",
+            "static_scene_reuse_reason_translation_guard_ratio",
+            "static_scene_reuse_reason_rotation_guard_ratio",
+            "static_scene_reuse_reason_invalid_eye_pose_ratio",
+            "static_scene_reuse_reason_static_cadence_ratio",
+            "static_scene_reuse_reason_adaptive_pass_ratio",
+            "static_scene_reuse_reason_worker_failure_ratio",
+            "static_scene_base_reuse_reason_cache_miss_ratio",
+            "static_scene_base_reuse_reason_signature_unavailable_ratio",
+            "static_scene_base_reuse_reason_signature_change_ratio",
+            "static_scene_base_reuse_reason_age_limit_ratio",
+            "static_scene_base_reuse_reason_head_reset_ratio",
+            "static_scene_base_reuse_reason_translation_guard_ratio",
+            "static_scene_base_reuse_reason_rotation_guard_ratio",
+            "static_scene_base_reuse_reason_invalid_eye_pose_ratio",
+            "static_scene_base_reuse_reason_static_cadence_ratio",
+            "static_scene_base_reuse_reason_adaptive_pass_ratio",
+            "static_scene_base_reuse_reason_worker_failure_ratio",
+            "static_scene_overlay_reuse_reason_cache_miss_ratio",
+            "static_scene_overlay_reuse_reason_signature_unavailable_ratio",
+            "static_scene_overlay_reuse_reason_signature_change_ratio",
+            "static_scene_overlay_reuse_reason_age_limit_ratio",
+            "static_scene_overlay_reuse_reason_head_reset_ratio",
+            "static_scene_overlay_reuse_reason_translation_guard_ratio",
+            "static_scene_overlay_reuse_reason_rotation_guard_ratio",
+            "static_scene_overlay_reuse_reason_invalid_eye_pose_ratio",
+            "static_scene_overlay_reuse_reason_static_cadence_ratio",
+            "static_scene_overlay_reuse_reason_adaptive_pass_ratio",
+            "static_scene_overlay_reuse_reason_worker_failure_ratio",
             "scene_pose_staleness_ms_at_publish",
             "scene_pose_staleness_savings_ms",
             "preview_window_wall",
@@ -11463,14 +23030,29 @@ class InvPhyTrainerWarp:
             "cuda_memory_reserved_gib",
         ]
         immersive_render_profile_summary_keys = [
-            key for key in immersive_render_profile_keys if key != "eval_png_write_wall"
+            key
+            for key in immersive_render_profile_keys
+            if key != "eval_png_write_wall"
         ]
         immersive_render_profile_series = (
             {key: [] for key in immersive_render_profile_keys}
-            if render_profile
+            if profile_enabled
             else None
         )
-        immersive_render_profile_rows = [] if render_profile else None
+        immersive_render_profile_rows = [] if profile_enabled else None
+        def _mark_dropped_present_packet(packet):
+            return None
+
+        def _ingest_presentation_result(result):
+            return None
+
+        def _finalize_present_profile_frame(
+            frame_index,
+            *,
+            present_result=None,
+            dropped=False,
+        ):
+            return None
 
         try:
             startup_timeline = self._make_immersive_startup_timeline()
@@ -11696,6 +23278,7 @@ class InvPhyTrainerWarp:
                 force=True,
             )
             scene_renderer.set_layout(layout)
+            scene_execute_renderer = scene_renderer
             self._record_immersive_startup_milestone(
                 startup_timeline,
                 "scene_layout_applied",
@@ -11873,7 +23456,12 @@ class InvPhyTrainerWarp:
             print(
                 "[live_openxr_controller] immersive controller case profile: "
                 f"case={live_controller_case_profile['case_name']} "
-                f"translation_scale={live_controller_case_profile['controller_translation_scale']:.2f} "
+                "default_translation_scale="
+                f"{live_controller_case_profile['controller_translation_scale_default']:.2f} "
+                "translation_scale_multiplier="
+                f"{live_controller_case_profile['controller_translation_scale_multiplier']:.2f} "
+                "effective_translation_scale="
+                f"{live_controller_case_profile['controller_translation_scale']:.2f} "
                 f"post_select_grab_mode={live_controller_case_profile['post_select_grab_mode']}",
                 flush=True,
             )
@@ -11976,11 +23564,11 @@ class InvPhyTrainerWarp:
             ).clone()
             current_pos = gaussians.get_xyz
             current_rot = gaussians.get_rotation
-            relations_single = get_topk_indices(prev_x, K=4)
+            relations_single = get_topk_indices(prev_x, K=3)
             weights_single, weights_indices_single = knn_weights_sparse(
                 prev_x,
                 current_pos,
-                K=4,
+                K=3,
             )
             rotation_cache = build_rotation_reuse_cache(
                 weights_indices=weights_indices_single,
@@ -12090,29 +23678,73 @@ class InvPhyTrainerWarp:
                         eye_height,
                         scene_width,
                         scene_height,
+                        static_scene_mode=immersive_static_scene_mode,
                     )
                 )
-                print(
-                    "[quest_display] immersive balanced background tuning: "
-                    f"mode={self._immersive_balanced_runtime_state['background_mode']} "
-                    f"background_resolution="
-                    f"{self._immersive_balanced_runtime_state['background_width']}x"
-                    f"{self._immersive_balanced_runtime_state['background_height']} "
-                    "side_wall_mode=disabled "
-                    f"table_mode={self._immersive_balanced_runtime_state['table_mode']} "
-                    f"table_roi_render_scale="
-                    f"{self._immersive_balanced_runtime_state['table_roi_render_scale']:.2f}",
-                    flush=True,
+                self._immersive_balanced_runtime_state[
+                    "support_entry_overlay_enabled"
+                ] = bool(immersive_support_entry_overlay_enabled)
+                balanced_runtime_mode = str(
+                    self._immersive_balanced_runtime_state["static_scene_mode"]
                 )
-                if not static_scene_overlap_requested:
+                if (
+                    balanced_runtime_mode
+                    == self.IMMERSIVE_STATIC_SCENE_MODE_BALANCED_FOCUS
+                ):
                     print(
-                        "[quest_display] immersive static-scene overlap: "
-                        "mode=serial_reference",
+                        "[quest_display] immersive static-scene tuning: "
+                        f"static_scene_mode={balanced_runtime_mode} "
+                        f"mode={self._immersive_balanced_runtime_state['background_mode']} "
+                        f"base_resolution="
+                        f"{self._immersive_balanced_runtime_state['background_width']}x"
+                        f"{self._immersive_balanced_runtime_state['background_height']} "
+                        "side_wall_mode=disabled "
+                        "focus_mode=table_roi "
+                        "table_roi_render_scale="
+                        f"{self._immersive_balanced_runtime_state['table_roi_render_scale']:.2f}",
                         flush=True,
                     )
-                if static_scene_overlap_requested:
-                    worker_validation_request = self._build_immersive_balanced_scene_render_plan(
+                elif (
+                    balanced_runtime_mode
+                    == self.IMMERSIVE_STATIC_SCENE_MODE_BALANCED_SUPPORT_FOCUS
+                ):
+                    print(
+                        "[quest_display] immersive static-scene tuning: "
+                        f"static_scene_mode={balanced_runtime_mode} "
+                        f"mode={self._immersive_balanced_runtime_state['background_mode']} "
+                        "side_wall_mode=disabled "
+                        "focus_mode=support_roi "
+                        "support_roi_render_scale="
+                        f"{self._immersive_balanced_runtime_state['support_roi_render_scale']:.2f}",
+                        flush=True,
+                    )
+                elif (
+                    balanced_runtime_mode
+                    == self.IMMERSIVE_STATIC_SCENE_MODE_THREE_RING_FOVEATION
+                ):
+                    print(
+                        "[quest_display] immersive static-scene tuning: "
+                        f"static_scene_mode={balanced_runtime_mode} "
+                        f"mode={self._immersive_balanced_runtime_state['background_mode']} "
+                        f"outer_resolution="
+                        f"{self._immersive_balanced_runtime_state['background_width']}x"
+                        f"{self._immersive_balanced_runtime_state['background_height']} "
+                        "side_wall_mode=disabled "
+                        f"focus_mode={self._immersive_balanced_runtime_state['focus_mode']} "
+                        "outer_render_scale="
+                        f"{self._immersive_balanced_runtime_state['outer_render_scale']:.2f} "
+                        "mid_render_scale="
+                        f"{self._immersive_balanced_runtime_state['mid_render_scale']:.2f} "
+                        "inner_render_scale="
+                        f"{self._immersive_balanced_runtime_state['inner_render_scale']:.2f}",
+                        flush=True,
+                    )
+                worker_validation_request = (
+                    self._build_immersive_balanced_scene_render_plan(
                         scene_renderer,
+                        None,
+                        None,
+                        None,
                         last_left_eye_pose_world,
                         last_right_eye_pose_world,
                         initial_left_intrinsic,
@@ -12121,8 +23753,147 @@ class InvPhyTrainerWarp:
                         eye_height,
                         scene_width,
                         scene_height,
+                        active_interaction=False,
                         render_profile_frame=None,
                     )
+                )
+                balanced_warmup_kwargs = (
+                    self._build_immersive_balanced_renderer_warmup_kwargs(
+                        scene_renderer,
+                        worker_validation_request,
+                    )
+                )
+                balanced_main_warmup_paths = []
+                balanced_worker_warmup_paths = []
+                if balanced_warmup_kwargs is not None:
+                    balanced_main_warmup_paths = (
+                        scene_renderer.warmup_balanced_runtime_paths(
+                            **balanced_warmup_kwargs
+                        )
+                    )
+                startup_layer_seed_request = {
+                    eye_label: [
+                        IMMERSIVE_BALANCED_LAYER_BACKGROUND_BASE,
+                        IMMERSIVE_BALANCED_LAYER_FULL_BASE,
+                        IMMERSIVE_BALANCED_LAYER_TABLE_BASE,
+                    ]
+                    for eye_label in ("left", "right")
+                }
+                if (
+                    str(
+                        worker_validation_request.get(
+                            "static_scene_mode",
+                            self.IMMERSIVE_STATIC_SCENE_MODE_BALANCED_FOCUS,
+                        )
+                    ).strip().lower()
+                    == self.IMMERSIVE_STATIC_SCENE_MODE_BALANCED_FOCUS
+                ):
+                    for eye_label in ("left", "right"):
+                        startup_layer_seed_request[eye_label].append(
+                            IMMERSIVE_BALANCED_LAYER_TABLE_OVERLAY
+                        )
+                elif (
+                    str(immersive_static_scene_mode).strip().lower()
+                    == self.IMMERSIVE_STATIC_SCENE_MODE_BALANCED_SUPPORT_FOCUS
+                ):
+                    for eye_label in ("left", "right"):
+                        startup_layer_seed_request[eye_label].append(
+                            IMMERSIVE_BALANCED_LAYER_TABLE_OVERLAY
+                        )
+                static_scene_layer_cache = self._seed_immersive_static_scene_layer_cache(
+                    renderer=scene_execute_renderer,
+                    render_plan=worker_validation_request,
+                    head_pose_state=head_pose_state,
+                    requested_layers_by_eye=startup_layer_seed_request,
+                )
+                print(
+                    "[quest_display] immersive balanced warmup complete: "
+                    "paths="
+                    + ",".join(sorted(balanced_main_warmup_paths))
+                    + " layer_seed="
+                    + ",".join(
+                        sorted(
+                            {
+                                layer_name
+                                for layers in startup_layer_seed_request.values()
+                                for layer_name in layers
+                            }
+                        )
+                    ),
+                    flush=True,
+                )
+                if not static_scene_overlap_requested:
+                    left_eye_worker = None
+                    right_eye_worker = None
+                    try:
+                        left_eye_worker = _ImmersiveBalancedSceneEyeRenderWorker(
+                            eye_label="left",
+                            scene_assets_root=scene_assets_root,
+                            scene_width=scene_width,
+                            scene_height=scene_height,
+                            lighting_mode=immersive_render_options["lighting_mode"],
+                            balanced_render_backend="pyrender",
+                            static_scene_mode=immersive_static_scene_mode,
+                            layout=layout,
+                            cuda_device_index=int(torch.cuda.current_device()),
+                        )
+                        left_eye_worker.start(
+                            validation_request=_build_immersive_balanced_scene_eye_request(
+                                worker_validation_request,
+                                "left",
+                            ),
+                            warmup_kwargs=balanced_warmup_kwargs,
+                        )
+                        right_eye_worker = _ImmersiveBalancedSceneEyeRenderWorker(
+                            eye_label="right",
+                            scene_assets_root=scene_assets_root,
+                            scene_width=scene_width,
+                            scene_height=scene_height,
+                            lighting_mode=immersive_render_options["lighting_mode"],
+                            balanced_render_backend="pyrender",
+                            static_scene_mode=immersive_static_scene_mode,
+                            layout=layout,
+                            cuda_device_index=int(torch.cuda.current_device()),
+                        )
+                        right_eye_worker.start(
+                            validation_request=_build_immersive_balanced_scene_eye_request(
+                                worker_validation_request,
+                                "right",
+                            ),
+                            warmup_kwargs=balanced_warmup_kwargs,
+                        )
+                        balanced_eye_workers = {
+                            "left": left_eye_worker,
+                            "right": right_eye_worker,
+                        }
+                        balanced_eye_parallel_enabled = True
+                        print(
+                            "[quest_display] immersive static-scene parallelism: "
+                            "mode=eye_parallel",
+                            flush=True,
+                        )
+                    except Exception as exc:
+                        for eye_worker in (left_eye_worker, right_eye_worker):
+                            if eye_worker is None:
+                                continue
+                            try:
+                                eye_worker.stop()
+                            except Exception:
+                                pass
+                        balanced_eye_workers = {}
+                        balanced_eye_parallel_enabled = False
+                        print(
+                            "[quest_display] immersive static-scene parallelism unavailable; "
+                            "falling back to serial_reference: "
+                            f"{type(exc).__name__}: {exc}",
+                            flush=True,
+                        )
+                        print(
+                            "[quest_display] immersive static-scene overlap: "
+                            "mode=serial_reference",
+                            flush=True,
+                        )
+                if static_scene_overlap_requested:
                     try:
                         static_scene_worker = _ImmersiveStaticSceneRenderWorker(
                             scene_assets_root=scene_assets_root,
@@ -12130,11 +23901,16 @@ class InvPhyTrainerWarp:
                             scene_height=scene_height,
                             lighting_mode=immersive_render_options["lighting_mode"],
                             balanced_render_backend="pyrender",
+                            static_scene_mode=immersive_static_scene_mode,
                             layout=layout,
                             cuda_device_index=int(torch.cuda.current_device()),
                         )
                         worker_startup_debug = static_scene_worker.start(
                             validation_request=worker_validation_request,
+                            warmup_kwargs=balanced_warmup_kwargs,
+                        )
+                        balanced_worker_warmup_paths = list(
+                            worker_startup_debug.get("warmup_paths") or []
                         )
                         static_scene_overlap_enabled = True
                         if scene_depth_reproject_enabled:
@@ -12166,7 +23942,10 @@ class InvPhyTrainerWarp:
                         if framegen_requested:
                             print(
                                 "[quest_display] immersive static-scene framegen: "
-                                f"mode={immersive_framegen_mode} reuse_max_age_frames=1",
+                                "mode="
+                                f"{immersive_framegen_mode} "
+                                "reuse_max_age_frames="
+                                f"{self._immersive_static_scene_framegen_max_age_frames(immersive_framegen_mode)}",
                                 flush=True,
                             )
                     except Exception as exc:
@@ -12196,11 +23975,48 @@ class InvPhyTrainerWarp:
                             f"{type(exc).__name__}: {exc}",
                             flush=True,
                         )
+                warmup_main_label = (
+                    ",".join(balanced_main_warmup_paths)
+                    if balanced_main_warmup_paths
+                    else "none"
+                )
+                warmup_worker_label = (
+                    ",".join(balanced_worker_warmup_paths)
+                    if static_scene_overlap_enabled
+                    else "disabled"
+                )
+                print(
+                    "[quest_display] immersive balanced renderer warmup complete: "
+                    f"main_paths={warmup_main_label} "
+                    f"worker_paths={warmup_worker_label}",
+                    flush=True,
+                )
             print(
                 "[quest_display] immersive gaussian render: "
                 f"mode={immersive_gaussian_render_mode}",
                 flush=True,
             )
+            if (
+                static_scene_overlap_requested
+                and immersive_gaussian_render_mode == "stereo_parallel"
+            ):
+                print(
+                    "[quest_display] immersive gaussian render overlap path: "
+                    "mode=stereo_parallel branch_b=main_thread_cuda_streams",
+                    flush=True,
+                )
+            if presentation_backend_enabled:
+                pipeline_source = (
+                    "explicit_flag"
+                    if immersive_present_pipeline_enabled
+                    else "framegen_auto"
+                )
+                print(
+                    "[quest_display] immersive presentation pipeline: "
+                    "mode=cross_frame_present latest_wins=1 "
+                    f"source={pipeline_source} backend={presentation_backend_kind}",
+                    flush=True,
+                )
 
             self._set_scene_collider_boxes(layout)
             support_surface_boxes_np = None
@@ -12341,6 +24157,9 @@ class InvPhyTrainerWarp:
                 == self.IMMERSIVE_BALANCED_INTERNAL_STEREO_MODE
             ):
                 balanced_side_wall_mode = "disabled"
+                balanced_static_scene_mode = (
+                    self.IMMERSIVE_STATIC_SCENE_MODE_BALANCED_FOCUS
+                )
                 if self._immersive_balanced_runtime_state is not None:
                     balanced_side_wall_mode = str(
                         self._immersive_balanced_runtime_state.get(
@@ -12348,15 +24167,41 @@ class InvPhyTrainerWarp:
                             "disabled",
                         )
                     )
+                    balanced_static_scene_mode = str(
+                        self._immersive_balanced_runtime_state.get(
+                            "static_scene_mode",
+                            self.IMMERSIVE_STATIC_SCENE_MODE_BALANCED_FOCUS,
+                        )
+                    )
                 if balanced_side_wall_mode == "disabled":
-                    startup_scene_validation_mode = (
-                        "assembled_balanced_per_eye_background_table_roi"
-                    )
-                    print(
-                        "[quest_display] immersive balanced side-strip startup validation "
-                        "skipped; shipped balanced mode uses per-eye room backgrounds",
-                        flush=True,
-                    )
+                    if (
+                        balanced_static_scene_mode
+                        == self.IMMERSIVE_STATIC_SCENE_MODE_BALANCED_FOCUS
+                    ):
+                        startup_scene_validation_mode = (
+                            "assembled_balanced_per_eye_background_table_roi"
+                        )
+                        print(
+                            "[quest_display] immersive static-scene startup validation "
+                            "skipped; balanced_focus uses per-eye background with table ROI",
+                            flush=True,
+                        )
+                    elif (
+                        balanced_static_scene_mode
+                        == self.IMMERSIVE_STATIC_SCENE_MODE_BALANCED_SUPPORT_FOCUS
+                    ):
+                        startup_scene_validation_mode = (
+                            "assembled_balanced_per_eye_background_support_roi"
+                        )
+                        print(
+                            "[quest_display] immersive static-scene startup validation "
+                            "skipped; balanced_support_focus uses per-eye background with one active support ROI",
+                            flush=True,
+                        )
+                    else:
+                        raise ValueError(
+                            f"Unsupported immersive static scene mode: {balanced_static_scene_mode}"
+                        )
                 else:
                     balanced_edge_valid, balanced_edge_debug = (
                         self._validate_immersive_balanced_edge_warp_startup(
@@ -12407,6 +24252,7 @@ class InvPhyTrainerWarp:
                 live_head_alignment,
                 layout,
                 scene_renderer,
+                scene_execute_renderer,
                 initial_sample.left_eye,
                 initial_sample.right_eye,
                 last_left_eye_pose_world,
@@ -12418,7 +24264,7 @@ class InvPhyTrainerWarp:
                 background_black,
                 background_white,
                 diagnostic_view_render_path,
-                save_success_bundle=render_profile,
+                save_success_bundle=profile_enabled,
                 scene_stereo_mode=active_scene_stereo_mode,
                 scene_width=scene_width,
                 scene_height=scene_height,
@@ -12467,6 +24313,45 @@ class InvPhyTrainerWarp:
             last_valid_target = current_target.clone()
             last_valid_gaussian_state = self._capture_gaussian_runtime_state(gaussians)
             last_valid_object_center = x[: self.num_all_points].mean(dim=0).clone()
+            committed_safe_sim_state = self._capture_sim_state()
+            committed_safe_target = current_target.clone()
+            committed_safe_gaussian_state = self._capture_gaussian_runtime_state(
+                gaussians
+            )
+            committed_safe_interaction_snapshot = (
+                self._capture_immersive_stable_interaction_snapshot(
+                    controller_interaction_state,
+                    controller_anchor_preview_state,
+                )
+            )
+            committed_safe_cover_left_frame = None
+            committed_safe_cover_right_frame = None
+            committed_safe_preview_frame = None
+
+            def _update_balanced_scene_input_cache_from_points(object_points_t):
+                bounds_min_t = object_points_t.min(dim=0).values - 0.01
+                bounds_max_t = object_points_t.max(dim=0).values + 0.01
+                support_center_np = (
+                    self._object_support_patch_center(object_points_t)
+                    .detach()
+                    .cpu()
+                    .numpy()
+                    .astype(np.float32)
+                )
+                balanced_scene_input_cache["last_object_bounds_min_world"] = (
+                    bounds_min_t.detach().cpu().numpy().astype(np.float32)
+                )
+                balanced_scene_input_cache["last_object_bounds_max_world"] = (
+                    bounds_max_t.detach().cpu().numpy().astype(np.float32)
+                )
+                balanced_scene_input_cache["last_object_support_center_world"] = (
+                    support_center_np
+                )
+                return bounds_min_t, bounds_max_t, support_center_np
+
+            _update_balanced_scene_input_cache_from_points(
+                scene_rest_state["x"][: self.num_all_points]
+            )
 
             glfw.make_context_current(window)
             if preview_display_active:
@@ -12533,8 +24418,938 @@ class InvPhyTrainerWarp:
                 gl.glUseProgram(0)
                 preview_vao = gl.glGenVertexArrays(1)
 
+            if presentation_backend_enabled:
+                presentation_worker_cls = (
+                    _ImmersivePresentationWorkerLegacy
+                    if presentation_backend_kind == "legacy_single_worker"
+                    else _ImmersivePresentationWorker
+                )
+                presentation_worker = presentation_worker_cls(
+                    owner=self,
+                    immersive_bridge=immersive_bridge,
+                    eye_width=eye_width,
+                    eye_height=eye_height,
+                    preview_enabled=preview_display_active,
+                    cuda_device_index=int(torch.cuda.current_device()),
+                )
+                presentation_worker.start()
+
+            def _copy_present_overlay_eye_render_state(eye_render_state):
+                if eye_render_state is None:
+                    return None
+                return {
+                    "intrinsic_t": eye_render_state["intrinsic_t"].clone(),
+                    "w2c_cv_t": eye_render_state["w2c_cv_t"].clone(),
+                    "intrinsic_np": np.asarray(
+                        eye_render_state["intrinsic_np"],
+                        dtype=np.float32,
+                    ).copy(),
+                    "w2c_cv_np": np.asarray(
+                        eye_render_state["w2c_cv_np"],
+                        dtype=np.float32,
+                    ).copy(),
+                    "height": int(eye_render_state["height"]),
+                    "width": int(eye_render_state["width"]),
+                }
+
+            def _append_immersive_render_profile_row(frame_index, frame_profile):
+                if frame_profile is None:
+                    return
+                self._render_profile_append_frame(
+                    immersive_render_profile_series,
+                    immersive_render_profile_rows,
+                    frame_index,
+                    frame_profile,
+                )
+                if self._render_profile_should_log(frame_index, profile_freq):
+                    self._log_immersive_render_profile_frame(
+                        frame_index,
+                        frame_profile,
+                    )
+
+            def _finalize_present_profile_frame(
+                frame_index,
+                *,
+                present_result=None,
+                dropped=False,
+            ):
+                frame_profile = presentation_pending_profile_frames.pop(
+                    int(frame_index),
+                    None,
+                )
+                if frame_profile is None:
+                    return
+                if present_result is not None:
+                    for key, value in (
+                        (present_result.get("render_profile_updates") or {}).items()
+                    ):
+                        frame_profile[key] = float(value)
+                    frame_profile["compositing_ms"] = float(
+                        present_result.get("compose_wall_ms", 0.0)
+                    ) / 1000.0
+                    frame_profile["overlay_publish_ms"] = float(
+                        present_result.get("overlay_wall_ms", 0.0)
+                        + present_result.get("publish_wall_ms", 0.0)
+                    ) / 1000.0
+                    frame_profile["scene_present_queue_wait_ms"] = float(
+                        present_result.get("queue_wait_ms", 0.0)
+                    ) / 1000.0
+                    frame_profile["scene_present_worker_ms"] = float(
+                        present_result.get("worker_wall_ms", 0.0)
+                    ) / 1000.0
+                    frame_profile["scene_present_compose_ms"] = float(
+                        present_result.get("compose_wall_ms", 0.0)
+                    ) / 1000.0
+                    frame_profile["scene_present_compose_left_ms"] = float(
+                        present_result.get("compose_left_ms", 0.0)
+                    ) / 1000.0
+                    frame_profile["scene_present_compose_right_ms"] = float(
+                        present_result.get("compose_right_ms", 0.0)
+                    ) / 1000.0
+                    frame_profile["scene_present_overlay_ms"] = float(
+                        present_result.get("overlay_wall_ms", 0.0)
+                    ) / 1000.0
+                    frame_profile["scene_present_overlay_left_ms"] = float(
+                        present_result.get("overlay_left_ms", 0.0)
+                    ) / 1000.0
+                    frame_profile["scene_present_overlay_right_ms"] = float(
+                        present_result.get("overlay_right_ms", 0.0)
+                    ) / 1000.0
+                    frame_profile["scene_present_parallel_wait_ms"] = float(
+                        present_result.get("parallel_wait_ms", 0.0)
+                    ) / 1000.0
+                    frame_profile["scene_present_publish_ms"] = float(
+                        present_result.get("publish_wall_ms", 0.0)
+                    ) / 1000.0
+                    frame_profile["scene_present_source_age_ms"] = float(
+                        present_result.get("source_age_ms", 0.0)
+                    ) / 1000.0
+                frame_profile["scene_present_drop_count"] = 1.0 if dropped else 0.0
+                frame_profile["scene_present_drop_ratio"] = 1.0 if dropped else 0.0
+                _append_immersive_render_profile_row(
+                    int(frame_index),
+                    frame_profile,
+                )
+
+            def _mark_dropped_present_packet(packet):
+                nonlocal presentation_dropped_count
+                if packet is None:
+                    return
+                presentation_pending_safe_snapshots.pop(
+                    int(packet.get("source_frame_index", -1)),
+                    None,
+                )
+                if int(packet.get("source_frame_index", -1)) <= 1:
+                    return
+                presentation_dropped_count += 1
+                presentation_drop_ratio_samples.append(1.0)
+                if profile_enabled:
+                    _finalize_present_profile_frame(
+                        packet["source_frame_index"],
+                        dropped=True,
+                    )
+
+            def _capture_stable_present_safe_snapshot():
+                return {
+                    "sim_state": self._capture_sim_state(),
+                    "target": current_target.clone(),
+                    "gaussian_state": self._capture_gaussian_runtime_state(
+                        gaussians
+                    ),
+                    "interaction_snapshot": (
+                        self._capture_immersive_stable_interaction_snapshot(
+                            controller_interaction_state,
+                            controller_anchor_preview_state,
+                        )
+                    ),
+                }
+
+            def _capture_stable_cover_frame_snapshot(
+                left_frame,
+                right_frame,
+                *,
+                preview_frame=None,
+            ):
+                if not torch.is_tensor(left_frame) or not torch.is_tensor(right_frame):
+                    return None
+                return {
+                    "left_frame": left_frame.clone(),
+                    "right_frame": right_frame.clone(),
+                    "preview_frame": None
+                    if preview_frame is None
+                    else preview_frame.clone(),
+                }
+
+            def _promote_committed_safe_anchor(snapshot):
+                nonlocal committed_safe_sim_state
+                nonlocal committed_safe_target
+                nonlocal committed_safe_gaussian_state
+                nonlocal committed_safe_interaction_snapshot
+                if snapshot is None:
+                    return
+                committed_safe_sim_state = {
+                    "x": snapshot["sim_state"]["x"].clone(),
+                    "v": snapshot["sim_state"]["v"].clone(),
+                }
+                committed_safe_target = snapshot["target"].clone()
+                committed_safe_gaussian_state = {
+                    "xyz": snapshot["gaussian_state"]["xyz"].clone(),
+                    "rotation": snapshot["gaussian_state"]["rotation"].clone(),
+                }
+                committed_safe_interaction_snapshot = copy.deepcopy(
+                    snapshot.get("interaction_snapshot", {})
+                )
+
+            def _promote_committed_safe_cover_snapshot(snapshot):
+                nonlocal committed_safe_cover_left_frame
+                nonlocal committed_safe_cover_right_frame
+                nonlocal committed_safe_preview_frame
+                if snapshot is None:
+                    return
+                committed_safe_cover_left_frame = snapshot["left_frame"].clone()
+                committed_safe_cover_right_frame = snapshot["right_frame"].clone()
+                preview_frame = snapshot.get("preview_frame")
+                committed_safe_preview_frame = (
+                    None if preview_frame is None else preview_frame.clone()
+                )
+
+            def _restore_stable_committed_safe_anchor(affected_sources):
+                nonlocal current_target
+                nonlocal prev_target
+                nonlocal x
+                nonlocal prev_x
+                nonlocal current_pos
+                nonlocal current_rot
+                nonlocal last_valid_sim_state
+                nonlocal last_valid_target
+                nonlocal last_valid_gaussian_state
+                nonlocal last_valid_object_center
+                rollback_result = self._rollback_immersive_stable_visual_reject(
+                    controller_interaction_state,
+                    controller_anchor_preview_state,
+                    controller_attachment_metadata,
+                    committed_safe_sim_state,
+                    committed_safe_target,
+                    gaussians,
+                    committed_safe_gaussian_state,
+                    committed_safe_interaction_snapshot,
+                )
+                restored_target = rollback_result["restored_target"]
+                prev_target = restored_target.clone()
+                current_target = restored_target.clone()
+                x = committed_safe_sim_state["x"].clone()
+                prev_x = x.clone()
+                current_pos = gaussians.get_xyz
+                current_rot = gaussians.get_rotation
+                last_valid_sim_state = {
+                    "x": committed_safe_sim_state["x"].clone(),
+                    "v": committed_safe_sim_state["v"].clone(),
+                }
+                last_valid_target = committed_safe_target.clone()
+                last_valid_gaussian_state = {
+                    "xyz": committed_safe_gaussian_state["xyz"].clone(),
+                    "rotation": committed_safe_gaussian_state["rotation"].clone(),
+                }
+                last_valid_object_center = (
+                    x[: self.num_all_points].mean(dim=0).detach().clone()
+                )
+                _update_balanced_scene_input_cache_from_points(
+                    x[: self.num_all_points]
+                )
+                return rollback_result
+
+            def _record_stable_rollback_result(rollback_result):
+                nonlocal stable_rollback_preserved_interaction_count
+                nonlocal stable_rollback_released_new_grab_count
+                nonlocal stable_rollback_preserved_left_count
+                nonlocal stable_rollback_preserved_right_count
+                preserved_sources = list(
+                    rollback_result.get("preserved_sources", [])
+                )
+                released_sources = list(
+                    rollback_result.get("released_sources", [])
+                )
+                stable_rollback_preserved_interaction_count += len(
+                    preserved_sources
+                )
+                stable_rollback_released_new_grab_count += len(
+                    released_sources
+                )
+                stable_rollback_preserved_left_count += int(
+                    "left" in preserved_sources
+                )
+                stable_rollback_preserved_right_count += int(
+                    "right" in preserved_sources
+                )
+                return preserved_sources, released_sources
+
+            def _ingest_presentation_result(result):
+                nonlocal first_real_publish_done
+                nonlocal latest_preview_completion
+                nonlocal presentation_completed_frame_count
+                nonlocal synthetic_framegen_published_count
+                nonlocal synthetic_framegen_launch_count
+                nonlocal present_arbiter_real_publish_count
+                nonlocal present_arbiter_synthetic_publish_count
+                nonlocal present_arbiter_synthetic_dropped_by_real_count
+                nonlocal stable_compose_reject_count
+                nonlocal stable_compose_reject_blue_scene_exposure_count
+                nonlocal stable_compose_reject_gaussian_blue_source_count
+                nonlocal stable_compose_reject_rollback_count
+                nonlocal stable_cover_publish_count
+                nonlocal stable_cover_publish_compose_reject_count
+                nonlocal stable_cover_publish_source_corruption_count
+                nonlocal stable_cover_publish_missing_cache_count
+                nonlocal stable_cover_publish_ms_samples
+                nonlocal stable_rollback_preserved_interaction_count
+                nonlocal stable_rollback_released_new_grab_count
+                nonlocal stable_rollback_preserved_left_count
+                nonlocal stable_rollback_preserved_right_count
+                if result is None:
+                    return
+                if not bool(result.get("ok", False)):
+                    raise RuntimeError(
+                        "Immersive presentation worker failed: "
+                        f"{result.get('error', 'unknown error')}"
+                    )
+                payload = result.get("payload")
+                if payload is None:
+                    return
+                payload_kind = str(
+                    payload.get("payload_kind", "real_publish")
+                ).strip().lower()
+                payload_backend_kind = str(
+                    payload.get(
+                        "presentation_backend_kind",
+                        presentation_backend_kind or "unknown",
+                    )
+                ).strip().lower()
+                split_presentation_payload = (
+                    payload_backend_kind == "split_experimental"
+                )
+                count_for_stats = int(payload.get("source_frame_index", -1)) > 1
+                if payload_kind == "stable_compose_rejected":
+                    frame_index = int(payload.get("source_frame_index", -1))
+                    presentation_pending_safe_snapshots.pop(frame_index, None)
+                    if count_for_stats and bool(
+                        payload.get("cover_cache_missing", False)
+                    ):
+                        stable_cover_publish_missing_cache_count += 1
+                    if count_for_stats:
+                        stable_compose_reject_count += 1
+                        if bool(payload.get("blue_scene_exposure_reject", False)):
+                            stable_compose_reject_blue_scene_exposure_count += 1
+                        if bool(payload.get("gaussian_blue_source_reject", False)):
+                            stable_compose_reject_gaussian_blue_source_count += 1
+                    rollback_result = _restore_stable_committed_safe_anchor(
+                        payload.get("affected_sources", [])
+                    )
+                    stable_compose_reject_rollback_count += 1
+                    _record_stable_rollback_result(rollback_result)
+                    if profile_enabled:
+                        _finalize_present_profile_frame(
+                            frame_index,
+                            dropped=True,
+                        )
+                    return
+                if payload_kind == "stable_cover_publish":
+                    frame_index = int(payload.get("source_frame_index", -1))
+                    presentation_pending_safe_snapshots.pop(frame_index, None)
+                    if count_for_stats:
+                        stable_compose_reject_count += 1
+                        stable_cover_publish_count += 1
+                        stable_cover_publish_compose_reject_count += int(
+                            str(payload.get("reject_source", "")).strip().lower()
+                            == "compose_reject"
+                        )
+                        stable_cover_publish_source_corruption_count += int(
+                            str(payload.get("reject_source", "")).strip().lower()
+                            == "source_corruption"
+                        )
+                        stable_cover_publish_ms_samples.append(
+                            float(payload.get("publish_wall_ms", 0.0))
+                        )
+                        if bool(payload.get("blue_scene_exposure_reject", False)):
+                            stable_compose_reject_blue_scene_exposure_count += 1
+                        if bool(payload.get("gaussian_blue_source_reject", False)):
+                            stable_compose_reject_gaussian_blue_source_count += 1
+                    rollback_result = _restore_stable_committed_safe_anchor(
+                        payload.get("affected_sources", [])
+                    )
+                    stable_compose_reject_rollback_count += 1
+                    _record_stable_rollback_result(rollback_result)
+                    if payload.get("preview_frame") is not None:
+                        latest_preview_completion = payload
+                    if profile_enabled:
+                        _finalize_present_profile_frame(
+                            frame_index,
+                            dropped=True,
+                        )
+                    return
+                if payload_kind == "synthetic_publish":
+                    if count_for_stats:
+                        presentation_completed_frame_count += 1
+                        synthetic_framegen_published_count += 1
+                        if split_presentation_payload:
+                            present_arbiter_synthetic_publish_count += 1
+                        launch_increment = int(
+                            round(
+                                float(
+                                    payload.get(
+                                        "synthetic_launch_count_increment",
+                                        0.0,
+                                    )
+                                )
+                            )
+                        )
+                        synthetic_framegen_launch_count += launch_increment
+                        if launch_increment > 0:
+                            synthetic_framegen_pending_real_at_launch_samples.append(
+                                float(
+                                    payload.get(
+                                        "synthetic_pending_real_at_launch",
+                                        0.0,
+                                    )
+                                )
+                            )
+                            synthetic_framegen_immediate_sample_hit_samples.append(
+                                float(
+                                    payload.get(
+                                        "synthetic_immediate_sample_hit",
+                                        0.0,
+                                    )
+                                )
+                            )
+                        synthetic_framegen_resolved_samples.append(1.0)
+                        synthetic_framegen_source_age_ms_samples.append(
+                            float(payload.get("synthetic_source_age_ms", 0.0))
+                        )
+                        synthetic_framegen_total_scene_age_ms_samples.append(
+                            float(payload.get("synthetic_total_scene_age_ms", 0.0))
+                        )
+                        synthetic_framegen_handoff_delay_ms_samples.append(
+                            float(payload.get("synthetic_handoff_delay_ms", 0.0))
+                        )
+                        synthetic_framegen_translation_m_samples.append(
+                            float(payload.get("synthetic_translation_m", 0.0))
+                        )
+                        synthetic_framegen_rotation_deg_samples.append(
+                            float(payload.get("synthetic_rotation_deg", 0.0))
+                        )
+                        synthetic_framegen_skip_no_new_sample_samples.append(0.0)
+                        synthetic_framegen_skip_source_age_samples.append(0.0)
+                        synthetic_framegen_skip_translation_samples.append(0.0)
+                        synthetic_framegen_skip_rotation_samples.append(0.0)
+                        synthetic_framegen_skip_stale_packet_samples.append(0.0)
+                        synthetic_framegen_skip_invalid_pose_samples.append(0.0)
+                        synthetic_framegen_skip_latewarp_failure_samples.append(0.0)
+                        synthetic_framegen_skip_pending_real_yield_samples.append(
+                            0.0
+                        )
+                        synthetic_framegen_skip_real_source_inconsistent_samples.append(
+                            0.0
+                        )
+                        synthetic_source_real_timewarp_applied_samples.append(
+                            float(
+                                payload.get(
+                                    "synthetic_source_real_timewarp_applied",
+                                    0.0,
+                                )
+                            )
+                        )
+                        synthetic_source_real_timewarp_fallback_left_samples.append(
+                            float(
+                                payload.get(
+                                    "synthetic_source_real_timewarp_fallback_left",
+                                    0.0,
+                                )
+                            )
+                        )
+                        synthetic_source_real_timewarp_fallback_right_samples.append(
+                            float(
+                                payload.get(
+                                    "synthetic_source_real_timewarp_fallback_right",
+                                    0.0,
+                                )
+                            )
+                        )
+                        synthetic_source_consistent_samples.append(
+                            float(
+                                payload.get("synthetic_source_consistent", 1.0)
+                            )
+                        )
+                    if payload.get("preview_frame") is not None:
+                        latest_preview_completion = payload
+                    return
+                if payload_kind == "synthetic_skip":
+                    if count_for_stats:
+                        launch_increment = int(
+                            round(
+                                float(
+                                    payload.get(
+                                        "synthetic_launch_count_increment",
+                                        0.0,
+                                    )
+                                )
+                            )
+                        )
+                        synthetic_framegen_launch_count += launch_increment
+                        if launch_increment > 0:
+                            synthetic_framegen_pending_real_at_launch_samples.append(
+                                float(
+                                    payload.get(
+                                        "synthetic_pending_real_at_launch",
+                                        0.0,
+                                    )
+                                )
+                            )
+                            synthetic_framegen_immediate_sample_hit_samples.append(
+                                float(
+                                    payload.get(
+                                        "synthetic_immediate_sample_hit",
+                                        0.0,
+                                    )
+                                )
+                            )
+                        synthetic_framegen_resolved_samples.append(0.0)
+                        synthetic_framegen_source_age_ms_samples.append(
+                            float(payload.get("synthetic_source_age_ms", 0.0))
+                        )
+                        synthetic_framegen_total_scene_age_ms_samples.append(
+                            float(payload.get("synthetic_total_scene_age_ms", 0.0))
+                        )
+                        synthetic_framegen_handoff_delay_ms_samples.append(
+                            float(payload.get("synthetic_handoff_delay_ms", 0.0))
+                        )
+                        synthetic_framegen_translation_m_samples.append(
+                            float(payload.get("synthetic_translation_m", 0.0))
+                        )
+                        synthetic_framegen_rotation_deg_samples.append(
+                            float(payload.get("synthetic_rotation_deg", 0.0))
+                        )
+                        skip_reason = str(
+                            payload.get("synthetic_skip_reason", "")
+                        ).strip().lower()
+                        synthetic_framegen_skip_no_new_sample_samples.append(
+                            1.0 if skip_reason == "no_new_sample" else 0.0
+                        )
+                        synthetic_framegen_skip_source_age_samples.append(
+                            1.0 if skip_reason == "source_age" else 0.0
+                        )
+                        synthetic_framegen_skip_translation_samples.append(
+                            1.0 if skip_reason == "translation" else 0.0
+                        )
+                        synthetic_framegen_skip_rotation_samples.append(
+                            1.0 if skip_reason == "rotation" else 0.0
+                        )
+                        synthetic_framegen_skip_stale_packet_samples.append(
+                            1.0 if skip_reason == "stale_packet" else 0.0
+                        )
+                        synthetic_framegen_skip_invalid_pose_samples.append(
+                            1.0 if skip_reason == "invalid_pose" else 0.0
+                        )
+                        synthetic_framegen_skip_latewarp_failure_samples.append(
+                            1.0 if skip_reason == "latewarp_failure" else 0.0
+                        )
+                        synthetic_framegen_skip_pending_real_yield_samples.append(
+                            1.0 if skip_reason == "pending_real_yield" else 0.0
+                        )
+                        synthetic_framegen_skip_real_source_inconsistent_samples.append(
+                            1.0
+                            if skip_reason == "real_source_inconsistent"
+                            else 0.0
+                        )
+                        synthetic_source_real_timewarp_applied_samples.append(
+                            float(
+                                payload.get(
+                                    "synthetic_source_real_timewarp_applied",
+                                    0.0,
+                                )
+                            )
+                        )
+                        synthetic_source_real_timewarp_fallback_left_samples.append(
+                            float(
+                                payload.get(
+                                    "synthetic_source_real_timewarp_fallback_left",
+                                    0.0,
+                                )
+                            )
+                        )
+                        synthetic_source_real_timewarp_fallback_right_samples.append(
+                            float(
+                                payload.get(
+                                    "synthetic_source_real_timewarp_fallback_right",
+                                    0.0,
+                                )
+                            )
+                        )
+                        synthetic_source_consistent_samples.append(
+                            float(
+                                payload.get("synthetic_source_consistent", 1.0)
+                            )
+                        )
+                        if (
+                            split_presentation_payload
+                            and skip_reason == "pending_real_yield"
+                        ):
+                            present_arbiter_synthetic_dropped_by_real_count += 1
+                    return
+                if count_for_stats:
+                    presentation_completed_frame_count += 1
+                    if split_presentation_payload:
+                        present_arbiter_real_publish_count += 1
+                queue_wait_ms = float(payload.get("queue_wait_ms", 0.0))
+                worker_wall_ms = float(payload.get("worker_wall_ms", 0.0))
+                compose_wall_ms = float(payload.get("compose_wall_ms", 0.0))
+                compose_left_ms = float(payload.get("compose_left_ms", 0.0))
+                compose_right_ms = float(payload.get("compose_right_ms", 0.0))
+                overlay_wall_ms = float(payload.get("overlay_wall_ms", 0.0))
+                overlay_left_ms = float(payload.get("overlay_left_ms", 0.0))
+                overlay_right_ms = float(payload.get("overlay_right_ms", 0.0))
+                parallel_wait_ms = float(payload.get("parallel_wait_ms", 0.0))
+                publish_wall_ms = float(payload.get("publish_wall_ms", 0.0))
+                source_age_ms = float(payload.get("source_age_ms", 0.0))
+                scene_pose_staleness_ms = float(
+                    payload.get("scene_pose_staleness_ms_at_publish", 0.0)
+                )
+                if count_for_stats:
+                    presentation_queue_wait_ms_samples.append(queue_wait_ms)
+                    presentation_worker_ms_samples.append(worker_wall_ms)
+                    presentation_compose_ms_samples.append(compose_wall_ms)
+                    presentation_compose_left_ms_samples.append(compose_left_ms)
+                    presentation_compose_right_ms_samples.append(compose_right_ms)
+                    presentation_overlay_ms_samples.append(overlay_wall_ms)
+                    presentation_overlay_left_ms_samples.append(overlay_left_ms)
+                    presentation_overlay_right_ms_samples.append(overlay_right_ms)
+                    presentation_parallel_wait_ms_samples.append(parallel_wait_ms)
+                    presentation_publish_ms_samples.append(publish_wall_ms)
+                    presentation_source_age_ms_samples.append(source_age_ms)
+                    if scene_pose_staleness_ms > 0.0:
+                        scene_pose_staleness_ms_samples.append(
+                            scene_pose_staleness_ms
+                        )
+                    presentation_drop_ratio_samples.append(0.0)
+                    render_stage_times["compositing_ms"].append(
+                        compose_wall_ms / 1000.0
+                    )
+                    render_stage_times["overlay_publish_ms"].append(
+                        (overlay_wall_ms + publish_wall_ms) / 1000.0
+                    )
+                    render_stage_times["scene_present_worker_ms"].append(
+                        worker_wall_ms / 1000.0
+                    )
+                    render_stage_times["scene_present_queue_wait_ms"].append(
+                        queue_wait_ms / 1000.0
+                    )
+                    render_stage_times["scene_present_compose_left_ms"].append(
+                        compose_left_ms / 1000.0
+                    )
+                    render_stage_times["scene_present_compose_right_ms"].append(
+                        compose_right_ms / 1000.0
+                    )
+                    render_stage_times["scene_present_overlay_left_ms"].append(
+                        overlay_left_ms / 1000.0
+                    )
+                    render_stage_times["scene_present_overlay_right_ms"].append(
+                        overlay_right_ms / 1000.0
+                    )
+                    render_stage_times["scene_present_parallel_wait_ms"].append(
+                        parallel_wait_ms / 1000.0
+                    )
+                    render_stage_times["scene_present_source_age_ms"].append(
+                        source_age_ms / 1000.0
+                    )
+                if payload.get("preview_frame") is not None:
+                    latest_preview_completion = payload
+                if (
+                    payload_kind == "real_publish"
+                    and payload_backend_kind == "legacy_single_worker"
+                ):
+                    _promote_committed_safe_anchor(
+                        presentation_pending_safe_snapshots.pop(
+                            int(payload.get("source_frame_index", -1)),
+                            None,
+                        )
+                    )
+                    _promote_committed_safe_cover_snapshot(
+                        payload.get("stable_cover_frame_snapshot")
+                    )
+                _finalize_present_profile_frame(
+                    payload["source_frame_index"],
+                    present_result=payload,
+                    dropped=False,
+                )
+                if not first_real_publish_done:
+                    self._record_immersive_startup_milestone(
+                        startup_timeline,
+                        "first_publish_done",
+                        immersive_bridge,
+                    )
+                    first_real_publish_done = True
+                    if startup_keepalive_state is not None:
+                        startup_keepalive_state["enabled"] = False
+                    startup_gap_ms = startup_timeline.get("startup_gap_ms")
+                    if startup_gap_ms is not None:
+                        print(
+                            "[quest_display] immersive startup first real publish: "
+                            f"startup_gap_ms={startup_gap_ms:.1f}",
+                            flush=True,
+                        )
+
+            def _drain_presentation_results():
+                if presentation_worker is None:
+                    return
+                while True:
+                    result = presentation_worker.poll_result()
+                    if result is None:
+                        break
+                    _ingest_presentation_result(result)
+
+            def _check_first_real_publish_watchdog():
+                if (
+                    not presentation_backend_enabled
+                    or presentation_worker is None
+                    or first_real_publish_done
+                    or not framegen_requested
+                    or not scene_depth_reproject_enabled
+                ):
+                    return
+                snapshot = presentation_worker.first_real_publish_watchdog_snapshot()
+                if bool(snapshot.get("first_real_publish_completed", False)):
+                    return
+                first_real_submit_wall_time_s = snapshot.get(
+                    "first_real_submit_wall_time_s"
+                )
+                if first_real_submit_wall_time_s is None:
+                    return
+                elapsed_s = time.perf_counter() - float(first_real_submit_wall_time_s)
+                if elapsed_s <= 2.0:
+                    return
+                presentation_worker.mark_first_real_publish_timeout()
+                snapshot = presentation_worker.first_real_publish_watchdog_snapshot()
+                if startup_keepalive_state is not None:
+                    startup_keepalive_state["enabled"] = False
+                failure_details = self._format_immersive_startup_timeline_failure(
+                    startup_timeline,
+                    immersive_bridge,
+                )
+                worker_details = (
+                    presentation_worker.format_first_real_publish_watchdog_snapshot(
+                        snapshot
+                    )
+                )
+                raise RuntimeError(
+                    "Immersive experimental path failed to complete a valid first "
+                    "real publish within 2.0 s.\n"
+                    + (failure_details + "\n" if failure_details else "")
+                    + (worker_details + "\n" if worker_details else "")
+                    + immersive_bridge.debug_summary()
+                )
+
+            def _update_preview_from_latest_completion(current_frame_profile):
+                nonlocal latest_preview_completion
+                if (
+                    not preview_display_active
+                    or preview_tex is None
+                    or preview_uploader is None
+                    or latest_preview_completion is None
+                ):
+                    return
+                preview_frame = latest_preview_completion.get("preview_frame")
+                preview_ready_event = latest_preview_completion.get("preview_ready_event")
+                if preview_frame is None:
+                    latest_preview_completion = None
+                    return
+                preview_update_start = time.perf_counter()
+                if preview_ready_event is not None and torch.cuda.is_available():
+                    torch.cuda.current_stream().wait_event(preview_ready_event)
+                glfw.make_context_current(window)
+                preview_uploader.upload(preview_frame)
+                fb_width, fb_height = glfw.get_framebuffer_size(window)
+                gl.glViewport(0, 0, fb_width, fb_height)
+                gl.glDisable(gl.GL_DEPTH_TEST)
+                gl.glClear(gl.GL_COLOR_BUFFER_BIT)
+                gl.glUseProgram(preview_prog)
+                gl.glBindVertexArray(preview_vao)
+                gl.glActiveTexture(gl.GL_TEXTURE0)
+                gl.glBindTexture(gl.GL_TEXTURE_2D, preview_tex)
+                gl.glDrawArrays(gl.GL_TRIANGLE_STRIP, 0, 4)
+                gl.glBindTexture(gl.GL_TEXTURE_2D, 0)
+                gl.glBindVertexArray(0)
+                gl.glUseProgram(0)
+                glfw.swap_buffers(window)
+                preview_update_ms = 1000.0 * (
+                    time.perf_counter() - preview_update_start
+                )
+                if frame_count > 1:
+                    presentation_preview_ms_samples.append(preview_update_ms)
+                    render_stage_times["scene_present_preview_ms"].append(
+                        preview_update_ms / 1000.0
+                    )
+                if current_frame_profile is not None:
+                    current_frame_profile["scene_present_preview_ms"] = (
+                        preview_update_ms / 1000.0
+                    )
+                latest_preview_completion = None
+
+            def _present_preview_frame_direct(preview_frame, current_frame_profile):
+                if (
+                    not preview_display_active
+                    or preview_tex is None
+                    or preview_uploader is None
+                    or preview_frame is None
+                ):
+                    return
+                preview_window_start = (
+                    time.perf_counter() if current_frame_profile is not None else None
+                )
+                glfw.make_context_current(window)
+                preview_uploader.upload(preview_frame)
+                fb_width, fb_height = glfw.get_framebuffer_size(window)
+                gl.glViewport(0, 0, fb_width, fb_height)
+                gl.glDisable(gl.GL_DEPTH_TEST)
+                gl.glClear(gl.GL_COLOR_BUFFER_BIT)
+                gl.glUseProgram(preview_prog)
+                gl.glBindVertexArray(preview_vao)
+                gl.glActiveTexture(gl.GL_TEXTURE0)
+                gl.glBindTexture(gl.GL_TEXTURE_2D, preview_tex)
+                gl.glDrawArrays(gl.GL_TRIANGLE_STRIP, 0, 4)
+                gl.glBindTexture(gl.GL_TEXTURE_2D, 0)
+                gl.glBindVertexArray(0)
+                gl.glUseProgram(0)
+                glfw.swap_buffers(window)
+                if preview_window_start is not None:
+                    self._render_profile_add_wall_time(
+                        current_frame_profile,
+                        "preview_window_wall",
+                        time.perf_counter() - preview_window_start,
+                    )
+
+            def _maybe_publish_stable_cover_frame_direct(
+                *,
+                reject_source,
+                count_for_stats,
+            ):
+                nonlocal stable_cover_publish_count
+                nonlocal stable_cover_publish_compose_reject_count
+                nonlocal stable_cover_publish_source_corruption_count
+                nonlocal stable_cover_publish_missing_cache_count
+                nonlocal stable_cover_publish_ms_samples
+                cover_result = self._publish_immersive_stable_cover_frame(
+                    immersive_bridge,
+                    left_eye_frame=committed_safe_cover_left_frame,
+                    right_eye_frame=committed_safe_cover_right_frame,
+                    preview_frame=committed_safe_preview_frame,
+                    reject_source=reject_source,
+                    backend_kind="main_thread_direct",
+                )
+                if count_for_stats:
+                    if bool(cover_result.get("cache_hit", False)):
+                        stable_cover_publish_count += 1
+                        if str(reject_source).strip().lower() == "compose_reject":
+                            stable_cover_publish_compose_reject_count += 1
+                        elif (
+                            str(reject_source).strip().lower()
+                            == "source_corruption"
+                        ):
+                            stable_cover_publish_source_corruption_count += 1
+                        stable_cover_publish_ms_samples.append(
+                            float(cover_result.get("publish_wall_ms", 0.0))
+                        )
+                    else:
+                        stable_cover_publish_missing_cache_count += 1
+                return cover_result
+
+            def _arm_immersive_steady_state_metrics_epoch():
+                nonlocal first_real_publish_done
+                nonlocal steady_state_metrics_epoch_armed
+                nonlocal steady_state_scalar_count_baselines
+                nonlocal steady_state_reason_count_baselines
+                if steady_state_metrics_epoch_armed:
+                    return
+                if presentation_backend_enabled and presentation_worker is not None:
+                    if not presentation_worker.wait_for_idle(timeout=60.0):
+                        raise RuntimeError(
+                            "Timed out draining immersive presentation startup work "
+                            "before steady-state metrics epoch."
+                        )
+                    _drain_presentation_results()
+                if immersive_bridge is not None:
+                    if not immersive_bridge.wait_for_bridge_idle(timeout=60.0):
+                        raise RuntimeError(
+                            "Timed out draining immersive bridge startup work "
+                            "before steady-state metrics epoch."
+                        )
+                    lifetime_bridge_stats = immersive_bridge.bridge_commit_stats(
+                        scope="lifetime"
+                    )
+                    immersive_bridge.begin_steady_state_metrics_epoch(
+                        frame_id_boundary=int(
+                            lifetime_bridge_stats.get("latest_frame_id", 0)
+                        )
+                    )
+                if not first_real_publish_done:
+                    raise RuntimeError(
+                        "Immersive steady-state metrics epoch reached counted "
+                        "frames before first real publish completed."
+                    )
+                if (
+                    startup_keepalive_state is not None
+                    and bool(startup_keepalive_state.get("enabled", False))
+                ):
+                    raise RuntimeError(
+                        "Immersive steady-state metrics epoch reached counted "
+                        "frames while startup keepalive was still enabled."
+                    )
+                steady_state_scalar_count_baselines = {
+                    "static_scene_cache_invalidation_count": int(
+                        static_scene_cache_invalidation_count
+                    ),
+                    "static_scene_signature_change_count": int(
+                        static_scene_signature_change_count
+                    ),
+                    "static_scene_base_signature_change_count": int(
+                        static_scene_base_signature_change_count
+                    ),
+                    "static_scene_overlay_signature_change_count": int(
+                        static_scene_overlay_signature_change_count
+                    ),
+                }
+                steady_state_reason_count_baselines = {
+                    "static_scene_reuse_reason_counts": dict(
+                        static_scene_reuse_reason_counts
+                    ),
+                    "static_scene_base_reuse_reason_counts": dict(
+                        static_scene_base_reuse_reason_counts
+                    ),
+                    "static_scene_overlay_reuse_reason_counts": dict(
+                        static_scene_overlay_reuse_reason_counts
+                    ),
+                }
+                steady_state_metrics_epoch_armed = True
+
+            def _steady_state_scalar_count(name, current_value):
+                baseline_value = int(
+                    steady_state_scalar_count_baselines.get(name, 0)
+                )
+                return max(0, int(current_value) - baseline_value)
+
+            def _steady_state_reason_counts(name, current_counts):
+                baseline_counts = steady_state_reason_count_baselines.get(name, {})
+                steady_counts = {}
+                for reason, count in current_counts.items():
+                    delta = int(count) - int(baseline_counts.get(reason, 0))
+                    if delta > 0:
+                        steady_counts[str(reason)] = int(delta)
+                return steady_counts
+
             while True:
-                total_timer.start()
+                total_frame_start = time.perf_counter()
+                if presentation_backend_enabled:
+                    _drain_presentation_results()
+                    _check_first_real_publish_watchdog()
+                if frame_count > 1 and not steady_state_metrics_epoch_armed:
+                    _arm_immersive_steady_state_metrics_epoch()
                 controller_reset_triggered = False
                 controller_overlay_by_source = {}
 
@@ -12654,13 +25469,16 @@ class InvPhyTrainerWarp:
                             reason="reset",
                             support_fraction=reset_support_fraction,
                         )
+                        _update_balanced_scene_input_cache_from_points(
+                            reset_object_points
+                        )
                         prev_x = scene_rest_state["x"].clone()
                         controller_reset_triggered = True
                 else:
                     current_live_left_controller = None
                     current_live_right_controller = None
 
-                render_profile_frame = self._render_profile_new_frame(render_profile)
+                render_profile_frame = self._render_profile_new_frame(profile_enabled)
                 render_sample = last_immersive_sample
                 render_sample_received_monotonic_s = (
                     self._sample_received_monotonic_s(render_sample)
@@ -12690,24 +25508,92 @@ class InvPhyTrainerWarp:
                 framegen_reuse_age_frames = 0.0
                 framegen_reuse_translation_m = 0.0
                 framegen_reuse_rotation_deg = 0.0
+                framegen_reuse_reason = "off"
+                framegen_signature_changed = False
+                framegen_max_age_hit = False
+                direct_framegen_reuse_applied = False
+                base_refresh_required = False
+                overlay_refresh_required = False
+                base_refresh_reasons = []
+                overlay_refresh_reasons = []
+                base_refresh_max_age_hit = False
+                overlay_refresh_max_age_hit = False
+                layer_refresh_plan = None
+                framegen_metrics_enabled_for_frame = (
+                    immersive_framegen_mode in {"static", "adaptive"}
+                )
                 static_scene_request_submitted = False
+                static_scene_request_is_layered = False
                 balanced_scene_render_plan = None
+                prebuilt_overlap_render_plan = None
+                prebuilt_overlap_render_plan_signature = None
                 if last_immersive_sample is None:
                     raise RuntimeError("Immersive bridge stopped providing pose samples.")
                 if last_left_eye_pose_world is None or last_right_eye_pose_world is None:
                     raise RuntimeError("Immersive eye poses became unavailable.")
-                if immersive_framegen_mode in {"static", "adaptive"}:
+                if (
+                    static_scene_overlap_enabled
+                    and active_scene_stereo_mode
+                    == self.IMMERSIVE_BALANCED_INTERNAL_STEREO_MODE
+                ):
+                    cached_bounds_min = balanced_scene_input_cache[
+                        "last_object_bounds_min_world"
+                    ]
+                    cached_bounds_max = balanced_scene_input_cache[
+                        "last_object_bounds_max_world"
+                    ]
+                    if cached_bounds_min is None or cached_bounds_max is None:
+                        if not static_scene_overlap_cache_miss_logged:
+                            print(
+                                "[quest_display] immersive static-scene overlap skipped "
+                                "for one frame; cached object bounds are unavailable",
+                                flush=True,
+                            )
+                            static_scene_overlap_cache_miss_logged = True
+                    else:
+                        focus_active_interaction = bool(
+                            controller_interaction_state.get("left") is not None
+                            or controller_interaction_state.get("right") is not None
+                        )
+                        prebuilt_overlap_render_plan = (
+                            self._build_immersive_balanced_scene_render_plan(
+                                scene_renderer,
+                                cached_bounds_min,
+                                cached_bounds_max,
+                                balanced_scene_input_cache[
+                                    "last_object_support_center_world"
+                                ],
+                                last_left_eye_pose_world,
+                                last_right_eye_pose_world,
+                                left_intrinsic,
+                                right_intrinsic,
+                                eye_width,
+                                eye_height,
+                                scene_width,
+                                scene_height,
+                                active_interaction=focus_active_interaction,
+                                render_profile_frame=render_profile_frame,
+                            )
+                        )
+                        prebuilt_overlap_render_plan_signature = (
+                            self._build_immersive_static_scene_signature(
+                                prebuilt_overlap_render_plan
+                            )
+                        )
+                if framegen_metrics_enabled_for_frame:
                     framegen_decision = (
                         self._evaluate_immersive_static_scene_framegen_reuse(
                             framegen_mode=immersive_framegen_mode,
-                            framegen_cache=static_scene_framegen_cache,
+                            framegen_cache=static_scene_reuse_cache,
                             render_sample=render_sample,
                             head_pose_state=head_pose_state,
                             left_eye_pose_world=last_left_eye_pose_world,
                             right_eye_pose_world=last_right_eye_pose_world,
+                            render_plan_signature=prebuilt_overlap_render_plan_signature,
                         )
                     )
-                    framegen_reuse_applied = bool(framegen_decision["reuse"])
+                    direct_framegen_reuse_applied = bool(framegen_decision["reuse"])
+                    framegen_reuse_applied = bool(direct_framegen_reuse_applied)
                     framegen_forced_render = 0.0 if framegen_reuse_applied else 1.0
                     framegen_reuse_age_frames = float(
                         framegen_decision["reuse_age_frames"]
@@ -12718,6 +25604,89 @@ class InvPhyTrainerWarp:
                     framegen_reuse_rotation_deg = float(
                         framegen_decision["rotation_deg"]
                     )
+                    framegen_reuse_reason = str(framegen_decision["reason"])
+                    framegen_signature_changed = bool(
+                        framegen_decision.get("signature_changed", False)
+                    )
+                    framegen_max_age_hit = bool(
+                        framegen_decision.get("max_age_hit", False)
+                    )
+                    if (
+                        not direct_framegen_reuse_applied
+                        and static_scene_overlap_enabled
+                        and active_scene_stereo_mode
+                        == self.IMMERSIVE_BALANCED_INTERNAL_STEREO_MODE
+                        and prebuilt_overlap_render_plan is not None
+                    ):
+                        if static_scene_layer_cache is None:
+                            static_scene_layer_cache = (
+                                self._empty_immersive_static_scene_layer_cache()
+                            )
+                        layer_refresh_plan = (
+                            self._evaluate_immersive_balanced_layer_refresh_plan(
+                                framegen_mode=immersive_framegen_mode,
+                                layer_cache=static_scene_layer_cache,
+                                render_plan=prebuilt_overlap_render_plan,
+                                render_sample=render_sample,
+                                head_pose_state=head_pose_state,
+                            )
+                        )
+                        base_refresh_required = bool(
+                            layer_refresh_plan["base_refresh_required"]
+                        )
+                        overlay_refresh_required = bool(
+                            layer_refresh_plan["overlay_refresh_required"]
+                        )
+                        base_refresh_reasons = list(
+                            layer_refresh_plan["base_reasons"]
+                        )
+                        overlay_refresh_reasons = list(
+                            layer_refresh_plan["overlay_reasons"]
+                        )
+                        base_refresh_max_age_hit = bool(
+                            layer_refresh_plan["base_max_age_hit"]
+                        )
+                        overlay_refresh_max_age_hit = bool(
+                            layer_refresh_plan["overlay_max_age_hit"]
+                        )
+                        if bool(layer_refresh_plan["base_signature_changed"]):
+                            static_scene_base_signature_change_count += 1
+                        if bool(layer_refresh_plan["overlay_signature_changed"]):
+                            static_scene_overlay_signature_change_count += 1
+                        framegen_signature_changed = bool(framegen_signature_changed) or bool(
+                            layer_refresh_plan["base_signature_changed"]
+                            or layer_refresh_plan["overlay_signature_changed"]
+                        )
+                        framegen_max_age_hit = bool(framegen_max_age_hit) or bool(
+                            base_refresh_max_age_hit or overlay_refresh_max_age_hit
+                        )
+                        if bool(layer_refresh_plan["all_required_layers_reusable"]):
+                            framegen_reuse_applied = True
+                            framegen_forced_render = 0.0
+                            framegen_reuse_age_frames = float(
+                                layer_refresh_plan["max_reuse_age_frames"]
+                            )
+                            framegen_reuse_reason = (
+                                "static_cadence"
+                                if str(immersive_framegen_mode).strip().lower()
+                                == "static"
+                                else "adaptive_guardrails_passed"
+                            )
+                    if framegen_signature_changed:
+                        static_scene_signature_change_count += 1
+                    if not framegen_reuse_applied:
+                        static_scene_cache_invalidation_count += 1
+                        if base_refresh_required and base_refresh_reasons:
+                            framegen_reuse_reason = str(base_refresh_reasons[0])
+                        elif overlay_refresh_required and overlay_refresh_reasons:
+                            framegen_reuse_reason = str(overlay_refresh_reasons[0])
+                        static_scene_reuse_reason_counts[framegen_reuse_reason] = (
+                            static_scene_reuse_reason_counts.get(
+                                framegen_reuse_reason,
+                                0,
+                            )
+                            + 1
+                        )
                 if render_profile_frame is not None:
                     render_profile_frame["static_scene_reuse_applied"] = float(
                         framegen_reuse_applied
@@ -12734,52 +25703,112 @@ class InvPhyTrainerWarp:
                     render_profile_frame["static_scene_reuse_rotation_deg"] = float(
                         framegen_reuse_rotation_deg
                     )
-                if (
-                    not framegen_reuse_applied
-                    and active_scene_stereo_mode
-                    == self.IMMERSIVE_BALANCED_INTERNAL_STEREO_MODE
-                ):
-                    balanced_scene_render_plan = (
-                        self._build_immersive_balanced_scene_render_plan(
-                            scene_renderer,
-                            last_left_eye_pose_world,
-                            last_right_eye_pose_world,
-                            left_intrinsic,
-                            right_intrinsic,
-                            eye_width,
-                            eye_height,
-                            scene_width,
-                            scene_height,
-                            render_profile_frame=render_profile_frame,
-                        )
+                    self._record_immersive_static_scene_reuse_profile_metrics(
+                        render_profile_frame,
+                        fresh_render=not framegen_reuse_applied,
+                        reason=framegen_reuse_reason,
+                        max_age_hit=framegen_max_age_hit,
+                        cache_invalidation_count=_steady_state_scalar_count(
+                            "static_scene_cache_invalidation_count",
+                            static_scene_cache_invalidation_count,
+                        ),
+                        signature_change_count=_steady_state_scalar_count(
+                            "static_scene_signature_change_count",
+                            static_scene_signature_change_count,
+                        ),
+                    )
+                    self._record_immersive_static_scene_layer_reuse_profile_metrics(
+                        render_profile_frame,
+                        category="base",
+                        refreshed=base_refresh_required,
+                        reasons=base_refresh_reasons,
+                        max_age_hit=base_refresh_max_age_hit,
+                        signature_change_count=_steady_state_scalar_count(
+                            "static_scene_base_signature_change_count",
+                            static_scene_base_signature_change_count,
+                        ),
+                    )
+                    self._record_immersive_static_scene_layer_reuse_profile_metrics(
+                        render_profile_frame,
+                        category="overlay",
+                        refreshed=overlay_refresh_required,
+                        reasons=overlay_refresh_reasons,
+                        max_age_hit=overlay_refresh_max_age_hit,
+                        signature_change_count=_steady_state_scalar_count(
+                            "static_scene_overlay_signature_change_count",
+                            static_scene_overlay_signature_change_count,
+                        ),
                     )
                 if (
                     not framegen_reuse_applied
                     and static_scene_overlap_enabled
                     and static_scene_worker is not None
+                    and active_scene_stereo_mode
+                    == self.IMMERSIVE_BALANCED_INTERNAL_STEREO_MODE
                 ):
-                    try:
-                        static_scene_worker.submit(balanced_scene_render_plan)
-                        static_scene_request_submitted = True
-                    except Exception as exc:
-                        if not static_scene_overlap_failure_logged:
-                            print(
-                                "[quest_display] immersive static-scene overlap disabled; "
-                                "falling back to serial room render: "
-                                f"{type(exc).__name__}: {exc}",
-                                flush=True,
+                    if prebuilt_overlap_render_plan is not None:
+                        balanced_scene_render_plan = prebuilt_overlap_render_plan
+                        try:
+                            layer_request = None
+                            if layer_refresh_plan is not None:
+                                layer_request = (
+                                    _build_immersive_balanced_scene_layer_request(
+                                        balanced_scene_render_plan,
+                                        layer_refresh_plan["requested_layers_by_eye"],
+                                    )
+                                )
+                                static_scene_request_is_layered = True
+                            static_scene_worker.submit(
+                                balanced_scene_render_plan
+                                if layer_request is None
+                                else layer_request
                             )
-                            static_scene_overlap_failure_logged = True
-                        if static_scene_worker is not None:
-                            try:
-                                static_scene_worker.stop()
-                            except Exception:
-                                pass
-                        static_scene_worker = None
-                        static_scene_overlap_enabled = False
-                        scene_depth_reproject_enabled = False
-                        static_scene_framegen_cache = None
-                        immersive_framegen_mode = "off"
+                            static_scene_request_submitted = True
+                        except Exception as exc:
+                            if framegen_metrics_enabled_for_frame:
+                                framegen_reuse_reason = "worker_failure"
+                                static_scene_cache_invalidation_count += 1
+                                static_scene_reuse_reason_counts["worker_failure"] = (
+                                    static_scene_reuse_reason_counts.get(
+                                        "worker_failure",
+                                        0,
+                                    )
+                                    + 1
+                                )
+                                if render_profile_frame is not None:
+                                    self._record_immersive_static_scene_reuse_profile_metrics(
+                                        render_profile_frame,
+                                        fresh_render=True,
+                                        reason="worker_failure",
+                                        max_age_hit=framegen_max_age_hit,
+                                        cache_invalidation_count=_steady_state_scalar_count(
+                                            "static_scene_cache_invalidation_count",
+                                            static_scene_cache_invalidation_count,
+                                        ),
+                                        signature_change_count=_steady_state_scalar_count(
+                                            "static_scene_signature_change_count",
+                                            static_scene_signature_change_count,
+                                        ),
+                                    )
+                            if not static_scene_overlap_failure_logged:
+                                print(
+                                    "[quest_display] immersive static-scene overlap disabled; "
+                                    "falling back to serial room render: "
+                                    f"{type(exc).__name__}: {exc}",
+                                    flush=True,
+                                )
+                                static_scene_overlap_failure_logged = True
+                            if static_scene_worker is not None:
+                                try:
+                                    static_scene_worker.stop()
+                                except Exception:
+                                    pass
+                            static_scene_worker = None
+                            static_scene_overlap_enabled = False
+                            scene_depth_reproject_enabled = False
+                            static_scene_reuse_cache = None
+                            immersive_framegen_mode = "off"
+                            balanced_scene_render_plan = None
 
                 if (
                     idle_lock_state.get("active", False)
@@ -12879,14 +25908,12 @@ class InvPhyTrainerWarp:
                     support_surface_boxes_t,
                     layout.scene_up,
                 )
-                object_bounds_min = object_points.min(dim=0).values - 0.01
-                object_bounds_max = object_points.max(dim=0).values + 0.01
-                object_support_center = (
-                    self._object_support_patch_center(object_points)
-                    .detach()
-                    .cpu()
-                    .numpy()
-                    .astype(np.float32)
+                (
+                    object_bounds_min,
+                    object_bounds_max,
+                    object_support_center,
+                ) = _update_balanced_scene_input_cache_from_points(
+                    object_points
                 )
                 controller_predefined_anchor_states = (
                     self._compute_predefined_interaction_anchor_states(
@@ -12907,17 +25934,69 @@ class InvPhyTrainerWarp:
                                 interaction_state,
                             )
                         )
+                frame_contact_tracked = False
+                for source in ("left", "right"):
+                    interaction_state = controller_interaction_state.get(source)
+                    if interaction_state is None:
+                        continue
+                    contact_object_indices = interaction_state.get("contact_object_indices")
+                    if contact_object_indices is None:
+                        continue
+                    contact_object_indices = torch.as_tensor(
+                        contact_object_indices,
+                        dtype=torch.long,
+                        device=object_points.device,
+                    )
+                    if int(contact_object_indices.numel()) <= 0:
+                        continue
+                    current_anchor = current_interaction_anchor_by_source[source]
+                    current_contact_world = (
+                        self._current_live_controller_grabbed_contact_world(
+                            interaction_state,
+                            object_points,
+                            current_anchor,
+                        )
+                    )
+                    if current_anchor is None or current_contact_world is None:
+                        continue
+                    frame_contact_tracked = True
+                    if profile_enabled:
+                        interaction_contact_gap_mm_samples.append(
+                            float(
+                                torch.linalg.norm(
+                                    current_contact_world - current_anchor
+                                ).item()
+                                * 1000.0
+                            )
+                        )
+                if frame_contact_tracked and profile_enabled:
+                    interaction_contact_tracked_frames += 1
+                stable_rope_active_contact_only_overlay = bool(
+                    stable_rope_contact_only_active_overlay_enabled
+                )
                 controller_overlay_by_source = {}
                 for source, controller_world in (
                     ("left", current_live_left_controller),
                     ("right", current_live_right_controller),
                 ):
+                    interaction_state = controller_interaction_state[source]
+                    interaction_active = interaction_state is not None
+                    if not interaction_active:
+                        self._clear_live_controller_active_overlay_hold(source)
+                    preview_context = self._resolve_live_controller_preview_context(
+                        source,
+                        controller_world,
+                        object_points,
+                        object_bounds_min,
+                        object_bounds_max,
+                    )
                     overlay_entry = self._build_live_controller_world_overlay(
                         source,
                         controller_world,
                         object_points,
                         object_bounds_min,
                         object_bounds_max,
+                        preview_context=preview_context,
                     )
                     if overlay_entry is not None:
                         cycle_edge = self._controller_anchor_cycle_edge(
@@ -12979,9 +26058,12 @@ class InvPhyTrainerWarp:
                                 overlay_entry["hit_world"],
                                 available_anchor_states,
                             )
-                        ray_origin_world, ray_direction_world = self._controller_world_ray_pose(
-                            controller_world
-                        )
+                        ray_origin_world = overlay_entry.get("origin_world")
+                        ray_direction_world = overlay_entry.get("direction_world")
+                        if ray_origin_world is None or ray_direction_world is None:
+                            ray_origin_world, ray_direction_world = self._controller_world_ray_pose(
+                                controller_world
+                            )
                         if (
                             nearest_anchor is None
                             and ray_origin_world is not None
@@ -13001,33 +26083,88 @@ class InvPhyTrainerWarp:
                                 if selected_preview_anchor is not None
                                 else nearest_anchor
                             )
-                        overlay_entry["attach_candidate"] = attach_candidate_anchor is not None
-                        overlay_entry["attach_candidate_world"] = (
-                            attach_candidate_anchor["center_world"]
-                            if attach_candidate_anchor is not None
-                            else None
-                        )
-                        interaction_state = controller_interaction_state[source]
-                        overlay_entry["attachment_active"] = interaction_state is not None
-                        overlay_entry["attach_active_world"] = (
-                            self._current_controller_attach_center_world(
+                        active_overlay_state = (
+                            self._resolve_live_controller_active_overlay_world(
                                 interaction_state,
+                                object_points,
                                 current_interaction_anchor_by_source[source],
                             )
                         )
+                        overlay_entry["attach_candidate"] = (
+                            attach_candidate_anchor is not None and not interaction_active
+                        )
+                        overlay_entry["attach_candidate_world"] = (
+                            attach_candidate_anchor["center_world"]
+                            if attach_candidate_anchor is not None and not interaction_active
+                            else None
+                        )
+                        overlay_entry["attachment_active"] = interaction_active
+                        overlay_entry["active_contact_only"] = bool(
+                            stable_rope_active_contact_only_overlay and interaction_active
+                        )
+                        overlay_entry["attach_active_world"] = active_overlay_state.get(
+                            "active_overlay_world"
+                        )
+                        overlay_entry["active_overlay_world"] = active_overlay_state.get(
+                            "active_overlay_world"
+                        )
+                        overlay_entry[
+                            "active_overlay_fallback_world"
+                        ] = active_overlay_state.get("active_overlay_fallback_world")
+                        overlay_entry["active_overlay_source"] = active_overlay_state.get(
+                            "active_overlay_source"
+                        )
+                        overlay_entry[
+                            "active_overlay_interaction_id"
+                        ] = active_overlay_state.get("active_overlay_interaction_id")
+                        if interaction_active:
+                            active_ray_end_world = active_overlay_state.get(
+                                "active_overlay_world"
+                            )
+                            if active_ray_end_world is None:
+                                active_ray_end_world = active_overlay_state.get(
+                                    "active_overlay_fallback_world"
+                                )
+                            if active_ray_end_world is not None:
+                                overlay_entry["ray_end_world"] = active_ray_end_world
                         controller_overlay_by_source[source] = overlay_entry
+                    elif not interaction_active:
+                        self._clear_live_controller_active_overlay_hold(source)
                     self._log_controller_anchor_preview_transition(
                         source,
                         controller_anchor_preview_state[source],
                         controller_anchor_preview_state_cache,
                     )
 
-                render_timer.start()
+                render_stage_start = time.perf_counter()
                 render_sample_id = (
                     -1 if render_sample is None else int(render_sample.sample)
                 )
-                publish_sample_id = render_sample_id
-                scene_pose_sample = render_sample
+                render_sample_received_monotonic_s = self._sample_received_monotonic_s(
+                    render_sample
+                )
+                scene_source_sample_id = int(render_sample_id)
+                scene_source_sample_received_monotonic_s = (
+                    render_sample_received_monotonic_s
+                )
+                scene_source_left_eye_pose_world = np.asarray(
+                    last_left_eye_pose_world,
+                    dtype=np.float32,
+                ).copy()
+                scene_source_right_eye_pose_world = np.asarray(
+                    last_right_eye_pose_world,
+                    dtype=np.float32,
+                ).copy()
+                scene_source_left_intrinsic = np.asarray(
+                    left_intrinsic,
+                    dtype=np.float32,
+                ).copy()
+                scene_source_right_intrinsic = np.asarray(
+                    right_intrinsic,
+                    dtype=np.float32,
+                ).copy()
+                publish_sample_id = int(scene_source_sample_id)
+                scene_pose_sample = None
                 scene_timewarp_applied = 0.0
                 scene_timewarp_fallback_left_used = 0.0
                 scene_timewarp_fallback_right_used = 0.0
@@ -13036,6 +26173,8 @@ class InvPhyTrainerWarp:
                 simulation_lbs_wall_s = float(sim_time + interp_time)
                 overlap_wait_wall_s = 0.0
                 static_scene_worker_wall_s = 0.0
+                static_scene_execute_wall_s = 0.0
+                static_scene_assemble_wall_s = 0.0
                 static_scene_render_wall_s = 0.0
                 gaussian_render_wall_s = 0.0
                 branch_b_ready_wall_s = 0.0
@@ -13086,16 +26225,116 @@ class InvPhyTrainerWarp:
                 right_gaussian_depth = None
                 scene_layers_ready = False
                 if (
-                    framegen_reuse_applied
-                    and static_scene_framegen_cache is not None
+                    direct_framegen_reuse_applied
+                    and static_scene_reuse_cache is not None
                 ):
-                    left_scene_color = static_scene_framegen_cache["left_scene_color"]
-                    left_scene_depth = static_scene_framegen_cache["left_scene_depth"]
-                    right_scene_color = static_scene_framegen_cache["right_scene_color"]
-                    right_scene_depth = static_scene_framegen_cache["right_scene_depth"]
-                    static_scene_framegen_cache["age_displayed_frames"] = int(
+                    static_scene_reuse_start = time.perf_counter()
+                    if (
+                        prebuilt_overlap_render_plan is not None
+                        and static_scene_layer_cache is not None
+                    ):
+                        self._increment_immersive_static_scene_layer_cache_age(
+                            layer_cache=static_scene_layer_cache,
+                            required_layers_by_eye=(
+                                self._collect_immersive_balanced_required_layers(
+                                    prebuilt_overlap_render_plan
+                                )
+                            ),
+                        )
+                    left_scene_color = static_scene_reuse_cache["left_scene_color"]
+                    left_scene_depth = static_scene_reuse_cache["left_scene_depth"]
+                    right_scene_color = static_scene_reuse_cache["right_scene_color"]
+                    right_scene_depth = static_scene_reuse_cache["right_scene_depth"]
+                    scene_source_sample_id = int(
+                        static_scene_reuse_cache.get("source_sample_id", -1)
+                    )
+                    scene_source_sample_received_monotonic_s = (
+                        static_scene_reuse_cache.get(
+                            "source_sample_received_monotonic_s"
+                        )
+                    )
+                    if static_scene_reuse_cache.get("source_left_eye_pose_world") is not None:
+                        scene_source_left_eye_pose_world = np.asarray(
+                            static_scene_reuse_cache["source_left_eye_pose_world"],
+                            dtype=np.float32,
+                        ).copy()
+                    if static_scene_reuse_cache.get("source_right_eye_pose_world") is not None:
+                        scene_source_right_eye_pose_world = np.asarray(
+                            static_scene_reuse_cache["source_right_eye_pose_world"],
+                            dtype=np.float32,
+                        ).copy()
+                    if static_scene_reuse_cache.get("source_left_intrinsic") is not None:
+                        scene_source_left_intrinsic = np.asarray(
+                            static_scene_reuse_cache["source_left_intrinsic"],
+                            dtype=np.float32,
+                        ).copy()
+                    if static_scene_reuse_cache.get("source_right_intrinsic") is not None:
+                        scene_source_right_intrinsic = np.asarray(
+                            static_scene_reuse_cache["source_right_intrinsic"],
+                            dtype=np.float32,
+                        ).copy()
+                    publish_sample_id = int(scene_source_sample_id)
+                    static_scene_reuse_cache["age_displayed_frames"] = int(
                         framegen_reuse_age_frames
                     )
+                    static_scene_assemble_wall_s = (
+                        time.perf_counter() - static_scene_reuse_start
+                    )
+                    static_scene_render_wall_s = static_scene_assemble_wall_s
+                    scene_layers_ready = True
+                elif (
+                    framegen_reuse_applied
+                    and layer_refresh_plan is not None
+                    and prebuilt_overlap_render_plan is not None
+                    and static_scene_layer_cache is not None
+                ):
+                    balanced_scene_render_plan = prebuilt_overlap_render_plan
+                    static_scene_reuse_start = time.perf_counter()
+                    self._mark_immersive_static_scene_layer_cache_usage(
+                        layer_cache=static_scene_layer_cache,
+                        decisions_by_eye=layer_refresh_plan["decisions_by_eye"],
+                    )
+                    cached_scene_render_outputs = (
+                        _build_immersive_balanced_render_outputs_from_layer_cache(
+                            balanced_scene_render_plan,
+                            static_scene_layer_cache,
+                        )
+                    )
+                    (
+                        left_scene_color,
+                        left_scene_depth,
+                        right_scene_color,
+                        right_scene_depth,
+                    ) = self._assemble_immersive_balanced_scene_from_render_outputs(
+                        scene_renderer,
+                        balanced_scene_render_plan,
+                        cached_scene_render_outputs,
+                        eye_width,
+                        eye_height,
+                        shared_scene_compose_cache=shared_scene_compose_cache,
+                        reproject_caches=shared_scene_reproject_caches,
+                        render_profile_frame=render_profile_frame,
+                    )
+                    if framegen_metrics_enabled_for_frame:
+                        static_scene_reuse_cache = (
+                            self._make_immersive_static_scene_reuse_cache_entry(
+                                render_plan=balanced_scene_render_plan,
+                                render_sample=render_sample,
+                                head_pose_state=head_pose_state,
+                                left_eye_pose_world=last_left_eye_pose_world,
+                                right_eye_pose_world=last_right_eye_pose_world,
+                                left_intrinsic=left_intrinsic,
+                                right_intrinsic=right_intrinsic,
+                                left_scene_color=left_scene_color,
+                                left_scene_depth=left_scene_depth,
+                                right_scene_color=right_scene_color,
+                                right_scene_depth=right_scene_depth,
+                            )
+                        )
+                    static_scene_assemble_wall_s = (
+                        time.perf_counter() - static_scene_reuse_start
+                    )
+                    static_scene_render_wall_s = static_scene_assemble_wall_s
                     scene_layers_ready = True
                 if static_scene_request_submitted:
                     gaussian_render_mode_for_frame = immersive_gaussian_render_mode
@@ -13134,15 +26373,17 @@ class InvPhyTrainerWarp:
                     branch_b_ready_wall_s = (
                         float(simulation_lbs_wall_s) + float(gaussian_render_wall_s)
                     )
-                    overlap_wait_start = time.perf_counter()
+                    static_scene_execute_start = time.perf_counter()
                     try:
                         static_scene_result = static_scene_worker.get_result(timeout=60.0)
-                        overlap_wait_wall_s = time.perf_counter() - overlap_wait_start
+                        overlap_wait_wall_s = (
+                            time.perf_counter() - static_scene_execute_start
+                        )
+                        static_scene_execute_wall_s = overlap_wait_wall_s
                         static_scene_worker_wall_s = (
                             float(static_scene_result.get("worker_wall_ms", 0.0))
                             / 1000.0
                         )
-                        static_scene_render_wall_s = static_scene_worker_wall_s
                         if render_profile_frame is not None:
                             render_profile_frame["static_scene_worker_wall_ms"] = (
                                 static_scene_worker_wall_s
@@ -13150,6 +26391,41 @@ class InvPhyTrainerWarp:
                             render_profile_frame["overlap_wait_wall_ms"] = (
                                 overlap_wait_wall_s
                             )
+                        static_scene_assemble_start = time.perf_counter()
+                        if static_scene_request_is_layered:
+                            (
+                                static_scene_layer_cache,
+                                fresh_layers_by_eye,
+                            ) = self._update_immersive_static_scene_layer_cache(
+                                layer_cache=static_scene_layer_cache,
+                                render_plan=balanced_scene_render_plan,
+                                layer_outputs=static_scene_result,
+                                head_pose_state=head_pose_state,
+                            )
+                            scene_render_outputs = (
+                                _build_immersive_balanced_render_outputs_from_layer_cache(
+                                    balanced_scene_render_plan,
+                                    static_scene_layer_cache,
+                                    fresh_layers_by_eye=fresh_layers_by_eye,
+                                )
+                            )
+                        else:
+                            scene_render_outputs = static_scene_result
+                            if static_scene_layer_cache is not None:
+                                (
+                                    static_scene_layer_cache,
+                                    _,
+                                ) = self._update_immersive_static_scene_layer_cache(
+                                    layer_cache=static_scene_layer_cache,
+                                    render_plan=balanced_scene_render_plan,
+                                    layer_outputs=(
+                                        _extract_immersive_balanced_layer_outputs_from_render_outputs(
+                                            balanced_scene_render_plan,
+                                            static_scene_result,
+                                        )
+                                    ),
+                                    head_pose_state=head_pose_state,
+                                )
                         (
                             left_scene_color,
                             left_scene_depth,
@@ -13158,16 +26434,16 @@ class InvPhyTrainerWarp:
                         ) = self._assemble_immersive_balanced_scene_from_render_outputs(
                             scene_renderer,
                             balanced_scene_render_plan,
-                            static_scene_result,
+                            scene_render_outputs,
                             eye_width,
                             eye_height,
                             shared_scene_compose_cache=shared_scene_compose_cache,
                             reproject_caches=shared_scene_reproject_caches,
                             render_profile_frame=render_profile_frame,
                         )
-                        if immersive_framegen_mode in {"static", "adaptive"}:
-                            static_scene_framegen_cache = (
-                                self._make_immersive_static_scene_framegen_cache_entry(
+                        if framegen_metrics_enabled_for_frame:
+                            static_scene_reuse_cache = (
+                                self._make_immersive_static_scene_reuse_cache_entry(
                                     render_plan=balanced_scene_render_plan,
                                     render_sample=render_sample,
                                     head_pose_state=head_pose_state,
@@ -13181,8 +26457,40 @@ class InvPhyTrainerWarp:
                                     right_scene_depth=right_scene_depth,
                                 )
                             )
+                        static_scene_assemble_wall_s = (
+                            time.perf_counter() - static_scene_assemble_start
+                        )
+                        static_scene_render_wall_s = (
+                            float(static_scene_execute_wall_s)
+                            + float(static_scene_assemble_wall_s)
+                        )
                         scene_layers_ready = True
                     except Exception as exc:
+                        if framegen_metrics_enabled_for_frame:
+                            framegen_reuse_reason = "worker_failure"
+                            static_scene_cache_invalidation_count += 1
+                            static_scene_reuse_reason_counts["worker_failure"] = (
+                                static_scene_reuse_reason_counts.get(
+                                    "worker_failure",
+                                    0,
+                                )
+                                + 1
+                            )
+                            if render_profile_frame is not None:
+                                self._record_immersive_static_scene_reuse_profile_metrics(
+                                    render_profile_frame,
+                                    fresh_render=True,
+                                    reason="worker_failure",
+                                    max_age_hit=framegen_max_age_hit,
+                                    cache_invalidation_count=_steady_state_scalar_count(
+                                        "static_scene_cache_invalidation_count",
+                                        static_scene_cache_invalidation_count,
+                                    ),
+                                    signature_change_count=_steady_state_scalar_count(
+                                        "static_scene_signature_change_count",
+                                        static_scene_signature_change_count,
+                                    ),
+                                )
                         if not static_scene_overlap_failure_logged:
                             print(
                                 "[quest_display] immersive static-scene overlap failed "
@@ -13199,8 +26507,38 @@ class InvPhyTrainerWarp:
                         static_scene_worker = None
                         static_scene_overlap_enabled = False
                         scene_depth_reproject_enabled = False
-                        static_scene_framegen_cache = None
+                        static_scene_reuse_cache = None
                         immersive_framegen_mode = "off"
+                        balanced_scene_render_plan = None
+
+                if (
+                    not scene_layers_ready
+                    and active_scene_stereo_mode
+                    == self.IMMERSIVE_BALANCED_INTERNAL_STEREO_MODE
+                    and balanced_scene_render_plan is None
+                ):
+                    focus_active_interaction = bool(
+                        controller_interaction_state.get("left") is not None
+                        or controller_interaction_state.get("right") is not None
+                    )
+                    balanced_scene_render_plan = (
+                        self._build_immersive_balanced_scene_render_plan(
+                            scene_renderer,
+                            object_bounds_min.detach().cpu().numpy().astype(np.float32),
+                            object_bounds_max.detach().cpu().numpy().astype(np.float32),
+                            np.asarray(object_support_center, dtype=np.float32),
+                            last_left_eye_pose_world,
+                            last_right_eye_pose_world,
+                            left_intrinsic,
+                            right_intrinsic,
+                            eye_width,
+                            eye_height,
+                            scene_width,
+                            scene_height,
+                            active_interaction=focus_active_interaction,
+                            render_profile_frame=render_profile_frame,
+                        )
+                    )
 
                 if not scene_layers_ready:
                     if (
@@ -13208,16 +26546,70 @@ class InvPhyTrainerWarp:
                         == self.IMMERSIVE_BALANCED_INTERNAL_STEREO_MODE
                         and balanced_scene_render_plan is not None
                     ):
-                        static_scene_render_start = time.perf_counter()
-                        serial_scene_outputs = (
-                            _execute_immersive_balanced_scene_render_plan(
-                                scene_renderer,
-                                balanced_scene_render_plan,
+                        scene_render_outputs = None
+                        parallel_metrics = None
+                        if balanced_eye_parallel_enabled and balanced_eye_workers:
+                            static_scene_execute_start = time.perf_counter()
+                            try:
+                                (
+                                    scene_render_outputs,
+                                    parallel_metrics,
+                                ) = _execute_immersive_balanced_scene_render_plan_parallel(
+                                    balanced_eye_workers,
+                                    balanced_scene_render_plan,
+                                )
+                                static_scene_execute_wall_s = (
+                                    time.perf_counter() - static_scene_execute_start
+                                )
+                            except Exception as exc:
+                                if not balanced_eye_parallel_failure_logged:
+                                    print(
+                                        "[quest_display] immersive balanced eye-parallel "
+                                        "render failed mid-run; falling back to serial "
+                                        f"render: {type(exc).__name__}: {exc}",
+                                        flush=True,
+                                    )
+                                    balanced_eye_parallel_failure_logged = True
+                                for eye_worker in balanced_eye_workers.values():
+                                    try:
+                                        eye_worker.stop()
+                                    except Exception:
+                                        pass
+                                balanced_eye_workers = {}
+                                balanced_eye_parallel_enabled = False
+                        if scene_render_outputs is None:
+                            static_scene_execute_start = time.perf_counter()
+                            scene_render_outputs = (
+                                _execute_immersive_balanced_scene_render_plan(
+                                    scene_execute_renderer,
+                                    balanced_scene_render_plan,
+                                )
                             )
-                        )
-                        static_scene_render_wall_s = (
-                            time.perf_counter() - static_scene_render_start
-                        )
+                            static_scene_execute_wall_s = (
+                                time.perf_counter() - static_scene_execute_start
+                            )
+                        if render_profile_frame is not None and parallel_metrics is not None:
+                            for metric_key, metric_value in parallel_metrics.items():
+                                render_profile_frame[metric_key] = float(metric_value)
+                        if (
+                            immersive_framegen_mode in {"static", "adaptive"}
+                            and static_scene_layer_cache is not None
+                        ):
+                            (
+                                static_scene_layer_cache,
+                                _,
+                            ) = self._update_immersive_static_scene_layer_cache(
+                                layer_cache=static_scene_layer_cache,
+                                render_plan=balanced_scene_render_plan,
+                                layer_outputs=(
+                                    _extract_immersive_balanced_layer_outputs_from_render_outputs(
+                                        balanced_scene_render_plan,
+                                        scene_render_outputs,
+                                    )
+                                ),
+                                head_pose_state=head_pose_state,
+                            )
+                        static_scene_assemble_start = time.perf_counter()
                         (
                             left_scene_color,
                             left_scene_depth,
@@ -13226,15 +26618,38 @@ class InvPhyTrainerWarp:
                         ) = self._assemble_immersive_balanced_scene_from_render_outputs(
                             scene_renderer,
                             balanced_scene_render_plan,
-                            serial_scene_outputs,
+                            scene_render_outputs,
                             eye_width,
                             eye_height,
                             shared_scene_compose_cache=shared_scene_compose_cache,
                             reproject_caches=shared_scene_reproject_caches,
                             render_profile_frame=render_profile_frame,
                         )
+                        static_scene_assemble_wall_s = (
+                            time.perf_counter() - static_scene_assemble_start
+                        )
+                        static_scene_render_wall_s = (
+                            float(static_scene_execute_wall_s)
+                            + float(static_scene_assemble_wall_s)
+                        )
+                        if immersive_framegen_mode in {"static", "adaptive"}:
+                            static_scene_reuse_cache = (
+                                self._make_immersive_static_scene_reuse_cache_entry(
+                                    render_plan=balanced_scene_render_plan,
+                                    render_sample=render_sample,
+                                    head_pose_state=head_pose_state,
+                                    left_eye_pose_world=last_left_eye_pose_world,
+                                    right_eye_pose_world=last_right_eye_pose_world,
+                                    left_intrinsic=left_intrinsic,
+                                    right_intrinsic=right_intrinsic,
+                                    left_scene_color=left_scene_color,
+                                    left_scene_depth=left_scene_depth,
+                                    right_scene_color=right_scene_color,
+                                    right_scene_depth=right_scene_depth,
+                                )
+                            )
                     else:
-                        static_scene_render_start = time.perf_counter()
+                        static_scene_execute_start = time.perf_counter()
                         (
                             left_scene_color,
                             left_scene_depth,
@@ -13242,11 +26657,16 @@ class InvPhyTrainerWarp:
                             right_scene_depth,
                         ) = self._render_immersive_scene_frames_for_mode(
                             scene_renderer,
+                            scene_execute_renderer,
                             active_scene_stereo_mode,
                             layout,
                             object_support_center,
                             object_bounds_min.detach().cpu().numpy().astype(np.float32),
                             object_bounds_max.detach().cpu().numpy().astype(np.float32),
+                            bool(
+                                controller_interaction_state.get("left") is not None
+                                or controller_interaction_state.get("right") is not None
+                            ),
                             last_left_eye_pose_world,
                             last_right_eye_pose_world,
                             left_intrinsic,
@@ -13259,9 +26679,10 @@ class InvPhyTrainerWarp:
                             reproject_caches=shared_scene_reproject_caches,
                             render_profile_frame=render_profile_frame,
                         )
-                        static_scene_render_wall_s = (
-                            time.perf_counter() - static_scene_render_start
+                        static_scene_execute_wall_s = (
+                            time.perf_counter() - static_scene_execute_start
                         )
+                        static_scene_render_wall_s = static_scene_execute_wall_s
 
                 if left_gaussian_rgba is None:
                     gaussian_render_mode_for_frame = immersive_gaussian_render_mode
@@ -13305,254 +26726,533 @@ class InvPhyTrainerWarp:
                     float(static_scene_render_wall_s),
                     float(branch_b_ready_wall_s),
                 )
+                compose_artifact_interaction_context = None
+                if stable_compose_safety_enabled:
+                    compose_artifact_interaction_context = (
+                        self._build_immersive_compose_artifact_interaction_context(
+                            int(frame_count),
+                            controller_interaction_state,
+                            current_live_left_controller=current_live_left_controller,
+                            current_live_right_controller=current_live_right_controller,
+                        )
+                    )
+                gaussian_source_validation_result = None
+                if stable_gaussian_source_validation_enabled:
+                    gaussian_source_validation_result = (
+                        self._analyze_immersive_gaussian_source_corruption(
+                            frame_index=int(frame_count),
+                            sample_id=int(scene_source_sample_id),
+                            backend_kind=(
+                                "legacy_single_worker_source"
+                                if presentation_backend_enabled
+                                else "main_thread_direct_source"
+                            ),
+                            path_kind=(
+                                "stable_present_pipeline_source"
+                                if presentation_backend_enabled
+                                else "stable_non_pipeline_source"
+                            ),
+                            controller_interaction_state=controller_interaction_state,
+                            left_gaussian_rgba=left_gaussian_rgba,
+                            left_gaussian_depth=left_gaussian_depth,
+                            right_gaussian_rgba=right_gaussian_rgba,
+                            right_gaussian_depth=right_gaussian_depth,
+                        )
+                    )
+                    if gaussian_source_validation_result.get("corrupted", False):
+                        rollback_sources = list(
+                            gaussian_source_validation_result.get("affected_sources", [])
+                        )
+                        if not rollback_sources:
+                            rollback_sources = [
+                                source
+                                for source in ("left", "right")
+                                if controller_interaction_state.get(source) is not None
+                            ]
+                        debug_payload = {
+                            "corrupted_eyes": list(
+                                gaussian_source_validation_result.get(
+                                    "corrupted_eyes",
+                                    [],
+                                )
+                            ),
+                            "eye_debug": gaussian_source_validation_result.get(
+                                "debug_by_eye",
+                                {},
+                            ),
+                            "interaction_context": gaussian_source_validation_result.get(
+                                "interaction_context",
+                                {},
+                            ),
+                        }
+                        print(
+                            "[live_openxr_controller] immersive interaction_corruption_rollback "
+                            f"sources={rollback_sources} "
+                            f"debug={debug_payload}",
+                            flush=True,
+                        )
+                        if (
+                            presentation_backend_enabled
+                            and presentation_worker is not None
+                        ):
+                            if not presentation_worker.wait_for_idle(timeout=5.0):
+                                raise RuntimeError(
+                                    "Timed out waiting for stable immersive "
+                                    "presentation worker to go idle before "
+                                    "source-corruption cover publish."
+                                )
+                            _drain_presentation_results()
+                        rollback_result = _restore_stable_committed_safe_anchor(
+                            rollback_sources
+                        )
+                        _record_stable_rollback_result(rollback_result)
+                        cover_publish_result = (
+                            _maybe_publish_stable_cover_frame_direct(
+                                reject_source="source_corruption",
+                                count_for_stats=bool(frame_count > 1),
+                            )
+                        )
+                        if bool(cover_publish_result.get("cache_hit", False)):
+                            _present_preview_frame_direct(
+                                cover_publish_result.get("preview_frame"),
+                                render_profile_frame,
+                            )
+                        continue
 
-                compositing_stage_start = time.perf_counter()
-                (
-                    left_eye_frame,
-                    left_eye_frame_depth,
-                    left_compose_metrics,
-                    right_eye_frame,
-                    right_eye_frame_depth,
-                    right_compose_metrics,
-                ) = self._compose_immersive_stereo_eye_frames(
-                    left_scene_color,
-                    left_scene_depth,
-                    right_scene_color,
-                    right_scene_depth,
-                    left_gaussian_rgba,
-                    left_gaussian_depth,
-                    right_gaussian_rgba,
-                    right_gaussian_depth,
-                    eye_height,
-                    eye_width,
-                    immersive_compose_mode,
-                    gaussian_compose_roi_padding,
-                    render_profile_frame=render_profile_frame,
-                    output_dtype=eye_frame_output_dtype,
-                )
-
-                publish_sample = immersive_bridge.get_latest_sample()
-                publish_left_eye_pose_world = last_left_eye_pose_world
-                publish_right_eye_pose_world = last_right_eye_pose_world
-                publish_left_intrinsic = left_intrinsic
-                publish_right_intrinsic = right_intrinsic
-                if (
-                    scene_depth_reproject_enabled
-                    and publish_sample is not None
-                    and self._immersive_sample_has_valid_eye_pose(publish_sample)
-                    and int(publish_sample.sample) > render_sample_id
-                ):
+                if presentation_backend_enabled:
+                    if render_profile_frame is not None:
+                        render_profile_frame["publish_sample_id"] = float(
+                            publish_sample_id
+                        )
+                        render_profile_frame["scene_timewarp_applied"] = float(
+                            scene_timewarp_applied
+                        )
+                        render_profile_frame[
+                            "scene_timewarp_fallback_left_used"
+                        ] = float(scene_timewarp_fallback_left_used)
+                        render_profile_frame[
+                            "scene_timewarp_fallback_right_used"
+                        ] = float(scene_timewarp_fallback_right_used)
+                else:
+                    compositing_stage_start = time.perf_counter()
+                    source_ready_wall_time_s = compositing_stage_start
+                    left_compose_artifact_token = None
+                    right_compose_artifact_token = None
+                    left_compose_artifact_analysis = None
+                    right_compose_artifact_analysis = None
+                    left_compose_artifact_pre_overlay = None
+                    right_compose_artifact_pre_overlay = None
+                    left_compose_artifact_extra_metadata = None
+                    right_compose_artifact_extra_metadata = None
+                    left_compose_artifact_pre_stabilization = None
+                    right_compose_artifact_pre_stabilization = None
                     (
-                        predicted_left_eye_pose_world,
-                        predicted_right_eye_pose_world,
-                    ) = self._predict_immersive_eye_poses_for_sample(
-                        publish_sample,
-                        live_head_alignment,
-                        head_pose_state,
-                        frame_count,
-                    )
-                    if predicted_left_eye_pose_world is not None:
-                        publish_left_eye_pose_world = predicted_left_eye_pose_world
-                    if predicted_right_eye_pose_world is not None:
-                        publish_right_eye_pose_world = predicted_right_eye_pose_world
-                    if (
-                        publish_sample.left_eye is not None
-                        and publish_sample.left_eye.pose_valid
-                    ):
-                        publish_left_intrinsic = self._eye_sample_intrinsic(
-                            publish_sample.left_eye,
-                            eye_width,
-                            eye_height,
-                        )
-                    if (
-                        publish_sample.right_eye is not None
-                        and publish_sample.right_eye.pose_valid
-                    ):
-                        publish_right_intrinsic = self._eye_sample_intrinsic(
-                            publish_sample.right_eye,
-                            eye_width,
-                            eye_height,
-                        )
-                    latewarp_span = self._render_profile_begin_cuda_span(
-                        render_profile_frame,
-                        "scene_timewarp_gpu_ms",
-                    )
-                    try:
-                        (
-                            warped_left_eye_frame,
-                            warped_left_eye_depth,
-                            _,
-                        ) = self._latewarp_immersive_scene_eye(
-                            left_eye_frame,
-                            left_eye_frame_depth,
-                            last_left_eye_pose_world,
-                            publish_left_eye_pose_world,
-                            left_intrinsic,
-                            publish_left_intrinsic,
-                            eye_height,
-                            eye_width,
-                            "left",
-                            reproject_caches=shared_scene_reproject_caches,
-                            render_profile_frame=render_profile_frame,
-                        )
-                        if (
-                            torch.is_tensor(warped_left_eye_frame)
-                            and torch.is_tensor(warped_left_eye_depth)
-                            and tuple(warped_left_eye_frame.shape)
-                            == (eye_height, eye_width, 4)
-                            and tuple(warped_left_eye_depth.shape)
-                            == (eye_height, eye_width)
-                            and self._is_finite_tensor(warped_left_eye_frame)
-                            and self._is_finite_tensor(warped_left_eye_depth)
-                        ):
-                            left_eye_frame = warped_left_eye_frame
-                            left_eye_frame_depth = warped_left_eye_depth
-                        else:
-                            scene_timewarp_fallback_left_used = 1.0
-                    except Exception:
-                        scene_timewarp_fallback_left_used = 1.0
-                    try:
-                        (
-                            warped_right_eye_frame,
-                            warped_right_eye_depth,
-                            _,
-                        ) = self._latewarp_immersive_scene_eye(
-                            right_eye_frame,
-                            right_eye_frame_depth,
-                            last_right_eye_pose_world,
-                            publish_right_eye_pose_world,
-                            right_intrinsic,
-                            publish_right_intrinsic,
-                            eye_height,
-                            eye_width,
-                            "right",
-                            reproject_caches=shared_scene_reproject_caches,
-                            render_profile_frame=render_profile_frame,
-                        )
-                        if (
-                            torch.is_tensor(warped_right_eye_frame)
-                            and torch.is_tensor(warped_right_eye_depth)
-                            and tuple(warped_right_eye_frame.shape)
-                            == (eye_height, eye_width, 4)
-                            and tuple(warped_right_eye_depth.shape)
-                            == (eye_height, eye_width)
-                            and self._is_finite_tensor(warped_right_eye_frame)
-                            and self._is_finite_tensor(warped_right_eye_depth)
-                        ):
-                            right_eye_frame = warped_right_eye_frame
-                            right_eye_frame_depth = warped_right_eye_depth
-                        else:
-                            scene_timewarp_fallback_right_used = 1.0
-                    except Exception:
-                        scene_timewarp_fallback_right_used = 1.0
-                    self._render_profile_end_cuda_span(
-                        render_profile_frame,
-                        latewarp_span,
-                    )
-                    scene_timewarp_applied = 1.0
-                    scene_pose_sample = publish_sample
-                    publish_sample_id = int(publish_sample.sample)
-                    left_overlay_eye_render_state = (
-                        self._prepare_immersive_eye_render_state(
-                            publish_left_eye_pose_world,
-                            publish_left_intrinsic,
-                            eye_height,
-                            eye_width,
-                            eye_label="left_publish",
-                        )
-                    )
-                    right_overlay_eye_render_state = (
-                        self._prepare_immersive_eye_render_state(
-                            publish_right_eye_pose_world,
-                            publish_right_intrinsic,
-                            eye_height,
-                            eye_width,
-                            eye_label="right_publish",
-                        )
-                    )
-                compositing_wall_s = time.perf_counter() - compositing_stage_start
-
-                if render_profile_frame is not None:
-                    render_profile_frame["publish_sample_id"] = float(
-                        publish_sample_id
-                    )
-                    render_profile_frame["scene_timewarp_applied"] = float(
-                        scene_timewarp_applied
-                    )
-                    render_profile_frame["scene_timewarp_fallback_left_used"] = float(
-                        scene_timewarp_fallback_left_used
-                    )
-                    render_profile_frame["scene_timewarp_fallback_right_used"] = float(
-                        scene_timewarp_fallback_right_used
-                    )
-                    self._render_profile_record_immersive_compose_metrics(
-                        render_profile_frame,
-                        "left",
+                        left_eye_frame,
+                        left_eye_frame_depth,
                         left_compose_metrics,
-                    )
-                    self._render_profile_record_immersive_compose_metrics(
-                        render_profile_frame,
-                        "right",
+                        right_eye_frame,
+                        right_eye_frame_depth,
                         right_compose_metrics,
-                    )
-
-                overlay_stage_start = time.perf_counter()
-                overlay_projection_start = (
-                    time.perf_counter() if render_profile_frame is not None else None
-                )
-                projected_overlay_entries = (
-                    self._project_live_controller_world_overlays_batched(
-                        list(controller_overlay_by_source.values()),
-                        {
-                            "left": left_overlay_eye_render_state,
-                            "right": right_overlay_eye_render_state,
-                        },
+                    ) = self._compose_immersive_stereo_eye_frames(
+                        left_scene_color,
+                        left_scene_depth,
+                        right_scene_color,
+                        right_scene_depth,
+                        left_gaussian_rgba,
+                        left_gaussian_depth,
+                        right_gaussian_rgba,
+                        right_gaussian_depth,
                         eye_height,
                         eye_width,
+                        immersive_compose_mode,
+                        gaussian_compose_roi_padding,
+                        render_profile_frame=render_profile_frame,
+                        output_dtype=eye_frame_output_dtype,
+                        collect_compose_metrics=stable_compose_safety_enabled,
                     )
-                )
-                left_eye_overlay_entries = projected_overlay_entries.get("left", [])
-                right_eye_overlay_entries = projected_overlay_entries.get("right", [])
-                if overlay_projection_start is not None:
-                    self._render_profile_add_wall_time(
-                        render_profile_frame,
-                        "overlay_projection_wall",
-                        time.perf_counter() - overlay_projection_start,
-                    )
-                if left_eye_overlay_entries:
-                    overlay_draw_left_start = (
-                        time.perf_counter() if render_profile_frame is not None else None
-                    )
-                    self._draw_live_controller_overlay(
-                        left_eye_frame,
-                        left_eye_overlay_entries,
-                    )
-                    if overlay_draw_left_start is not None:
-                        self._render_profile_add_wall_time(
-                            render_profile_frame,
-                            "overlay_draw_left_wall",
-                            time.perf_counter() - overlay_draw_left_start,
+                    if stable_compose_safety_enabled:
+                        left_stabilized_compose = (
+                            self._stabilize_immersive_stable_compose_eye(
+                                eye_label="left",
+                                frame_index=int(frame_count),
+                                sample_id=int(scene_source_sample_id),
+                                backend_kind="main_thread_direct",
+                                path_kind="stable_non_pipeline",
+                                compose_mode=immersive_compose_mode,
+                                scene_color=left_scene_color,
+                                scene_depth=left_scene_depth,
+                                gaussian_rgba=left_gaussian_rgba,
+                                gaussian_depth=left_gaussian_depth,
+                                composed_pre_overlay=left_eye_frame,
+                                composed_pre_overlay_depth=left_eye_frame_depth,
+                                compose_metrics=left_compose_metrics or {},
+                                interaction_context=compose_artifact_interaction_context,
+                            )
                         )
-                if right_eye_overlay_entries:
-                    overlay_draw_right_start = (
-                        time.perf_counter() if render_profile_frame is not None else None
-                    )
-                    self._draw_live_controller_overlay(
-                        right_eye_frame,
-                        right_eye_overlay_entries,
-                    )
-                    if overlay_draw_right_start is not None:
-                        self._render_profile_add_wall_time(
-                            render_profile_frame,
-                            "overlay_draw_right_wall",
-                            time.perf_counter() - overlay_draw_right_start,
+                        left_eye_frame = left_stabilized_compose["final_eye_frame"]
+                        left_eye_frame_depth = left_stabilized_compose[
+                            "final_eye_frame_depth"
+                        ]
+                        left_compose_metrics = left_stabilized_compose[
+                            "final_compose_metrics"
+                        ]
+                        left_compose_artifact_analysis = left_stabilized_compose[
+                            "final_analysis"
+                        ]
+                        left_compose_artifact_token = left_stabilized_compose[
+                            "artifact_token"
+                        ]
+                        if left_compose_artifact_token is not None:
+                            left_compose_artifact_pre_overlay = left_eye_frame.clone()
+                        left_compose_artifact_pre_stabilization = (
+                            left_stabilized_compose.get("pre_stabilization_frame")
                         )
-                overlay_draw_wall_s = time.perf_counter() - overlay_stage_start
+                        left_compose_artifact_extra_metadata = {
+                            "pre_stabilization": copy.deepcopy(
+                                left_compose_artifact_analysis.get(
+                                    "pre_stabilization"
+                                )
+                            ),
+                            "stabilization": copy.deepcopy(
+                                left_compose_artifact_analysis.get("stabilization")
+                            ),
+                            "post_stabilization_cleared": not bool(
+                                left_compose_artifact_analysis.get("trigger_reasons")
+                            ),
+                        }
+                        right_stabilized_compose = (
+                            self._stabilize_immersive_stable_compose_eye(
+                                eye_label="right",
+                                frame_index=int(frame_count),
+                                sample_id=int(scene_source_sample_id),
+                                backend_kind="main_thread_direct",
+                                path_kind="stable_non_pipeline",
+                                compose_mode=immersive_compose_mode,
+                                scene_color=right_scene_color,
+                                scene_depth=right_scene_depth,
+                                gaussian_rgba=right_gaussian_rgba,
+                                gaussian_depth=right_gaussian_depth,
+                                composed_pre_overlay=right_eye_frame,
+                                composed_pre_overlay_depth=right_eye_frame_depth,
+                                compose_metrics=right_compose_metrics or {},
+                                interaction_context=compose_artifact_interaction_context,
+                            )
+                        )
+                        right_eye_frame = right_stabilized_compose["final_eye_frame"]
+                        right_eye_frame_depth = right_stabilized_compose[
+                            "final_eye_frame_depth"
+                        ]
+                        right_compose_metrics = right_stabilized_compose[
+                            "final_compose_metrics"
+                        ]
+                        right_compose_artifact_analysis = right_stabilized_compose[
+                            "final_analysis"
+                        ]
+                        right_compose_artifact_token = right_stabilized_compose[
+                            "artifact_token"
+                        ]
+                        if right_compose_artifact_token is not None:
+                            right_compose_artifact_pre_overlay = right_eye_frame.clone()
+                        right_compose_artifact_pre_stabilization = (
+                            right_stabilized_compose.get("pre_stabilization_frame")
+                        )
+                        right_compose_artifact_extra_metadata = {
+                            "pre_stabilization": copy.deepcopy(
+                                right_compose_artifact_analysis.get(
+                                    "pre_stabilization"
+                                )
+                            ),
+                            "stabilization": copy.deepcopy(
+                                right_compose_artifact_analysis.get("stabilization")
+                            ),
+                            "post_stabilization_cleared": not bool(
+                                right_compose_artifact_analysis.get("trigger_reasons")
+                            ),
+                        }
 
-                if left_eye_frame.dtype != torch.uint8:
-                    left_eye_frame = left_eye_frame.clamp(0.0, 255.0).to(torch.uint8)
-                if right_eye_frame.dtype != torch.uint8:
-                    right_eye_frame = right_eye_frame.clamp(0.0, 255.0).to(torch.uint8)
+                    default_left_overlay_eye_render_state = left_overlay_eye_render_state
+                    default_right_overlay_eye_render_state = right_overlay_eye_render_state
+                    real_publish_state = self._resolve_and_apply_immersive_real_publish_state(
+                        immersive_bridge,
+                        left_eye_frame=left_eye_frame,
+                        left_eye_frame_depth=left_eye_frame_depth,
+                        right_eye_frame=right_eye_frame,
+                        right_eye_frame_depth=right_eye_frame_depth,
+                        scene_depth_reproject_enabled=scene_depth_reproject_enabled,
+                        scene_source_sample_id=scene_source_sample_id,
+                        scene_source_left_eye_pose_world=scene_source_left_eye_pose_world,
+                        scene_source_right_eye_pose_world=scene_source_right_eye_pose_world,
+                        scene_source_left_intrinsic=scene_source_left_intrinsic,
+                        scene_source_right_intrinsic=scene_source_right_intrinsic,
+                        default_left_overlay_eye_render_state=default_left_overlay_eye_render_state,
+                        default_right_overlay_eye_render_state=default_right_overlay_eye_render_state,
+                        live_head_alignment=live_head_alignment,
+                        head_pose_state=head_pose_state,
+                        frame_index=frame_count,
+                        eye_width=eye_width,
+                        eye_height=eye_height,
+                        queue_wait_ms=0.0,
+                        source_ready_wall_time_s=source_ready_wall_time_s,
+                        static_scene_reuse_age_frames=float(
+                            framegen_reuse_age_frames
+                        ),
+                        stale_packet=False,
+                        reproject_caches=shared_scene_reproject_caches,
+                        render_profile_frame=render_profile_frame,
+                        latewarp_render_profile_frame=render_profile_frame,
+                        scene_source_received_monotonic_s=scene_source_sample_received_monotonic_s,
+                    )
+                    left_eye_frame = real_publish_state["left_eye_frame"]
+                    left_eye_frame_depth = real_publish_state["left_eye_frame_depth"]
+                    right_eye_frame = real_publish_state["right_eye_frame"]
+                    right_eye_frame_depth = real_publish_state["right_eye_frame_depth"]
+                    publish_state = real_publish_state["publish_state"]
+                    publish_sample = real_publish_state["publish_sample"]
+                    publish_sample_id = int(real_publish_state["publish_sample_id"])
+                    left_overlay_eye_render_state = real_publish_state[
+                        "left_overlay_eye_render_state"
+                    ]
+                    right_overlay_eye_render_state = real_publish_state[
+                        "right_overlay_eye_render_state"
+                    ]
+                    scene_timewarp_applied = float(
+                        real_publish_state["scene_timewarp_applied"]
+                    )
+                    scene_timewarp_fallback_left_used = float(
+                        real_publish_state["scene_timewarp_fallback_left_used"]
+                    )
+                    scene_timewarp_fallback_right_used = float(
+                        real_publish_state["scene_timewarp_fallback_right_used"]
+                    )
+                    scene_pose_sample = real_publish_state["scene_pose_sample"]
+                    scene_pose_received_monotonic_s = real_publish_state[
+                        "scene_pose_received_monotonic_s"
+                    ]
+                    compositing_wall_s = time.perf_counter() - compositing_stage_start
+
+                    if render_profile_frame is not None:
+                        render_profile_frame["publish_sample_id"] = float(
+                            publish_sample_id
+                        )
+                        render_profile_frame["scene_timewarp_applied"] = float(
+                            scene_timewarp_applied
+                        )
+                        render_profile_frame["scene_timewarp_fallback_left_used"] = float(
+                            scene_timewarp_fallback_left_used
+                        )
+                        render_profile_frame["scene_timewarp_fallback_right_used"] = float(
+                            scene_timewarp_fallback_right_used
+                        )
+                        self._render_profile_record_immersive_compose_metrics(
+                            render_profile_frame,
+                            "left",
+                            left_compose_metrics,
+                        )
+                        self._render_profile_record_immersive_compose_metrics(
+                            render_profile_frame,
+                            "right",
+                            right_compose_metrics,
+                        )
+                    stable_compose_reject_decision = (
+                        self._evaluate_immersive_stable_compose_safety_gate(
+                            left_analysis=left_compose_artifact_analysis,
+                            right_analysis=right_compose_artifact_analysis,
+                        )
+                        if stable_compose_safety_gate_enabled
+                        else None
+                    )
+                    if (
+                        stable_compose_reject_decision is not None
+                        and bool(
+                            stable_compose_reject_decision.get(
+                                "reject_publish",
+                                False,
+                            )
+                        )
+                    ):
+                        self._record_immersive_stable_compose_stabilization_fallback_reject(
+                            left_compose_artifact_analysis,
+                            right_compose_artifact_analysis,
+                        )
+                        self._finalize_immersive_runtime_compose_artifact(
+                            left_compose_artifact_token,
+                            scene_color=left_scene_color,
+                            scene_depth=left_scene_depth,
+                            gaussian_rgba=left_gaussian_rgba,
+                            gaussian_depth=left_gaussian_depth,
+                            composed_pre_overlay=left_compose_artifact_pre_overlay,
+                            final_post_overlay=left_eye_frame,
+                            compose_mode=immersive_compose_mode,
+                            pre_stabilization_composed_pre_overlay=left_compose_artifact_pre_stabilization,
+                            extra_metadata=left_compose_artifact_extra_metadata,
+                        )
+                        self._finalize_immersive_runtime_compose_artifact(
+                            right_compose_artifact_token,
+                            scene_color=right_scene_color,
+                            scene_depth=right_scene_depth,
+                            gaussian_rgba=right_gaussian_rgba,
+                            gaussian_depth=right_gaussian_depth,
+                            composed_pre_overlay=right_compose_artifact_pre_overlay,
+                            final_post_overlay=right_eye_frame,
+                            compose_mode=immersive_compose_mode,
+                            pre_stabilization_composed_pre_overlay=right_compose_artifact_pre_stabilization,
+                            extra_metadata=right_compose_artifact_extra_metadata,
+                        )
+                        rollback_sources = stable_compose_reject_decision.get(
+                            "affected_sources",
+                            [],
+                        )
+                        if frame_count > 1:
+                            stable_compose_reject_count += 1
+                            if bool(
+                                stable_compose_reject_decision.get(
+                                    "blue_scene_exposure_reject",
+                                    False,
+                                )
+                            ):
+                                stable_compose_reject_blue_scene_exposure_count += 1
+                            if bool(
+                                stable_compose_reject_decision.get(
+                                    "gaussian_blue_source_reject",
+                                    False,
+                                )
+                            ):
+                                stable_compose_reject_gaussian_blue_source_count += 1
+                        rollback_result = _restore_stable_committed_safe_anchor(
+                            rollback_sources
+                        )
+                        stable_compose_reject_rollback_count += 1
+                        _record_stable_rollback_result(rollback_result)
+                        cover_publish_result = (
+                            _maybe_publish_stable_cover_frame_direct(
+                                reject_source="compose_reject",
+                                count_for_stats=bool(frame_count > 1),
+                            )
+                        )
+                        if bool(cover_publish_result.get("cache_hit", False)):
+                            _present_preview_frame_direct(
+                                cover_publish_result.get("preview_frame"),
+                                render_profile_frame,
+                            )
+                        continue
+
+                    overlay_stage_start = time.perf_counter()
+                    support_overlay_active_support_id = None
+                    support_overlay_cache = None
+                    if immersive_support_entry_overlay_enabled:
+                        support_overlay_entry = (
+                            self._resolve_immersive_support_overlay_entry(
+                                scene_renderer,
+                                balanced_scene_render_plan,
+                                immersive_static_scene_mode,
+                            )
+                        )
+                        support_overlay_active_support_id = (
+                            None
+                            if support_overlay_entry is None
+                            or support_overlay_entry.get("support_id") is None
+                            else int(support_overlay_entry["support_id"])
+                        )
+                        support_overlay_cache = (
+                            self._build_immersive_support_overlay_cache(scene_renderer)
+                        )
+                    overlay_projection_start = (
+                        time.perf_counter() if render_profile_frame is not None else None
+                    )
+                    projected_overlay_entries = (
+                        self._project_live_controller_world_overlays_batched(
+                            list(controller_overlay_by_source.values()),
+                            {
+                                "left": left_overlay_eye_render_state,
+                                "right": right_overlay_eye_render_state,
+                            },
+                            eye_height,
+                            eye_width,
+                        )
+                    )
+                    left_eye_overlay_entries = projected_overlay_entries.get("left", [])
+                    right_eye_overlay_entries = projected_overlay_entries.get("right", [])
+                    if overlay_projection_start is not None:
+                        self._render_profile_add_wall_time(
+                            render_profile_frame,
+                            "overlay_projection_wall",
+                            time.perf_counter() - overlay_projection_start,
+                        )
+                    if left_eye_overlay_entries or immersive_support_entry_overlay_enabled:
+                        overlay_draw_left_start = (
+                            time.perf_counter() if render_profile_frame is not None else None
+                        )
+                        if left_eye_overlay_entries:
+                            self._draw_live_controller_overlay(
+                                left_eye_frame,
+                                left_eye_overlay_entries,
+                            )
+                        if immersive_support_entry_overlay_enabled:
+                            self._draw_immersive_support_entry_overlay(
+                                left_eye_frame,
+                                support_overlay_cache,
+                                support_overlay_active_support_id,
+                                left_overlay_eye_render_state,
+                            )
+                        if overlay_draw_left_start is not None:
+                            self._render_profile_add_wall_time(
+                                render_profile_frame,
+                                "overlay_draw_left_wall",
+                                time.perf_counter() - overlay_draw_left_start,
+                            )
+                    if right_eye_overlay_entries or immersive_support_entry_overlay_enabled:
+                        overlay_draw_right_start = (
+                            time.perf_counter() if render_profile_frame is not None else None
+                        )
+                        if right_eye_overlay_entries:
+                            self._draw_live_controller_overlay(
+                                right_eye_frame,
+                                right_eye_overlay_entries,
+                            )
+                        if immersive_support_entry_overlay_enabled:
+                            self._draw_immersive_support_entry_overlay(
+                                right_eye_frame,
+                                support_overlay_cache,
+                                support_overlay_active_support_id,
+                                right_overlay_eye_render_state,
+                            )
+                        if overlay_draw_right_start is not None:
+                            self._render_profile_add_wall_time(
+                                render_profile_frame,
+                                "overlay_draw_right_wall",
+                                time.perf_counter() - overlay_draw_right_start,
+                            )
+                    overlay_draw_wall_s = time.perf_counter() - overlay_stage_start
+
+                    if left_eye_frame.dtype != torch.uint8:
+                        left_eye_frame = left_eye_frame.clamp(0.0, 255.0).to(torch.uint8)
+                    if right_eye_frame.dtype != torch.uint8:
+                        right_eye_frame = right_eye_frame.clamp(0.0, 255.0).to(torch.uint8)
+                    if stable_compose_safety_enabled:
+                        self._finalize_immersive_runtime_compose_artifact(
+                            left_compose_artifact_token,
+                            scene_color=left_scene_color,
+                            scene_depth=left_scene_depth,
+                            gaussian_rgba=left_gaussian_rgba,
+                            gaussian_depth=left_gaussian_depth,
+                            composed_pre_overlay=left_compose_artifact_pre_overlay,
+                            final_post_overlay=left_eye_frame,
+                            compose_mode=immersive_compose_mode,
+                            pre_stabilization_composed_pre_overlay=left_compose_artifact_pre_stabilization,
+                            extra_metadata=left_compose_artifact_extra_metadata,
+                        )
+                        self._finalize_immersive_runtime_compose_artifact(
+                            right_compose_artifact_token,
+                            scene_color=right_scene_color,
+                            scene_depth=right_scene_depth,
+                            gaussian_rgba=right_gaussian_rgba,
+                            gaussian_depth=right_gaussian_depth,
+                            composed_pre_overlay=right_compose_artifact_pre_overlay,
+                            final_post_overlay=right_eye_frame,
+                            compose_mode=immersive_compose_mode,
+                            pre_stabilization_composed_pre_overlay=right_compose_artifact_pre_stabilization,
+                            extra_metadata=right_compose_artifact_extra_metadata,
+                        )
 
                 validation_sources = []
                 for source in self._sources_pending_grab_start_validation(
@@ -13611,14 +27311,12 @@ class InvPhyTrainerWarp:
                         current_pos = gaussians.get_xyz
                         current_rot = gaussians.get_rotation
                         object_points = x[: self.num_all_points]
-                        object_bounds_min = object_points.min(dim=0).values - 0.01
-                        object_bounds_max = object_points.max(dim=0).values + 0.01
-                        object_support_center = (
-                            self._object_support_patch_center(object_points)
-                            .detach()
-                            .cpu()
-                            .numpy()
-                            .astype(np.float32)
+                        (
+                            object_bounds_min,
+                            object_bounds_max,
+                            object_support_center,
+                        ) = _update_balanced_scene_input_cache_from_points(
+                            object_points
                         )
                         (
                             left_scene_color,
@@ -13627,11 +27325,16 @@ class InvPhyTrainerWarp:
                             right_scene_depth,
                         ) = self._render_immersive_scene_frames_for_mode(
                             scene_renderer,
+                            scene_execute_renderer,
                             active_scene_stereo_mode,
                             layout,
                             object_support_center,
                             object_bounds_min.detach().cpu().numpy().astype(np.float32),
                             object_bounds_max.detach().cpu().numpy().astype(np.float32),
+                            bool(
+                                controller_interaction_state.get("left") is not None
+                                or controller_interaction_state.get("right") is not None
+                            ),
                             last_left_eye_pose_world,
                             last_right_eye_pose_world,
                             left_intrinsic,
@@ -13713,150 +27416,279 @@ class InvPhyTrainerWarp:
                         time.perf_counter() - grab_validation_start,
                     )
 
-                if left_eye_frame.dtype != torch.uint8:
-                    left_eye_frame = left_eye_frame.clamp(0.0, 255.0).to(torch.uint8)
-                if right_eye_frame.dtype != torch.uint8:
-                    right_eye_frame = right_eye_frame.clamp(0.0, 255.0).to(torch.uint8)
-
-                if scene_depth_reproject_enabled:
-                    publish_measurement_s = time.monotonic()
-                    render_pose_staleness_ms = 0.0
-                    if render_sample_received_monotonic_s is not None:
-                        render_pose_staleness_ms = max(
-                            0.0,
-                            (publish_measurement_s - render_sample_received_monotonic_s)
-                            * 1000.0,
+                if presentation_backend_enabled:
+                    support_overlay_active_support_id = None
+                    support_overlay_cache = None
+                    if immersive_support_entry_overlay_enabled:
+                        support_overlay_entry = (
+                            self._resolve_immersive_support_overlay_entry(
+                                scene_renderer,
+                                balanced_scene_render_plan,
+                                immersive_static_scene_mode,
+                            )
                         )
-                    scene_pose_received_monotonic_s = self._sample_received_monotonic_s(
-                        scene_pose_sample
-                    )
-                    if scene_pose_received_monotonic_s is None:
-                        scene_pose_staleness_ms_at_publish = render_pose_staleness_ms
-                    else:
-                        scene_pose_staleness_ms_at_publish = max(
-                            0.0,
-                            (publish_measurement_s - scene_pose_received_monotonic_s)
-                            * 1000.0,
+                        support_overlay_active_support_id = (
+                            None
+                            if support_overlay_entry is None
+                            or support_overlay_entry.get("support_id") is None
+                            else int(support_overlay_entry["support_id"])
                         )
-                    scene_pose_staleness_savings_ms = max(
-                        0.0,
-                        render_pose_staleness_ms
-                        - scene_pose_staleness_ms_at_publish,
+                        support_overlay_cache = (
+                            self._build_immersive_support_overlay_cache(scene_renderer)
+                        )
+                    producer_ready_event = None
+                    if torch.cuda.is_available():
+                        producer_ready_event = torch.cuda.Event()
+                        producer_ready_event.record(torch.cuda.current_stream())
+                    source_ready_wall_time_s = time.perf_counter()
+                    present_packet = {
+                        "source_frame_index": int(frame_count),
+                        "source_ready_wall_time_s": float(source_ready_wall_time_s),
+                        "enqueue_wall_time_s": float(source_ready_wall_time_s),
+                        "producer_ready_event": producer_ready_event,
+                        "render_profile_enabled": bool(profile_enabled),
+                        "immersive_framegen_mode": immersive_framegen_mode,
+                        "render_sample_id": int(render_sample_id),
+                        "render_sample_received_monotonic_s": (
+                            render_sample_received_monotonic_s
+                        ),
+                        "static_scene_reuse_applied": bool(framegen_reuse_applied),
+                        "static_scene_reuse_age_frames": float(
+                            framegen_reuse_age_frames
+                        ),
+                        "scene_depth_reproject_enabled": bool(
+                            scene_depth_reproject_enabled
+                        ),
+                        "scene_source_sample_id": int(scene_source_sample_id),
+                        "scene_source_received_monotonic_s": (
+                            scene_source_sample_received_monotonic_s
+                        ),
+                        "scene_source_left_eye_pose_world": np.asarray(
+                            scene_source_left_eye_pose_world,
+                            dtype=np.float32,
+                        ).copy(),
+                        "scene_source_right_eye_pose_world": np.asarray(
+                            scene_source_right_eye_pose_world,
+                            dtype=np.float32,
+                        ).copy(),
+                        "scene_source_left_intrinsic": np.asarray(
+                            scene_source_left_intrinsic,
+                            dtype=np.float32,
+                        ).copy(),
+                        "scene_source_right_intrinsic": np.asarray(
+                            scene_source_right_intrinsic,
+                            dtype=np.float32,
+                        ).copy(),
+                        "live_head_alignment": None
+                        if not scene_depth_reproject_enabled
+                        else self._copy_immersive_packet_value(live_head_alignment),
+                        "head_pose_state": None
+                        if not scene_depth_reproject_enabled
+                        else self._copy_immersive_packet_value(head_pose_state),
+                        "immersive_compose_mode": immersive_compose_mode,
+                        "gaussian_compose_roi_padding": gaussian_compose_roi_padding,
+                        "left_scene_color": left_scene_color.clone(),
+                        "left_scene_depth": left_scene_depth.clone(),
+                        "right_scene_color": right_scene_color.clone(),
+                        "right_scene_depth": right_scene_depth.clone(),
+                        "left_gaussian_rgba": left_gaussian_rgba.clone(),
+                        "left_gaussian_depth": None
+                        if left_gaussian_depth is None
+                        else left_gaussian_depth.clone(),
+                        "right_gaussian_rgba": right_gaussian_rgba.clone(),
+                        "right_gaussian_depth": None
+                        if right_gaussian_depth is None
+                        else right_gaussian_depth.clone(),
+                        "controller_overlay_entries": copy.deepcopy(
+                            list(controller_overlay_by_source.values())
+                        ),
+                        "compose_artifact_interaction_context": None
+                        if compose_artifact_interaction_context is None
+                        else copy.deepcopy(compose_artifact_interaction_context),
+                        "support_overlay_enabled": bool(
+                            immersive_support_entry_overlay_enabled
+                        ),
+                        "support_overlay_cache": support_overlay_cache,
+                        "support_overlay_active_support_id": (
+                            support_overlay_active_support_id
+                        ),
+                        "left_overlay_eye_render_state": (
+                            _copy_present_overlay_eye_render_state(
+                                left_overlay_eye_render_state
+                            )
+                        ),
+                        "right_overlay_eye_render_state": (
+                            _copy_present_overlay_eye_render_state(
+                                right_overlay_eye_render_state
+                            )
+                        ),
+                    }
+                    present_submit_start = time.perf_counter()
+                    if (
+                        stable_compose_safety_gate_enabled
+                        and presentation_backend_kind == "legacy_single_worker"
+                    ):
+                        presentation_pending_safe_snapshots[int(frame_count)] = (
+                            _capture_stable_present_safe_snapshot()
+                        )
+                    dropped_packet = presentation_worker.submit(present_packet)
+                    scene_present_submit_wall_s = (
+                        time.perf_counter() - present_submit_start
                     )
                     if frame_count > 1:
-                        scene_pose_staleness_ms_samples.append(
-                            float(scene_pose_staleness_ms_at_publish)
+                        presentation_submit_ms_samples.append(
+                            scene_present_submit_wall_s * 1000.0
                         )
+                        render_stage_times["scene_present_submit_ms"].append(
+                            scene_present_submit_wall_s
+                        )
+                    _mark_dropped_present_packet(dropped_packet)
+                    if not first_real_publish_done and startup_timeline is not None:
+                        first_publish_begin_time = startup_timeline.get(
+                            "first_publish_begin_ms"
+                        )
+                        if first_publish_begin_time is None:
+                            self._record_immersive_startup_milestone(
+                                startup_timeline,
+                                "first_publish_begin",
+                                immersive_bridge,
+                            )
                     if render_profile_frame is not None:
-                        render_profile_frame[
-                            "scene_pose_staleness_ms_at_publish"
-                        ] = scene_pose_staleness_ms_at_publish / 1000.0
-                        render_profile_frame[
-                            "scene_pose_staleness_savings_ms"
-                        ] = scene_pose_staleness_savings_ms / 1000.0
+                        render_profile_frame["scene_present_submit_ms"] = float(
+                            scene_present_submit_wall_s
+                        )
+                    _update_preview_from_latest_completion(render_profile_frame)
+                else:
+                    if left_eye_frame.dtype != torch.uint8:
+                        left_eye_frame = left_eye_frame.clamp(0.0, 255.0).to(torch.uint8)
+                    if right_eye_frame.dtype != torch.uint8:
+                        right_eye_frame = right_eye_frame.clamp(0.0, 255.0).to(torch.uint8)
 
-                if not first_real_publish_done:
-                    self._record_immersive_startup_milestone(
-                        startup_timeline,
-                        "first_publish_begin",
-                        immersive_bridge,
-                    )
-                publish_stage_start = time.perf_counter()
-                publish_ok, publish_stats = immersive_bridge.publish_stereo_frames(
-                    left_eye_frame,
-                    right_eye_frame,
-                )
-                publish_stage_wall_s = time.perf_counter() - publish_stage_start
-                overlay_publish_wall_s = overlay_draw_wall_s + publish_stage_wall_s
-                if render_profile_frame is not None:
-                    render_profile_frame["publish_total_wall"] = float(
-                        publish_stats.get("total_wall", 0.0)
-                    )
-                    render_profile_frame["publish_process_check_wall"] = float(
-                        publish_stats.get("process_check_wall", 0.0)
-                    )
-                    render_profile_frame["publish_pending_drain_nonblock_wall"] = float(
-                        publish_stats.get("pending_drain_nonblock_wall", 0.0)
-                    )
-                    render_profile_frame["publish_pending_drain_block_wall"] = float(
-                        publish_stats.get("pending_drain_block_wall", 0.0)
-                    )
-                    render_profile_frame["publish_gpu_to_cpu_wait_wall"] = float(
-                        publish_stats.get("gpu_to_cpu_wait_wall", 0.0)
-                    )
-                    render_profile_frame["publish_gpu_to_cpu_copy_cuda"] = float(
-                        publish_stats.get("gpu_to_cpu_copy_cuda", 0.0)
-                    )
-                    render_profile_frame["publish_cpu_mmap_copy_wall"] = float(
-                        publish_stats.get("cpu_mmap_copy_wall", 0.0)
-                    )
-                    render_profile_frame["publish_header_write_wall"] = float(
-                        publish_stats.get("header_write_wall", 0.0)
-                    )
-                    render_profile_frame["publish_stage_enqueue_wall"] = float(
-                        publish_stats.get("stage_enqueue_wall", 0.0)
-                    )
-                    render_profile_frame["publish_fallback_copy_wall"] = float(
-                        publish_stats.get("fallback_copy_wall", 0.0)
-                    )
-                if not publish_ok:
-                    failure_details = ""
+                    if scene_depth_reproject_enabled:
+                        publish_measurement_s = time.monotonic()
+                        render_pose_staleness_ms = 0.0
+                        if render_sample_received_monotonic_s is not None:
+                            render_pose_staleness_ms = max(
+                                0.0,
+                                (publish_measurement_s - render_sample_received_monotonic_s)
+                                * 1000.0,
+                            )
+                        if scene_pose_received_monotonic_s is None:
+                            scene_pose_staleness_ms_at_publish = render_pose_staleness_ms
+                        else:
+                            scene_pose_staleness_ms_at_publish = max(
+                                0.0,
+                                (publish_measurement_s - scene_pose_received_monotonic_s)
+                                * 1000.0,
+                            )
+                        scene_pose_staleness_savings_ms = max(
+                            0.0,
+                            render_pose_staleness_ms
+                            - scene_pose_staleness_ms_at_publish,
+                        )
+                        if frame_count > 1:
+                            scene_pose_staleness_ms_samples.append(
+                                float(scene_pose_staleness_ms_at_publish)
+                            )
+                        if render_profile_frame is not None:
+                            render_profile_frame[
+                                "scene_pose_staleness_ms_at_publish"
+                            ] = scene_pose_staleness_ms_at_publish / 1000.0
+                            render_profile_frame[
+                                "scene_pose_staleness_savings_ms"
+                            ] = scene_pose_staleness_savings_ms / 1000.0
+
                     if not first_real_publish_done:
-                        failure_details = self._format_immersive_startup_timeline_failure(
+                        self._record_immersive_startup_milestone(
                             startup_timeline,
+                            "first_publish_begin",
                             immersive_bridge,
                         )
-                    raise RuntimeError(
-                        "Quest immersive bridge stopped accepting stereo frames.\n"
-                        + (failure_details + "\n" if failure_details else "")
-                        + immersive_bridge.debug_summary()
+                    publish_stage_start = time.perf_counter()
+                    publish_ok, publish_stats = immersive_bridge.publish_stereo_frames(
+                        left_eye_frame,
+                        right_eye_frame,
                     )
-                if not first_real_publish_done:
-                    self._record_immersive_startup_milestone(
-                        startup_timeline,
-                        "first_publish_done",
-                        immersive_bridge,
-                    )
-                    first_real_publish_done = True
-                    if startup_keepalive_state is not None:
-                        startup_keepalive_state["enabled"] = False
-                    startup_gap_ms = startup_timeline.get("startup_gap_ms")
-                    if startup_gap_ms is not None:
-                        print(
-                            "[quest_display] immersive startup first real publish: "
-                            f"startup_gap_ms={startup_gap_ms:.1f}",
-                            flush=True,
+                    publish_stage_wall_s = time.perf_counter() - publish_stage_start
+                    overlay_publish_wall_s = overlay_draw_wall_s + publish_stage_wall_s
+                    if render_profile_frame is not None:
+                        render_profile_frame["publish_total_wall"] = float(
+                            publish_stats.get("total_wall", 0.0)
                         )
-
-                if preview_display_active and preview_tex is not None:
-                    preview_window_start = (
-                        time.perf_counter() if render_profile_frame is not None else None
-                    )
-                    glfw.make_context_current(window)
-                    if preview_uploader is None:
+                        render_profile_frame["publish_process_check_wall"] = float(
+                            publish_stats.get("process_check_wall", 0.0)
+                        )
+                        render_profile_frame["publish_pending_drain_nonblock_wall"] = float(
+                            publish_stats.get("pending_drain_nonblock_wall", 0.0)
+                        )
+                        render_profile_frame["publish_pending_drain_block_wall"] = float(
+                            publish_stats.get("pending_drain_block_wall", 0.0)
+                        )
+                        render_profile_frame["publish_gpu_to_cpu_wait_wall"] = float(
+                            publish_stats.get("gpu_to_cpu_wait_wall", 0.0)
+                        )
+                        render_profile_frame["publish_gpu_to_cpu_copy_cuda"] = float(
+                            publish_stats.get("gpu_to_cpu_copy_cuda", 0.0)
+                        )
+                        render_profile_frame["publish_cpu_mmap_copy_wall"] = float(
+                            publish_stats.get("cpu_mmap_copy_wall", 0.0)
+                        )
+                        render_profile_frame["publish_header_write_wall"] = float(
+                            publish_stats.get("header_write_wall", 0.0)
+                        )
+                        render_profile_frame["publish_stage_enqueue_wall"] = float(
+                            publish_stats.get("stage_enqueue_wall", 0.0)
+                        )
+                        render_profile_frame["publish_fallback_copy_wall"] = float(
+                            publish_stats.get("fallback_copy_wall", 0.0)
+                        )
+                    if not publish_ok:
+                        failure_details = ""
+                        if not first_real_publish_done:
+                            failure_details = self._format_immersive_startup_timeline_failure(
+                                startup_timeline,
+                                immersive_bridge,
+                            )
                         raise RuntimeError(
-                            "Preview window is active but PreviewTextureCudaUploader was not initialized."
+                            "Quest immersive bridge stopped accepting stereo frames.\n"
+                            + (failure_details + "\n" if failure_details else "")
+                            + immersive_bridge.debug_summary()
                         )
-                    preview_uploader.upload(left_eye_frame)
-                    fb_width, fb_height = glfw.get_framebuffer_size(window)
-                    gl.glViewport(0, 0, fb_width, fb_height)
-                    gl.glDisable(gl.GL_DEPTH_TEST)
-                    gl.glClear(gl.GL_COLOR_BUFFER_BIT)
-                    gl.glUseProgram(preview_prog)
-                    gl.glBindVertexArray(preview_vao)
-                    gl.glActiveTexture(gl.GL_TEXTURE0)
-                    gl.glBindTexture(gl.GL_TEXTURE_2D, preview_tex)
-                    gl.glDrawArrays(gl.GL_TRIANGLE_STRIP, 0, 4)
-                    gl.glBindTexture(gl.GL_TEXTURE_2D, 0)
-                    gl.glBindVertexArray(0)
-                    gl.glUseProgram(0)
-                    glfw.swap_buffers(window)
-                    if preview_window_start is not None:
-                        self._render_profile_add_wall_time(
-                            render_profile_frame,
-                            "preview_window_wall",
-                            time.perf_counter() - preview_window_start,
+                    if not first_real_publish_done:
+                        self._record_immersive_startup_milestone(
+                            startup_timeline,
+                            "first_publish_done",
+                            immersive_bridge,
                         )
+                        first_real_publish_done = True
+                        if startup_keepalive_state is not None:
+                            startup_keepalive_state["enabled"] = False
+                        startup_gap_ms = startup_timeline.get("startup_gap_ms")
+                        if startup_gap_ms is not None:
+                            print(
+                                "[quest_display] immersive startup first real publish: "
+                                f"startup_gap_ms={startup_gap_ms:.1f}",
+                                flush=True,
+                            )
+                    if stable_compose_safety_gate_enabled:
+                        _promote_committed_safe_anchor(
+                            _capture_stable_present_safe_snapshot()
+                        )
+                    if (
+                        stable_compose_safety_gate_enabled
+                        or stable_gaussian_source_validation_enabled
+                    ):
+                        _promote_committed_safe_cover_snapshot(
+                            _capture_stable_cover_frame_snapshot(
+                                left_eye_frame,
+                                right_eye_frame,
+                                preview_frame=left_eye_frame,
+                            )
+                        )
+                    _present_preview_frame_direct(
+                        left_eye_frame,
+                        render_profile_frame,
+                    )
 
                 glfw_poll_start = time.perf_counter() if render_profile_frame is not None else None
                 glfw.poll_events()
@@ -13866,9 +27698,23 @@ class InvPhyTrainerWarp:
                         "glfw_poll_wall",
                         time.perf_counter() - glfw_poll_start,
                     )
-                render_time = render_timer.stop()
+                render_time = time.perf_counter() - render_stage_start
                 if frame_count > 1:
                     component_times["rendering"].append(render_time)
+                    static_scene_branch_full_s = (
+                        float(static_scene_worker_wall_s)
+                        if float(static_scene_worker_wall_s) > 0.0
+                        else float(static_scene_render_wall_s)
+                    )
+                    render_stage_times["static_scene_branch_full_ms"].append(
+                        static_scene_branch_full_s
+                    )
+                    render_stage_times["compose_join_full_ms"].append(
+                        max(
+                            static_scene_branch_full_s,
+                            float(branch_b_ready_wall_s),
+                        )
+                    )
                     render_stage_times["static_scene_render_ms"].append(
                         float(static_scene_render_wall_s)
                     )
@@ -13884,14 +27730,21 @@ class InvPhyTrainerWarp:
                     render_stage_times["pre_compose_ready_ms"].append(
                         float(pre_compose_ready_wall_s)
                     )
-                    render_stage_times["compositing_ms"].append(
-                        float(compositing_wall_s)
-                    )
-                    render_stage_times["overlay_publish_ms"].append(
-                        float(overlay_publish_wall_s)
-                    )
+                    if not presentation_backend_enabled:
+                        render_stage_times["compositing_ms"].append(
+                            float(compositing_wall_s)
+                        )
+                        render_stage_times["overlay_publish_ms"].append(
+                            float(overlay_publish_wall_s)
+                        )
                 if render_profile_frame is not None:
                     render_profile_frame["rendering"] = float(render_time)
+                    render_profile_frame["static_scene_execute_wall_ms"] = float(
+                        static_scene_execute_wall_s
+                    )
+                    render_profile_frame["static_scene_assemble_wall_ms"] = float(
+                        static_scene_assemble_wall_s
+                    )
                     render_profile_frame["static_scene_render_ms"] = float(
                         static_scene_render_wall_s
                     )
@@ -13906,12 +27759,6 @@ class InvPhyTrainerWarp:
                     )
                     render_profile_frame["pre_compose_ready_ms"] = float(
                         pre_compose_ready_wall_s
-                    )
-                    render_profile_frame["compositing_ms"] = float(
-                        compositing_wall_s
-                    )
-                    render_profile_frame["overlay_publish_ms"] = float(
-                        overlay_publish_wall_s
                     )
                     render_profile_frame = self._render_profile_finalize_frame(
                         render_profile_frame
@@ -13930,26 +27777,80 @@ class InvPhyTrainerWarp:
                     last_valid_object_center = (
                         x[: self.num_all_points].mean(dim=0).detach().clone()
                     )
+                    if (
+                        stable_gaussian_source_validation_enabled
+                        and gaussian_source_validation_result is not None
+                    ):
+                        self._commit_immersive_gaussian_source_valid_frame(
+                            frame_index=int(frame_count),
+                            sample_id=int(scene_source_sample_id),
+                            metrics_by_eye=gaussian_source_validation_result.get(
+                                "metrics_by_eye",
+                                {},
+                            ),
+                            left_gaussian_rgba=left_gaussian_rgba,
+                            left_gaussian_depth=left_gaussian_depth,
+                            right_gaussian_rgba=right_gaussian_rgba,
+                            right_gaussian_depth=right_gaussian_depth,
+                        )
 
-                total_time = total_timer.stop()
+                total_time = time.perf_counter() - total_frame_start
                 if frame_count > 1:
                     component_times["total"].append(total_time)
 
                 if render_profile_frame is not None:
                     self._render_profile_capture_cuda_memory(render_profile_frame)
-                if frame_count > 1 and immersive_framegen_mode in {"static", "adaptive"}:
+                    self._record_immersive_static_scene_reuse_profile_metrics(
+                        render_profile_frame,
+                        fresh_render=not framegen_reuse_applied,
+                        reason=framegen_reuse_reason,
+                        max_age_hit=framegen_max_age_hit,
+                        cache_invalidation_count=_steady_state_scalar_count(
+                            "static_scene_cache_invalidation_count",
+                            static_scene_cache_invalidation_count,
+                        ),
+                        signature_change_count=_steady_state_scalar_count(
+                            "static_scene_signature_change_count",
+                            static_scene_signature_change_count,
+                        ),
+                    )
+                if frame_count > 1 and framegen_metrics_enabled_for_frame:
                     static_scene_reuse_applied_samples.append(
                         float(framegen_reuse_applied)
                     )
-                if render_profile_frame is not None and frame_count > 1:
-                    self._render_profile_append_frame(
-                        immersive_render_profile_series,
-                        immersive_render_profile_rows,
-                        frame_count,
-                        render_profile_frame,
+                    static_scene_fresh_render_samples.append(
+                        0.0 if framegen_reuse_applied else 1.0
                     )
-                    if self._render_profile_should_log(frame_count, render_profile_every):
-                        self._log_immersive_render_profile_frame(
+                    static_scene_reuse_max_age_hit_samples.append(
+                        1.0 if framegen_max_age_hit else 0.0
+                    )
+                    static_scene_base_refresh_samples.append(
+                        1.0 if base_refresh_required else 0.0
+                    )
+                    static_scene_overlay_refresh_samples.append(
+                        1.0 if overlay_refresh_required else 0.0
+                    )
+                    static_scene_base_reuse_max_age_hit_samples.append(
+                        1.0 if base_refresh_max_age_hit else 0.0
+                    )
+                    static_scene_overlay_reuse_max_age_hit_samples.append(
+                        1.0 if overlay_refresh_max_age_hit else 0.0
+                    )
+                    for reason in base_refresh_reasons:
+                        static_scene_base_reuse_reason_counts[reason] = (
+                            static_scene_base_reuse_reason_counts.get(reason, 0) + 1
+                        )
+                    for reason in overlay_refresh_reasons:
+                        static_scene_overlay_reuse_reason_counts[reason] = (
+                            static_scene_overlay_reuse_reason_counts.get(reason, 0) + 1
+                        )
+                if render_profile_frame is not None and frame_count > 1:
+                    if presentation_backend_enabled:
+                        presentation_pending_profile_frames[int(frame_count)] = (
+                            render_profile_frame
+                        )
+                    else:
+                        _append_immersive_render_profile_row(
                             frame_count,
                             render_profile_frame,
                         )
@@ -14003,6 +27904,22 @@ class InvPhyTrainerWarp:
                 raise RuntimeError(message) from exc
             raise
         finally:
+            self._immersive_stable_present_policy_active = False
+            self._immersive_active_render_preset_name_value = "balanced"
+            if presentation_worker is not None:
+                presentation_stop_result = presentation_worker.stop()
+                _mark_dropped_present_packet(
+                    presentation_stop_result.get("dropped_packet")
+                )
+                for result in presentation_stop_result.get("results", []):
+                    _ingest_presentation_result(result)
+                for pending_frame_index in list(
+                    presentation_pending_profile_frames.keys()
+                ):
+                    _finalize_present_profile_frame(
+                        pending_frame_index,
+                        dropped=True,
+                    )
             if frame_count > 1 and component_times["total"]:
                 frames_used_for_stats = len(component_times["total"])
                 summary_header = (
@@ -14012,15 +27929,89 @@ class InvPhyTrainerWarp:
                 log_lines = [summary_header.lstrip("\n")]
                 total_frame_times = component_times["total"]
                 total_time_seconds = sum(total_frame_times)
-                published_fps = frames_used_for_stats / total_time_seconds
-                average_frame_time = np.mean(total_frame_times)
-                print(f"Published FPS: {published_fps:.2f}")
-                print(f"Average Total Frame Time: {average_frame_time * 1000:.2f} ms")
-                log_lines.append(f"Published FPS: {published_fps:.2f}")
-                log_lines.append(
-                    f"Average Total Frame Time: {average_frame_time * 1000:.2f} ms"
+                source_fps = (
+                    frames_used_for_stats / total_time_seconds
+                    if total_time_seconds > 0.0
+                    else 0.0
                 )
+                steady_static_scene_cache_invalidation_count = _steady_state_scalar_count(
+                    "static_scene_cache_invalidation_count",
+                    static_scene_cache_invalidation_count,
+                )
+                steady_static_scene_signature_change_count = _steady_state_scalar_count(
+                    "static_scene_signature_change_count",
+                    static_scene_signature_change_count,
+                )
+                steady_static_scene_base_signature_change_count = (
+                    _steady_state_scalar_count(
+                        "static_scene_base_signature_change_count",
+                        static_scene_base_signature_change_count,
+                    )
+                )
+                steady_static_scene_overlay_signature_change_count = (
+                    _steady_state_scalar_count(
+                        "static_scene_overlay_signature_change_count",
+                        static_scene_overlay_signature_change_count,
+                    )
+                )
+                steady_static_scene_reuse_reason_counts = _steady_state_reason_counts(
+                    "static_scene_reuse_reason_counts",
+                    static_scene_reuse_reason_counts,
+                )
+                steady_static_scene_base_reuse_reason_counts = (
+                    _steady_state_reason_counts(
+                        "static_scene_base_reuse_reason_counts",
+                        static_scene_base_reuse_reason_counts,
+                    )
+                )
+                steady_static_scene_overlay_reuse_reason_counts = (
+                    _steady_state_reason_counts(
+                        "static_scene_overlay_reuse_reason_counts",
+                        static_scene_overlay_reuse_reason_counts,
+                    )
+                )
+                published_fps = None
+                synthetic_framegen_fps = None
+                average_synthetic_framegen_applied_ratio = None
+                average_synthetic_framegen_candidate_age_ms = None
+                average_synthetic_framegen_total_scene_age_ms = None
+                average_synthetic_framegen_handoff_delay_ms = None
+                average_synthetic_framegen_translation_m = None
+                average_synthetic_framegen_rotation_deg = None
+                average_synthetic_skip_no_new_sample_ratio = None
+                average_synthetic_skip_source_age_ratio = None
+                average_synthetic_skip_translation_ratio = None
+                average_synthetic_skip_rotation_ratio = None
+                average_synthetic_skip_stale_packet_ratio = None
+                average_synthetic_skip_invalid_pose_ratio = None
+                average_synthetic_skip_latewarp_failure_ratio = None
+                average_synthetic_skip_pending_real_yield_ratio = None
+                average_synthetic_skip_real_source_inconsistent_ratio = None
+                average_synthetic_pending_real_at_launch_ratio = None
+                average_synthetic_immediate_sample_hit_ratio = None
+                average_synthetic_source_real_timewarp_applied_ratio = None
+                average_synthetic_source_real_timewarp_fallback_left_ratio = None
+                average_synthetic_source_real_timewarp_fallback_right_ratio = None
+                average_synthetic_source_consistent_ratio = None
+                if presentation_backend_enabled:
+                    published_fps = (
+                        float(presentation_completed_frame_count) / total_time_seconds
+                        if total_time_seconds > 0.0
+                        else 0.0
+                    )
+                if total_time_seconds > 0.0 and synthetic_framegen_published_count > 0:
+                    synthetic_framegen_fps = (
+                        float(synthetic_framegen_published_count) / total_time_seconds
+                    )
+                average_frame_time = np.mean(total_frame_times)
                 average_static_scene_reuse_ratio = 0.0
+                average_scene_pose_staleness_ms = None
+                average_static_scene_fresh_render_ratio = None
+                average_static_scene_base_refresh_ratio = 0.0
+                average_static_scene_overlay_refresh_ratio = 0.0
+                average_static_scene_max_age_hit_ratio = None
+                average_static_scene_base_max_age_hit_ratio = None
+                average_static_scene_overlay_max_age_hit_ratio = None
                 if scene_pose_staleness_ms_samples:
                     average_scene_pose_staleness_ms = float(
                         np.mean(
@@ -14030,12 +28021,6 @@ class InvPhyTrainerWarp:
                             )
                         )
                     )
-                    scene_staleness_line = (
-                        "Average Scene Pose Staleness at Publish: "
-                        f"{average_scene_pose_staleness_ms:.2f} ms"
-                    )
-                    print(scene_staleness_line)
-                    log_lines.append(scene_staleness_line)
                 if static_scene_reuse_applied_samples:
                     average_static_scene_reuse_ratio = float(
                         np.mean(
@@ -14045,38 +28030,591 @@ class InvPhyTrainerWarp:
                             )
                         )
                     )
-                    static_scene_reuse_line = (
-                        "Average Static Scene Reuse Ratio: "
-                        f"{average_static_scene_reuse_ratio * 100.0:.1f}%"
+                if static_scene_fresh_render_samples:
+                    average_static_scene_fresh_render_ratio = float(
+                        np.mean(
+                            np.asarray(
+                                static_scene_fresh_render_samples,
+                                dtype=np.float64,
+                            )
+                        )
                     )
-                    print(static_scene_reuse_line)
-                    log_lines.append(static_scene_reuse_line)
-                fresh_static_scene_render_fps = published_fps * (
+                if static_scene_base_refresh_samples:
+                    average_static_scene_base_refresh_ratio = float(
+                        np.mean(
+                            np.asarray(
+                                static_scene_base_refresh_samples,
+                                dtype=np.float64,
+                            )
+                        )
+                    )
+                if static_scene_overlay_refresh_samples:
+                    average_static_scene_overlay_refresh_ratio = float(
+                        np.mean(
+                            np.asarray(
+                                static_scene_overlay_refresh_samples,
+                                dtype=np.float64,
+                            )
+                        )
+                    )
+                if static_scene_reuse_max_age_hit_samples:
+                    average_static_scene_max_age_hit_ratio = float(
+                        np.mean(
+                            np.asarray(
+                                static_scene_reuse_max_age_hit_samples,
+                                dtype=np.float64,
+                            )
+                        )
+                    )
+                if static_scene_base_reuse_max_age_hit_samples:
+                    average_static_scene_base_max_age_hit_ratio = float(
+                        np.mean(
+                            np.asarray(
+                                static_scene_base_reuse_max_age_hit_samples,
+                                dtype=np.float64,
+                            )
+                        )
+                    )
+                if static_scene_overlay_reuse_max_age_hit_samples:
+                    average_static_scene_overlay_max_age_hit_ratio = float(
+                        np.mean(
+                            np.asarray(
+                                static_scene_overlay_reuse_max_age_hit_samples,
+                                dtype=np.float64,
+                            )
+                        )
+                    )
+                if synthetic_framegen_resolved_samples:
+                    average_synthetic_framegen_applied_ratio = float(
+                        np.mean(
+                            np.asarray(
+                                synthetic_framegen_resolved_samples,
+                                dtype=np.float64,
+                            )
+                        )
+                    )
+                if synthetic_framegen_source_age_ms_samples:
+                    average_synthetic_framegen_candidate_age_ms = float(
+                        np.mean(
+                            np.asarray(
+                                synthetic_framegen_source_age_ms_samples,
+                                dtype=np.float64,
+                            )
+                        )
+                    )
+                if synthetic_framegen_total_scene_age_ms_samples:
+                    average_synthetic_framegen_total_scene_age_ms = float(
+                        np.mean(
+                            np.asarray(
+                                synthetic_framegen_total_scene_age_ms_samples,
+                                dtype=np.float64,
+                            )
+                        )
+                    )
+                if synthetic_framegen_handoff_delay_ms_samples:
+                    average_synthetic_framegen_handoff_delay_ms = float(
+                        np.mean(
+                            np.asarray(
+                                synthetic_framegen_handoff_delay_ms_samples,
+                                dtype=np.float64,
+                            )
+                        )
+                    )
+                if synthetic_framegen_translation_m_samples:
+                    average_synthetic_framegen_translation_m = float(
+                        np.mean(
+                            np.asarray(
+                                synthetic_framegen_translation_m_samples,
+                                dtype=np.float64,
+                            )
+                        )
+                    )
+                if synthetic_framegen_rotation_deg_samples:
+                    average_synthetic_framegen_rotation_deg = float(
+                        np.mean(
+                            np.asarray(
+                                synthetic_framegen_rotation_deg_samples,
+                                dtype=np.float64,
+                            )
+                        )
+                    )
+                if synthetic_framegen_skip_no_new_sample_samples:
+                    average_synthetic_skip_no_new_sample_ratio = float(
+                        np.mean(
+                            np.asarray(
+                                synthetic_framegen_skip_no_new_sample_samples,
+                                dtype=np.float64,
+                            )
+                        )
+                    )
+                    average_synthetic_skip_source_age_ratio = float(
+                        np.mean(
+                            np.asarray(
+                                synthetic_framegen_skip_source_age_samples,
+                                dtype=np.float64,
+                            )
+                        )
+                    )
+                    average_synthetic_skip_translation_ratio = float(
+                        np.mean(
+                            np.asarray(
+                                synthetic_framegen_skip_translation_samples,
+                                dtype=np.float64,
+                            )
+                        )
+                    )
+                    average_synthetic_skip_rotation_ratio = float(
+                        np.mean(
+                            np.asarray(
+                                synthetic_framegen_skip_rotation_samples,
+                                dtype=np.float64,
+                            )
+                        )
+                    )
+                    average_synthetic_skip_stale_packet_ratio = float(
+                        np.mean(
+                            np.asarray(
+                                synthetic_framegen_skip_stale_packet_samples,
+                                dtype=np.float64,
+                            )
+                        )
+                    )
+                    average_synthetic_skip_invalid_pose_ratio = float(
+                        np.mean(
+                            np.asarray(
+                                synthetic_framegen_skip_invalid_pose_samples,
+                                dtype=np.float64,
+                            )
+                        )
+                    )
+                    average_synthetic_skip_latewarp_failure_ratio = float(
+                        np.mean(
+                            np.asarray(
+                                synthetic_framegen_skip_latewarp_failure_samples,
+                                dtype=np.float64,
+                            )
+                        )
+                    )
+                    average_synthetic_skip_pending_real_yield_ratio = float(
+                        np.mean(
+                            np.asarray(
+                                synthetic_framegen_skip_pending_real_yield_samples,
+                                dtype=np.float64,
+                            )
+                        )
+                    )
+                    average_synthetic_skip_real_source_inconsistent_ratio = float(
+                        np.mean(
+                            np.asarray(
+                                synthetic_framegen_skip_real_source_inconsistent_samples,
+                                dtype=np.float64,
+                            )
+                        )
+                    )
+                if synthetic_framegen_pending_real_at_launch_samples:
+                    average_synthetic_pending_real_at_launch_ratio = float(
+                        np.mean(
+                            np.asarray(
+                                synthetic_framegen_pending_real_at_launch_samples,
+                                dtype=np.float64,
+                            )
+                        )
+                    )
+                if synthetic_framegen_immediate_sample_hit_samples:
+                    average_synthetic_immediate_sample_hit_ratio = float(
+                        np.mean(
+                            np.asarray(
+                                synthetic_framegen_immediate_sample_hit_samples,
+                                dtype=np.float64,
+                            )
+                        )
+                    )
+                if synthetic_source_real_timewarp_applied_samples:
+                    average_synthetic_source_real_timewarp_applied_ratio = float(
+                        np.mean(
+                            np.asarray(
+                                synthetic_source_real_timewarp_applied_samples,
+                                dtype=np.float64,
+                            )
+                        )
+                    )
+                    average_synthetic_source_real_timewarp_fallback_left_ratio = float(
+                        np.mean(
+                            np.asarray(
+                                synthetic_source_real_timewarp_fallback_left_samples,
+                                dtype=np.float64,
+                            )
+                        )
+                    )
+                    average_synthetic_source_real_timewarp_fallback_right_ratio = float(
+                        np.mean(
+                            np.asarray(
+                                synthetic_source_real_timewarp_fallback_right_samples,
+                                dtype=np.float64,
+                            )
+                        )
+                    )
+                    average_synthetic_source_consistent_ratio = float(
+                        np.mean(
+                            np.asarray(
+                                synthetic_source_consistent_samples,
+                                dtype=np.float64,
+                            )
+                        )
+                    )
+                fresh_static_scene_render_fps = source_fps * (
                     1.0 - average_static_scene_reuse_ratio
                 )
-                fresh_static_scene_render_fps_line = (
-                    "Fresh Static Scene Render FPS: "
-                    f"{fresh_static_scene_render_fps:.2f}"
+                fresh_static_scene_base_render_fps = (
+                    source_fps * average_static_scene_base_refresh_ratio
                 )
-                print(fresh_static_scene_render_fps_line)
-                log_lines.append(fresh_static_scene_render_fps_line)
-                viewer_consumed_source_fps = None
+                fresh_static_scene_overlay_render_fps = (
+                    source_fps * average_static_scene_overlay_refresh_ratio
+                )
+                viewer_render_fps = None
+                bridge_submit_fps = None
+                committed_shared_update_fps = None
+                committed_shared_source_delta_fps = None
+                committed_shared_drop_ratio = None
+                committed_shared_drop_count = None
+                committed_shared_queue_max_depth = None
+                committed_shared_pending_replace_count = None
+                committed_shared_active_promote_count = None
+                committed_shared_capacity_block_count = None
+                committed_shared_capacity_wait_ms = None
+                committed_shared_retired_copying_max_depth = None
+                committed_shared_physical_in_use_max_depth = None
+                committed_shared_free_stage_min = None
+                bridge_commit_gpu_to_cpu_ms = None
+                bridge_commit_direct_path_ratio = None
+                bridge_commit_direct_copy_ms = None
+                bridge_commit_fallback_ratio = None
+                bridge_commit_cpu_mmap_ms = None
+                bridge_commit_header_write_ms = None
+                bridge_commit_total_ms = None
+                bridge_submit_to_commit_start_ms = None
+                bridge_commit_wait_for_gpu_ready_ms = None
+                bridge_commit_thread_wake_delay_ms = None
+                bridge_commit_active_service_ms = None
+                bridge_publish_sample_check_count = None
+                bridge_publish_sample_mismatch_count = None
+                bridge_direct_commit_enabled = None
+                bridge_direct_commit_warning = None
+                viewer_applied_update_fps = None
+                viewer_source_frame_delta_fps = None
+                viewer_coalesced_source_count = None
+                viewer_coalesced_source_ratio = None
+                viewer_accounting_inconsistency_count = None
+                viewer_applied_vs_source_delta_gap = None
+                viewer_coalesced_reconstructed_count = None
+                viewer_accounting_aggregate_inconsistent = False
+                compose_artifact_debug_summary = {}
+                gaussian_source_debug_summary = {}
+                active_overlay_debug_summary = {}
+                if diagnostic_collection_enabled:
+                    compose_artifact_debug_summary = (
+                        self._summarize_immersive_compose_artifact_debug_state()
+                    )
+                    gaussian_source_debug_summary = (
+                        self._summarize_immersive_gaussian_source_debug_state()
+                    )
+                    active_overlay_debug_summary = (
+                        self._summarize_live_controller_active_overlay_state()
+                    )
                 if immersive_bridge is not None:
-                    viewer_consumed_stats = immersive_bridge.viewer_consumed_source_stats()
-                    viewer_consumed_source_fps = float(
-                        viewer_consumed_stats.get("average_fps", 0.0)
+                    try:
+                        immersive_bridge.wait_for_bridge_idle(timeout=1.0)
+                    except Exception:
+                        pass
+                    bridge_commit_stats = immersive_bridge.bridge_commit_stats(
+                        scope="steady_state",
+                        elapsed_override_s=total_time_seconds,
                     )
-                    if viewer_consumed_source_fps <= 0.0:
-                        viewer_consumed_source_fps = float(
-                            viewer_consumed_stats.get("recent_fps", 0.0)
+                    bridge_submit_fps = float(
+                        bridge_commit_stats.get("bridge_submit_fps", 0.0)
+                    )
+                    committed_shared_update_fps = float(
+                        bridge_commit_stats.get("committed_update_fps", 0.0)
+                    )
+                    committed_shared_source_delta_fps = float(
+                        bridge_commit_stats.get("committed_source_delta_fps", 0.0)
+                    )
+                    committed_shared_drop_ratio = float(
+                        bridge_commit_stats.get("drop_ratio", 0.0)
+                    )
+                    committed_shared_drop_count = int(
+                        bridge_commit_stats.get("dropped_pending_count", 0)
+                    )
+                    committed_shared_queue_max_depth = int(
+                        bridge_commit_stats.get("queue_max_depth", 0)
+                    )
+                    committed_shared_pending_replace_count = int(
+                        bridge_commit_stats.get("pending_replace_count", 0)
+                    )
+                    committed_shared_active_promote_count = int(
+                        bridge_commit_stats.get("active_promote_count", 0)
+                    )
+                    committed_shared_capacity_block_count = int(
+                        bridge_commit_stats.get("capacity_block_count", 0)
+                    )
+                    committed_shared_capacity_wait_ms = float(
+                        bridge_commit_stats.get("capacity_wait_ms", 0.0)
+                    )
+                    committed_shared_retired_copying_max_depth = int(
+                        bridge_commit_stats.get("retired_copying_max_depth", 0)
+                    )
+                    committed_shared_physical_in_use_max_depth = int(
+                        bridge_commit_stats.get("physical_in_use_max_depth", 0)
+                    )
+                    committed_shared_free_stage_min = int(
+                        bridge_commit_stats.get("free_stage_min", 0)
+                    )
+                    bridge_commit_gpu_to_cpu_ms = float(
+                        bridge_commit_stats.get("bridge_commit_gpu_to_cpu_ms", 0.0)
+                    )
+                    bridge_commit_direct_path_ratio = float(
+                        bridge_commit_stats.get("bridge_commit_direct_path_ratio", 0.0)
+                    )
+                    bridge_commit_direct_copy_ms = float(
+                        bridge_commit_stats.get("bridge_commit_direct_copy_ms", 0.0)
+                    )
+                    bridge_commit_fallback_ratio = float(
+                        bridge_commit_stats.get("bridge_commit_fallback_ratio", 0.0)
+                    )
+                    bridge_commit_cpu_mmap_ms = float(
+                        bridge_commit_stats.get("bridge_commit_cpu_mmap_ms", 0.0)
+                    )
+                    bridge_commit_header_write_ms = float(
+                        bridge_commit_stats.get("bridge_commit_header_write_ms", 0.0)
+                    )
+                    bridge_commit_total_ms = float(
+                        bridge_commit_stats.get("bridge_commit_total_ms", 0.0)
+                    )
+                    bridge_submit_to_commit_start_ms = float(
+                        bridge_commit_stats.get(
+                            "bridge_submit_to_commit_start_ms", 0.0
                         )
-                if viewer_consumed_source_fps is not None and viewer_consumed_source_fps > 0.0:
-                    viewer_consumed_line = (
-                        "Viewer-Consumed Source FPS: "
-                        f"{viewer_consumed_source_fps:.2f}"
                     )
-                    print(viewer_consumed_line)
-                    log_lines.append(viewer_consumed_line)
+                    bridge_commit_wait_for_gpu_ready_ms = float(
+                        bridge_commit_stats.get(
+                            "bridge_commit_wait_for_gpu_ready_ms", 0.0
+                        )
+                    )
+                    bridge_commit_thread_wake_delay_ms = float(
+                        bridge_commit_stats.get(
+                            "bridge_commit_thread_wake_delay_ms", 0.0
+                        )
+                    )
+                    bridge_commit_active_service_ms = float(
+                        bridge_commit_stats.get(
+                            "bridge_commit_active_service_ms", 0.0
+                        )
+                    )
+                    bridge_publish_sample_check_count = int(
+                        bridge_commit_stats.get(
+                            "bridge_publish_sample_check_count", 0
+                        )
+                    )
+                    bridge_publish_sample_mismatch_count = int(
+                        bridge_commit_stats.get(
+                            "bridge_publish_sample_mismatch_count", 0
+                        )
+                    )
+                    bridge_direct_commit_enabled = bool(
+                        bridge_commit_stats.get("direct_commit_enabled", False)
+                    )
+                    direct_commit_warning_value = bridge_commit_stats.get(
+                        "direct_commit_warning", None
+                    )
+                    if direct_commit_warning_value is not None:
+                        bridge_direct_commit_warning = str(direct_commit_warning_value)
+                    viewer_render_stats = immersive_bridge.viewer_render_stats(
+                        scope="steady_state",
+                        elapsed_override_s=total_time_seconds,
+                    )
+                    viewer_render_fps = float(viewer_render_stats.get("average_fps", 0.0))
+                    if viewer_render_fps <= 0.0:
+                        viewer_render_fps = float(viewer_render_stats.get("recent_fps", 0.0))
+                    viewer_applied_stats = immersive_bridge.viewer_applied_update_stats(
+                        scope="steady_state",
+                        elapsed_override_s=total_time_seconds,
+                    )
+                    viewer_applied_update_fps = float(
+                        viewer_applied_stats.get("average_fps", 0.0)
+                    )
+                    if viewer_applied_update_fps <= 0.0:
+                        viewer_applied_update_fps = float(
+                            viewer_applied_stats.get("recent_fps", 0.0)
+                        )
+                    viewer_source_delta_stats = (
+                        immersive_bridge.viewer_source_frame_delta_stats(
+                            scope="steady_state",
+                            elapsed_override_s=total_time_seconds,
+                        )
+                    )
+                    viewer_source_frame_delta_fps = float(
+                        viewer_source_delta_stats.get("average_fps", 0.0)
+                    )
+                    if viewer_source_frame_delta_fps <= 0.0:
+                        viewer_source_frame_delta_fps = float(
+                            viewer_source_delta_stats.get("recent_fps", 0.0)
+                        )
+                    viewer_coalescing_stats = (
+                        immersive_bridge.viewer_source_coalescing_stats(
+                            scope="steady_state"
+                        )
+                    )
+                    viewer_accounting_stats = immersive_bridge.viewer_accounting_stats(
+                        scope="steady_state"
+                    )
+                    viewer_coalesced_source_count = int(
+                        viewer_coalescing_stats.get("count", 0)
+                    )
+                    viewer_coalesced_source_ratio = float(
+                        viewer_coalescing_stats.get("ratio", 0.0)
+                    )
+                    viewer_accounting_inconsistency_count = int(
+                        viewer_accounting_stats.get(
+                            "viewer_accounting_inconsistency_count", 0
+                        )
+                    )
+                    viewer_applied_vs_source_delta_gap = int(
+                        viewer_accounting_stats.get(
+                            "viewer_applied_vs_source_delta_gap", 0
+                        )
+                    )
+                    viewer_coalesced_reconstructed_count = int(
+                        viewer_accounting_stats.get(
+                            "viewer_coalesced_reconstructed_count", 0
+                        )
+                    )
+                    viewer_accounting_aggregate_inconsistent = bool(
+                        viewer_accounting_stats.get("aggregate_inconsistent", False)
+                    )
+                def _append_fps_line(section_lines, label, value, description):
+                    if value is None or value <= 0.0:
+                        return
+                    section_lines.append(
+                        f"{label}: {float(value):.2f} ({description})"
+                    )
+
+                def _append_scalar_line(section_lines, label, value):
+                    if value is None:
+                        return
+                    section_lines.append(f"{label}: {value}")
+
+                def _append_section(section_lines):
+                    if not section_lines:
+                        return
+                    print("")
+                    log_lines.append("")
+                    for line in section_lines:
+                        print(line)
+                        log_lines.append(line)
+
+                frames_sent_out_fps = (
+                    published_fps if published_fps is not None else bridge_submit_fps
+                )
+                static_scene_branch_full_samples = render_stage_times.get(
+                    "static_scene_branch_full_ms", []
+                )
+                static_scene_branch_full_avg_ms = (
+                    float(
+                        np.mean(
+                            np.asarray(
+                                static_scene_branch_full_samples,
+                                dtype=np.float64,
+                            )
+                        )
+                    )
+                    * 1000.0
+                    if static_scene_branch_full_samples
+                    else None
+                )
+                static_scene_residual_avg_ms = (
+                    float(
+                        np.mean(
+                            np.asarray(
+                                render_stage_times.get("static_scene_render_ms", []),
+                                dtype=np.float64,
+                            )
+                        )
+                    )
+                    * 1000.0
+                    if render_stage_times.get("static_scene_render_ms", [])
+                    else None
+                )
+
+                high_level_lines = ["High-Level Results:"]
+                _append_fps_line(
+                    high_level_lines,
+                    "Source FPS",
+                    source_fps,
+                    "new full frames the app produces each second",
+                )
+                _append_fps_line(
+                    high_level_lines,
+                    "Frames Sent Out FPS",
+                    frames_sent_out_fps,
+                    "frames the app sends toward display each second",
+                )
+                if synthetic_framegen_fps is not None:
+                    _append_fps_line(
+                        high_level_lines,
+                        "Synthetic Framegen FPS",
+                        synthetic_framegen_fps,
+                        "extra in-between views warped from the previous real composed frame",
+                    )
+                _append_fps_line(
+                    high_level_lines,
+                    "Viewer Render FPS",
+                    viewer_render_fps,
+                    "how often the headset/viewer tries to draw",
+                )
+                _append_fps_line(
+                    high_level_lines,
+                    "Viewer New Frame Available FPS",
+                    viewer_source_frame_delta_fps,
+                    "how often a newer image reaches the viewer",
+                )
+                _append_fps_line(
+                    high_level_lines,
+                    "Viewer New Frame Shown FPS",
+                    viewer_applied_update_fps,
+                    "how often the viewer actually switches to a newer image",
+                )
+                high_level_lines.append(
+                    "Average Total Frame Time: "
+                    f"{average_frame_time * 1000.0:.2f} ms "
+                    "(average steady-state time per source frame)"
+                )
+                _append_fps_line(
+                    high_level_lines,
+                    "Fresh Static Scene Render FPS",
+                    fresh_static_scene_render_fps,
+                    "how often the room is freshly rendered instead of reused",
+                )
+                if static_scene_base_refresh_samples:
+                    _append_fps_line(
+                        high_level_lines,
+                        "Fresh Static Scene Base Render FPS",
+                        fresh_static_scene_base_render_fps,
+                        "how often full base room layers are freshly rerendered",
+                    )
+                if static_scene_overlay_refresh_samples:
+                    _append_fps_line(
+                        high_level_lines,
+                        "Fresh Static Scene Overlay Render FPS",
+                        fresh_static_scene_overlay_render_fps,
+                        "how often room overlay layers are freshly rerendered",
+                    )
+                if static_scene_reuse_applied_samples:
+                    high_level_lines.append(
+                        "Average Static Scene Reuse Ratio: "
+                        f"{average_static_scene_reuse_ratio * 100.0:.1f}% "
+                        "(how often the room/static scene is reused)"
+                    )
+
                 if startup_render_debug is not None:
                     startup_compose_line = (
                         "Startup compose mode: "
@@ -14087,8 +28625,890 @@ class InvPhyTrainerWarp:
                             f" suppressed={startup_render_debug.get('suppressed_by_scene_depth_eyes', [])}"
                             f" invalid_depth={startup_render_debug.get('scene_depth_invalid_eyes', [])}"
                         )
-                    print(startup_compose_line)
-                    log_lines.append(startup_compose_line)
+                else:
+                    startup_compose_line = None
+
+                diagnostics_lines = ["Diagnostics:"]
+                if presentation_backend_enabled and presentation_backend_kind is not None:
+                    diagnostics_lines.append(
+                        f"Presentation Backend: {presentation_backend_kind}"
+                    )
+                if average_scene_pose_staleness_ms is not None:
+                    diagnostics_lines.append(
+                        "Average Scene Pose Staleness at Publish: "
+                        f"{average_scene_pose_staleness_ms:.2f} ms"
+                    )
+                if average_synthetic_framegen_applied_ratio is not None:
+                    diagnostics_lines.append(
+                        "Synthetic Framegen Applied Ratio: "
+                        f"{average_synthetic_framegen_applied_ratio * 100.0:.1f}%"
+                    )
+                if synthetic_framegen_launch_count > 0:
+                    diagnostics_lines.append(
+                        "Synthetic Framegen Launch Count: "
+                        f"{int(synthetic_framegen_launch_count)}"
+                    )
+                if average_synthetic_pending_real_at_launch_ratio is not None:
+                    diagnostics_lines.append(
+                        "Synthetic Framegen Pending Real At Launch Ratio: "
+                        f"{average_synthetic_pending_real_at_launch_ratio * 100.0:.1f}%"
+                    )
+                if average_synthetic_immediate_sample_hit_ratio is not None:
+                    diagnostics_lines.append(
+                        "Synthetic Framegen Immediate Sample Hit Ratio: "
+                        f"{average_synthetic_immediate_sample_hit_ratio * 100.0:.1f}%"
+                    )
+                if average_synthetic_source_real_timewarp_applied_ratio is not None:
+                    diagnostics_lines.append(
+                        "Synthetic Source Real Timewarp Applied Ratio: "
+                        f"{average_synthetic_source_real_timewarp_applied_ratio * 100.0:.1f}%"
+                    )
+                if average_synthetic_source_real_timewarp_fallback_left_ratio is not None:
+                    diagnostics_lines.append(
+                        "Synthetic Source Real Timewarp Fallback Left Ratio: "
+                        f"{average_synthetic_source_real_timewarp_fallback_left_ratio * 100.0:.1f}%"
+                    )
+                if average_synthetic_source_real_timewarp_fallback_right_ratio is not None:
+                    diagnostics_lines.append(
+                        "Synthetic Source Real Timewarp Fallback Right Ratio: "
+                        f"{average_synthetic_source_real_timewarp_fallback_right_ratio * 100.0:.1f}%"
+                    )
+                if average_synthetic_source_consistent_ratio is not None:
+                    diagnostics_lines.append(
+                        "Synthetic Source Consistent Ratio: "
+                        f"{average_synthetic_source_consistent_ratio * 100.0:.1f}%"
+                    )
+                if average_synthetic_framegen_candidate_age_ms is not None:
+                    diagnostics_lines.append(
+                        "Synthetic Framegen Candidate Age Ms: "
+                        f"{average_synthetic_framegen_candidate_age_ms:.2f}"
+                    )
+                if average_synthetic_framegen_total_scene_age_ms is not None:
+                    diagnostics_lines.append(
+                        "Synthetic Framegen Total Scene Age Ms: "
+                        f"{average_synthetic_framegen_total_scene_age_ms:.2f}"
+                    )
+                if average_synthetic_framegen_handoff_delay_ms is not None:
+                    diagnostics_lines.append(
+                        "Synthetic Framegen Handoff Delay Ms: "
+                        f"{average_synthetic_framegen_handoff_delay_ms:.2f}"
+                    )
+                if average_synthetic_framegen_translation_m is not None:
+                    diagnostics_lines.append(
+                        "Synthetic Framegen Translation M: "
+                        f"{average_synthetic_framegen_translation_m:.4f}"
+                    )
+                if average_synthetic_framegen_rotation_deg is not None:
+                    diagnostics_lines.append(
+                        "Synthetic Framegen Rotation Deg: "
+                        f"{average_synthetic_framegen_rotation_deg:.3f}"
+                    )
+                if average_synthetic_skip_no_new_sample_ratio is not None:
+                    diagnostics_lines.append(
+                        "Synthetic Framegen Skip Ratios: "
+                        f"no_new_sample={average_synthetic_skip_no_new_sample_ratio * 100.0:.1f}% "
+                        f"source_age={average_synthetic_skip_source_age_ratio * 100.0:.1f}% "
+                        f"translation={average_synthetic_skip_translation_ratio * 100.0:.1f}% "
+                        f"rotation={average_synthetic_skip_rotation_ratio * 100.0:.1f}% "
+                        f"stale_packet={average_synthetic_skip_stale_packet_ratio * 100.0:.1f}% "
+                        f"real_source_inconsistent={average_synthetic_skip_real_source_inconsistent_ratio * 100.0:.1f}% "
+                        f"pending_real_yield={average_synthetic_skip_pending_real_yield_ratio * 100.0:.1f}% "
+                        f"invalid_pose={average_synthetic_skip_invalid_pose_ratio * 100.0:.1f}% "
+                        f"latewarp_failure={average_synthetic_skip_latewarp_failure_ratio * 100.0:.1f}%"
+                    )
+                if (
+                    presentation_backend_kind == "split_experimental"
+                    and (
+                    present_arbiter_real_publish_count > 0
+                    or present_arbiter_synthetic_publish_count > 0
+                    or present_arbiter_synthetic_dropped_by_real_count > 0
+                    )
+                ):
+                    diagnostics_lines.append(
+                        "Present Arbiter Counts: "
+                        f"real_publish={int(present_arbiter_real_publish_count)} "
+                        f"synthetic_publish={int(present_arbiter_synthetic_publish_count)} "
+                        f"synthetic_dropped_by_real={int(present_arbiter_synthetic_dropped_by_real_count)}"
+                    )
+                if average_static_scene_fresh_render_ratio is not None:
+                    diagnostics_lines.append(
+                        "Average Static Scene Fresh Render Ratio: "
+                        f"{average_static_scene_fresh_render_ratio * 100.0:.1f}%"
+                    )
+                if static_scene_base_refresh_samples:
+                    diagnostics_lines.append(
+                        "Average Static Scene Base Refresh Ratio: "
+                        f"{average_static_scene_base_refresh_ratio * 100.0:.1f}%"
+                    )
+                if static_scene_overlay_refresh_samples:
+                    diagnostics_lines.append(
+                        "Average Static Scene Overlay Refresh Ratio: "
+                        f"{average_static_scene_overlay_refresh_ratio * 100.0:.1f}%"
+                    )
+                if static_scene_branch_full_avg_ms is not None:
+                    diagnostics_lines.append(
+                        "Static Scene Full Branch Time Ms: "
+                        f"{static_scene_branch_full_avg_ms:.2f}"
+                    )
+                if static_scene_residual_avg_ms is not None:
+                    diagnostics_lines.append(
+                        "Static Scene Critical-Path Residual Ms: "
+                        f"{static_scene_residual_avg_ms:.2f}"
+                    )
+                if average_static_scene_max_age_hit_ratio is not None:
+                    diagnostics_lines.append(
+                        "Static Scene Reuse Max Age Hit Ratio: "
+                        f"{average_static_scene_max_age_hit_ratio * 100.0:.1f}%"
+                    )
+                if average_static_scene_base_max_age_hit_ratio is not None:
+                    diagnostics_lines.append(
+                        "Static Scene Base Reuse Max Age Hit Ratio: "
+                        f"{average_static_scene_base_max_age_hit_ratio * 100.0:.1f}%"
+                    )
+                if average_static_scene_overlay_max_age_hit_ratio is not None:
+                    diagnostics_lines.append(
+                        "Static Scene Overlay Reuse Max Age Hit Ratio: "
+                        f"{average_static_scene_overlay_max_age_hit_ratio * 100.0:.1f}%"
+                    )
+                if steady_static_scene_reuse_reason_counts:
+                    ordered_reuse_reasons = sorted(
+                        steady_static_scene_reuse_reason_counts.items(),
+                        key=lambda item: (-item[1], item[0]),
+                    )
+                    diagnostics_lines.append(
+                        "Static Scene Reuse Stop Reasons: "
+                        + ", ".join(
+                            f"{reason}={count}"
+                            for reason, count in ordered_reuse_reasons
+                        )
+                    )
+                if steady_static_scene_base_reuse_reason_counts:
+                    ordered_base_reuse_reasons = sorted(
+                        steady_static_scene_base_reuse_reason_counts.items(),
+                        key=lambda item: (-item[1], item[0]),
+                    )
+                    diagnostics_lines.append(
+                        "Static Scene Base Stop Reasons: "
+                        + ", ".join(
+                            f"{reason}={count}"
+                            for reason, count in ordered_base_reuse_reasons
+                        )
+                    )
+                if steady_static_scene_overlay_reuse_reason_counts:
+                    ordered_overlay_reuse_reasons = sorted(
+                        steady_static_scene_overlay_reuse_reason_counts.items(),
+                        key=lambda item: (-item[1], item[0]),
+                    )
+                    diagnostics_lines.append(
+                        "Static Scene Overlay Stop Reasons: "
+                        + ", ".join(
+                            f"{reason}={count}"
+                            for reason, count in ordered_overlay_reuse_reasons
+                        )
+                    )
+                if (
+                    immersive_framegen_mode in {"static", "adaptive"}
+                    or steady_static_scene_cache_invalidation_count > 0
+                    or steady_static_scene_signature_change_count > 0
+                ):
+                    diagnostics_lines.append(
+                        "Static Scene Cache Invalidation Count: "
+                        f"{int(steady_static_scene_cache_invalidation_count)}"
+                    )
+                    diagnostics_lines.append(
+                        "Static Scene Signature Change Count: "
+                        f"{int(steady_static_scene_signature_change_count)}"
+                    )
+                if (
+                    immersive_framegen_mode in {"static", "adaptive"}
+                    or steady_static_scene_base_signature_change_count > 0
+                    or steady_static_scene_overlay_signature_change_count > 0
+                ):
+                    diagnostics_lines.append(
+                        "Static Scene Base Signature Change Count: "
+                        f"{int(steady_static_scene_base_signature_change_count)}"
+                    )
+                    diagnostics_lines.append(
+                        "Static Scene Overlay Signature Change Count: "
+                        f"{int(steady_static_scene_overlay_signature_change_count)}"
+                    )
+
+                if published_fps is not None and published_fps > 0.0:
+                    diagnostics_lines.append(f"Published FPS: {published_fps:.2f}")
+                elif bridge_submit_fps is not None and bridge_submit_fps > 0.0:
+                    diagnostics_lines.append(
+                        f"Bridge Submit FPS: {bridge_submit_fps:.2f}"
+                    )
+                if (
+                    committed_shared_update_fps is not None
+                    and committed_shared_update_fps > 0.0
+                ):
+                    diagnostics_lines.append(
+                        "Committed Shared Update FPS: "
+                        f"{committed_shared_update_fps:.2f}"
+                    )
+                if (
+                    committed_shared_source_delta_fps is not None
+                    and committed_shared_source_delta_fps > 0.0
+                ):
+                    diagnostics_lines.append(
+                        "Committed Shared Source Delta FPS: "
+                        f"{committed_shared_source_delta_fps:.2f}"
+                    )
+                if (
+                    committed_shared_drop_ratio is not None
+                    and committed_shared_drop_count is not None
+                ):
+                    diagnostics_lines.append(
+                        "Committed Shared Drop Ratio: "
+                        f"{committed_shared_drop_ratio * 100.0:.1f}% "
+                        f"(count={committed_shared_drop_count})"
+                    )
+                _append_scalar_line(
+                    diagnostics_lines,
+                    "Committed Shared Logical Queue Max Depth",
+                    committed_shared_queue_max_depth,
+                )
+                _append_scalar_line(
+                    diagnostics_lines,
+                    "Committed Shared Pending Replace Count",
+                    committed_shared_pending_replace_count,
+                )
+                _append_scalar_line(
+                    diagnostics_lines,
+                    "Committed Shared Active Promote Count",
+                    committed_shared_active_promote_count,
+                )
+                _append_scalar_line(
+                    diagnostics_lines,
+                    "Committed Shared Capacity Block Count",
+                    committed_shared_capacity_block_count,
+                )
+                if committed_shared_capacity_wait_ms is not None:
+                    diagnostics_lines.append(
+                        "Committed Shared Capacity Wait Ms: "
+                        f"{committed_shared_capacity_wait_ms:.2f}"
+                    )
+                _append_scalar_line(
+                    diagnostics_lines,
+                    "Committed Shared Retired Copying Max Depth",
+                    committed_shared_retired_copying_max_depth,
+                )
+                _append_scalar_line(
+                    diagnostics_lines,
+                    "Committed Shared Physical In-Use Max Depth",
+                    committed_shared_physical_in_use_max_depth,
+                )
+                _append_scalar_line(
+                    diagnostics_lines,
+                    "Committed Shared Free Stage Min",
+                    committed_shared_free_stage_min,
+                )
+                if bridge_commit_gpu_to_cpu_ms is not None:
+                    diagnostics_lines.append(
+                        "bridge_commit_gpu_to_cpu_ms: "
+                        f"{bridge_commit_gpu_to_cpu_ms:.2f}"
+                    )
+                if bridge_commit_direct_path_ratio is not None:
+                    diagnostics_lines.append(
+                        "bridge_commit_direct_path_ratio: "
+                        f"{bridge_commit_direct_path_ratio:.3f}"
+                    )
+                if bridge_commit_direct_copy_ms is not None:
+                    diagnostics_lines.append(
+                        "bridge_commit_direct_copy_ms: "
+                        f"{bridge_commit_direct_copy_ms:.2f}"
+                    )
+                if bridge_commit_fallback_ratio is not None:
+                    diagnostics_lines.append(
+                        "bridge_commit_fallback_ratio: "
+                        f"{bridge_commit_fallback_ratio:.3f}"
+                    )
+                if bridge_commit_cpu_mmap_ms is not None:
+                    diagnostics_lines.append(
+                        "bridge_commit_cpu_mmap_ms: "
+                        f"{bridge_commit_cpu_mmap_ms:.2f}"
+                    )
+                if bridge_commit_header_write_ms is not None:
+                    diagnostics_lines.append(
+                        "bridge_commit_header_write_ms: "
+                        f"{bridge_commit_header_write_ms:.2f}"
+                    )
+                if bridge_commit_total_ms is not None:
+                    diagnostics_lines.append(
+                        "bridge_commit_total_ms: "
+                        f"{bridge_commit_total_ms:.2f}"
+                    )
+                if bridge_submit_to_commit_start_ms is not None:
+                    diagnostics_lines.append(
+                        "bridge_submit_to_commit_start_ms: "
+                        f"{bridge_submit_to_commit_start_ms:.2f}"
+                    )
+                if bridge_commit_wait_for_gpu_ready_ms is not None:
+                    diagnostics_lines.append(
+                        "bridge_commit_wait_for_gpu_ready_ms: "
+                        f"{bridge_commit_wait_for_gpu_ready_ms:.2f}"
+                    )
+                if bridge_commit_thread_wake_delay_ms is not None:
+                    diagnostics_lines.append(
+                        "bridge_commit_thread_wake_delay_ms: "
+                        f"{bridge_commit_thread_wake_delay_ms:.2f}"
+                    )
+                if bridge_commit_active_service_ms is not None:
+                    diagnostics_lines.append(
+                        "bridge_commit_active_service_ms: "
+                        f"{bridge_commit_active_service_ms:.2f}"
+                    )
+                if bridge_direct_commit_enabled is not None:
+                    bridge_direct_commit_status = (
+                        "enabled"
+                        if bridge_direct_commit_enabled
+                        else "disabled"
+                    )
+                    bridge_direct_commit_line = (
+                        "Bridge Direct Commit Path: "
+                        f"{bridge_direct_commit_status}"
+                    )
+                    if (
+                        not bridge_direct_commit_enabled
+                        and bridge_direct_commit_warning
+                    ):
+                        bridge_direct_commit_line += (
+                            f" ({bridge_direct_commit_warning})"
+                        )
+                    diagnostics_lines.append(bridge_direct_commit_line)
+                if (
+                    bridge_publish_sample_check_count is not None
+                    and bridge_publish_sample_check_count > 0
+                ):
+                    diagnostics_lines.append(
+                        "Bridge Publish Sample Integrity: "
+                        f"checks={int(bridge_publish_sample_check_count)} "
+                        f"mismatches={int(bridge_publish_sample_mismatch_count or 0)}"
+                    )
+                if compose_artifact_debug_summary.get("enabled", False):
+                    diagnostics_lines.append(
+                        "Compose Artifact Debug Analyzed Frames: "
+                        f"{int(compose_artifact_debug_summary.get('analyzed_frame_count', 0))}"
+                    )
+                    diagnostics_lines.append(
+                        "Compose Artifact Debug Interaction-Gated Frames: "
+                        f"{int(compose_artifact_debug_summary.get('interaction_gated_analyzed_frame_count', 0))}"
+                    )
+                    diagnostics_lines.append(
+                        "Stable Compose Pre-Stabilization Candidate Count: "
+                        f"{int(compose_artifact_debug_summary.get('pre_stabilization_candidate_count', 0))}"
+                    )
+                    diagnostics_lines.append(
+                        "Stable Compose Pre-Stabilization Blue Scene Exposure Count: "
+                        f"{int(compose_artifact_debug_summary.get('pre_stabilization_blue_scene_exposure_count', 0))}"
+                    )
+                    diagnostics_lines.append(
+                        "Stable Compose Pre-Stabilization Post-Release Occluded Fall Count: "
+                        f"{int(compose_artifact_debug_summary.get('pre_stabilization_post_release_occluded_fall_count', 0))}"
+                    )
+                    diagnostics_lines.append(
+                        "Stable Compose Pre-Stabilization Depth Suppression Count: "
+                        f"{int(compose_artifact_debug_summary.get('pre_stabilization_depth_suppression_count', 0))}"
+                    )
+                    diagnostics_lines.append(
+                        "Stable Compose Stabilization Applied Count: "
+                        f"{int(compose_artifact_debug_summary.get('stabilization_applied_count', 0))}"
+                    )
+                    diagnostics_lines.append(
+                        "Stable Compose Stabilization Prevented Blue Exposure Count: "
+                        f"{int(compose_artifact_debug_summary.get('stabilization_prevented_blue_exposure_count', 0))}"
+                    )
+                    diagnostics_lines.append(
+                        "Stable Compose Stabilization Prevented Post-Release Occluded Fall Count: "
+                        f"{int(compose_artifact_debug_summary.get('stabilization_prevented_post_release_occluded_fall_count', 0))}"
+                    )
+                    diagnostics_lines.append(
+                        "Stable Compose Stabilization Prevented Depth Suppression Count: "
+                        f"{int(compose_artifact_debug_summary.get('stabilization_prevented_depth_suppression_count', 0))}"
+                    )
+                    diagnostics_lines.append(
+                        "Stable Compose Stabilization Fallback Reject Count: "
+                        f"{int(compose_artifact_debug_summary.get('stabilization_fallback_reject_count', 0))}"
+                    )
+                    diagnostics_lines.append(
+                        "Stable Compose Stabilization Avg Ms: "
+                        f"{float(compose_artifact_debug_summary.get('stabilization_avg_ms', 0.0)):.2f} ms"
+                    )
+                    diagnostics_lines.append(
+                        "Compose Artifact Metric Inconsistency Count: "
+                        f"{int(compose_artifact_debug_summary.get('compose_metric_inconsistency_count', 0))}"
+                    )
+                    compose_metric_inconsistency_reason_counts = (
+                        compose_artifact_debug_summary.get(
+                            "compose_metric_inconsistency_reason_counts",
+                            {},
+                        )
+                        or {}
+                    )
+                    if compose_metric_inconsistency_reason_counts:
+                        diagnostics_lines.append(
+                            "Compose Artifact Metric Inconsistency Reasons: "
+                            + " ".join(
+                                f"{str(reason)}={int(count)}"
+                                for reason, count in sorted(
+                                    compose_metric_inconsistency_reason_counts.items()
+                                )
+                            )
+                        )
+                    diagnostics_lines.append(
+                        "Compose Suspicious Frame Count: "
+                        f"{int(compose_artifact_debug_summary.get('suspicious_frame_count', 0))}"
+                    )
+                    diagnostics_lines.append(
+                        "Compose Suspicious Depth Suppression Count: "
+                        f"{int(compose_artifact_debug_summary.get('depth_suppression_suspicious_count', 0))}"
+                    )
+                    diagnostics_lines.append(
+                        "Compose Suspicious Blue Scene Exposure Count: "
+                        f"{int(compose_artifact_debug_summary.get('blue_scene_exposure_suspicious_count', 0))}"
+                    )
+                    diagnostics_lines.append(
+                        "Compose Suspicious Post-Release Occluded Fall Count: "
+                        f"{int(compose_artifact_debug_summary.get('post_release_occluded_fall_suspicious_count', 0))}"
+                    )
+                    diagnostics_lines.append(
+                        "Compose Suspicious Gaussian Blue Source Count: "
+                        f"{int(compose_artifact_debug_summary.get('gaussian_blue_source_suspicious_count', 0))}"
+                    )
+                    diagnostics_lines.append(
+                        "Compose Artifact Debug Bundle Count: "
+                        f"{int(compose_artifact_debug_summary.get('bundle_capture_count', 0))}"
+                    )
+                    compose_artifact_output_dir = compose_artifact_debug_summary.get(
+                        "output_dir"
+                    )
+                    if (
+                        compose_artifact_debug_summary.get(
+                            "compose_metric_inconsistency_capture_count",
+                            0,
+                        )
+                        > 0
+                        and compose_artifact_output_dir
+                    ):
+                        diagnostics_lines.append(
+                            "Compose Artifact Metric Inconsistency Output: "
+                            + os.path.join(
+                                compose_artifact_output_dir,
+                                "compose_artifact_debug",
+                                "inconsistency_samples",
+                            )
+                        )
+                    if compose_artifact_output_dir:
+                        diagnostics_lines.append(
+                            "Compose Artifact Debug Output: "
+                            + os.path.join(
+                                compose_artifact_output_dir,
+                                "compose_artifact_debug",
+                            )
+                        )
+                if stable_compose_safety_gate_enabled:
+                    diagnostics_lines.append(
+                        "Stable Compose Reject Count: "
+                        f"{int(stable_compose_reject_count)}"
+                    )
+                    diagnostics_lines.append(
+                        "Stable Compose Reject Blue Scene Exposure Count: "
+                        f"{int(stable_compose_reject_blue_scene_exposure_count)}"
+                    )
+                    diagnostics_lines.append(
+                        "Stable Compose Reject Gaussian Blue Source Count: "
+                        f"{int(stable_compose_reject_gaussian_blue_source_count)}"
+                    )
+                    diagnostics_lines.append(
+                        "Stable Compose Reject Rollback Count: "
+                        f"{int(stable_compose_reject_rollback_count)}"
+                    )
+                    diagnostics_lines.append(
+                        "Stable Rollback Preserved Interaction Count: "
+                        f"{int(stable_rollback_preserved_interaction_count)}"
+                    )
+                    diagnostics_lines.append(
+                        "Stable Rollback Released New Grab Count: "
+                        f"{int(stable_rollback_released_new_grab_count)}"
+                    )
+                    diagnostics_lines.append(
+                        "Stable Rollback Preserved Left Count: "
+                        f"{int(stable_rollback_preserved_left_count)}"
+                    )
+                    diagnostics_lines.append(
+                        "Stable Rollback Preserved Right Count: "
+                        f"{int(stable_rollback_preserved_right_count)}"
+                    )
+                if (
+                    interaction_contact_tracked_frames > 0
+                    or interaction_contact_gap_mm_samples
+                ):
+                    diagnostics_lines.append(
+                        "Interaction Contact Gap Avg Mm: "
+                        + (
+                            f"{float(np.mean(np.asarray(interaction_contact_gap_mm_samples, dtype=np.float64))):.2f}"
+                            if interaction_contact_gap_mm_samples
+                            else "0.00"
+                        )
+                    )
+                    diagnostics_lines.append(
+                        "Interaction Contact Gap Max Mm: "
+                        + (
+                            f"{float(np.max(np.asarray(interaction_contact_gap_mm_samples, dtype=np.float64))):.2f}"
+                            if interaction_contact_gap_mm_samples
+                            else "0.00"
+                        )
+                    )
+                    diagnostics_lines.append(
+                        "Interaction Contact Tracked Frames: "
+                        f"{int(interaction_contact_tracked_frames)}"
+                    )
+                if (
+                    active_overlay_debug_summary.get("active_overlay_total_count", 0)
+                    > 0
+                    or active_overlay_debug_summary.get(
+                        "active_overlay_fallback_count", 0
+                    )
+                    > 0
+                    or active_overlay_debug_summary.get(
+                        "active_overlay_held_marker_count", 0
+                    )
+                    > 0
+                    or active_overlay_debug_summary.get(
+                        "active_overlay_hold_expired_count", 0
+                    )
+                    > 0
+                ):
+                    diagnostics_lines.append(
+                        "Interaction Active Overlay Fallback Count: "
+                        f"{int(active_overlay_debug_summary.get('active_overlay_fallback_count', 0))}"
+                    )
+                    diagnostics_lines.append(
+                        "Interaction Active Overlay Held Marker Count: "
+                        f"{int(active_overlay_debug_summary.get('active_overlay_held_marker_count', 0))}"
+                    )
+                    diagnostics_lines.append(
+                        "Interaction Active Overlay Hold Expired Count: "
+                        f"{int(active_overlay_debug_summary.get('active_overlay_hold_expired_count', 0))}"
+                    )
+                    tracked_contact_ratio = active_overlay_debug_summary.get(
+                        "tracked_contact_ratio"
+                    )
+                    if tracked_contact_ratio is not None:
+                        diagnostics_lines.append(
+                            "Interaction Active Overlay Tracked Contact Ratio: "
+                            f"{float(tracked_contact_ratio) * 100.0:.1f}%"
+                        )
+                if (
+                    stable_compose_safety_gate_enabled
+                    or stable_gaussian_source_validation_enabled
+                ):
+                    diagnostics_lines.append(
+                        "Stable Cover Publish Count: "
+                        f"{int(stable_cover_publish_count)}"
+                    )
+                    diagnostics_lines.append(
+                        "Stable Cover Publish Compose Reject Count: "
+                        f"{int(stable_cover_publish_compose_reject_count)}"
+                    )
+                    diagnostics_lines.append(
+                        "Stable Cover Publish Source Corruption Count: "
+                        f"{int(stable_cover_publish_source_corruption_count)}"
+                    )
+                    diagnostics_lines.append(
+                        "Stable Cover Publish Missing Cache Count: "
+                        f"{int(stable_cover_publish_missing_cache_count)}"
+                    )
+                    diagnostics_lines.append(
+                        "Stable Cover Publish Avg Ms: "
+                        + (
+                            f"{float(np.mean(stable_cover_publish_ms_samples)):.2f} ms"
+                            if stable_cover_publish_ms_samples
+                            else "0.00 ms"
+                        )
+                    )
+                if gaussian_source_debug_summary.get("enabled", False):
+                    diagnostics_lines.append(
+                        "Interaction Corruption Rollback Count: "
+                        f"{int(gaussian_source_debug_summary.get('rollback_count', 0))}"
+                    )
+                    diagnostics_lines.append(
+                        "Interaction Corruption Coverage Jump Count: "
+                        f"{int(gaussian_source_debug_summary.get('coverage_jump_count', 0))}"
+                    )
+                    diagnostics_lines.append(
+                        "Interaction Corruption Metric Inconsistency Count: "
+                        f"{int(gaussian_source_debug_summary.get('interaction_corruption_metric_inconsistency_count', 0))}"
+                    )
+                    interaction_metric_inconsistency_reason_counts = (
+                        gaussian_source_debug_summary.get(
+                            "interaction_corruption_metric_inconsistency_reason_counts",
+                            {},
+                        )
+                        or {}
+                    )
+                    if interaction_metric_inconsistency_reason_counts:
+                        diagnostics_lines.append(
+                            "Interaction Corruption Metric Inconsistency Reasons: "
+                            + " ".join(
+                                f"{str(reason)}={int(count)}"
+                                for reason, count in sorted(
+                                    interaction_metric_inconsistency_reason_counts.items()
+                                )
+                            )
+                        )
+                    diagnostics_lines.append(
+                        "Interaction Corruption Bundle Count: "
+                        f"{int(gaussian_source_debug_summary.get('bundle_capture_count', 0))}"
+                    )
+                    gaussian_source_output_dir = gaussian_source_debug_summary.get(
+                        "output_dir"
+                    )
+                    if (
+                        gaussian_source_debug_summary.get(
+                            "interaction_corruption_metric_inconsistency_capture_count",
+                            0,
+                        )
+                        > 0
+                        and gaussian_source_output_dir
+                    ):
+                        diagnostics_lines.append(
+                            "Interaction Corruption Metric Inconsistency Output: "
+                            + os.path.join(
+                                gaussian_source_output_dir,
+                                "inconsistency_samples",
+                            )
+                        )
+                    if gaussian_source_output_dir:
+                        diagnostics_lines.append(
+                            "Interaction Corruption Output: "
+                            + gaussian_source_output_dir
+                        )
+                if viewer_coalesced_source_count is not None:
+                    diagnostics_lines.append(
+                        "Viewer Coalesced Source Count: "
+                        f"{viewer_coalesced_source_count}"
+                    )
+                if viewer_coalesced_source_ratio is not None:
+                    diagnostics_lines.append(
+                        "Viewer Coalesced Source Ratio: "
+                        f"{viewer_coalesced_source_ratio * 100.0:.1f}%"
+                    )
+                if viewer_accounting_inconsistency_count is not None:
+                    diagnostics_lines.append(
+                        "viewer_accounting_inconsistency_count: "
+                        f"{viewer_accounting_inconsistency_count}"
+                    )
+                if viewer_applied_vs_source_delta_gap is not None:
+                    diagnostics_lines.append(
+                        "viewer_applied_vs_source_delta_gap: "
+                        f"{viewer_applied_vs_source_delta_gap}"
+                    )
+                if viewer_coalesced_reconstructed_count is not None:
+                    diagnostics_lines.append(
+                        "viewer_coalesced_reconstructed_count: "
+                        f"{viewer_coalesced_reconstructed_count}"
+                    )
+                if (
+                    viewer_accounting_inconsistency_count is not None
+                    and (
+                        viewer_accounting_inconsistency_count > 0
+                        or viewer_accounting_aggregate_inconsistent
+                    )
+                ):
+                    diagnostics_lines.append(
+                        "Viewer Accounting Diagnostic: "
+                        f"applied_vs_source_delta_gap={viewer_applied_vs_source_delta_gap} "
+                        f"coalesced={viewer_coalesced_source_count} "
+                        f"reconstructed={viewer_coalesced_reconstructed_count} "
+                        f"inconsistency_count={viewer_accounting_inconsistency_count}"
+                    )
+                if presentation_backend_enabled:
+                    present_summary_rows = []
+                    if presentation_submit_ms_samples:
+                        present_summary_rows.append(
+                            (
+                                "Presentation submit",
+                                float(np.mean(np.asarray(presentation_submit_ms_samples))),
+                            )
+                        )
+                    if presentation_queue_wait_ms_samples:
+                        present_summary_rows.append(
+                            (
+                                "Presentation queue wait",
+                                float(
+                                    np.mean(
+                                        np.asarray(
+                                            presentation_queue_wait_ms_samples,
+                                            dtype=np.float64,
+                                        )
+                                    )
+                                ),
+                            )
+                        )
+                    if presentation_worker_ms_samples:
+                        present_summary_rows.append(
+                            (
+                                "Presentation worker",
+                                float(
+                                    np.mean(
+                                        np.asarray(
+                                            presentation_worker_ms_samples,
+                                            dtype=np.float64,
+                                        )
+                                    )
+                                ),
+                            )
+                        )
+                    if presentation_compose_ms_samples:
+                        present_summary_rows.append(
+                            (
+                                "Presentation compose",
+                                float(
+                                    np.mean(
+                                        np.asarray(
+                                            presentation_compose_ms_samples,
+                                            dtype=np.float64,
+                                        )
+                                    )
+                                ),
+                            )
+                        )
+                    if presentation_compose_left_ms_samples:
+                        present_summary_rows.append(
+                            (
+                                "Present compose left",
+                                float(
+                                    np.mean(
+                                        np.asarray(
+                                            presentation_compose_left_ms_samples,
+                                            dtype=np.float64,
+                                        )
+                                    )
+                                ),
+                            )
+                        )
+                    if presentation_compose_right_ms_samples:
+                        present_summary_rows.append(
+                            (
+                                "Present compose right",
+                                float(
+                                    np.mean(
+                                        np.asarray(
+                                            presentation_compose_right_ms_samples,
+                                            dtype=np.float64,
+                                        )
+                                    )
+                                ),
+                            )
+                        )
+                    if presentation_overlay_ms_samples:
+                        present_summary_rows.append(
+                            (
+                                "Presentation overlay",
+                                float(
+                                    np.mean(
+                                        np.asarray(
+                                            presentation_overlay_ms_samples,
+                                            dtype=np.float64,
+                                        )
+                                    )
+                                ),
+                            )
+                        )
+                    if presentation_overlay_left_ms_samples:
+                        present_summary_rows.append(
+                            (
+                                "Present overlay left",
+                                float(
+                                    np.mean(
+                                        np.asarray(
+                                            presentation_overlay_left_ms_samples,
+                                            dtype=np.float64,
+                                        )
+                                    )
+                                ),
+                            )
+                        )
+                    if presentation_overlay_right_ms_samples:
+                        present_summary_rows.append(
+                            (
+                                "Present overlay right",
+                                float(
+                                    np.mean(
+                                        np.asarray(
+                                            presentation_overlay_right_ms_samples,
+                                            dtype=np.float64,
+                                        )
+                                    )
+                                ),
+                            )
+                        )
+                    if presentation_parallel_wait_ms_samples:
+                        present_summary_rows.append(
+                            (
+                                "Present parallel wait",
+                                float(
+                                    np.mean(
+                                        np.asarray(
+                                            presentation_parallel_wait_ms_samples,
+                                            dtype=np.float64,
+                                        )
+                                    )
+                                ),
+                            )
+                        )
+                    if presentation_source_age_ms_samples:
+                        present_summary_rows.append(
+                            (
+                                "Presentation source age",
+                                float(
+                                    np.mean(
+                                        np.asarray(
+                                            presentation_source_age_ms_samples,
+                                            dtype=np.float64,
+                                        )
+                                    )
+                                ),
+                            )
+                        )
+                    if presentation_drop_ratio_samples:
+                        present_drop_ratio = float(
+                            np.mean(
+                                np.asarray(
+                                    presentation_drop_ratio_samples,
+                                    dtype=np.float64,
+                                )
+                            )
+                        )
+                        diagnostics_lines.append(
+                            "Presentation Drop Ratio: "
+                            f"{present_drop_ratio * 100.0:.1f}% "
+                            f"(count={int(presentation_dropped_count)})"
+                        )
+                    if present_summary_rows:
+                        present_label_width = max(
+                            len("Presentation"),
+                            *(len(row[0]) for row in present_summary_rows),
+                        )
+                        present_value_width = max(
+                            len("Avg"),
+                            *(
+                                len(f"{row[1]:.2f} ms")
+                                for row in present_summary_rows
+                            ),
+                        )
+                        diagnostics_lines.append(
+                            f"{'Presentation':<{present_label_width}}  {'Avg':>{present_value_width}}"
+                        )
+                        for label, avg_value_ms in present_summary_rows:
+                            diagnostics_lines.append(
+                                f"{label:<{present_label_width}}  "
+                                f"{f'{avg_value_ms:.2f} ms':>{present_value_width}}"
+                            )
+                if startup_compose_line is not None:
+                    diagnostics_lines.append(startup_compose_line)
                 component_summary_rows = []
                 component_name_labels = {
                     "simulator": "Spring-mass simulation",
@@ -14108,27 +29528,41 @@ class InvPhyTrainerWarp:
                                 float(np.mean(component_times_list)),
                             )
                         )
-                for line in self._format_component_summary_lines(
-                    average_frame_time,
-                    component_summary_rows,
-                ):
-                    print(line)
-                    log_lines.append(line)
+                component_lines = ["Component Breakdown:"]
+                component_lines.extend(
+                    self._format_component_summary_lines(
+                        average_frame_time,
+                        component_summary_rows,
+                    )
+                )
                 render_stage_rows = []
                 for stage_key, stage_label in (
-                    ("static_scene_render_ms", "Parallel branch A: Static scene render"),
+                    (
+                        "static_scene_branch_full_ms",
+                        "Parallel branch A: Static scene render (full branch time)",
+                    ),
                     (
                         "branch_b_ready_ms",
                         "Parallel branch B: Spring-mass simulation + LBS + Gaussian render",
                     ),
                     (
-                        "pre_compose_ready_ms",
-                        "Join at compose: Pre-compose ready time",
+                        "compose_join_full_ms",
+                        "Join at compose: earliest start after both branches finish",
                     ),
                     ("simulation_lbs_wall_ms", "Spring-mass simulation + LBS"),
                     ("gaussian_render_wall_ms", "Gaussian render"),
                     ("compositing_ms", "Compositing"),
                     ("overlay_publish_ms", "Overlay + publish"),
+                    ("scene_present_worker_ms", "Presentation worker"),
+                    ("scene_present_queue_wait_ms", "Presentation queue wait"),
+                    ("scene_present_submit_ms", "Presentation submit"),
+                    ("scene_present_compose_left_ms", "Presentation compose left"),
+                    ("scene_present_compose_right_ms", "Presentation compose right"),
+                    ("scene_present_overlay_left_ms", "Presentation overlay left"),
+                    ("scene_present_overlay_right_ms", "Presentation overlay right"),
+                    ("scene_present_parallel_wait_ms", "Presentation parallel wait"),
+                    ("scene_present_preview_ms", "Preview upload"),
+                    ("scene_present_source_age_ms", "Presentation source age"),
                 ):
                     stage_samples = render_stage_times.get(stage_key, [])
                     if stage_samples:
@@ -14138,13 +29572,16 @@ class InvPhyTrainerWarp:
                                 float(np.mean(np.asarray(stage_samples, dtype=np.float64))),
                             )
                         )
-                for line in self._format_immersive_render_stage_breakdown_lines(
+                render_stage_lines = self._format_immersive_render_stage_breakdown_lines(
                     average_frame_time,
                     render_stage_rows,
-                ):
-                    print(line)
-                    log_lines.append(line)
-                if render_profile:
+                )
+
+                _append_section(high_level_lines)
+                _append_section(component_lines)
+                _append_section(render_stage_lines)
+                if diagnostic_collection_enabled:
+                    _append_section(diagnostics_lines)
                     render_profile_lines = self._render_profile_summary_lines(
                         "immersive",
                         immersive_render_profile_series,
@@ -14180,8 +29617,20 @@ class InvPhyTrainerWarp:
                 gl.glDeleteTextures([preview_tex])
             if preview_vao is not None:
                 gl.glDeleteVertexArrays(1, [preview_vao])
+            if presentation_worker is not None:
+                try:
+                    presentation_worker.stop()
+                except Exception:
+                    pass
             if static_scene_worker is not None:
                 static_scene_worker.stop()
+            for eye_worker in balanced_eye_workers.values():
+                try:
+                    eye_worker.stop()
+                except Exception:
+                    pass
+            if scene_execute_renderer is not None and scene_execute_renderer is not scene_renderer:
+                scene_execute_renderer.delete()
             if scene_renderer is not None:
                 scene_renderer.delete()
             if cuda_ctx is not None:
@@ -14197,12 +29646,16 @@ class InvPhyTrainerWarp:
         cuda_ctx=None,
         interactive_window_mode="visible",
         scene_assets_root="./assets/scenes",
-        render_profile=False,
-        render_profile_every=30,
+        profile=False,
+        profile_freq=30,
         immersive_timewarp="off",
-        immersive_static_scene_overlap="off",
+        immersive_static_scene_overlap="on",
+        immersive_static_scene_mode="balanced_support_focus",
+        immersive_support_entry_overlay=False,
         immersive_framegen="off",
-        immersive_gaussian_render="serial",
+        immersive_gaussian_render="stereo_parallel",
+        immersive_present_pipeline=True,
+        immersive_controller_translation_scale=1.2,
     ):
         if n_dup != 0:
             raise ValueError(
@@ -14216,12 +29669,18 @@ class InvPhyTrainerWarp:
             cuda_ctx=cuda_ctx,
             interactive_window_mode=interactive_window_mode,
             scene_assets_root=scene_assets_root,
-            render_profile=render_profile,
-            render_profile_every=render_profile_every,
+            profile=profile,
+            profile_freq=profile_freq,
             immersive_timewarp=immersive_timewarp,
             immersive_static_scene_overlap=immersive_static_scene_overlap,
+            immersive_static_scene_mode=immersive_static_scene_mode,
+            immersive_support_entry_overlay=immersive_support_entry_overlay,
             immersive_framegen=immersive_framegen,
             immersive_gaussian_render=immersive_gaussian_render,
+            immersive_present_pipeline=immersive_present_pipeline,
+            immersive_controller_translation_scale=(
+                immersive_controller_translation_scale
+            ),
         )
 
     def _create_gs_view(
@@ -14320,6 +29779,38 @@ class InvPhyTrainerWarp:
         width,
         eye_label=None,
     ):
+        overlay_eye_render_state = self._prepare_immersive_overlay_eye_render_state(
+            eye_pose_world,
+            intrinsic,
+            height,
+            width,
+        )
+        eye_w2c_cv = np.asarray(
+            overlay_eye_render_state["w2c_cv_np"],
+            dtype=np.float32,
+        ).copy()
+        intrinsic_np = np.asarray(
+            overlay_eye_render_state["intrinsic_np"],
+            dtype=np.float32,
+        ).copy()
+        eye_view, _ = self._update_cached_gs_view(
+            cache_key=f"immersive_{eye_label or 'default'}",
+            camera_pose_world=eye_pose_world,
+            w2c=eye_w2c_cv,
+            intrinsic=intrinsic_np,
+            height=height,
+            width=width,
+        )
+        overlay_eye_render_state["view"] = eye_view
+        return overlay_eye_render_state
+
+    def _prepare_immersive_overlay_eye_render_state(
+        self,
+        eye_pose_world,
+        intrinsic,
+        height,
+        width,
+    ):
         eye_w2c_cv = self._camera_pose_world_to_cv_w2c(eye_pose_world)
         intrinsic_t = torch.as_tensor(
             intrinsic,
@@ -14331,18 +29822,13 @@ class InvPhyTrainerWarp:
             dtype=torch.float32,
             device=cfg.device,
         )
-        eye_view, _ = self._update_cached_gs_view(
-            cache_key=f"immersive_{eye_label or 'default'}",
-            camera_pose_world=eye_pose_world,
-            w2c=eye_w2c_cv,
-            intrinsic=intrinsic,
-            height=height,
-            width=width,
-        )
         return {
-            "view": eye_view,
             "intrinsic_t": intrinsic_t,
             "w2c_cv_t": eye_w2c_cv_t,
+            "intrinsic_np": np.asarray(intrinsic, dtype=np.float32).copy(),
+            "w2c_cv_np": np.asarray(eye_w2c_cv, dtype=np.float32).copy(),
+            "height": int(height),
+            "width": int(width),
         }
 
     def _resolve_composited_frame_resolution(
@@ -14884,6 +30370,476 @@ class InvPhyTrainerWarp:
             / max(float(int(width) * int(height)), 1.0)
         )
 
+    def _roi_bounds_overlap(self, roi_a, roi_b) -> bool:
+        if roi_a is None or roi_b is None:
+            return False
+        ax0, ay0, ax1, ay1 = [int(v) for v in roi_a]
+        bx0, by0, bx1, by1 = [int(v) for v in roi_b]
+        return not (
+            ax1 <= bx0
+            or bx1 <= ax0
+            or ay1 <= by0
+            or by1 <= ay0
+        )
+
+    def _expand_world_bounds(
+        self,
+        bounds_min,
+        bounds_max,
+        padding_m: float,
+    ) -> tuple[np.ndarray, np.ndarray] | tuple[None, None]:
+        if bounds_min is None or bounds_max is None:
+            return None, None
+        padding = float(max(padding_m, 0.0))
+        bounds_min_np = np.asarray(bounds_min, dtype=np.float32).copy()
+        bounds_max_np = np.asarray(bounds_max, dtype=np.float32).copy()
+        bounds_min_np -= padding
+        bounds_max_np += padding
+        return bounds_min_np, bounds_max_np
+
+    def _world_bounds_overlap(self, bounds_min_a, bounds_max_a, bounds_min_b, bounds_max_b) -> bool:
+        if (
+            bounds_min_a is None
+            or bounds_max_a is None
+            or bounds_min_b is None
+            or bounds_max_b is None
+        ):
+            return False
+        return not (
+            float(bounds_max_a[0]) < float(bounds_min_b[0])
+            or float(bounds_min_a[0]) > float(bounds_max_b[0])
+            or float(bounds_max_a[1]) < float(bounds_min_b[1])
+            or float(bounds_min_a[1]) > float(bounds_max_b[1])
+            or float(bounds_max_a[2]) < float(bounds_min_b[2])
+            or float(bounds_min_a[2]) > float(bounds_max_b[2])
+        )
+
+    def _immersive_support_surface_axis_info(self, scene_up):
+        scene_up_np = np.asarray(scene_up, dtype=np.float32).reshape(-1)
+        vertical_axis = int(np.argmax(np.abs(scene_up_np)))
+        top_uses_min = bool(float(scene_up_np[vertical_axis]) < 0.0)
+        lateral_axes = [axis for axis in range(3) if axis != vertical_axis]
+        return vertical_axis, top_uses_min, lateral_axes
+
+    def _immersive_support_distance_metrics(
+        self,
+        support_center_world,
+        support_entry,
+        scene_up,
+    ):
+        if support_center_world is None or support_entry is None:
+            return None
+        support_center_np = np.asarray(support_center_world, dtype=np.float32).reshape(-1)
+        bounds_min = np.asarray(support_entry["bounds_min"], dtype=np.float32).reshape(-1)
+        bounds_max = np.asarray(support_entry["bounds_max"], dtype=np.float32).reshape(-1)
+        vertical_axis, top_uses_min, lateral_axes = (
+            self._immersive_support_surface_axis_info(scene_up)
+        )
+        horizontal_sq = 0.0
+        for axis in lateral_axes:
+            coord = float(support_center_np[axis])
+            lower = float(bounds_min[axis])
+            upper = float(bounds_max[axis])
+            if coord < lower:
+                horizontal_sq += (lower - coord) ** 2
+            elif coord > upper:
+                horizontal_sq += (coord - upper) ** 2
+        top_plane = float(bounds_min[vertical_axis] if top_uses_min else bounds_max[vertical_axis])
+        vertical_distance = abs(float(support_center_np[vertical_axis]) - top_plane)
+        return {
+            "horizontal_distance_m": float(np.sqrt(horizontal_sq)),
+            "vertical_distance_m": float(vertical_distance),
+        }
+
+    def _select_immersive_active_support_entry(
+        self,
+        scene_renderer,
+        object_support_center_world,
+    ):
+        balanced_runtime_state = getattr(
+            self,
+            "_immersive_balanced_runtime_state",
+            None,
+        )
+        if balanced_runtime_state is None:
+            return None
+        support_state = balanced_runtime_state.setdefault(
+            "active_support_state",
+            {
+                "active_support_id": None,
+                "invalid_frames": 0,
+                "switch_count": 0,
+            },
+        )
+        support_entries = []
+        if scene_renderer is not None:
+            support_entries = list(scene_renderer.support_surface_entries_ref())
+        if not support_entries:
+            support_state["active_support_id"] = None
+            support_state["invalid_frames"] = 0
+            return None
+
+        support_entries_by_id = {
+            int(entry["support_id"]): entry for entry in support_entries
+        }
+        table_entry = next(
+            (entry for entry in support_entries if str(entry.get("kind", "")) == "table"),
+            support_entries[0],
+        )
+        current_support_id = support_state.get("active_support_id")
+        current_entry = support_entries_by_id.get(
+            None if current_support_id is None else int(current_support_id)
+        )
+        if object_support_center_world is None:
+            selected_entry = current_entry if current_entry is not None else table_entry
+            support_state["active_support_id"] = int(selected_entry["support_id"])
+            support_state["invalid_frames"] = 0
+            return selected_entry
+
+        candidate_rankings = []
+        candidate_metrics_by_id = {}
+        for entry in support_entries:
+            metrics = self._immersive_support_distance_metrics(
+                object_support_center_world,
+                entry,
+                scene_renderer.layout.scene_up,
+            )
+            if metrics is None:
+                continue
+            if (
+                float(metrics["horizontal_distance_m"])
+                > float(self.IMMERSIVE_BALANCED_SUPPORT_HORIZONTAL_DISTANCE_M)
+            ):
+                continue
+            if (
+                float(metrics["vertical_distance_m"])
+                > float(self.IMMERSIVE_BALANCED_SUPPORT_VERTICAL_DISTANCE_M)
+            ):
+                continue
+            entry_id = int(entry["support_id"])
+            candidate_metrics_by_id[entry_id] = metrics
+            candidate_rankings.append(
+                (
+                    float(metrics["horizontal_distance_m"]),
+                    -float(entry.get("support_area", 0.0)),
+                    entry_id,
+                )
+            )
+        candidate_rankings.sort()
+        best_entry = (
+            None
+            if not candidate_rankings
+            else support_entries_by_id[candidate_rankings[0][2]]
+        )
+
+        new_entry = current_entry
+        switched = False
+        if current_entry is None:
+            new_entry = best_entry
+        else:
+            current_metrics = candidate_metrics_by_id.get(int(current_entry["support_id"]))
+            if current_metrics is not None:
+                support_state["invalid_frames"] = 0
+                if best_entry is not None and int(best_entry["support_id"]) != int(
+                    current_entry["support_id"]
+                ):
+                    best_metrics = candidate_metrics_by_id[int(best_entry["support_id"])]
+                    if float(best_metrics["horizontal_distance_m"]) <= (
+                        float(current_metrics["horizontal_distance_m"])
+                        - float(self.IMMERSIVE_BALANCED_SUPPORT_SWITCH_DISTANCE_M)
+                    ):
+                        new_entry = best_entry
+            else:
+                invalid_frames = int(support_state.get("invalid_frames", 0)) + 1
+                support_state["invalid_frames"] = invalid_frames
+                if (
+                    best_entry is not None
+                    and invalid_frames
+                    >= int(self.IMMERSIVE_BALANCED_SUPPORT_INVALID_FRAMES_TO_SWITCH)
+                ):
+                    new_entry = best_entry
+                    support_state["invalid_frames"] = 0
+                elif (
+                    invalid_frames
+                    > int(self.IMMERSIVE_BALANCED_SUPPORT_INVALID_FRAMES_TO_HOLD)
+                ):
+                    new_entry = None
+        if new_entry is not current_entry:
+            switched = True
+            support_state["switch_count"] = int(support_state.get("switch_count", 0)) + 1
+            if object_support_center_world is not None:
+                if new_entry is None:
+                    print(
+                        "[quest_display] immersive active support ROI switched: "
+                        "kind=none component_id=None support_id=None",
+                        flush=True,
+                    )
+                else:
+                    print(
+                        "[quest_display] immersive active support ROI switched: "
+                        f"kind={new_entry.get('kind')} "
+                        f"component_id={new_entry.get('component_id')} "
+                        f"support_id={new_entry.get('support_id')}",
+                        flush=True,
+                    )
+        support_state["active_support_id"] = (
+            None if new_entry is None else int(new_entry["support_id"])
+        )
+        if new_entry is not None and candidate_metrics_by_id.get(int(new_entry["support_id"])) is not None:
+            support_state["invalid_frames"] = 0
+        support_state["switched_this_frame"] = bool(switched)
+        return new_entry
+
+    def _select_immersive_warmup_support_entry(self, scene_renderer):
+        if scene_renderer is None:
+            return None
+        support_entries = list(scene_renderer.support_surface_entries_ref())
+        if not support_entries:
+            return None
+        non_table_entries = [
+            entry
+            for entry in support_entries
+            if str(entry.get("kind", "support")) != "table"
+        ]
+        if not non_table_entries:
+            return None
+        non_table_entries.sort(
+            key=lambda entry: (
+                -float(entry.get("support_area", 0.0)),
+                int(entry.get("support_id", 0)),
+            )
+        )
+        return non_table_entries[0]
+
+    def _build_immersive_balanced_renderer_warmup_kwargs(
+        self,
+        scene_renderer,
+        render_plan,
+    ):
+        if scene_renderer is None or render_plan is None:
+            return None
+        static_scene_mode = str(
+            render_plan.get(
+                "static_scene_mode",
+                self.IMMERSIVE_STATIC_SCENE_MODE_BALANCED_FOCUS,
+            )
+        ).strip().lower()
+        if static_scene_mode not in {
+            self.IMMERSIVE_STATIC_SCENE_MODE_BALANCED_FOCUS,
+            self.IMMERSIVE_STATIC_SCENE_MODE_BALANCED_SUPPORT_FOCUS,
+        }:
+            return None
+
+        table_roi_bounds_by_eye = {}
+        focus_roi_bounds_by_eye = {}
+        for eye_label in ("left", "right"):
+            eye_plan = render_plan.get(eye_label) or {}
+            table_roi_bounds = eye_plan.get("table_roi_bounds")
+            if table_roi_bounds is None:
+                support_render_kind = str(
+                    eye_plan.get("support_render_kind", "none")
+                ).strip().lower()
+                if support_render_kind == "table":
+                    table_roi_bounds = eye_plan.get("support_roi_bounds")
+            if table_roi_bounds is not None:
+                table_roi_bounds_by_eye[eye_label] = tuple(
+                    int(v) for v in table_roi_bounds
+                )
+
+            support_render_kind = str(
+                eye_plan.get("support_render_kind", "none")
+            ).strip().lower()
+            support_roi_bounds = eye_plan.get("support_roi_bounds")
+            if support_render_kind == "focus" and support_roi_bounds is not None:
+                focus_roi_bounds_by_eye[eye_label] = tuple(
+                    int(v) for v in support_roi_bounds
+                )
+
+        representative_support_entry = self._select_immersive_warmup_support_entry(
+            scene_renderer
+        )
+        if representative_support_entry is not None:
+            for eye_label in ("left", "right"):
+                if focus_roi_bounds_by_eye.get(eye_label) is not None:
+                    continue
+                eye_plan = render_plan.get(eye_label) or {}
+                eye_pose_world = eye_plan.get("eye_pose_world")
+                eye_intrinsic = eye_plan.get("eye_intrinsic")
+                eye_width = int(eye_plan.get("eye_width", 0))
+                eye_height = int(eye_plan.get("eye_height", 0))
+                if (
+                    eye_pose_world is None
+                    or eye_intrinsic is None
+                    or eye_width <= 0
+                    or eye_height <= 0
+                ):
+                    continue
+                eye_w2c_cv = self._camera_pose_world_to_cv_w2c(eye_pose_world)
+                focus_roi_bounds, _, focus_fullframe_fallback, _ = (
+                    self._resolve_immersive_balanced_support_render_roi(
+                        representative_support_entry.get(
+                            "render_bounds_min",
+                            representative_support_entry["bounds_min"],
+                        ),
+                        representative_support_entry.get(
+                            "render_bounds_max",
+                            representative_support_entry["bounds_max"],
+                        ),
+                        eye_intrinsic,
+                        eye_w2c_cv,
+                        eye_width,
+                        eye_height,
+                        prev_bounds=None,
+                    )
+                )
+                if not focus_fullframe_fallback and focus_roi_bounds is not None:
+                    focus_roi_bounds_by_eye[eye_label] = tuple(
+                        int(v) for v in focus_roi_bounds
+                    )
+
+        table_roi_render_scale = float(
+            render_plan.get(
+                "table_roi_render_scale",
+                self.IMMERSIVE_BALANCED_TABLE_ROI_SUPERSAMPLE_SCALE,
+            )
+        )
+        focus_roi_render_scale = float(
+            render_plan.get(
+                "support_roi_render_scale",
+                render_plan.get(
+                    "table_roi_render_scale",
+                    self.IMMERSIVE_BALANCED_TABLE_ROI_SUPERSAMPLE_SCALE,
+                ),
+            )
+        )
+        return {
+            "left_eye_pose_world": np.asarray(
+                render_plan["left"]["eye_pose_world"],
+                dtype=np.float32,
+            ).copy(),
+            "right_eye_pose_world": np.asarray(
+                render_plan["right"]["eye_pose_world"],
+                dtype=np.float32,
+            ).copy(),
+            "left_eye_intrinsic": np.asarray(
+                render_plan["left"]["eye_intrinsic"],
+                dtype=np.float32,
+            ).copy(),
+            "right_eye_intrinsic": np.asarray(
+                render_plan["right"]["eye_intrinsic"],
+                dtype=np.float32,
+            ).copy(),
+            "left_base_intrinsic": np.asarray(
+                render_plan["left"]["base_scene_intrinsic"],
+                dtype=np.float32,
+            ).copy(),
+            "right_base_intrinsic": np.asarray(
+                render_plan["right"]["base_scene_intrinsic"],
+                dtype=np.float32,
+            ).copy(),
+            "eye_width": int(render_plan["left"]["eye_width"]),
+            "eye_height": int(render_plan["left"]["eye_height"]),
+            "scene_width": int(render_plan["scene_width"]),
+            "scene_height": int(render_plan["scene_height"]),
+            "table_roi_bounds_by_eye": dict(table_roi_bounds_by_eye),
+            "focus_roi_bounds_by_eye": dict(focus_roi_bounds_by_eye),
+            "table_roi_render_scale": table_roi_render_scale,
+            "focus_roi_render_scale": focus_roi_render_scale,
+        }
+
+    def _select_immersive_balanced_focus_subset_entries(
+        self,
+        scene_renderer,
+        focus_roi_bounds,
+        intrinsic,
+        w2c,
+        width,
+        height,
+        *,
+        object_bounds_min_world=None,
+        object_bounds_max_world=None,
+        active_interaction=False,
+    ) -> tuple[list[int], float, int, bool]:
+        if focus_roi_bounds is None:
+            return [], 0.0, 0, False
+        catalog_entries = scene_renderer.focus_render_catalog_world_entries_ref()
+        catalog_entries_by_id = scene_renderer.focus_render_catalog_world_by_id_ref()
+        bvh_nodes = scene_renderer.focus_render_bvh_world_nodes()
+        total_faces = int(scene_renderer.focus_render_catalog_total_faces())
+        if not catalog_entries or not bvh_nodes or total_faces <= 0:
+            return [], 1.0, 0, True
+
+        selected_entry_ids: set[int] = {
+            int(v) for v in scene_renderer.focus_render_active_table_entry_ids()
+        }
+        interaction_bounds_min, interaction_bounds_max = self._expand_world_bounds(
+            object_bounds_min_world,
+            object_bounds_max_world,
+            self.IMMERSIVE_BALANCED_FOCUS_SUBSET_OBJECT_PADDING_M,
+        )
+        traversal_stack = [0]
+        roi_padding = int(self.IMMERSIVE_BALANCED_FOCUS_SUBSET_SELECTION_PADDING)
+        while traversal_stack:
+            node_index = traversal_stack.pop()
+            if node_index < 0 or node_index >= len(bvh_nodes):
+                continue
+            node = bvh_nodes[node_index]
+            projected_bounds = self._compute_immersive_projected_roi_bounds(
+                node["bounds_min"],
+                node["bounds_max"],
+                intrinsic,
+                w2c,
+                width,
+                height,
+                padding=roi_padding,
+                snap=1,
+                min_size=1,
+            )
+            if not self._roi_bounds_overlap(projected_bounds, focus_roi_bounds):
+                continue
+            if bool(node.get("is_leaf", False)):
+                for entry_id in node.get("leaf_entry_ids", []):
+                    selected_entry_ids.add(int(entry_id))
+                continue
+            right_child = int(node.get("right_child", -1))
+            left_child = int(node.get("left_child", -1))
+            if right_child >= 0:
+                traversal_stack.append(right_child)
+            if left_child >= 0:
+                traversal_stack.append(left_child)
+
+        if (
+            bool(active_interaction)
+            and interaction_bounds_min is not None
+            and interaction_bounds_max is not None
+        ):
+            for entry in catalog_entries:
+                entry_id = int(entry["entry_id"])
+                if entry_id in selected_entry_ids:
+                    continue
+                if self._world_bounds_overlap(
+                    entry["bounds_min"],
+                    entry["bounds_max"],
+                    interaction_bounds_min,
+                    interaction_bounds_max,
+                ):
+                    selected_entry_ids.add(entry_id)
+
+        ordered_selected_entry_ids = sorted(int(v) for v in selected_entry_ids)
+        selected_face_count = 0
+        for entry_id in ordered_selected_entry_ids:
+            entry = catalog_entries_by_id.get(int(entry_id))
+            if entry is None:
+                return [], 1.0, 0, True
+            selected_face_count += int(entry["face_count"])
+        face_ratio = float(selected_face_count) / max(float(total_faces), 1.0)
+        return (
+            ordered_selected_entry_ids,
+            face_ratio,
+            len(ordered_selected_entry_ids),
+            False,
+        )
+
     def _resolve_immersive_render_roi(
         self,
         bounds_min,
@@ -15036,6 +30992,252 @@ class InvPhyTrainerWarp:
                 fullframe_fallback = True
                 hysteresis_bounds = None
         return roi_bounds, roi_ratio, fullframe_fallback, hysteresis_bounds
+
+    def _resolve_immersive_balanced_support_render_roi(
+        self,
+        support_bounds_min,
+        support_bounds_max,
+        intrinsic,
+        w2c,
+        width,
+        height,
+        prev_bounds=None,
+    ):
+        roi_bounds, roi_ratio, fullframe_fallback = self._resolve_immersive_render_roi(
+            support_bounds_min,
+            support_bounds_max,
+            intrinsic,
+            w2c,
+            width,
+            height,
+            padding=int(self.IMMERSIVE_BALANCED_TABLE_ROI_PADDING),
+            snap=int(self.IMMERSIVE_BALANCED_TABLE_ROI_SNAP),
+            min_size=int(self.IMMERSIVE_BALANCED_TABLE_ROI_MIN_SIZE),
+            fullframe_threshold=float(self.IMMERSIVE_TABLE_ROI_FULLFRAME_THRESHOLD),
+        )
+        hysteresis_bounds = None
+        if not fullframe_fallback and roi_bounds is not None:
+            hysteresis_bounds = self._apply_immersive_roi_hysteresis(
+                prev_bounds,
+                roi_bounds,
+                width,
+                height,
+                shrink_limit_px=int(self.IMMERSIVE_BALANCED_TABLE_ROI_SHRINK_MAX_PX),
+            )
+            roi_bounds = hysteresis_bounds
+            roi_ratio = self._roi_area_ratio(roi_bounds, width, height)
+            if roi_ratio > float(self.IMMERSIVE_TABLE_ROI_FULLFRAME_THRESHOLD):
+                roi_bounds = None
+                roi_ratio = 1.0
+                fullframe_fallback = True
+                hysteresis_bounds = None
+        return roi_bounds, roi_ratio, fullframe_fallback, hysteresis_bounds
+
+    def _compute_immersive_balanced_center_focus_roi_bounds(
+        self,
+        width,
+        height,
+    ):
+        width = int(width)
+        height = int(height)
+        center_width = max(
+            int(round(float(width) * self.IMMERSIVE_BALANCED_FOCUS_CENTER_WIDTH_RATIO)),
+            int(self.IMMERSIVE_BALANCED_FOCUS_ROI_MIN_SIZE),
+        )
+        center_height = max(
+            int(round(float(height) * self.IMMERSIVE_BALANCED_FOCUS_CENTER_HEIGHT_RATIO)),
+            int(self.IMMERSIVE_BALANCED_FOCUS_ROI_MIN_SIZE),
+        )
+        snap = max(int(self.IMMERSIVE_BALANCED_FOCUS_ROI_SNAP), 1)
+        center_width = min(
+            int(width),
+            int(np.ceil(float(center_width) / float(snap))) * snap,
+        )
+        center_height = min(
+            int(height),
+            int(np.ceil(float(center_height) / float(snap))) * snap,
+        )
+        x0 = max(0, (int(width) - center_width) // 2)
+        y0 = max(0, (int(height) - center_height) // 2)
+        x1 = min(int(width), x0 + center_width)
+        y1 = min(int(height), y0 + center_height)
+        if x1 <= x0 or y1 <= y0:
+            return None
+        return (int(x0), int(y0), int(x1), int(y1))
+
+    def _compute_immersive_center_box_bounds(
+        self,
+        width,
+        height,
+        *,
+        width_ratio,
+        height_ratio,
+        snap,
+        min_size,
+    ):
+        width = int(width)
+        height = int(height)
+        snap = max(int(snap), 1)
+        box_width = max(
+            int(round(float(width) * float(width_ratio))),
+            int(min_size),
+        )
+        box_height = max(
+            int(round(float(height) * float(height_ratio))),
+            int(min_size),
+        )
+        box_width = min(
+            int(width),
+            int(np.ceil(float(box_width) / float(snap))) * snap,
+        )
+        box_height = min(
+            int(height),
+            int(np.ceil(float(box_height) / float(snap))) * snap,
+        )
+        x0 = max(0, (int(width) - box_width) // 2)
+        y0 = max(0, (int(height) - box_height) // 2)
+        x1 = min(int(width), x0 + box_width)
+        y1 = min(int(height), y0 + box_height)
+        if x1 <= x0 or y1 <= y0:
+            return None
+        return (int(x0), int(y0), int(x1), int(y1))
+
+    def _merge_immersive_roi_bounds(
+        self,
+        roi_a,
+        roi_b,
+        width,
+        height,
+        *,
+        snap,
+        min_size,
+    ):
+        if roi_a is None:
+            roi_bounds = roi_b
+        elif roi_b is None:
+            roi_bounds = roi_a
+        else:
+            ax0, ay0, ax1, ay1 = [int(v) for v in roi_a]
+            bx0, by0, bx1, by1 = [int(v) for v in roi_b]
+            roi_bounds = (
+                min(ax0, bx0),
+                min(ay0, by0),
+                max(ax1, bx1),
+                max(ay1, by1),
+            )
+        if roi_bounds is None:
+            return None
+        x0, y0, x1, y1 = [int(v) for v in roi_bounds]
+        snap = max(int(snap), 1)
+        x0 = int(np.floor(float(x0) / float(snap))) * snap
+        y0 = int(np.floor(float(y0) / float(snap))) * snap
+        x1 = int(np.ceil(float(x1) / float(snap))) * snap
+        y1 = int(np.ceil(float(y1) / float(snap))) * snap
+        x0 = max(0, min(int(width), x0))
+        x1 = max(0, min(int(width), x1))
+        y0 = max(0, min(int(height), y0))
+        y1 = max(0, min(int(height), y1))
+        if x1 <= x0 or y1 <= y0:
+            return None
+
+        def _expand_axis(lo, hi, limit):
+            size = int(hi) - int(lo)
+            if size >= int(min_size):
+                return int(lo), int(hi)
+            if int(limit) <= int(min_size):
+                return 0, int(limit)
+            extra = int(min_size) - size
+            lo -= extra // 2
+            hi += extra - (extra // 2)
+            if lo < 0:
+                hi = min(int(limit), hi - lo)
+                lo = 0
+            if hi > int(limit):
+                lo = max(0, lo - (hi - int(limit)))
+                hi = int(limit)
+            if (hi - lo) < int(min_size):
+                if lo <= 0:
+                    lo = 0
+                    hi = min(int(limit), int(min_size))
+                else:
+                    hi = int(limit)
+                    lo = max(0, hi - int(min_size))
+            return int(lo), int(hi)
+
+        x0, x1 = _expand_axis(x0, x1, width)
+        y0, y1 = _expand_axis(y0, y1, height)
+        if x1 <= x0 or y1 <= y0:
+            return None
+        return (int(x0), int(y0), int(x1), int(y1))
+
+    def _resolve_immersive_balanced_focus_render_roi(
+        self,
+        object_bounds_min,
+        object_bounds_max,
+        intrinsic,
+        w2c,
+        width,
+        height,
+        *,
+        active_interaction=False,
+        prev_bounds=None,
+    ):
+        center_roi_bounds = self._compute_immersive_balanced_center_focus_roi_bounds(
+            width,
+            height,
+        )
+        object_roi_bounds = None
+        if (
+            bool(active_interaction)
+            and object_bounds_min is not None
+            and object_bounds_max is not None
+        ):
+            object_roi_bounds = self._compute_immersive_projected_roi_bounds(
+                object_bounds_min,
+                object_bounds_max,
+                intrinsic,
+                w2c,
+                width,
+                height,
+                padding=int(self.IMMERSIVE_BALANCED_FOCUS_ROI_PADDING),
+                snap=int(self.IMMERSIVE_BALANCED_FOCUS_ROI_SNAP),
+                min_size=int(self.IMMERSIVE_BALANCED_FOCUS_ROI_MIN_SIZE),
+            )
+        roi_bounds = self._merge_immersive_roi_bounds(
+            center_roi_bounds,
+            object_roi_bounds,
+            width,
+            height,
+            snap=int(self.IMMERSIVE_BALANCED_FOCUS_ROI_SNAP),
+            min_size=int(self.IMMERSIVE_BALANCED_FOCUS_ROI_MIN_SIZE),
+        )
+        hysteresis_bounds = None
+        if roi_bounds is not None:
+            hysteresis_bounds = self._apply_immersive_roi_hysteresis(
+                prev_bounds,
+                roi_bounds,
+                width,
+                height,
+                shrink_limit_px=int(
+                    self.IMMERSIVE_BALANCED_FOCUS_ROI_SHRINK_MAX_PX
+                ),
+            )
+            roi_bounds = hysteresis_bounds
+        roi_ratio = self._roi_area_ratio(roi_bounds, width, height)
+        fullframe_fallback = (
+            roi_bounds is None
+            or roi_ratio > float(self.IMMERSIVE_BALANCED_FOCUS_ROI_FULLFRAME_THRESHOLD)
+        )
+        if fullframe_fallback:
+            roi_bounds = None
+            roi_ratio = 1.0
+            hysteresis_bounds = None
+        return roi_bounds, roi_ratio, fullframe_fallback, {
+            "center_roi_bounds": center_roi_bounds,
+            "object_roi_bounds": object_roi_bounds,
+            "hysteresis_bounds": hysteresis_bounds,
+            "active_interaction": bool(active_interaction),
+        }
 
     def _resolve_immersive_balanced_side_wall_strip_roi(
         self,
@@ -15313,7 +31515,9 @@ class InvPhyTrainerWarp:
         eye_height,
         scene_width,
         scene_height,
+        static_scene_mode="balanced_focus",
     ):
+        static_scene_mode = str(static_scene_mode).strip().lower()
         center_eye_pose_world, center_intrinsic = self._build_immersive_center_scene_view(
             left_eye_pose_world,
             right_eye_pose_world,
@@ -15327,46 +31531,55 @@ class InvPhyTrainerWarp:
             scene_width,
             scene_height,
         )
-        near_reference_depth_m = self._compute_immersive_balanced_background_reference_depth(
-            layout,
-            center_eye_pose_world,
-        )
-        far_reference_depth_m, far_wall_center_world = (
-            self._compute_immersive_balanced_far_reference_depth(
-                layout,
-                center_eye_pose_world,
-            )
-        )
+        background_width = int(scene_width)
+        background_height = int(scene_height)
         runtime_state = {
-            "background_mode": "per_eye_background",
+            "static_scene_mode": static_scene_mode,
+            "background_mode": "per_eye_full_scene",
             "side_wall_mode": "disabled",
-            "table_mode": "roi_per_eye",
-            "near_reference_depth_m": float(near_reference_depth_m),
-            "far_reference_depth_m": float(far_reference_depth_m),
-            "far_wall_center_world": far_wall_center_world.astype(np.float32).tolist(),
-            "background_width": int(scene_width),
-            "background_height": int(scene_height),
+            "background_width": int(background_width),
+            "background_height": int(background_height),
             "background_intrinsic": background_intrinsic.astype(np.float32).copy(),
             "background_compose_caches": {"left": {}, "right": {}},
-            "table_roi_render_scale": float(
-                self.IMMERSIVE_BALANCED_TABLE_ROI_SUPERSAMPLE_SCALE
-            ),
-            "side_wall_roi_state": {
-                "left": {"left": None, "right": None},
-                "right": {"left": None, "right": None},
-            },
-            "table_roi_state": {"left": None, "right": None},
-            "startup_shifts_px": {
-                "near": {
-                    "left": {"dx": 0.0, "dy": 0.0},
-                    "right": {"dx": 0.0, "dy": 0.0},
-                },
-                "far": {
-                    "left": {"dx": 0.0, "dy": 0.0},
-                    "right": {"dx": 0.0, "dy": 0.0},
-                },
-            },
         }
+        if (
+            static_scene_mode
+            == self.IMMERSIVE_STATIC_SCENE_MODE_BALANCED_SUPPORT_FOCUS
+        ):
+            runtime_state.update(
+                {
+                    "focus_mode": "support_roi",
+                    "support_roi_render_scale": float(
+                        self.IMMERSIVE_BALANCED_TABLE_ROI_SUPERSAMPLE_SCALE
+                    ),
+                    "support_roi_state": {"left": None, "right": None},
+                    "active_support_state": {
+                        "active_support_id": None,
+                        "invalid_frames": 0,
+                        "switch_count": 0,
+                    },
+                    "support_occlusion_state": {
+                        eye_label: {
+                            "suppressed": False,
+                            "candidate_suppress": None,
+                            "candidate_frames": 0,
+                            "support_id": None,
+                            "flip_count": 0,
+                        }
+                        for eye_label in ("left", "right")
+                    },
+                }
+            )
+        else:
+            runtime_state.update(
+                {
+                    "focus_mode": "table_roi",
+                    "table_roi_render_scale": float(
+                        self.IMMERSIVE_BALANCED_TABLE_ROI_SUPERSAMPLE_SCALE
+                    ),
+                    "table_roi_state": {"left": None, "right": None},
+                }
+            )
         return runtime_state
 
     def _scene_valid_roi_coverage(self, valid_mask, roi_bounds):
@@ -15522,9 +31735,12 @@ class InvPhyTrainerWarp:
     ):
         if iterations is None:
             iterations = int(self.IMMERSIVE_REPROJECT_HOLE_FILL_ITERS)
-        color_filled = color
-        depth_filled = depth
-        valid_filled = valid_mask
+        color_out = color
+        depth_out = depth
+        valid_out = valid_mask
+        color_filled = color_out
+        depth_filled = depth_out
+        valid_filled = valid_out
         if background_rgba is None:
             background_rgba = torch.as_tensor(
                 self.IMMERSIVE_SCENE_CLEAR_RGBA,
@@ -15586,7 +31802,7 @@ class InvPhyTrainerWarp:
         if bool(remaining_invalid.any().item()):
             color_filled[remaining_invalid] = background_rgba
             depth_filled[remaining_invalid] = 0.0
-        return color, depth, valid_mask
+        return color_out, depth_out, valid_out
 
     @torch.no_grad()
     def _reproject_immersive_scene_eye_frame(
@@ -15610,6 +31826,9 @@ class InvPhyTrainerWarp:
         repair_roi_bounds=None,
         target_roi_bounds=None,
         profile_key_prefix="scene_reproject",
+        debug_capture=None,
+        stats_out=None,
+        band_metric_bounds=None,
     ):
         device = source_color.device
         dtype = torch.float32
@@ -15806,6 +32025,23 @@ class InvPhyTrainerWarp:
                     + 2.0
                 )
             )
+            if stats_out is not None:
+                projected_sample_count = int(projected_valid.sum().item())
+                stats_out["projected_sample_count"] = projected_sample_count
+                if band_metric_bounds is not None:
+                    band_projected_counts = {}
+                    for band_name, band_bounds in band_metric_bounds.items():
+                        bx0, by0, bx1, by1 = [int(v) for v in band_bounds]
+                        band_projected_counts[str(band_name)] = int(
+                            (
+                                projected_valid
+                                & (target_u >= float(bx0))
+                                & (target_u < float(bx1))
+                                & (target_v >= float(by0))
+                                & (target_v < float(by1))
+                            ).sum().item()
+                        )
+                    stats_out["band_projected_sample_counts"] = band_projected_counts
             if int(projected_valid.sum().item()) > 0:
                 projected_depth = target_z[projected_valid]
                 projected_u = target_u[projected_valid] - float(roi_origin_x)
@@ -15891,6 +32127,11 @@ class InvPhyTrainerWarp:
 
         self._render_profile_end_cuda_span(render_profile_frame, reproject_span)
         pre_fill_ratio = float(target_valid.to(dtype=torch.float32).mean().item())
+        if stats_out is not None:
+            stats_out["valid_pre_ratio"] = float(pre_fill_ratio)
+        if debug_capture is not None:
+            debug_capture["raw_valid"] = target_valid.detach().clone()
+            debug_capture["raw_depth"] = target_depth.detach().clone()
         if render_profile_frame is not None and eye_label is not None:
             render_profile_frame[
                 f"{profile_key_prefix}_valid_pre_{eye_label}_ratio"
@@ -15914,14 +32155,59 @@ class InvPhyTrainerWarp:
                 target_coverage=float(self.IMMERSIVE_REPROJECT_ROI_TARGET_COVERAGE),
             )
         self._render_profile_end_cuda_span(render_profile_frame, hole_fill_span)
+        post_fill_ratio = float(target_valid.to(dtype=torch.float32).mean().item())
+        if stats_out is not None:
+            stats_out["valid_post_ratio"] = float(post_fill_ratio)
+            stats_out["source_copy_ratio"] = 0.0
+            stats_out["unresolved_invalid_ratio"] = 0.0
+            stats_out["clear_color_ratio"] = 0.0
+        if target_roi_bounds is None:
+            remaining_invalid = ~target_valid
+            if bool(remaining_invalid.any().item()):
+                remaining_invalid_ratio = float(
+                    remaining_invalid.to(dtype=torch.float32).mean().item()
+                )
+                if stats_out is not None:
+                    stats_out["source_copy_ratio"] = float(remaining_invalid_ratio)
+                if (
+                    int(source_color_t.shape[0]) == int(target_color.shape[0])
+                    and int(source_color_t.shape[1]) == int(target_color.shape[1])
+                ):
+                    target_color[remaining_invalid] = source_color_t[remaining_invalid]
+                if (
+                    int(source_depth_t.shape[0]) == int(target_depth.shape[0])
+                    and int(source_depth_t.shape[1]) == int(target_depth.shape[1])
+                ):
+                    target_depth[remaining_invalid] = source_depth_t[remaining_invalid]
+                else:
+                    if stats_out is not None:
+                        stats_out["unresolved_invalid_ratio"] = float(
+                            remaining_invalid_ratio
+                        )
+        if stats_out is not None:
+            clear_color_mask = torch.all(
+                torch.isclose(
+                    target_color,
+                    background_rgba.view(1, 1, 4),
+                    atol=1e-3,
+                    rtol=0.0,
+                ),
+                dim=-1,
+            )
+            stats_out["clear_color_ratio"] = float(
+                clear_color_mask.to(dtype=torch.float32).mean().item()
+            )
         if render_profile_frame is not None and eye_label is not None:
             render_profile_frame[
                 f"{profile_key_prefix}_valid_post_{eye_label}_ratio"
-            ] = float(target_valid.to(dtype=torch.float32).mean().item())
+            ] = float(post_fill_ratio)
             if local_repair_roi_bounds is not None:
                 render_profile_frame[
                     f"{profile_key_prefix}_roi_post_{eye_label}_ratio"
                 ] = self._scene_valid_roi_coverage(target_valid, local_repair_roi_bounds)
+        if debug_capture is not None:
+            debug_capture["post_valid"] = target_valid.detach().clone()
+            debug_capture["post_depth"] = target_depth.detach().clone()
         return target_color, target_depth, target_valid
 
     def _scene_valid_patch_coverage(self, valid_mask, pixel, radius=None):
@@ -17042,17 +33328,81 @@ class InvPhyTrainerWarp:
             "scene_render_background_center_wall",
             "scene_render_left_wall",
             "scene_render_right_wall",
+            "scene_render_eye_left_total_ms",
+            "scene_render_eye_right_total_ms",
+            "scene_render_eye_left_dispatch_ms",
+            "scene_render_eye_right_dispatch_ms",
+            "scene_render_eye_left_queue_wait_ms",
+            "scene_render_eye_right_queue_wait_ms",
+            "scene_render_parallel_dispatch_ms",
+            "scene_render_parallel_wait_ms",
+            "scene_render_parallel_join_overhead_ms",
+            "scene_present_submit_ms",
+            "scene_present_queue_wait_ms",
+            "scene_present_worker_ms",
+            "scene_present_compose_ms",
+            "scene_present_compose_left_ms",
+            "scene_present_compose_right_ms",
+            "scene_present_overlay_ms",
+            "scene_present_overlay_left_ms",
+            "scene_present_overlay_right_ms",
+            "scene_present_parallel_wait_ms",
+            "scene_present_publish_ms",
+            "scene_present_preview_ms",
+            "scene_present_source_age_ms",
+            "scene_present_drop_count",
+            "scene_present_drop_ratio",
+            "scene_render_table_base_left_wall",
+            "scene_render_table_base_right_wall",
+            "scene_render_table_left_wall",
+            "scene_render_table_right_wall",
+            "scene_render_focus_left_wall",
+            "scene_render_focus_right_wall",
             "scene_prepare_background_eye_wall",
             "scene_render_far_center_wall",
             "scene_render_near_center_wall",
             "scene_render_side_left_wall",
             "scene_render_side_right_wall",
+            "scene_table_roi_left_ratio",
+            "scene_table_roi_right_ratio",
+            "scene_table_roi_supersample_scale",
+            "scene_table_fullframe_fallback_left_ratio",
+            "scene_table_fullframe_fallback_right_ratio",
+            "scene_focus_roi_left_ratio",
+            "scene_focus_roi_right_ratio",
+            "scene_focus_roi_supersample_scale",
+            "scene_focus_fullframe_fallback_left_ratio",
+            "scene_focus_fullframe_fallback_right_ratio",
+            "scene_support_roi_left_ratio",
+            "scene_support_roi_right_ratio",
+            "scene_support_fullframe_fallback_left_ratio",
+            "scene_support_fullframe_fallback_right_ratio",
+            "scene_support_occlusion_candidate_left_ratio",
+            "scene_support_occlusion_candidate_right_ratio",
+            "scene_support_occlusion_suppressed_left_ratio",
+            "scene_support_occlusion_suppressed_right_ratio",
+            "scene_support_occlusion_flip_left_ratio",
+            "scene_support_occlusion_flip_right_ratio",
+            "scene_support_occlusion_overlap_left_ratio",
+            "scene_support_occlusion_overlap_right_ratio",
+            "scene_support_occlusion_depth_gap_left_m",
+            "scene_support_occlusion_depth_gap_right_m",
+            "scene_support_occlusion_flip_count_left",
+            "scene_support_occlusion_flip_count_right",
+            "scene_active_support_is_table_ratio",
+            "scene_active_support_other_ratio",
+            "scene_active_support_none_ratio",
+            "scene_active_support_switch_count",
             "scene_side_roi_left_ratio",
             "scene_side_roi_right_ratio",
             "scene_side_strip_left_width_ratio",
             "scene_side_strip_right_width_ratio",
             "scene_side_fullframe_fallback_left_ratio",
             "scene_side_fullframe_fallback_right_ratio",
+            "scene_compose_table_base_left_cuda",
+            "scene_compose_table_base_right_cuda",
+            "scene_compose_table_left_cuda",
+            "scene_compose_table_right_cuda",
             "scene_compose_side_left_cuda",
             "scene_compose_side_right_cuda",
             "scene_reproject_background_left_cuda",
@@ -17077,6 +33427,11 @@ class InvPhyTrainerWarp:
             "scene_side_render_fallback_left_used",
             "scene_side_render_fallback_right_used",
             "scene_timewarp_applied",
+            "scene_timewarp_skipped_ratio",
+            "scene_timewarp_skip_queue_wait_ratio",
+            "scene_timewarp_skip_source_age_ratio",
+            "scene_timewarp_skip_reuse_age_ratio",
+            "scene_timewarp_skip_stale_packet_ratio",
             "scene_timewarp_fallback_left_used",
             "scene_timewarp_fallback_right_used",
             "scene_timewarp_gpu_ms",
@@ -17089,10 +33444,53 @@ class InvPhyTrainerWarp:
             "pre_compose_ready_ms",
             "compositing_ms",
             "overlay_publish_ms",
+            "static_scene_fresh_render_ratio",
+            "static_scene_base_refresh_ratio",
+            "static_scene_overlay_refresh_ratio",
             "scene_pose_staleness_ms_at_publish",
             "scene_pose_staleness_savings_ms",
             "render_sample_id",
             "publish_sample_id",
+            "static_scene_cache_invalidation_count",
+            "static_scene_signature_change_count",
+            "static_scene_base_signature_change_count",
+            "static_scene_overlay_signature_change_count",
+            "static_scene_reuse_max_age_hit_ratio",
+            "static_scene_base_reuse_max_age_hit_ratio",
+            "static_scene_overlay_reuse_max_age_hit_ratio",
+            "static_scene_reuse_reason_cache_miss_ratio",
+            "static_scene_reuse_reason_signature_unavailable_ratio",
+            "static_scene_reuse_reason_signature_change_ratio",
+            "static_scene_reuse_reason_age_limit_ratio",
+            "static_scene_reuse_reason_head_reset_ratio",
+            "static_scene_reuse_reason_translation_guard_ratio",
+            "static_scene_reuse_reason_rotation_guard_ratio",
+            "static_scene_reuse_reason_invalid_eye_pose_ratio",
+            "static_scene_reuse_reason_static_cadence_ratio",
+            "static_scene_reuse_reason_adaptive_pass_ratio",
+            "static_scene_reuse_reason_worker_failure_ratio",
+            "static_scene_base_reuse_reason_cache_miss_ratio",
+            "static_scene_base_reuse_reason_signature_unavailable_ratio",
+            "static_scene_base_reuse_reason_signature_change_ratio",
+            "static_scene_base_reuse_reason_age_limit_ratio",
+            "static_scene_base_reuse_reason_head_reset_ratio",
+            "static_scene_base_reuse_reason_translation_guard_ratio",
+            "static_scene_base_reuse_reason_rotation_guard_ratio",
+            "static_scene_base_reuse_reason_invalid_eye_pose_ratio",
+            "static_scene_base_reuse_reason_static_cadence_ratio",
+            "static_scene_base_reuse_reason_adaptive_pass_ratio",
+            "static_scene_base_reuse_reason_worker_failure_ratio",
+            "static_scene_overlay_reuse_reason_cache_miss_ratio",
+            "static_scene_overlay_reuse_reason_signature_unavailable_ratio",
+            "static_scene_overlay_reuse_reason_signature_change_ratio",
+            "static_scene_overlay_reuse_reason_age_limit_ratio",
+            "static_scene_overlay_reuse_reason_head_reset_ratio",
+            "static_scene_overlay_reuse_reason_translation_guard_ratio",
+            "static_scene_overlay_reuse_reason_rotation_guard_ratio",
+            "static_scene_overlay_reuse_reason_invalid_eye_pose_ratio",
+            "static_scene_overlay_reuse_reason_static_cadence_ratio",
+            "static_scene_overlay_reuse_reason_adaptive_pass_ratio",
+            "static_scene_overlay_reuse_reason_worker_failure_ratio",
         ):
             render_profile_frame[key] = 0.0
 
@@ -17300,6 +33698,7 @@ class InvPhyTrainerWarp:
     def _render_immersive_table_roi_scene_frames(
         self,
         scene_renderer,
+        scene_execute_renderer,
         layout,
         object_support_center_world,
         object_bounds_min_world,
@@ -17314,14 +33713,17 @@ class InvPhyTrainerWarp:
         scene_height,
         shared_scene_compose_cache=None,
         reproject_caches=None,
+        active_interaction=False,
         render_profile_frame=None,
     ):
         _ = layout
-        _ = object_support_center_world
-        _ = object_bounds_min_world
-        _ = object_bounds_max_world
+        if scene_execute_renderer is None:
+            scene_execute_renderer = scene_renderer
         render_plan = self._build_immersive_balanced_scene_render_plan(
             scene_renderer,
+            object_bounds_min_world,
+            object_bounds_max_world,
+            object_support_center_world,
             left_eye_pose_world,
             right_eye_pose_world,
             left_intrinsic,
@@ -17330,10 +33732,11 @@ class InvPhyTrainerWarp:
             eye_height,
             scene_width,
             scene_height,
+            active_interaction=active_interaction,
             render_profile_frame=render_profile_frame,
         )
         render_outputs = _execute_immersive_balanced_scene_render_plan(
-            scene_renderer,
+            scene_execute_renderer,
             render_plan,
         )
         return self._assemble_immersive_balanced_scene_from_render_outputs(
@@ -17351,11 +33754,13 @@ class InvPhyTrainerWarp:
     def _render_immersive_scene_frames_for_mode(
         self,
         scene_renderer,
+        scene_execute_renderer,
         scene_stereo_mode,
         layout,
         object_support_center_world,
         object_bounds_min_world,
         object_bounds_max_world,
+        active_interaction,
         left_eye_pose_world,
         right_eye_pose_world,
         left_intrinsic,
@@ -17419,20 +33824,22 @@ class InvPhyTrainerWarp:
         if scene_stereo_mode == self.IMMERSIVE_BALANCED_INTERNAL_STEREO_MODE:
             return self._render_immersive_table_roi_scene_frames(
                 scene_renderer,
+                scene_execute_renderer,
                 layout,
                 object_support_center_world,
                 object_bounds_min_world,
                 object_bounds_max_world,
-                left_eye_pose_world,
-                right_eye_pose_world,
-                left_intrinsic,
-                right_intrinsic,
-                eye_width,
-                eye_height,
-                scene_width,
-                scene_height,
+                left_eye_pose_world=left_eye_pose_world,
+                right_eye_pose_world=right_eye_pose_world,
+                left_intrinsic=left_intrinsic,
+                right_intrinsic=right_intrinsic,
+                eye_width=eye_width,
+                eye_height=eye_height,
+                scene_width=scene_width,
+                scene_height=scene_height,
                 shared_scene_compose_cache=shared_scene_compose_cache,
                 reproject_caches=reproject_caches,
+                active_interaction=active_interaction,
                 render_profile_frame=render_profile_frame,
             )
 

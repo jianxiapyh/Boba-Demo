@@ -16,7 +16,7 @@ np = None
 torch = None
 REPO_ROOT = Path(__file__).resolve().parent
 DEFAULT_SCENE_ASSETS_ROOT = REPO_ROOT / "assets" / "scenes"
-PUBLIC_DEMO_CASES = ("sloth", "rope", "hq_rope")
+PUBLIC_DEMO_CASES = ("sloth", "rope", "hq_rope", "rope_game")
 COMPAT_DEMO_CASE_ALIASES = {
     "hq_rope_0": "hq_rope",
 }
@@ -447,6 +447,12 @@ def main(argv: list[str] | None = None):
 
     cfg.load_from_yaml(case_manifest.get("config", "configs/real.yaml"))
     cfg.demo_case_name = canonical_case_name
+    cfg.demo_game_mode = str(case_manifest.get("game_mode", "")).strip().lower()
+    cfg.demo_game_course_path = (
+        None
+        if case_manifest.get("game_course") is None
+        else manifest_file_path(manifest_dir, case_manifest, "game_course")
+    )
 
     base_dir = f"./temp_experiments/{canonical_case_name}"
 

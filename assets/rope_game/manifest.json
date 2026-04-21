@@ -1,0 +1,11 @@
+{
+  "best_model": "../rope/best_model.pth",
+  "calibrate": "../rope/calibrate.pkl",
+  "config": "configs/real.yaml",
+  "final_data": "../rope/final_data.pkl",
+  "gaussian_ply": "../rope/rope.ply",
+  "metadata": "../rope/metadata.json",
+  "optimal_params": "../rope/optimal_params.pkl",
+  "game_mode": "rope_pick_place_v1",
+  "game_course": "course_v1.json"
+}

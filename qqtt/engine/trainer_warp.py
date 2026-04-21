@@ -79,6 +79,7 @@ TINY_BITMAP_FONT = {
     "8": ("111", "101", "111", "101", "111"),
     "9": ("111", "101", "111", "001", "111"),
     ".": ("000", "000", "000", "000", "010"),
+    "/": ("001", "001", "010", "100", "100"),
     "_": ("000", "000", "000", "000", "111"),
     ">": ("100", "010", "001", "010", "100"),
     " ": ("000", "000", "000", "000", "000"),
@@ -87,6 +88,7 @@ TINY_BITMAP_FONT = {
     "c": ("011", "100", "100", "100", "011"),
     "d": ("110", "101", "101", "101", "110"),
     "e": ("111", "100", "110", "100", "111"),
+    "g": ("111", "101", "111", "001", "111"),
     "h": ("101", "101", "111", "101", "101"),
     "i": ("111", "010", "010", "010", "111"),
     "k": ("101", "101", "110", "101", "101"),
@@ -100,6 +102,7 @@ TINY_BITMAP_FONT = {
     "r": ("110", "101", "110", "101", "101"),
     "t": ("111", "010", "010", "010", "010"),
     "u": ("101", "101", "101", "101", "111"),
+    "y": ("101", "101", "111", "001", "111"),
 }
 
 IMMERSIVE_BALANCED_LAYER_BACKGROUND_BASE = "background_base"
@@ -1949,6 +1952,12 @@ class _ImmersivePresentationWorkerLegacy:
             "support_overlay_active_support_id": packet.get(
                 "support_overlay_active_support_id"
             ),
+            "rope_game_overlay_enabled": bool(
+                packet.get("rope_game_overlay_enabled", False)
+            ),
+            "rope_game_overlay_state": self._copy_immersive_packet_value(
+                packet.get("rope_game_overlay_state")
+            ),
             "left_overlay_eye_render_state": packet["left_overlay_eye_render_state"],
             "right_overlay_eye_render_state": packet["right_overlay_eye_render_state"],
             "synthetic_source_real_timewarp_applied": 0.0,
@@ -2610,6 +2619,15 @@ class _ImmersivePresentationWorkerLegacy:
                     synthetic_source_state.get("support_overlay_active_support_id"),
                     left_overlay_eye_render_state,
                 )
+            if (
+                synthetic_source_state.get("rope_game_overlay_state") is not None
+                and left_overlay_eye_render_state is not None
+            ):
+                owner._draw_rope_game_overlay(
+                    left_eye_frame,
+                    synthetic_source_state.get("rope_game_overlay_state"),
+                    left_overlay_eye_render_state,
+                )
         with torch.cuda.stream(right_stream):
             right_stream.wait_stream(control_stream)
             right_eye_overlay_entries = projected_overlay_entries.get("right", [])
@@ -2623,6 +2641,15 @@ class _ImmersivePresentationWorkerLegacy:
                     right_eye_frame,
                     synthetic_source_state.get("support_overlay_cache"),
                     synthetic_source_state.get("support_overlay_active_support_id"),
+                    right_overlay_eye_render_state,
+                )
+            if (
+                synthetic_source_state.get("rope_game_overlay_state") is not None
+                and right_overlay_eye_render_state is not None
+            ):
+                owner._draw_rope_game_overlay(
+                    right_eye_frame,
+                    synthetic_source_state.get("rope_game_overlay_state"),
                     right_overlay_eye_render_state,
                 )
         with torch.cuda.stream(control_stream):
@@ -3632,6 +3659,16 @@ class _ImmersivePresentationWorkerLegacy:
                     packet.get("support_overlay_active_support_id"),
                     left_overlay_eye_render_state,
                 )
+            if (
+                packet.get("rope_game_overlay_enabled", False)
+                and packet.get("rope_game_overlay_state") is not None
+                and left_overlay_eye_render_state is not None
+            ):
+                owner._draw_rope_game_overlay(
+                    left_eye_frame,
+                    packet.get("rope_game_overlay_state"),
+                    left_overlay_eye_render_state,
+                )
             if left_overlay_end_event is not None:
                 left_overlay_end_event.record(left_stream)
 
@@ -3653,6 +3690,16 @@ class _ImmersivePresentationWorkerLegacy:
                     right_eye_frame,
                     packet.get("support_overlay_cache"),
                     packet.get("support_overlay_active_support_id"),
+                    right_overlay_eye_render_state,
+                )
+            if (
+                packet.get("rope_game_overlay_enabled", False)
+                and packet.get("rope_game_overlay_state") is not None
+                and right_overlay_eye_render_state is not None
+            ):
+                owner._draw_rope_game_overlay(
+                    right_eye_frame,
+                    packet.get("rope_game_overlay_state"),
                     right_overlay_eye_render_state,
                 )
             if right_overlay_end_event is not None:
@@ -4971,6 +5018,16 @@ class _ImmersivePresentationWorker(_ImmersivePresentationWorkerLegacy):
                     packet.get("support_overlay_active_support_id"),
                     left_overlay_eye_render_state,
                 )
+            if (
+                packet.get("rope_game_overlay_enabled", False)
+                and packet.get("rope_game_overlay_state") is not None
+                and left_overlay_eye_render_state is not None
+            ):
+                owner._draw_rope_game_overlay(
+                    left_eye_frame,
+                    packet.get("rope_game_overlay_state"),
+                    left_overlay_eye_render_state,
+                )
             left_overlay_end_event.record(left_stream)
 
         with torch.cuda.stream(right_stream):
@@ -4987,6 +5044,16 @@ class _ImmersivePresentationWorker(_ImmersivePresentationWorkerLegacy):
                     right_eye_frame,
                     packet.get("support_overlay_cache"),
                     packet.get("support_overlay_active_support_id"),
+                    right_overlay_eye_render_state,
+                )
+            if (
+                packet.get("rope_game_overlay_enabled", False)
+                and packet.get("rope_game_overlay_state") is not None
+                and right_overlay_eye_render_state is not None
+            ):
+                owner._draw_rope_game_overlay(
+                    right_eye_frame,
+                    packet.get("rope_game_overlay_state"),
                     right_overlay_eye_render_state,
                 )
             right_overlay_end_event.record(right_stream)
@@ -5365,6 +5432,15 @@ class _ImmersivePresentationWorker(_ImmersivePresentationWorkerLegacy):
                     synthetic_source_state.get("support_overlay_active_support_id"),
                     left_overlay_eye_render_state,
                 )
+            if (
+                synthetic_source_state.get("rope_game_overlay_state") is not None
+                and left_overlay_eye_render_state is not None
+            ):
+                owner._draw_rope_game_overlay(
+                    left_eye_frame,
+                    synthetic_source_state.get("rope_game_overlay_state"),
+                    left_overlay_eye_render_state,
+                )
         with torch.cuda.stream(right_stream):
             right_stream.wait_stream(control_stream)
             right_eye_overlay_entries = projected_overlay_entries.get("right", [])
@@ -5378,6 +5454,15 @@ class _ImmersivePresentationWorker(_ImmersivePresentationWorkerLegacy):
                     right_eye_frame,
                     synthetic_source_state.get("support_overlay_cache"),
                     synthetic_source_state.get("support_overlay_active_support_id"),
+                    right_overlay_eye_render_state,
+                )
+            if (
+                synthetic_source_state.get("rope_game_overlay_state") is not None
+                and right_overlay_eye_render_state is not None
+            ):
+                owner._draw_rope_game_overlay(
+                    right_eye_frame,
+                    synthetic_source_state.get("rope_game_overlay_state"),
                     right_overlay_eye_render_state,
                 )
         with torch.cuda.stream(control_stream):
@@ -6172,6 +6257,10 @@ class InvPhyTrainerWarp:
     IMMERSIVE_STARTUP_KEEPALIVE_INTERVAL_SECONDS = 0.25
     IMMERSIVE_CONTROLLER_HANDNESS_CONFIRM_STREAK = 5
     IMMERSIVE_CONTROLLER_HANDNESS_MAX_VALID_SAMPLES = 90
+    IMMERSIVE_CONTROLLER_SOURCE_PRESENT_CONFIRM_SAMPLES = 2
+    IMMERSIVE_CONTROLLER_SOURCE_ABSENT_CONFIRM_SAMPLES = 6
+    IMMERSIVE_CONTROLLER_SINGLE_LATERAL_MIN_M = 0.04
+    IMMERSIVE_CONTROLLER_SINGLE_PROJECTED_OFFSET_MIN_PX = 40.0
     IMMERSIVE_STARTUP_KEEPALIVE_RGBA = [232, 232, 232, 255]
     IMMERSIVE_GAUSSIAN_COMPOSE_ROI_PADDING = 24
     TIMING_OVERLAY_TEXT_COLOR = [255.0, 255.0, 255.0]
@@ -6192,6 +6281,59 @@ class InvPhyTrainerWarp:
     SUPPORT_ENTRY_OVERLAY_MAX_SCALE = 10
     SUPPORT_ENTRY_OVERLAY_LABEL_OFFSET_PX = 10
     SUPPORT_ENTRY_OVERLAY_COLLISION_PADDING_PX = 4
+    ROPE_GAME_COMPONENT_ALIASES = {
+        196: "table_main",
+        326: "sofa_big_front",
+        442: "sofa_small_left",
+        693: "sofa_right",
+    }
+    ROPE_GAME_PAD_ACTIVE_COLOR = [255.0, 176.0, 64.0]
+    ROPE_GAME_PAD_VALID_COLOR = [64.0, 232.0, 96.0]
+    ROPE_GAME_PAD_CLEAR_COLOR = [96.0, 255.0, 128.0]
+    ROPE_GAME_HUD_TEXT_COLOR = [255.0, 255.0, 255.0]
+    ROPE_GAME_HUD_BG_COLOR = [0.0, 0.0, 0.0]
+    ROPE_GAME_HUD_SCALE = 1
+    ROPE_GAME_HUD_MARGIN = 18
+    ROPE_GAME_HUD_REFERENCE_HEIGHT = 480
+    ROPE_GAME_HUD_MAX_SCALE = 6
+    ROPE_GAME_HUD_BG_BLEND = 0.42
+    ROPE_GAME_HUD_TEXT_BLEND = 0.84
+    ROPE_GAME_PAD_FILL_BLEND = 0.0
+    ROPE_GAME_PAD_OUTLINE_BLEND = 0.96
+    ROPE_GAME_PAD_OUTLINE_RADIUS = 2
+    ROPE_GAME_OUTLINE_SUPERSAMPLE_SCALE = 4
+    ROPE_GAME_OUTLINE_SUPERSAMPLE_MIN_SCALE = 2
+    ROPE_GAME_OUTLINE_SUPERSAMPLE_MAX_SCALE = 6
+    ROPE_GAME_OUTLINE_SUPERSAMPLE_MAX_EDGE_PX = 1536
+    ROPE_GAME_OUTLINE_ROI_PADDING_PX = 8
+    ROPE_GAME_PAD_TEXTURE_SIZE_PX = 256
+    ROPE_GAME_PAD_TEXTURE_MARGIN_PX = 18
+    ROPE_GAME_PAD_TEXTURE_THICKNESS_PX = 10
+    ROPE_GAME_PAD_MAX_PROJECTED_SPAN_RATIO = 1.25
+    ROPE_GAME_PAD_HEIGHT_OFFSET_M = 0.008
+    ROPE_GAME_PAD_INSIDE_PADDING_M = 0.015
+    ROPE_GAME_PAD_MIN_WIDTH_M = 0.12
+    ROPE_GAME_PAD_MIN_LENGTH_RATIO = 0.90
+    ROPE_GAME_MIN_INSIDE_FRACTION_CONTACT = 0.90
+    ROPE_GAME_MIN_TARGET_SUPPORT_CONTACT_FRACTION = 0.15
+    ROPE_GAME_START_ZONE_RADIUS_SCALE = 0.60
+    ROPE_GAME_DEBUG_LOG_INTERVAL_SECONDS = 1.0
+    ROPE_GAME_SETTLED_MAX_SPEED = 0.03
+    ROPE_GAME_SETTLED_MAX_MEAN_FRAME_DELTA = 0.003
+    ROPE_GAME_MIN_SUPPORT_FRACTION = 0.55
+    ROPE_GAME_CLEAR_DISPLAY_SECONDS = 0.75
+    ROPE_GAME_FINISH_MODAL_SCALE = 0.82
+    ROPE_GAME_FINISH_MODAL_REFERENCE_HEIGHT = 960
+    ROPE_GAME_FINISH_MODAL_MIN_SCALE = 0.68
+    ROPE_GAME_FINISH_MODAL_MAX_SCALE = 1.05
+    ROPE_GAME_FINISH_MODAL_TITLE_SCALE_MULTIPLIER = 1.20
+    ROPE_GAME_FINISH_MODAL_BG_BLEND = 0.38
+    ROPE_GAME_FINISH_MODAL_TEXT_BLEND = 0.98
+    ROPE_GAME_FINISH_MODAL_SHADOW_BLEND = 0.62
+    ROPE_GAME_FINISH_MODAL_TEXTURE_SCALE_MULTIPLIER = 2.0
+    ROPE_GAME_FINISH_MODAL_WORLD_DEPTH_M = 1.35
+    ROPE_GAME_FINISH_MODAL_WORLD_WIDTH_M = 0.62
+    ROPE_GAME_FINISH_MODAL_WORLD_MAX_HEIGHT_M = 0.24
 
     #getting called automatically right after you create an instance of the class
     def __init__(
@@ -6586,7 +6728,7 @@ class InvPhyTrainerWarp:
         if case_name is None:
             case_name = self._interaction_anchor_case_name()
         case_name = str(case_name).strip().lower()
-        return case_name in {"rope", "hq_rope"}
+        return case_name in {"rope", "hq_rope", "rope_game"}
 
     def _live_controller_case_profile(self, case_name=None):
         if case_name is None:
@@ -6627,6 +6769,7 @@ class InvPhyTrainerWarp:
         if case_name is None:
             case_name = self._interaction_anchor_case_name()
         case_name = str(case_name).strip().lower()
+        support_case_name = "rope" if self._is_rope_family_case(case_name) else case_name
         return {
             "case_name": case_name,
             "stable_frames_required": int(self.IMMERSIVE_IDLE_LOCK_STABLE_FRAMES),
@@ -6636,7 +6779,7 @@ class InvPhyTrainerWarp:
             ),
             "min_support_fraction": float(
                 self.IMMERSIVE_IDLE_LOCK_CASE_MIN_SUPPORT_FRACTION.get(
-                    case_name,
+                    support_case_name,
                     self.IMMERSIVE_IDLE_LOCK_CASE_MIN_SUPPORT_FRACTION["sloth"],
                 )
             ),
@@ -6658,7 +6801,7 @@ class InvPhyTrainerWarp:
             "v": torch.zeros_like(sim_state["v"]).detach().clone(),
         }
 
-    def _scene_support_fraction(
+    def _scene_support_contact_mask(
         self,
         object_points,
         support_surface_boxes,
@@ -6668,9 +6811,14 @@ class InvPhyTrainerWarp:
         z_tolerance=None,
     ):
         if object_points is None or int(object_points.numel()) == 0:
-            return 0.0
+            return None
+        point_count = int(object_points.shape[0])
         if support_surface_boxes is None:
-            return 0.0
+            return torch.zeros(
+                (point_count,),
+                dtype=torch.bool,
+                device=object_points.device,
+            )
         if xy_margin is None:
             xy_margin = float(self.IMMERSIVE_IDLE_LOCK_SUPPORT_XY_MARGIN)
         if z_tolerance is None:
@@ -6687,9 +6835,17 @@ class InvPhyTrainerWarp:
                 dtype=object_points.dtype,
             )
         if support_surface_boxes.ndim != 3 or support_surface_boxes.shape[1:] != (2, 3):
-            return 0.0
+            return torch.zeros(
+                (point_count,),
+                dtype=torch.bool,
+                device=object_points.device,
+            )
         if int(support_surface_boxes.shape[0]) == 0:
-            return 0.0
+            return torch.zeros(
+                (point_count,),
+                dtype=torch.bool,
+                device=object_points.device,
+            )
 
         scene_up_np = np.asarray(scene_up, dtype=np.float32).reshape(-1)
         vertical_axis = int(np.argmax(np.abs(scene_up_np)))
@@ -6698,7 +6854,6 @@ class InvPhyTrainerWarp:
 
         box_mins = support_surface_boxes[:, 0, :]
         box_maxs = support_surface_boxes[:, 1, :]
-        point_count = int(object_points.shape[0])
         box_count = int(support_surface_boxes.shape[0])
         support_mask = torch.ones(
             (point_count, box_count),
@@ -6720,7 +6875,26 @@ class InvPhyTrainerWarp:
             )
             <= z_tolerance
         )
-        supported_points = support_mask.any(dim=1)
+        return support_mask.any(dim=1)
+
+    def _scene_support_fraction(
+        self,
+        object_points,
+        support_surface_boxes,
+        scene_up,
+        *,
+        xy_margin=None,
+        z_tolerance=None,
+    ):
+        supported_points = self._scene_support_contact_mask(
+            object_points,
+            support_surface_boxes,
+            scene_up,
+            xy_margin=xy_margin,
+            z_tolerance=z_tolerance,
+        )
+        if supported_points is None or int(supported_points.numel()) == 0:
+            return 0.0
         return float(supported_points.to(dtype=torch.float32).mean().item())
 
     def _set_idle_lock_state(
@@ -7872,6 +8046,158 @@ class InvPhyTrainerWarp:
                 ),
             }
         return metadata
+
+    def _canonicalize_rope_family_controller_attachment_metadata(
+        self,
+        controller_attachment_metadata,
+        default_anchor_names=None,
+    ):
+        if not self._is_rope_family_case():
+            return controller_attachment_metadata
+
+        default_anchor_names = (
+            dict(default_anchor_names) if default_anchor_names is not None else {}
+        )
+        log_prefix = (
+            "[live_openxr_controller] immersive shared controller template: "
+        )
+        left_meta = controller_attachment_metadata.get("left")
+        right_meta = controller_attachment_metadata.get("right")
+        if left_meta is None or right_meta is None:
+            print(
+                log_prefix
+                + "skipped=1 reason=missing_source_metadata "
+                f"sources={sorted(controller_attachment_metadata.keys())} "
+                f"default_anchor_names={default_anchor_names}",
+                flush=True,
+            )
+            return controller_attachment_metadata
+
+        left_count = int(left_meta.get("spring_indices", torch.empty(0)).numel())
+        right_count = int(right_meta.get("spring_indices", torch.empty(0)).numel())
+        if left_count <= 0 or right_count <= 0:
+            print(
+                log_prefix
+                + "skipped=1 reason=empty_template "
+                f"left_spring_count={left_count} right_spring_count={right_count} "
+                f"default_anchor_names={default_anchor_names}",
+                flush=True,
+            )
+            return controller_attachment_metadata
+        if left_count != right_count:
+            print(
+                log_prefix
+                + "skipped=1 reason=spring_count_mismatch "
+                f"left_spring_count={left_count} right_spring_count={right_count} "
+                f"default_anchor_names={default_anchor_names}",
+                flush=True,
+            )
+            return controller_attachment_metadata
+
+        left_point_indices = list(left_meta.get("point_indices") or [])
+        right_point_indices = list(right_meta.get("point_indices") or [])
+        if len(left_point_indices) != 1 or len(right_point_indices) != 1:
+            print(
+                log_prefix
+                + "skipped=1 reason=unsupported_point_layout "
+                f"left_point_count={len(left_point_indices)} "
+                f"right_point_count={len(right_point_indices)} "
+                f"default_anchor_names={default_anchor_names}",
+                flush=True,
+            )
+            return controller_attachment_metadata
+
+        required_fields = (
+            "template_springs",
+            "template_rest_lengths",
+            "spring_y_template",
+            "spring_point_offsets",
+            "spring_capable_point_offsets",
+        )
+        missing_fields = [
+            field_name for field_name in required_fields if field_name not in right_meta
+        ]
+        if missing_fields:
+            print(
+                log_prefix
+                + "skipped=1 reason=missing_right_fields "
+                f"fields={missing_fields} "
+                f"default_anchor_names={default_anchor_names}",
+                flush=True,
+            )
+            return controller_attachment_metadata
+
+        right_template_springs = right_meta["template_springs"].clone()
+        if int(right_template_springs.shape[0]) != right_count:
+            print(
+                log_prefix
+                + "skipped=1 reason=right_template_shape_mismatch "
+                f"template_rows={int(right_template_springs.shape[0])} "
+                f"right_spring_count={right_count} "
+                f"default_anchor_names={default_anchor_names}",
+                flush=True,
+            )
+            return controller_attachment_metadata
+
+        right_controller_endpoint = self.num_all_points + self._controller_source_index(
+            "right"
+        )
+        left_controller_endpoint = self.num_all_points + self._controller_source_index(
+            "left"
+        )
+        left_template_springs = right_template_springs.clone()
+        left_template_springs[left_template_springs == right_controller_endpoint] = (
+            left_controller_endpoint
+        )
+
+        canonical_positions = list(range(right_count))
+        canonical_rest_lengths = right_meta["template_rest_lengths"].clone()
+        canonical_spring_y_template = right_meta["spring_y_template"].clone()
+        canonical_inactive_spring_y = right_meta.get("inactive_spring_y")
+        if canonical_inactive_spring_y is not None:
+            canonical_inactive_spring_y = canonical_inactive_spring_y.clone()
+        canonical_spring_point_offsets = right_meta["spring_point_offsets"].clone()
+        canonical_spring_capable_offsets = right_meta[
+            "spring_capable_point_offsets"
+        ].clone()
+
+        right_meta["template_springs"] = right_template_springs.clone()
+        right_meta["template_rest_lengths"] = canonical_rest_lengths.clone()
+        right_meta["spring_y_template"] = canonical_spring_y_template.clone()
+        right_meta["spring_point_offsets"] = canonical_spring_point_offsets.clone()
+        right_meta["spring_capable_point_offsets"] = (
+            canonical_spring_capable_offsets.clone()
+        )
+        right_meta["point_spring_positions"] = {
+            int(right_point_indices[0]): list(canonical_positions)
+        }
+        if canonical_inactive_spring_y is not None:
+            right_meta["inactive_spring_y"] = canonical_inactive_spring_y.clone()
+
+        left_meta["template_springs"] = left_template_springs
+        left_meta["template_rest_lengths"] = canonical_rest_lengths.clone()
+        left_meta["spring_y_template"] = canonical_spring_y_template.clone()
+        left_meta["spring_point_offsets"] = canonical_spring_point_offsets.clone()
+        left_meta["spring_capable_point_offsets"] = (
+            canonical_spring_capable_offsets.clone()
+        )
+        left_meta["point_spring_positions"] = {
+            int(left_point_indices[0]): list(canonical_positions)
+        }
+        if canonical_inactive_spring_y is not None:
+            left_meta["inactive_spring_y"] = canonical_inactive_spring_y.clone()
+
+        print(
+            log_prefix
+            + "applied=1 canonical_source=right "
+            f"left_spring_count_pre={left_count} right_spring_count_pre={right_count} "
+            f"left_spring_count_post={int(left_meta['template_springs'].shape[0])} "
+            f"right_spring_count_post={int(right_meta['template_springs'].shape[0])} "
+            "default_anchor_names_preserved=1 "
+            f"default_anchor_names={default_anchor_names}",
+            flush=True,
+        )
+        return controller_attachment_metadata
 
     def _build_two_point_live_controller_runtime(
         self,
@@ -9580,6 +9906,63 @@ class InvPhyTrainerWarp:
             blend=blend,
         )
 
+    def _blend_convex_quad(self, frame, quad_pixels, color, blend=0.45):
+        if quad_pixels is None:
+            return
+        quad_pixels_t = torch.as_tensor(
+            quad_pixels,
+            dtype=torch.float32,
+            device=frame.device,
+        )
+        if quad_pixels_t.ndim != 2 or quad_pixels_t.shape[0] < 4 or quad_pixels_t.shape[1] != 2:
+            return
+        height, width = frame.shape[:2]
+        min_x = max(0, int(torch.floor(quad_pixels_t[:, 0].min()).item()) - 1)
+        max_x = min(width, int(torch.ceil(quad_pixels_t[:, 0].max()).item()) + 2)
+        min_y = max(0, int(torch.floor(quad_pixels_t[:, 1].min()).item()) - 1)
+        max_y = min(height, int(torch.ceil(quad_pixels_t[:, 1].max()).item()) + 2)
+        if min_x >= max_x or min_y >= max_y:
+            return
+
+        ys = torch.arange(min_y, max_y, device=frame.device, dtype=torch.float32)
+        xs = torch.arange(min_x, max_x, device=frame.device, dtype=torch.float32)
+        grid_y, grid_x = torch.meshgrid(ys, xs, indexing="ij")
+        px = grid_x + 0.5
+        py = grid_y + 0.5
+        p0, p1, p2, p3 = [quad_pixels_t[idx] for idx in range(4)]
+
+        def _triangle_mask(a, b, c):
+            ab_x = b[0] - a[0]
+            ab_y = b[1] - a[1]
+            bc_x = c[0] - b[0]
+            bc_y = c[1] - b[1]
+            ca_x = a[0] - c[0]
+            ca_y = a[1] - c[1]
+            ap_x = px - a[0]
+            ap_y = py - a[1]
+            bp_x = px - b[0]
+            bp_y = py - b[1]
+            cp_x = px - c[0]
+            cp_y = py - c[1]
+            cross_ab = ab_x * ap_y - ab_y * ap_x
+            cross_bc = bc_x * bp_y - bc_y * bp_x
+            cross_ca = ca_x * cp_y - ca_y * cp_x
+            return ((cross_ab >= 0.0) & (cross_bc >= 0.0) & (cross_ca >= 0.0)) | (
+                (cross_ab <= 0.0) & (cross_bc <= 0.0) & (cross_ca <= 0.0)
+            )
+
+        quad_mask = _triangle_mask(p0, p1, p2) | _triangle_mask(p0, p2, p3)
+        if not bool(quad_mask.any().item()):
+            return
+        rgb_frame = frame[..., :3]
+        patch = rgb_frame[min_y:max_y, min_x:max_x]
+        self._blend_rgb_patch_masked_inplace(
+            patch,
+            quad_mask,
+            color,
+            blend=blend,
+        )
+
     def _blend_square_marker(self, frame, pixel, color, radius, blend=0.78):
         height, width = frame.shape[:2]
         x = int(round(float(pixel[0].item())))
@@ -10245,6 +10628,828 @@ class InvPhyTrainerWarp:
                 scale=scale,
                 blend=0.94,
             )
+
+    def _rope_game_enabled(self):
+        return self._interaction_anchor_case_name() == "rope_game"
+
+    def _rope_game_component_alias(self, component_id):
+        if component_id is None:
+            return None
+        component_id = int(component_id)
+        return str(
+            self.ROPE_GAME_COMPONENT_ALIASES.get(
+                component_id,
+                f"component_{component_id}",
+            )
+        )
+
+    def _load_rope_game_course_payload(self):
+        if not self._rope_game_enabled():
+            return None
+        course_path = getattr(cfg, "demo_game_course_path", None)
+        if not course_path:
+            raise FileNotFoundError(
+                "rope_game is enabled but cfg.demo_game_course_path is missing."
+            )
+        with open(course_path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        targets = payload.get("targets")
+        if not isinstance(targets, list) or not targets:
+            raise ValueError(
+                f"rope_game course at {course_path} must contain a non-empty 'targets' list."
+            )
+        fallback_targets = payload.get("fallback_targets", [])
+        if not isinstance(fallback_targets, list):
+            raise ValueError(
+                f"rope_game course at {course_path} must contain a list 'fallback_targets'."
+            )
+        payload["targets"] = list(targets)
+        payload["fallback_targets"] = list(fallback_targets)
+        return payload
+
+    def _rope_game_scene_frame(self, scene_up):
+        scene_up_np = np.asarray(scene_up, dtype=np.float32).reshape(-1)
+        if scene_up_np.shape[0] != 3 or not np.isfinite(scene_up_np).all():
+            scene_up_np = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+        norm = float(np.linalg.norm(scene_up_np))
+        if norm <= 1e-6:
+            scene_up_np = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+            norm = 1.0
+        scene_up_unit = (scene_up_np / norm).astype(np.float32)
+        vertical_axis = int(np.argmax(np.abs(scene_up_unit)))
+        top_uses_min = bool(float(scene_up_unit[vertical_axis]) < 0.0)
+        lateral_axes = [axis for axis in range(3) if axis != vertical_axis]
+        return {
+            "scene_up_unit": scene_up_unit,
+            "vertical_axis": vertical_axis,
+            "top_uses_min": top_uses_min,
+            "lateral_axes": tuple(lateral_axes),
+        }
+
+    def _build_rope_game_floor_support_entry(self, layout, scene_renderer):
+        bounds_min = np.asarray(layout.floor_box.mins, dtype=np.float32).copy()
+        bounds_max = np.asarray(layout.floor_box.maxs, dtype=np.float32).copy()
+        scene_frame = self._rope_game_scene_frame(layout.scene_up)
+        center = (0.5 * (bounds_min + bounds_max)).astype(np.float32)
+        vertical_axis = int(scene_frame["vertical_axis"])
+        lateral_axes = list(scene_frame["lateral_axes"])
+        center[vertical_axis] = (
+            bounds_min[vertical_axis]
+            if bool(scene_frame["top_uses_min"])
+            else bounds_max[vertical_axis]
+        )
+        support_id = -1
+        if scene_renderer is not None:
+            support_entries = list(scene_renderer.support_surface_entries_ref())
+            if support_entries:
+                support_id = max(int(entry["support_id"]) for entry in support_entries) + 1
+        return {
+            "support_id": int(support_id),
+            "component_id": None,
+            "kind": "floor",
+            "bounds_min": bounds_min,
+            "bounds_max": bounds_max,
+            "render_bounds_min": bounds_min.copy(),
+            "render_bounds_max": bounds_max.copy(),
+            "center": center,
+            "support_area": float(
+                max(0.0, float(bounds_max[lateral_axes[0]] - bounds_min[lateral_axes[0]]))
+                * max(0.0, float(bounds_max[lateral_axes[1]] - bounds_min[lateral_axes[1]]))
+            ),
+        }
+
+    def _rope_game_support_plane_frame(self, support_entry, scene_up):
+        bounds_min = np.asarray(support_entry["bounds_min"], dtype=np.float32)
+        bounds_max = np.asarray(support_entry["bounds_max"], dtype=np.float32)
+        scene_frame = self._rope_game_scene_frame(scene_up)
+        spans = np.maximum(bounds_max - bounds_min, 0.0).astype(np.float32)
+        lateral_axes = list(scene_frame["lateral_axes"])
+        lateral_axes.sort(
+            key=lambda axis_idx: float(spans[axis_idx]),
+            reverse=True,
+        )
+        long_axis_index = int(lateral_axes[0])
+        short_axis_index = int(lateral_axes[1])
+        base_long_axis_world = np.zeros(3, dtype=np.float32)
+        base_short_axis_world = np.zeros(3, dtype=np.float32)
+        base_long_axis_world[long_axis_index] = 1.0
+        base_short_axis_world[short_axis_index] = 1.0
+        support_center_world = (0.5 * (bounds_min + bounds_max)).astype(np.float32)
+        vertical_axis = int(scene_frame["vertical_axis"])
+        support_center_world[vertical_axis] = (
+            bounds_min[vertical_axis]
+            if bool(scene_frame["top_uses_min"])
+            else bounds_max[vertical_axis]
+        )
+        return {
+            "scene_up_unit": scene_frame["scene_up_unit"],
+            "bounds_min": bounds_min,
+            "bounds_max": bounds_max,
+            "support_center_world": support_center_world,
+            "base_long_axis_world": base_long_axis_world,
+            "base_short_axis_world": base_short_axis_world,
+            "support_long_span": float(spans[long_axis_index]),
+            "support_short_span": float(spans[short_axis_index]),
+        }
+
+    def _resolve_rope_game_support_entry(
+        self,
+        selector,
+        table_entry,
+        floor_entry,
+        non_table_support_entries,
+    ):
+        selector = str(selector or "").strip().lower()
+        if selector == "table":
+            return (
+                None
+                if table_entry is None
+                else self._copy_immersive_packet_value(table_entry)
+            )
+        if selector == "floor":
+            return self._copy_immersive_packet_value(floor_entry)
+        if selector.startswith("non_table_support_rank="):
+            try:
+                support_rank = int(selector.split("=", 1)[1])
+            except ValueError:
+                return None
+            if support_rank < 0 or support_rank >= len(non_table_support_entries):
+                return None
+            return self._copy_immersive_packet_value(
+                non_table_support_entries[support_rank]
+            )
+        if selector.startswith("component_id="):
+            try:
+                component_id = int(selector.split("=", 1)[1])
+            except ValueError:
+                return None
+            candidate_entries = []
+            if (
+                table_entry is not None
+                and table_entry.get("component_id") is not None
+                and int(table_entry.get("component_id")) == component_id
+            ):
+                candidate_entries.append(table_entry)
+            candidate_entries.extend(
+                entry
+                for entry in non_table_support_entries
+                if entry.get("component_id") is not None
+                and int(entry.get("component_id")) == component_id
+            )
+            if not candidate_entries:
+                return None
+            selected_entry = max(
+                candidate_entries,
+                key=lambda entry: (
+                    float(entry.get("support_area", 0.0)),
+                    -int(entry.get("support_id", 0)),
+                ),
+            )
+            return self._copy_immersive_packet_value(selected_entry)
+        raise ValueError(f"Unsupported rope_game target selector: {selector}")
+
+    def _resolve_rope_game_target(
+        self,
+        target_spec,
+        *,
+        scene_up,
+        table_entry,
+        floor_entry,
+        non_table_support_entries,
+        rope_rest_span_m,
+    ):
+        support_entry = self._resolve_rope_game_support_entry(
+            target_spec.get("selector"),
+            table_entry,
+            floor_entry,
+            non_table_support_entries,
+        )
+        if support_entry is None:
+            return None
+
+        plane_frame = self._rope_game_support_plane_frame(support_entry, scene_up)
+        support_long_span = float(plane_frame["support_long_span"])
+        support_short_span = float(plane_frame["support_short_span"])
+        if support_long_span <= 1e-6 or support_short_span <= 1e-6:
+            return None
+
+        size_scale = np.asarray(
+            target_spec.get("size_scale", [1.0, 0.25]),
+            dtype=np.float32,
+        ).reshape(-1)
+        if size_scale.shape[0] < 2:
+            return None
+        target_length_m = float(size_scale[0]) * float(rope_rest_span_m)
+        target_width_m = max(
+            float(size_scale[1]) * float(rope_rest_span_m),
+            float(self.ROPE_GAME_PAD_MIN_WIDTH_M),
+        )
+        target_length_m = min(target_length_m, 0.85 * support_long_span)
+        target_width_m = min(target_width_m, 0.70 * support_short_span)
+
+        yaw_deg = float(target_spec.get("yaw", 0.0))
+        yaw_rad = float(np.deg2rad(yaw_deg))
+        cos_yaw = float(np.cos(yaw_rad))
+        sin_yaw = float(np.sin(yaw_rad))
+        half_length = 0.5 * float(target_length_m)
+        half_width = 0.5 * float(target_width_m)
+        footprint_long_half = abs(cos_yaw) * half_length + abs(sin_yaw) * half_width
+        footprint_short_half = abs(sin_yaw) * half_length + abs(cos_yaw) * half_width
+        fit_ratio = min(
+            1.0,
+            (0.5 * support_long_span) / max(footprint_long_half, 1e-6),
+            (0.5 * support_short_span) / max(footprint_short_half, 1e-6),
+        )
+        if fit_ratio < 1.0:
+            target_length_m *= float(fit_ratio) * 0.98
+            target_width_m *= float(fit_ratio) * 0.98
+            half_length = 0.5 * float(target_length_m)
+            half_width = 0.5 * float(target_width_m)
+            footprint_long_half = (
+                abs(cos_yaw) * half_length + abs(sin_yaw) * half_width
+            )
+            footprint_short_half = (
+                abs(sin_yaw) * half_length + abs(cos_yaw) * half_width
+            )
+
+        if target_length_m < float(self.ROPE_GAME_PAD_MIN_LENGTH_RATIO) * float(
+            rope_rest_span_m
+        ):
+            return None
+
+        base_long_axis_world = plane_frame["base_long_axis_world"]
+        base_short_axis_world = plane_frame["base_short_axis_world"]
+        axis_long_world = (
+            cos_yaw * base_long_axis_world + sin_yaw * base_short_axis_world
+        ).astype(np.float32)
+        axis_short_world = (
+            -sin_yaw * base_long_axis_world + cos_yaw * base_short_axis_world
+        ).astype(np.float32)
+        axis_long_world /= max(float(np.linalg.norm(axis_long_world)), 1e-6)
+        axis_short_world /= max(float(np.linalg.norm(axis_short_world)), 1e-6)
+
+        available_long_shift = max(0.0, 0.5 * support_long_span - footprint_long_half)
+        available_short_shift = max(
+            0.0,
+            0.5 * support_short_span - footprint_short_half,
+        )
+        center_uv = np.asarray(
+            target_spec.get("center_uv", [0.0, 0.0]),
+            dtype=np.float32,
+        ).reshape(-1)
+        if center_uv.shape[0] < 2:
+            center_uv = np.pad(center_uv, (0, max(0, 2 - center_uv.shape[0])))
+        center_uv = np.clip(center_uv[:2], -1.0, 1.0)
+        center_world = (
+            plane_frame["support_center_world"]
+            + center_uv[0] * available_long_shift * base_long_axis_world
+            + center_uv[1] * available_short_shift * base_short_axis_world
+            + plane_frame["scene_up_unit"] * float(self.ROPE_GAME_PAD_HEIGHT_OFFSET_M)
+        ).astype(np.float32)
+
+        corners_world = np.stack(
+            [
+                center_world - half_length * axis_long_world - half_width * axis_short_world,
+                center_world + half_length * axis_long_world - half_width * axis_short_world,
+                center_world + half_length * axis_long_world + half_width * axis_short_world,
+                center_world - half_length * axis_long_world + half_width * axis_short_world,
+            ],
+            axis=0,
+        ).astype(np.float32)
+
+        support_surface_boxes_t = torch.as_tensor(
+            np.stack(
+                [
+                    plane_frame["bounds_min"],
+                    plane_frame["bounds_max"],
+                ],
+                axis=0,
+            )[None, ...],
+            dtype=torch.float32,
+            device=cfg.device,
+        )
+        return {
+            "name": str(target_spec.get("name", "target")).strip().lower(),
+            "selector": str(target_spec.get("selector", "")).strip().lower(),
+            "required_inside_fraction": float(
+                target_spec.get("required_inside_fraction", 0.75)
+            ),
+            "hold_s": float(target_spec.get("hold", 0.6)),
+            "center_uv": [float(center_uv[0]), float(center_uv[1])],
+            "yaw_deg": float(yaw_deg),
+            "target_length_m": float(target_length_m),
+            "target_width_m": float(target_width_m),
+            "support_id": int(support_entry["support_id"]),
+            "support_kind": str(support_entry.get("kind", "support")).strip().lower(),
+            "support_component_id": support_entry.get("component_id"),
+            "support_alias": self._rope_game_component_alias(
+                support_entry.get("component_id")
+            ),
+            "support_entry": support_entry,
+            "center_world": center_world,
+            "center_world_t": torch.as_tensor(
+                center_world,
+                dtype=torch.float32,
+                device=cfg.device,
+            ),
+            "axis_long_world": axis_long_world,
+            "axis_short_world": axis_short_world,
+            "axis_long_world_t": torch.as_tensor(
+                axis_long_world,
+                dtype=torch.float32,
+                device=cfg.device,
+            ),
+            "axis_short_world_t": torch.as_tensor(
+                axis_short_world,
+                dtype=torch.float32,
+                device=cfg.device,
+            ),
+            "pad_corners_world": corners_world,
+            "support_surface_boxes_t": support_surface_boxes_t,
+        }
+
+    def _resolve_rope_game_course(self, scene_renderer, layout, rope_rest_span_m):
+        payload = self._load_rope_game_course_payload()
+        if payload is None:
+            return None
+        table_entry = self._copy_immersive_support_entry(
+            self._find_immersive_table_support_entry(scene_renderer)
+        )
+        if table_entry is None:
+            raise RuntimeError("rope_game requires a table support entry in the scene.")
+        floor_entry = self._build_rope_game_floor_support_entry(layout, scene_renderer)
+        non_table_support_entries = [
+            self._copy_immersive_support_entry(entry)
+            for entry in scene_renderer.support_surface_entries_ref()
+            if str(entry.get("kind", "")).strip().lower() == "support"
+        ]
+        non_table_support_entries.sort(
+            key=lambda entry: (
+                -float(entry.get("support_area", 0.0)),
+                int(entry["support_id"]),
+            )
+        )
+        fallback_specs = list(payload.get("fallback_targets") or [])
+        fallback_index = 0
+        resolved_targets = []
+        for target_spec in payload["targets"]:
+            resolved_target = self._resolve_rope_game_target(
+                target_spec,
+                scene_up=layout.scene_up,
+                table_entry=table_entry,
+                floor_entry=floor_entry,
+                non_table_support_entries=non_table_support_entries,
+                rope_rest_span_m=rope_rest_span_m,
+            )
+            if resolved_target is None:
+                while fallback_index < len(fallback_specs):
+                    fallback_spec = fallback_specs[fallback_index]
+                    fallback_index += 1
+                    resolved_target = self._resolve_rope_game_target(
+                        fallback_spec,
+                        scene_up=layout.scene_up,
+                        table_entry=table_entry,
+                        floor_entry=floor_entry,
+                        non_table_support_entries=non_table_support_entries,
+                        rope_rest_span_m=rope_rest_span_m,
+                    )
+                    if resolved_target is not None:
+                        resolved_target["fallback_for"] = str(
+                            target_spec.get("name", "target")
+                        ).strip().lower()
+                        break
+            if resolved_target is None:
+                raise RuntimeError(
+                    "Unable to resolve rope_game target "
+                    f"'{target_spec.get('name', 'target')}' and no remaining fallback target fits."
+                )
+            resolved_targets.append(resolved_target)
+
+        course_name = str(
+            payload.get("course_name")
+            or getattr(cfg, "demo_game_mode", "")
+            or "rope_pick_place_v1"
+        ).strip().lower()
+        print(
+            "[quest_display] rope game course resolved: "
+            f"course={course_name} rope_rest_span_m={float(rope_rest_span_m):.4f} "
+            f"targets={len(resolved_targets)}",
+            flush=True,
+        )
+        for index, resolved_target in enumerate(resolved_targets, start=1):
+            fallback_for = resolved_target.get("fallback_for")
+            fallback_suffix = (
+                ""
+                if fallback_for is None
+                else f" fallback_for={fallback_for}"
+            )
+            print(
+                "[quest_display] rope game target: "
+                f"index={index} name={resolved_target['name']} "
+                f"alias={resolved_target.get('support_alias')} "
+                f"component_id={resolved_target.get('support_component_id')} "
+                f"support_kind={resolved_target['support_kind']} "
+                f"support_id={resolved_target['support_id']} "
+                f"size_m=({resolved_target['target_length_m']:.3f},"
+                f"{resolved_target['target_width_m']:.3f}) "
+                f"center_uv=({resolved_target['center_uv'][0]:.2f},"
+                f"{resolved_target['center_uv'][1]:.2f}) "
+                f"center_world=({resolved_target['center_world'][0]:.3f},"
+                f"{resolved_target['center_world'][1]:.3f},"
+                f"{resolved_target['center_world'][2]:.3f}) "
+                f"hold_s={resolved_target['hold_s']:.2f} "
+                f"inside_fraction={resolved_target['required_inside_fraction']:.2f}"
+                f"{fallback_suffix}",
+                flush=True,
+            )
+        return {
+            "course_name": course_name,
+            "game_mode": str(getattr(cfg, "demo_game_mode", "")).strip().lower(),
+            "targets": resolved_targets,
+        }
+
+    def _make_rope_game_runtime_state(self, scene_renderer, layout, scene_rest_state):
+        if not self._rope_game_enabled():
+            return None
+        rope_rest_points = scene_rest_state["x"][: self.num_all_points].detach()
+        rope_rest_span_m = self._principal_axis_span_torch(rope_rest_points)
+        resolved_course = self._resolve_rope_game_course(
+            scene_renderer,
+            layout,
+            rope_rest_span_m,
+        )
+        start_zone_center_world_t = self._object_support_patch_center(rope_rest_points)
+        start_zone_center_world = (
+            start_zone_center_world_t.detach().cpu().numpy().astype(np.float32)
+        )
+        start_zone_radius_m = (
+            float(self.ROPE_GAME_START_ZONE_RADIUS_SCALE) * float(rope_rest_span_m)
+        )
+        start_zone_support_id = None
+        start_zone_component_id = None
+        start_zone_support_alias = None
+        start_zone_support_fraction = 0.0
+        for target in resolved_course["targets"]:
+            support_fraction = self._scene_support_fraction(
+                rope_rest_points,
+                target["support_surface_boxes_t"],
+                layout.scene_up,
+            )
+            if support_fraction > start_zone_support_fraction:
+                start_zone_support_fraction = float(support_fraction)
+                start_zone_support_id = int(target["support_id"])
+                start_zone_component_id = target.get("support_component_id")
+                start_zone_support_alias = target.get("support_alias")
+        print(
+            "[quest_display] rope game start zone: "
+            f"alias={start_zone_support_alias} "
+            f"component_id={start_zone_component_id} "
+            f"support_id={start_zone_support_id} "
+            f"radius_m={float(start_zone_radius_m):.3f} "
+            f"support_fraction={float(start_zone_support_fraction):.3f} "
+            f"center_world=({start_zone_center_world[0]:.3f},"
+            f"{start_zone_center_world[1]:.3f},"
+            f"{start_zone_center_world[2]:.3f})",
+            flush=True,
+        )
+        return {
+            "enabled": True,
+            "game_mode": str(resolved_course.get("game_mode", "")).strip().lower(),
+            "course_name": str(resolved_course["course_name"]).strip().lower(),
+            "rope_rest_span_m": float(rope_rest_span_m),
+            "resolved_targets": list(resolved_course["targets"]),
+            "start_zone_support_id": start_zone_support_id,
+            "start_zone_component_id": start_zone_component_id,
+            "start_zone_support_alias": start_zone_support_alias,
+            "start_zone_center_world": start_zone_center_world,
+            "start_zone_center_world_t": start_zone_center_world_t.detach().clone(),
+            "start_zone_radius_m": float(start_zone_radius_m),
+            "current_index": 0,
+            "state": "warmup",
+            "course_started_wall": None,
+            "target_started_wall": None,
+            "clear_started_wall": None,
+            "hold_started_wall": None,
+            "last_debug_log_wall": None,
+            "last_eval_object_points": None,
+            "split_times_s": [],
+            "last_split_time_s": None,
+            "final_total_time_s": None,
+            "last_metrics": {
+                "inside_fraction_contact": 0.0,
+                "target_support_contact_fraction": 0.0,
+                "released": True,
+                "in_start_zone": False,
+                "success_active": False,
+            },
+        }
+
+    def _restart_rope_game_runtime_state(self, rope_game_state, *, now_wall=None):
+        if rope_game_state is None:
+            return None
+        if now_wall is None:
+            now_wall = time.perf_counter()
+        rope_game_state["current_index"] = 0
+        rope_game_state["state"] = (
+            "target_active"
+            if rope_game_state.get("resolved_targets")
+            else "course_finished"
+        )
+        rope_game_state["course_started_wall"] = float(now_wall)
+        rope_game_state["target_started_wall"] = float(now_wall)
+        rope_game_state["clear_started_wall"] = None
+        rope_game_state["hold_started_wall"] = None
+        rope_game_state["last_debug_log_wall"] = None
+        rope_game_state["last_eval_object_points"] = None
+        rope_game_state["split_times_s"] = []
+        rope_game_state["last_split_time_s"] = None
+        rope_game_state["final_total_time_s"] = None
+        rope_game_state["last_metrics"] = {
+            "inside_fraction_contact": 0.0,
+            "target_support_contact_fraction": 0.0,
+            "released": True,
+            "in_start_zone": False,
+            "success_active": False,
+        }
+        return rope_game_state
+
+    def _evaluate_rope_game_runtime_state(
+        self,
+        rope_game_state,
+        object_points,
+        object_velocities,
+        scene_up,
+        controller_interaction_state=None,
+        *,
+        now_wall=None,
+    ):
+        if rope_game_state is None or not bool(rope_game_state.get("enabled", False)):
+            return None
+        if now_wall is None:
+            now_wall = time.perf_counter()
+        targets = rope_game_state.get("resolved_targets") or []
+        if not targets:
+            rope_game_state["state"] = "course_finished"
+            rope_game_state["final_total_time_s"] = 0.0
+            return rope_game_state["last_metrics"]
+
+        if rope_game_state["state"] == "warmup":
+            rope_game_state["state"] = "target_active"
+            rope_game_state["course_started_wall"] = float(now_wall)
+            rope_game_state["target_started_wall"] = float(now_wall)
+
+        if rope_game_state["state"] == "target_cleared":
+            clear_started_wall = rope_game_state.get("clear_started_wall")
+            if (
+                clear_started_wall is not None
+                and float(now_wall) - float(clear_started_wall)
+                >= float(self.ROPE_GAME_CLEAR_DISPLAY_SECONDS)
+            ):
+                rope_game_state["current_index"] = int(rope_game_state["current_index"]) + 1
+                if int(rope_game_state["current_index"]) >= len(targets):
+                    rope_game_state["current_index"] = len(targets) - 1
+                    rope_game_state["state"] = "course_finished"
+                    rope_game_state["final_total_time_s"] = float(
+                        rope_game_state.get("final_total_time_s")
+                        or (
+                            float(now_wall)
+                            - float(rope_game_state.get("course_started_wall", now_wall))
+                        )
+                    )
+                else:
+                    rope_game_state["state"] = "target_active"
+                    rope_game_state["target_started_wall"] = float(now_wall)
+                rope_game_state["clear_started_wall"] = None
+                rope_game_state["hold_started_wall"] = None
+                rope_game_state["last_debug_log_wall"] = None
+                rope_game_state["last_eval_object_points"] = None
+            return rope_game_state["last_metrics"]
+
+        if rope_game_state["state"] == "course_finished":
+            rope_game_state["last_eval_object_points"] = object_points.detach().clone()
+            return rope_game_state["last_metrics"]
+
+        target = targets[int(rope_game_state["current_index"])]
+        offsets = object_points - target["center_world_t"].unsqueeze(0)
+        local_long = torch.matmul(offsets, target["axis_long_world_t"])
+        local_short = torch.matmul(offsets, target["axis_short_world_t"])
+        inside_padding = float(self.ROPE_GAME_PAD_INSIDE_PADDING_M)
+        inside_mask = (
+            local_long.abs()
+            <= (0.5 * float(target["target_length_m"]) + inside_padding)
+        ) & (
+            local_short.abs()
+            <= (0.5 * float(target["target_width_m"]) + inside_padding)
+        )
+        target_support_contact_mask = self._scene_support_contact_mask(
+            object_points,
+            target["support_surface_boxes_t"],
+            scene_up,
+        )
+        if (
+            target_support_contact_mask is None
+            or int(target_support_contact_mask.numel()) == 0
+        ):
+            target_support_contact_fraction = 0.0
+            inside_fraction_contact = 0.0
+        else:
+            target_support_contact_fraction = float(
+                target_support_contact_mask.to(dtype=torch.float32).mean().item()
+            )
+            if bool(target_support_contact_mask.any().item()):
+                inside_fraction_contact = float(
+                    inside_mask[target_support_contact_mask]
+                    .to(dtype=torch.float32)
+                    .mean()
+                    .item()
+                )
+            else:
+                inside_fraction_contact = 0.0
+        released = bool(
+            controller_interaction_state is None
+            or (
+                controller_interaction_state.get("left") is None
+                and controller_interaction_state.get("right") is None
+            )
+        )
+        object_support_center_t = self._object_support_patch_center(object_points)
+        start_zone_support_id = rope_game_state.get("start_zone_support_id")
+        in_start_zone = False
+        if (
+            start_zone_support_id is not None
+            and int(target["support_id"]) == int(start_zone_support_id)
+        ):
+            scene_up_t = torch.as_tensor(
+                np.asarray(scene_up, dtype=np.float32).reshape(-1),
+                dtype=object_points.dtype,
+                device=object_points.device,
+            )
+            scene_up_norm = float(torch.linalg.norm(scene_up_t).item())
+            if scene_up_norm <= 1e-6:
+                scene_up_t = torch.tensor(
+                    [0.0, 1.0, 0.0],
+                    dtype=object_points.dtype,
+                    device=object_points.device,
+                )
+            else:
+                scene_up_t = scene_up_t / scene_up_norm
+            start_zone_center_world_t = rope_game_state.get("start_zone_center_world_t")
+            if start_zone_center_world_t is not None:
+                center_delta = object_support_center_t - start_zone_center_world_t.to(
+                    device=object_points.device,
+                    dtype=object_points.dtype,
+                )
+                lateral_delta = center_delta - torch.dot(center_delta, scene_up_t) * scene_up_t
+                in_start_zone = bool(
+                    torch.linalg.norm(lateral_delta).item()
+                    <= float(rope_game_state.get("start_zone_radius_m", 0.0))
+                )
+        success_active = bool(
+            released
+            and inside_fraction_contact
+            >= float(
+                target.get(
+                    "required_inside_fraction",
+                    self.ROPE_GAME_MIN_INSIDE_FRACTION_CONTACT,
+                )
+            )
+            and target_support_contact_fraction
+            >= float(self.ROPE_GAME_MIN_TARGET_SUPPORT_CONTACT_FRACTION)
+            and not in_start_zone
+        )
+
+        metrics = {
+            "inside_fraction_contact": float(inside_fraction_contact),
+            "target_support_contact_fraction": float(
+                target_support_contact_fraction
+            ),
+            "released": bool(released),
+            "in_start_zone": bool(in_start_zone),
+            "success_active": bool(success_active),
+        }
+        rope_game_state["last_metrics"] = metrics
+        rope_game_state["last_eval_object_points"] = object_points.detach().clone()
+        if not success_active:
+            last_debug_log_wall = rope_game_state.get("last_debug_log_wall")
+            if (
+                last_debug_log_wall is None
+                or float(now_wall) - float(last_debug_log_wall)
+                >= float(self.ROPE_GAME_DEBUG_LOG_INTERVAL_SECONDS)
+            ):
+                print(
+                    "[quest_display] rope game target pending: "
+                    f"index={int(rope_game_state['current_index']) + 1}/{len(targets)} "
+                    f"name={target['name']} "
+                    f"alias={target.get('support_alias')} "
+                    f"component_id={target.get('support_component_id')} "
+                    f"inside_fraction_contact={float(inside_fraction_contact):.3f} "
+                    f"target_support_contact_fraction={float(target_support_contact_fraction):.3f} "
+                    f"released={int(bool(released))} "
+                    f"in_start_zone={int(bool(in_start_zone))}",
+                    flush=True,
+                )
+                rope_game_state["last_debug_log_wall"] = float(now_wall)
+
+        if success_active:
+            target_started_wall = float(
+                rope_game_state.get("target_started_wall", now_wall)
+            )
+            split_time_s = max(0.0, float(now_wall) - target_started_wall)
+            rope_game_state["split_times_s"].append(float(split_time_s))
+            rope_game_state["last_split_time_s"] = float(split_time_s)
+            target_index = int(rope_game_state["current_index"]) + 1
+            print(
+                "[quest_display] rope game target cleared: "
+                f"index={target_index}/{len(targets)} name={target['name']} "
+                f"alias={target.get('support_alias')} "
+                f"component_id={target.get('support_component_id')} "
+                f"split_s={float(split_time_s):.3f}",
+                flush=True,
+            )
+            if int(rope_game_state["current_index"]) >= len(targets) - 1:
+                rope_game_state["state"] = "course_finished"
+                rope_game_state["final_total_time_s"] = max(
+                    0.0,
+                    float(now_wall)
+                    - float(rope_game_state.get("course_started_wall", now_wall)),
+                )
+                print(
+                    "[quest_display] rope game finished: "
+                    f"course={rope_game_state['course_name']} "
+                    f"total_s={float(rope_game_state['final_total_time_s']):.3f}",
+                    flush=True,
+                )
+            else:
+                rope_game_state["state"] = "target_cleared"
+                rope_game_state["clear_started_wall"] = float(now_wall)
+            rope_game_state["last_debug_log_wall"] = float(now_wall)
+        return metrics
+
+    def _build_rope_game_overlay_state(
+        self,
+        rope_game_state,
+        *,
+        left_eye_pose_world=None,
+        right_eye_pose_world=None,
+        left_intrinsic=None,
+        right_intrinsic=None,
+        now_wall=None,
+    ):
+        if rope_game_state is None or not bool(rope_game_state.get("enabled", False)):
+            return None
+        targets = rope_game_state.get("resolved_targets") or []
+        if not targets:
+            return None
+        if now_wall is None:
+            now_wall = time.perf_counter()
+        current_index = max(
+            0,
+            min(int(rope_game_state.get("current_index", 0)), len(targets) - 1),
+        )
+        target = targets[current_index]
+        state_name = str(rope_game_state.get("state", "warmup")).strip().lower()
+        metrics = rope_game_state.get("last_metrics") or {}
+        if state_name in {"target_cleared", "course_finished"}:
+            pad_color = self.ROPE_GAME_PAD_CLEAR_COLOR
+        elif bool(metrics.get("success_active", False)):
+            pad_color = self.ROPE_GAME_PAD_VALID_COLOR
+        elif bool(metrics.get("in_start_zone", False)):
+            pad_color = self.ROPE_GAME_PAD_ACTIVE_COLOR
+        elif not bool(metrics.get("released", True)):
+            pad_color = self.ROPE_GAME_PAD_ACTIVE_COLOR
+        else:
+            pad_color = self.ROPE_GAME_PAD_ACTIVE_COLOR
+        finish_modal_lines = None
+        finish_modal_world_corners = None
+        if state_name == "course_finished":
+            total_s = float(rope_game_state.get("final_total_time_s") or 0.0)
+            finish_modal_lines = [
+                "game finished",
+                f"time {total_s:.1f}s",
+                "press B/Y to play again",
+            ]
+            finish_modal_world_corners = self._make_rope_game_finish_modal_world_corners(
+                finish_modal_lines,
+                left_eye_pose_world=left_eye_pose_world,
+                right_eye_pose_world=right_eye_pose_world,
+                left_intrinsic=left_intrinsic,
+                right_intrinsic=right_intrinsic,
+            )
+        return {
+            "target_index": int(current_index),
+            "state": state_name,
+            "pad_color": list(pad_color),
+            "pad_corners_world": (
+                None
+                if state_name == "course_finished"
+                else np.asarray(
+                    target["pad_corners_world"],
+                    dtype=np.float32,
+                ).copy()
+            ),
+            "finish_modal_lines": finish_modal_lines,
+            "finish_modal_world_corners": finish_modal_world_corners,
+        }
 
     def _render_profile_new_frame(self, enabled):
         if not enabled:
@@ -11171,6 +12376,771 @@ class InvPhyTrainerWarp:
             blend=blend,
         )
 
+    def _blend_rgba_patch_masked_inplace(
+        self,
+        rgba_patch,
+        mask,
+        color,
+        *,
+        alpha=255.0,
+        blend=1.0,
+    ):
+        if rgba_patch is None or rgba_patch.numel() == 0 or mask is None:
+            return
+        mask_t = mask.to(device=rgba_patch.device)
+        if mask_t.dtype != torch.bool:
+            mask_t = mask_t != 0
+        if not bool(mask_t.any().item()):
+            return
+        self._blend_rgb_patch_masked_inplace(
+            rgba_patch[..., :3],
+            mask_t,
+            color,
+            blend=blend,
+        )
+        alpha_patch = rgba_patch[..., 3]
+        alpha_value = float(alpha) * float(max(blend, 0.0))
+        if torch.is_floating_point(alpha_patch):
+            alpha_patch[mask_t] = torch.maximum(
+                alpha_patch[mask_t],
+                alpha_patch.new_full(alpha_patch[mask_t].shape, alpha_value),
+            )
+            return
+        if alpha_patch.dtype == torch.uint8:
+            alpha_patch[mask_t] = torch.maximum(
+                alpha_patch[mask_t],
+                alpha_patch.new_full(
+                    alpha_patch[mask_t].shape,
+                    int(round(max(0.0, min(255.0, alpha_value)))),
+                    dtype=torch.uint8,
+                ),
+            )
+            return
+        dtype_info = torch.iinfo(alpha_patch.dtype)
+        alpha_patch[mask_t] = torch.maximum(
+            alpha_patch[mask_t],
+            alpha_patch.new_full(
+                alpha_patch[mask_t].shape,
+                int(
+                    round(
+                        max(
+                            float(dtype_info.min),
+                            min(float(dtype_info.max), alpha_value),
+                        )
+                    )
+                ),
+                dtype=alpha_patch.dtype,
+            ),
+        )
+
+    def _draw_marker_line_rgba(
+        self,
+        rgba_patch,
+        start_pixel,
+        end_pixel,
+        color,
+        *,
+        radius=1,
+        alpha=255.0,
+        blend=1.0,
+    ):
+        height, width = rgba_patch.shape[:2]
+        start_x = float(start_pixel[0].item())
+        start_y = float(start_pixel[1].item())
+        end_x = float(end_pixel[0].item())
+        end_y = float(end_pixel[1].item())
+
+        min_x = max(0, int(np.floor(min(start_x, end_x) - radius - 1)))
+        max_x = min(width, int(np.ceil(max(start_x, end_x) + radius + 2)))
+        min_y = max(0, int(np.floor(min(start_y, end_y) - radius - 1)))
+        max_y = min(height, int(np.ceil(max(start_y, end_y) + radius + 2)))
+        if min_x >= max_x or min_y >= max_y:
+            return
+
+        seg_x = end_x - start_x
+        seg_y = end_y - start_y
+        seg_len_sq = seg_x * seg_x + seg_y * seg_y
+        if seg_len_sq < 1e-6:
+            ys = torch.arange(min_y, max_y, device=rgba_patch.device, dtype=torch.float32)
+            xs = torch.arange(min_x, max_x, device=rgba_patch.device, dtype=torch.float32)
+            grid_y, grid_x = torch.meshgrid(ys, xs, indexing="ij")
+            point_mask = torch.maximum(
+                torch.abs(grid_x - start_x),
+                torch.abs(grid_y - start_y),
+            ) <= (float(radius) + 0.5)
+            self._blend_rgba_patch_masked_inplace(
+                rgba_patch[min_y:max_y, min_x:max_x],
+                point_mask,
+                color,
+                alpha=alpha,
+                blend=blend,
+            )
+            return
+
+        ys = torch.arange(min_y, max_y, device=rgba_patch.device, dtype=torch.float32)
+        xs = torch.arange(min_x, max_x, device=rgba_patch.device, dtype=torch.float32)
+        grid_y, grid_x = torch.meshgrid(ys, xs, indexing="ij")
+        rel_x = grid_x - start_x
+        rel_y = grid_y - start_y
+        t = (rel_x * seg_x + rel_y * seg_y) / seg_len_sq
+        t = torch.clamp(t, 0.0, 1.0)
+        closest_x = start_x + t * seg_x
+        closest_y = start_y + t * seg_y
+        dist_x = torch.abs(grid_x - closest_x)
+        dist_y = torch.abs(grid_y - closest_y)
+        line_mask = torch.maximum(dist_x, dist_y) <= (float(radius) + 0.5)
+        self._blend_rgba_patch_masked_inplace(
+            rgba_patch[min_y:max_y, min_x:max_x],
+            line_mask,
+            color,
+            alpha=alpha,
+            blend=blend,
+        )
+
+    def _alpha_composite_rgba_patch_into_frame(
+        self,
+        frame,
+        overlay_color_rgba,
+        x0,
+        y0,
+        *,
+        coverage_mask=None,
+    ):
+        if frame is None or overlay_color_rgba is None or overlay_color_rgba.numel() == 0:
+            return
+        x0 = int(x0)
+        y0 = int(y0)
+        height, width = frame.shape[:2]
+        patch_h = int(overlay_color_rgba.shape[0])
+        patch_w = int(overlay_color_rgba.shape[1])
+        if patch_h <= 0 or patch_w <= 0:
+            return
+        x1 = min(width, x0 + patch_w)
+        y1 = min(height, y0 + patch_h)
+        if x0 >= x1 or y0 >= y1:
+            return
+        overlay_patch = overlay_color_rgba[: y1 - y0, : x1 - x0]
+        alpha = overlay_patch[..., 3:4].to(torch.float32).clamp(0.0, 255.0) / 255.0
+        if coverage_mask is not None:
+            coverage_t = coverage_mask[: y1 - y0, : x1 - x0].to(
+                device=frame.device,
+                dtype=torch.float32,
+            )
+            alpha = alpha * coverage_t.unsqueeze(-1)
+        if not bool((alpha > 0.0).any().item()):
+            return
+        frame_rgb = frame[y0:y1, x0:x1, :3]
+        overlay_rgb = overlay_patch[..., :3].to(torch.float32)
+        blended = frame_rgb.to(torch.float32).mul(1.0 - alpha).add(overlay_rgb * alpha)
+        if torch.is_floating_point(frame_rgb):
+            frame_rgb.copy_(blended.to(frame_rgb.dtype))
+            return
+        if frame_rgb.dtype == torch.uint8:
+            frame_rgb.copy_(blended.round().clamp(0.0, 255.0).to(torch.uint8))
+            return
+        dtype_info = torch.iinfo(frame_rgb.dtype)
+        frame_rgb.copy_(
+            blended.round()
+            .clamp(float(dtype_info.min), float(dtype_info.max))
+            .to(frame_rgb.dtype)
+        )
+
+    def _render_rope_game_supersampled_outline_roi(
+        self,
+        frame,
+        quad_pixels,
+        color,
+    ):
+        if frame is None or quad_pixels is None:
+            return None
+        quad_pixels_t = torch.as_tensor(
+            quad_pixels,
+            dtype=torch.float32,
+            device=frame.device,
+        )
+        if quad_pixels_t.ndim != 2 or quad_pixels_t.shape != (4, 2):
+            return None
+        height, width = frame.shape[:2]
+        padding = int(
+            max(
+                self.ROPE_GAME_OUTLINE_ROI_PADDING_PX,
+                self.ROPE_GAME_PAD_OUTLINE_RADIUS + 2,
+            )
+        )
+        x0 = max(0, int(torch.floor(quad_pixels_t[:, 0].min()).item()) - padding)
+        x1 = min(width, int(torch.ceil(quad_pixels_t[:, 0].max()).item()) + padding + 1)
+        y0 = max(0, int(torch.floor(quad_pixels_t[:, 1].min()).item()) - padding)
+        y1 = min(height, int(torch.ceil(quad_pixels_t[:, 1].max()).item()) + padding + 1)
+        if x0 >= x1 or y0 >= y1:
+            return None
+
+        target_w = int(x1 - x0)
+        target_h = int(y1 - y0)
+        supersample_scale = int(max(1, self.ROPE_GAME_OUTLINE_SUPERSAMPLE_SCALE))
+        sup_w = int(target_w * supersample_scale)
+        sup_h = int(target_h * supersample_scale)
+        overlay_color_rgba = torch.zeros(
+            (sup_h, sup_w, 4),
+            dtype=torch.float32,
+            device=frame.device,
+        )
+        overlay_depth = torch.zeros(
+            (sup_h, sup_w),
+            dtype=torch.float32,
+            device=frame.device,
+        )
+
+        local_quad_pixels = (
+            quad_pixels_t
+            - quad_pixels_t.new_tensor([float(x0), float(y0)])
+        ) * float(supersample_scale)
+        line_radius = max(
+            1,
+            int(round(float(self.ROPE_GAME_PAD_OUTLINE_RADIUS) * float(supersample_scale))),
+        )
+        for start_idx in range(4):
+            end_idx = (start_idx + 1) % 4
+            self._draw_marker_line_rgba(
+                overlay_color_rgba,
+                local_quad_pixels[start_idx],
+                local_quad_pixels[end_idx],
+                color,
+                radius=line_radius,
+                alpha=255.0,
+                blend=1.0,
+            )
+        overlay_coverage = overlay_color_rgba[..., 3] >= 1.0
+        if not bool(overlay_coverage.any().item()):
+            return None
+        overlay_depth[overlay_coverage] = 1.0
+        color_down, _, coverage_down = self._downsample_immersive_supersampled_overlay_patch(
+            overlay_color_rgba,
+            overlay_depth,
+            target_h,
+            target_w,
+        )
+        return {
+            "x0": int(x0),
+            "y0": int(y0),
+            "color_rgba": color_down,
+            "coverage_mask": coverage_down,
+        }
+
+    def _get_rope_game_pad_texture_cache(self):
+        cache = getattr(self, "_rope_game_pad_texture_cache_data", None)
+        if cache is None:
+            cache = {}
+            self._rope_game_pad_texture_cache_data = cache
+        return cache
+
+    def _build_rope_game_pad_texture_rgba(self, color):
+        color_rgb = tuple(
+            int(np.clip(round(float(channel)), 0, 255))
+            for channel in list(color[:3])
+        )
+        cache = self._get_rope_game_pad_texture_cache()
+        cached = cache.get(color_rgb)
+        if cached is not None:
+            return cached
+
+        size_px = int(max(32, self.ROPE_GAME_PAD_TEXTURE_SIZE_PX))
+        margin_px = int(max(2, self.ROPE_GAME_PAD_TEXTURE_MARGIN_PX))
+        thickness_px = int(max(1, self.ROPE_GAME_PAD_TEXTURE_THICKNESS_PX))
+        alpha_value = int(
+            np.clip(
+                round(float(self.ROPE_GAME_PAD_OUTLINE_BLEND) * 255.0),
+                0,
+                255,
+            )
+        )
+
+        texture_bgra = np.zeros((size_px, size_px, 4), dtype=np.uint8)
+        border_max = max(margin_px, size_px - margin_px - 1)
+        top_left = (margin_px, margin_px)
+        bottom_right = (border_max, border_max)
+        draw_color = (
+            int(color_rgb[2]),
+            int(color_rgb[1]),
+            int(color_rgb[0]),
+            alpha_value,
+        )
+        cv2.rectangle(
+            texture_bgra,
+            top_left,
+            bottom_right,
+            draw_color,
+            thickness=thickness_px,
+            lineType=cv2.LINE_AA,
+        )
+        texture_rgba = cv2.cvtColor(texture_bgra, cv2.COLOR_BGRA2RGBA)
+        texture_entry = {
+            "texture_rgba": texture_rgba,
+            "width_px": int(size_px),
+            "height_px": int(size_px),
+            "aspect_ratio": 1.0,
+        }
+        if len(cache) >= 8:
+            cache.clear()
+        cache[color_rgb] = texture_entry
+        return texture_entry
+
+    def _render_rope_game_outline_quad_roi(
+        self,
+        frame,
+        quad_pixels,
+        color,
+        *,
+        padding=4,
+        max_projected_span_ratio=None,
+    ):
+        if frame is None or quad_pixels is None:
+            return None
+        quad_pixels_np = np.asarray(quad_pixels, dtype=np.float32)
+        if quad_pixels_np.shape != (4, 2) or not np.all(np.isfinite(quad_pixels_np)):
+            return None
+
+        quad_area = float(abs(cv2.contourArea(quad_pixels_np.reshape(-1, 1, 2))))
+        if quad_area < 4.0:
+            return None
+
+        height, width = frame.shape[:2]
+        if max_projected_span_ratio is not None:
+            max_projected_span_ratio = float(max_projected_span_ratio)
+            raw_span_x = float(np.max(quad_pixels_np[:, 0]) - np.min(quad_pixels_np[:, 0]))
+            raw_span_y = float(np.max(quad_pixels_np[:, 1]) - np.min(quad_pixels_np[:, 1]))
+            if (
+                raw_span_x > (float(width) * max_projected_span_ratio)
+                or raw_span_y > (float(height) * max_projected_span_ratio)
+            ):
+                return None
+
+        x0 = max(0, int(np.floor(np.min(quad_pixels_np[:, 0])) - int(padding)))
+        x1 = min(width, int(np.ceil(np.max(quad_pixels_np[:, 0])) + int(padding) + 1))
+        y0 = max(0, int(np.floor(np.min(quad_pixels_np[:, 1])) - int(padding)))
+        y1 = min(height, int(np.ceil(np.max(quad_pixels_np[:, 1])) + int(padding) + 1))
+        if x0 >= x1 or y0 >= y1:
+            return None
+
+        target_w = int(x1 - x0)
+        target_h = int(y1 - y0)
+        longest_edge = float(max(target_w, target_h))
+        if longest_edge <= 0.0:
+            return None
+
+        if longest_edge <= 256.0:
+            desired_scale = float(self.ROPE_GAME_OUTLINE_SUPERSAMPLE_MAX_SCALE)
+        else:
+            desired_scale = float(self.ROPE_GAME_OUTLINE_SUPERSAMPLE_SCALE)
+        min_scale = float(self.ROPE_GAME_OUTLINE_SUPERSAMPLE_MIN_SCALE)
+        max_edge_scale = float(self.ROPE_GAME_OUTLINE_SUPERSAMPLE_MAX_EDGE_PX) / longest_edge
+        supersample_scale = min(desired_scale, max_edge_scale)
+        if max_edge_scale >= min_scale:
+            supersample_scale = max(supersample_scale, min_scale)
+        supersample_scale = max(1.0, supersample_scale)
+
+        sup_w = max(1, int(round(float(target_w) * supersample_scale)))
+        sup_h = max(1, int(round(float(target_h) * supersample_scale)))
+        outline_bgra = np.zeros((sup_h, sup_w, 4), dtype=np.uint8)
+        local_quad = (
+            quad_pixels_np - np.array([float(x0), float(y0)], dtype=np.float32)
+        ) * supersample_scale
+
+        final_line_width_px = max(1, int(2 * int(self.ROPE_GAME_PAD_OUTLINE_RADIUS) - 1))
+        supersampled_thickness = max(
+            1,
+            int(round(float(final_line_width_px) * supersample_scale)),
+        )
+        alpha_value = int(
+            np.clip(
+                round(float(self.ROPE_GAME_PAD_OUTLINE_BLEND) * 255.0),
+                0,
+                255,
+            )
+        )
+        color_bgra = (
+            int(np.clip(round(float(color[2])), 0, 255)),
+            int(np.clip(round(float(color[1])), 0, 255)),
+            int(np.clip(round(float(color[0])), 0, 255)),
+            alpha_value,
+        )
+        fixed_point_shift = 8
+        local_quad_fixed = np.round(
+            local_quad * float(1 << fixed_point_shift)
+        ).astype(np.int32)
+        cv2.polylines(
+            outline_bgra,
+            [local_quad_fixed.reshape(-1, 1, 2)],
+            isClosed=True,
+            color=color_bgra,
+            thickness=supersampled_thickness,
+            lineType=cv2.LINE_AA,
+            shift=fixed_point_shift,
+        )
+        if not np.any(outline_bgra[..., 3] > 0):
+            return None
+
+        outline_bgra_down = cv2.resize(
+            outline_bgra,
+            (target_w, target_h),
+            interpolation=cv2.INTER_AREA,
+        )
+        if outline_bgra_down.size == 0 or not np.any(outline_bgra_down[..., 3] > 0):
+            return None
+        outline_rgba_down = cv2.cvtColor(outline_bgra_down, cv2.COLOR_BGRA2RGBA)
+        return {
+            "x0": int(x0),
+            "y0": int(y0),
+            "color_rgba": torch.from_numpy(outline_rgba_down).to(
+                device=frame.device,
+                dtype=torch.float32,
+            ),
+            "coverage_mask": torch.from_numpy(outline_rgba_down[..., 3] > 0).to(
+                device=frame.device,
+            ),
+        }
+
+    def _get_rope_game_finish_modal_texture_cache(self):
+        cache = getattr(self, "_rope_game_finish_modal_texture_cache_data", None)
+        if cache is None:
+            cache = {}
+            self._rope_game_finish_modal_texture_cache_data = cache
+        return cache
+
+    def _build_rope_game_finish_modal_texture_rgba(
+        self,
+        finish_modal_lines,
+    ):
+        if not finish_modal_lines:
+            return None
+        finish_modal_key = tuple(str(line) for line in finish_modal_lines)
+        cache = self._get_rope_game_finish_modal_texture_cache()
+        cached = cache.get(finish_modal_key)
+        if cached is not None:
+            return cached
+
+        scale_multiplier = float(self.ROPE_GAME_FINISH_MODAL_TEXTURE_SCALE_MULTIPLIER)
+        body_scale = float(
+            np.clip(
+                float(self.ROPE_GAME_FINISH_MODAL_SCALE) * scale_multiplier,
+                float(self.ROPE_GAME_FINISH_MODAL_MIN_SCALE) * scale_multiplier,
+                float(self.ROPE_GAME_FINISH_MODAL_MAX_SCALE) * scale_multiplier,
+            )
+        )
+        title_scale = body_scale * float(
+            self.ROPE_GAME_FINISH_MODAL_TITLE_SCALE_MULTIPLIER
+        )
+        font_face = cv2.FONT_HERSHEY_DUPLEX
+        body_thickness = 2 if body_scale < 1.6 else 3
+        title_thickness = max(2, body_thickness)
+        line_gap = max(16, int(round(18.0 * body_scale)))
+        pad_x = max(28, int(round(28.0 * body_scale)))
+        pad_y = max(22, int(round(22.0 * body_scale)))
+        shadow_offset = max(2, int(round(2.0 * body_scale)))
+
+        line_specs = []
+        for line_idx, line in enumerate(finish_modal_lines):
+            line_scale = title_scale if line_idx == 0 else body_scale
+            line_thickness = title_thickness if line_idx == 0 else body_thickness
+            (text_w, text_h), baseline = cv2.getTextSize(
+                str(line),
+                font_face,
+                line_scale,
+                line_thickness,
+            )
+            line_specs.append(
+                {
+                    "text": str(line),
+                    "scale": float(line_scale),
+                    "thickness": int(line_thickness),
+                    "text_w": int(text_w),
+                    "text_h": int(text_h),
+                    "baseline": int(baseline),
+                }
+            )
+        if not line_specs:
+            return None
+
+        content_width = max(spec["text_w"] for spec in line_specs)
+        content_height = sum(
+            spec["text_h"] + spec["baseline"] for spec in line_specs
+        ) + max(0, len(line_specs) - 1) * line_gap
+        box_width = int(content_width + 2 * pad_x)
+        box_height = int(content_height + 2 * pad_y)
+        if box_width <= 0 or box_height <= 0:
+            return None
+
+        modal_patch = np.zeros((box_height, box_width, 4), dtype=np.uint8)
+        bg_alpha = int(
+            np.clip(round(float(self.ROPE_GAME_FINISH_MODAL_BG_BLEND) * 255.0), 0, 255)
+        )
+        text_alpha = int(
+            np.clip(
+                round(float(self.ROPE_GAME_FINISH_MODAL_TEXT_BLEND) * 255.0),
+                0,
+                255,
+            )
+        )
+        shadow_alpha = int(
+            np.clip(
+                round(float(self.ROPE_GAME_FINISH_MODAL_SHADOW_BLEND) * 255.0),
+                0,
+                255,
+            )
+        )
+        modal_patch[..., 3] = bg_alpha
+
+        cursor_y = int(pad_y)
+        for spec in line_specs:
+            text_x = max(0, (box_width - spec["text_w"]) // 2)
+            baseline_y = int(cursor_y + spec["text_h"])
+            if shadow_alpha > 0:
+                cv2.putText(
+                    modal_patch,
+                    spec["text"],
+                    (text_x + shadow_offset, baseline_y + shadow_offset),
+                    font_face,
+                    spec["scale"],
+                    (0, 0, 0, shadow_alpha),
+                    max(2, spec["thickness"] + 1),
+                    lineType=cv2.LINE_AA,
+                )
+            cv2.putText(
+                modal_patch,
+                spec["text"],
+                (text_x, baseline_y),
+                font_face,
+                spec["scale"],
+                (255, 255, 255, text_alpha),
+                spec["thickness"],
+                lineType=cv2.LINE_AA,
+            )
+            cursor_y += spec["text_h"] + spec["baseline"] + line_gap
+
+        texture_entry = {
+            "texture_rgba": modal_patch,
+            "width_px": int(box_width),
+            "height_px": int(box_height),
+            "aspect_ratio": float(box_height) / max(float(box_width), 1.0),
+        }
+        if len(cache) >= 8:
+            cache.clear()
+        cache[finish_modal_key] = texture_entry
+        return texture_entry
+
+    def _render_rope_game_textured_quad_roi(
+        self,
+        frame,
+        texture_entry,
+        quad_pixels,
+        *,
+        padding=4,
+        max_projected_span_ratio=None,
+    ):
+        if frame is None or texture_entry is None or quad_pixels is None:
+            return None
+        texture_rgba = texture_entry.get("texture_rgba")
+        if texture_rgba is None or int(texture_rgba.size) == 0:
+            return None
+        quad_pixels_np = np.asarray(quad_pixels, dtype=np.float32)
+        if quad_pixels_np.shape != (4, 2) or not np.all(np.isfinite(quad_pixels_np)):
+            return None
+
+        quad_area = float(abs(cv2.contourArea(quad_pixels_np.reshape(-1, 1, 2))))
+        if quad_area < 4.0:
+            return None
+
+        height, width = frame.shape[:2]
+        if max_projected_span_ratio is not None:
+            max_projected_span_ratio = float(max_projected_span_ratio)
+            raw_span_x = float(np.max(quad_pixels_np[:, 0]) - np.min(quad_pixels_np[:, 0]))
+            raw_span_y = float(np.max(quad_pixels_np[:, 1]) - np.min(quad_pixels_np[:, 1]))
+            if (
+                raw_span_x > (float(width) * max_projected_span_ratio)
+                or raw_span_y > (float(height) * max_projected_span_ratio)
+            ):
+                return None
+
+        x0 = max(0, int(np.floor(np.min(quad_pixels_np[:, 0])) - int(padding)))
+        x1 = min(width, int(np.ceil(np.max(quad_pixels_np[:, 0])) + int(padding) + 1))
+        y0 = max(0, int(np.floor(np.min(quad_pixels_np[:, 1])) - int(padding)))
+        y1 = min(height, int(np.ceil(np.max(quad_pixels_np[:, 1])) + int(padding) + 1))
+        if x0 >= x1 or y0 >= y1:
+            return None
+
+        local_quad = quad_pixels_np - np.array([float(x0), float(y0)], dtype=np.float32)
+        tex_h, tex_w = texture_rgba.shape[:2]
+        src_quad = np.array(
+            [
+                [0.0, 0.0],
+                [float(tex_w - 1), 0.0],
+                [float(tex_w - 1), float(tex_h - 1)],
+                [0.0, float(tex_h - 1)],
+            ],
+            dtype=np.float32,
+        )
+        warp_matrix = cv2.getPerspectiveTransform(src_quad, local_quad.astype(np.float32))
+        warped_rgba = cv2.warpPerspective(
+            texture_rgba,
+            warp_matrix,
+            (int(x1 - x0), int(y1 - y0)),
+            flags=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=(0, 0, 0, 0),
+        )
+        if warped_rgba.size == 0 or not np.any(warped_rgba[..., 3] > 0):
+            return None
+
+        return {
+            "x0": int(x0),
+            "y0": int(y0),
+            "color_rgba": torch.from_numpy(warped_rgba).to(
+                device=frame.device,
+                dtype=torch.float32,
+            ),
+            "coverage_mask": torch.from_numpy(warped_rgba[..., 3] > 0).to(
+                device=frame.device,
+            ),
+        }
+
+    def _make_rope_game_finish_modal_world_corners(
+        self,
+        finish_modal_lines,
+        *,
+        left_eye_pose_world,
+        right_eye_pose_world,
+        left_intrinsic,
+        right_intrinsic,
+    ):
+        if not finish_modal_lines:
+            return None
+        if left_eye_pose_world is None and right_eye_pose_world is None:
+            return None
+        texture_entry = self._build_rope_game_finish_modal_texture_rgba(
+            finish_modal_lines
+        )
+        if texture_entry is None:
+            return None
+        try:
+            center_eye_pose_world, _ = self._build_immersive_center_scene_view(
+                left_eye_pose_world,
+                right_eye_pose_world,
+                left_intrinsic,
+                right_intrinsic,
+            )
+        except ValueError:
+            return None
+
+        card_width = float(self.ROPE_GAME_FINISH_MODAL_WORLD_WIDTH_M)
+        card_height = min(
+            card_width * float(texture_entry["aspect_ratio"]),
+            float(self.ROPE_GAME_FINISH_MODAL_WORLD_MAX_HEIGHT_M),
+        )
+        if card_width <= 0.0 or card_height <= 0.0:
+            return None
+
+        card_center = (
+            np.asarray(center_eye_pose_world[:3, 3], dtype=np.float32)
+            + self._eye_forward_world(center_eye_pose_world).astype(np.float32)
+            * float(self.ROPE_GAME_FINISH_MODAL_WORLD_DEPTH_M)
+        )
+        right_world = np.asarray(center_eye_pose_world[:3, 0], dtype=np.float32)
+        up_world = np.asarray(center_eye_pose_world[:3, 1], dtype=np.float32)
+        half_width = 0.5 * card_width
+        half_height = 0.5 * card_height
+        return np.stack(
+            [
+                card_center - right_world * half_width + up_world * half_height,
+                card_center + right_world * half_width + up_world * half_height,
+                card_center + right_world * half_width - up_world * half_height,
+                card_center - right_world * half_width - up_world * half_height,
+            ],
+            axis=0,
+        ).astype(np.float32)
+
+    def _render_rope_game_finish_modal_quad_roi(
+        self,
+        frame,
+        texture_entry,
+        quad_pixels,
+    ):
+        return self._render_rope_game_textured_quad_roi(
+            frame,
+            texture_entry,
+            quad_pixels,
+            padding=4,
+        )
+
+    def _draw_rope_game_overlay(self, frame, rope_game_overlay_state, eye_render_state):
+        if frame is None or rope_game_overlay_state is None or eye_render_state is None:
+            return
+        state_name = str(rope_game_overlay_state.get("state", "")).strip().lower()
+        quad_world = rope_game_overlay_state.get("pad_corners_world")
+        if quad_world is not None:
+            quad_pixels, depth_valid = self._project_points_to_pixels(
+                torch.as_tensor(
+                    quad_world,
+                    dtype=torch.float32,
+                    device=frame.device,
+                ),
+                eye_render_state.get("intrinsic_t"),
+                eye_render_state.get("w2c_cv_t"),
+            )
+            if bool(depth_valid.all().item()):
+                pad_color = rope_game_overlay_state.get(
+                    "pad_color",
+                    self.ROPE_GAME_PAD_ACTIVE_COLOR,
+                )
+                overlay_roi = self._render_rope_game_outline_quad_roi(
+                    frame,
+                    quad_pixels.detach().cpu().numpy(),
+                    pad_color,
+                    padding=self.ROPE_GAME_OUTLINE_ROI_PADDING_PX,
+                    max_projected_span_ratio=self.ROPE_GAME_PAD_MAX_PROJECTED_SPAN_RATIO,
+                )
+                if overlay_roi is not None:
+                    self._alpha_composite_rgba_patch_into_frame(
+                        frame,
+                        overlay_roi["color_rgba"],
+                        overlay_roi["x0"],
+                        overlay_roi["y0"],
+                        coverage_mask=overlay_roi.get("coverage_mask"),
+                    )
+        finish_modal_lines = rope_game_overlay_state.get("finish_modal_lines") or []
+        finish_modal_world_corners = rope_game_overlay_state.get(
+            "finish_modal_world_corners"
+        )
+        if (
+            state_name == "course_finished"
+            and finish_modal_lines
+            and finish_modal_world_corners is not None
+        ):
+            quad_pixels, depth_valid = self._project_points_to_pixels(
+                torch.as_tensor(
+                    finish_modal_world_corners,
+                    dtype=torch.float32,
+                    device=frame.device,
+                ),
+                eye_render_state.get("intrinsic_t"),
+                eye_render_state.get("w2c_cv_t"),
+            )
+            if bool(depth_valid.all().item()):
+                texture_entry = self._build_rope_game_finish_modal_texture_rgba(
+                    finish_modal_lines
+                )
+                finish_modal = self._render_rope_game_finish_modal_quad_roi(
+                    frame,
+                    texture_entry,
+                    quad_pixels.detach().cpu().numpy(),
+                )
+                if finish_modal is not None:
+                    self._alpha_composite_rgba_patch_into_frame(
+                        frame,
+                        finish_modal["color_rgba"],
+                        finish_modal["x0"],
+                        finish_modal["y0"],
+                        coverage_mask=finish_modal.get("coverage_mask"),
+                    )
+
     def _mirror_symbol_about_palm(self, projected):
         mirrored = {"palm": projected["palm"]}
         palm = projected["palm"]
@@ -11733,6 +13703,7 @@ class InvPhyTrainerWarp:
         return {
             "state": "pending",
             "resolved": False,
+            "resolved_from": "none",
             "basis": head_basis_t.clone(),
             "head_basis": head_basis_t,
             "lateral_flip_applied": False,
@@ -11740,6 +13711,9 @@ class InvPhyTrainerWarp:
             "validation_mode": "pending",
             "validation_sample_id": None,
             "live_lateral_delta_x": None,
+            "single_source_name": None,
+            "single_source_live_x": None,
+            "single_source_projected_offset_x": None,
             "provisional_left_body_x": None,
             "provisional_right_body_x": None,
             "provisional_left_ray_x": None,
@@ -11749,11 +13723,18 @@ class InvPhyTrainerWarp:
             "final_left_ray_x": None,
             "final_right_ray_x": None,
             "candidate_flip": None,
+            "candidate_validation_mode": None,
             "candidate_streak": 0,
             "resolution_start_sample": None,
             "resolution_deadline_sample": None,
             "lock_reason": None,
             "lock_sample_id": None,
+            "seen_sources_ever": [],
+            "current_stable_sources": [],
+            "source_present_counts": {"left": 0, "right": 0},
+            "source_absent_counts": {"left": 0, "right": 0},
+            "pending_revalidation": False,
+            "pending_revalidation_reason": None,
             "late_controller_seen_after_lock": [],
             "locked_active_sources": [],
         }
@@ -11914,10 +13895,21 @@ class InvPhyTrainerWarp:
             f"sample={controller_basis_state['validation_sample_id']} "
             f"state={controller_basis_state.get('state', 'unknown')} "
             f"mode={controller_basis_state['validation_mode']} "
+            f"resolved_from={controller_basis_state.get('resolved_from', 'none')} "
             f"candidate_streak={int(controller_basis_state.get('candidate_streak', 0))} "
             f"lock_reason={controller_basis_state.get('lock_reason')} "
+            "stable_sources="
+            f"{controller_basis_state.get('current_stable_sources', [])} "
+            "seen_sources_ever="
+            f"{controller_basis_state.get('seen_sources_ever', [])} "
+            "pending_revalidation="
+            f"{int(bool(controller_basis_state.get('pending_revalidation', False)))} "
             f"screen_center_x={controller_basis_state['screen_center_x']:.2f} "
             f"live_lateral_delta_x={_fmt(controller_basis_state['live_lateral_delta_x'])} "
+            f"single_source={controller_basis_state.get('single_source_name')} "
+            f"single_source_live_x={_fmt(controller_basis_state.get('single_source_live_x'))} "
+            "single_source_projected_offset_x="
+            f"{_fmt(controller_basis_state.get('single_source_projected_offset_x'))} "
             f"provisional_left_body_x={_fmt(controller_basis_state['provisional_left_body_x'])} "
             f"provisional_right_body_x={_fmt(controller_basis_state['provisional_right_body_x'])} "
             f"provisional_left_ray_x={_fmt(controller_basis_state['provisional_left_ray_x'])} "
@@ -11939,6 +13931,179 @@ class InvPhyTrainerWarp:
             if controller_runtime_state.get(f"{source}_controller") is not None:
                 active_sources.append(source)
         return active_sources
+
+    def _update_immersive_controller_source_presence_state(
+        self,
+        controller_runtime_state,
+        controller_basis_state,
+        sample_id,
+    ):
+        updated_controller_basis_state = dict(controller_basis_state)
+        present_counts = dict(
+            updated_controller_basis_state.get(
+                "source_present_counts",
+                {"left": 0, "right": 0},
+            )
+        )
+        absent_counts = dict(
+            updated_controller_basis_state.get(
+                "source_absent_counts",
+                {"left": 0, "right": 0},
+            )
+        )
+        stable_sources = set(
+            updated_controller_basis_state.get("current_stable_sources", [])
+        )
+        seen_sources_ever = list(
+            updated_controller_basis_state.get("seen_sources_ever", [])
+        )
+        seen_sources_ever_set = set(seen_sources_ever)
+        raw_active_sources = set(
+            self._controller_basis_active_sources(controller_runtime_state)
+        )
+        first_time_join_sources = []
+        reconnect_sources = []
+
+        for source in ("left", "right"):
+            if source in raw_active_sources:
+                present_counts[source] = int(present_counts.get(source, 0)) + 1
+                absent_counts[source] = 0
+                if (
+                    source not in stable_sources
+                    and present_counts[source]
+                    >= int(self.IMMERSIVE_CONTROLLER_SOURCE_PRESENT_CONFIRM_SAMPLES)
+                ):
+                    stable_sources.add(source)
+                    if source in seen_sources_ever_set:
+                        reconnect_sources.append(source)
+                        event = "reconnect"
+                    else:
+                        first_time_join_sources.append(source)
+                        seen_sources_ever.append(source)
+                        seen_sources_ever_set.add(source)
+                        event = "first_join"
+                    ordered_stable_sources = [
+                        candidate
+                        for candidate in ("left", "right")
+                        if candidate in stable_sources
+                    ]
+                    print(
+                        "[live_openxr_controller] immersive controller source presence: "
+                        f"sample={sample_id} source={source} event={event} "
+                        f"stable_sources={ordered_stable_sources} "
+                        f"seen_sources_ever={seen_sources_ever}",
+                        flush=True,
+                    )
+            else:
+                absent_counts[source] = int(absent_counts.get(source, 0)) + 1
+                present_counts[source] = 0
+                if (
+                    source in stable_sources
+                    and absent_counts[source]
+                    >= int(self.IMMERSIVE_CONTROLLER_SOURCE_ABSENT_CONFIRM_SAMPLES)
+                ):
+                    stable_sources.remove(source)
+                    ordered_stable_sources = [
+                        candidate
+                        for candidate in ("left", "right")
+                        if candidate in stable_sources
+                    ]
+                    print(
+                        "[live_openxr_controller] immersive controller source presence: "
+                        f"sample={sample_id} source={source} event=absent "
+                        f"stable_sources={ordered_stable_sources} "
+                        f"seen_sources_ever={seen_sources_ever}",
+                        flush=True,
+                    )
+
+        updated_controller_basis_state["source_present_counts"] = present_counts
+        updated_controller_basis_state["source_absent_counts"] = absent_counts
+        updated_controller_basis_state["current_stable_sources"] = [
+            source for source in ("left", "right") if source in stable_sources
+        ]
+        updated_controller_basis_state["seen_sources_ever"] = seen_sources_ever
+        return (
+            updated_controller_basis_state,
+            first_time_join_sources,
+            reconnect_sources,
+        )
+
+    def _reopen_immersive_controller_basis_state(
+        self,
+        controller_basis_state,
+        sample_id,
+        reason,
+    ):
+        updated_controller_basis_state = dict(controller_basis_state)
+        updated_controller_basis_state["state"] = "pending"
+        updated_controller_basis_state["resolved"] = False
+        updated_controller_basis_state["validation_mode"] = f"pending_{reason}"
+        updated_controller_basis_state["validation_sample_id"] = int(sample_id)
+        updated_controller_basis_state["candidate_flip"] = None
+        updated_controller_basis_state["candidate_validation_mode"] = None
+        updated_controller_basis_state["candidate_streak"] = 0
+        updated_controller_basis_state["resolution_start_sample"] = int(sample_id)
+        updated_controller_basis_state["resolution_deadline_sample"] = (
+            int(sample_id)
+            + int(self.IMMERSIVE_CONTROLLER_HANDNESS_MAX_VALID_SAMPLES)
+        )
+        updated_controller_basis_state["lock_reason"] = None
+        updated_controller_basis_state["lock_sample_id"] = None
+        updated_controller_basis_state["pending_revalidation"] = False
+        updated_controller_basis_state["pending_revalidation_reason"] = None
+        updated_controller_basis_state["live_lateral_delta_x"] = None
+        updated_controller_basis_state["single_source_name"] = None
+        updated_controller_basis_state["single_source_live_x"] = None
+        updated_controller_basis_state["single_source_projected_offset_x"] = None
+        updated_controller_basis_state["provisional_left_body_x"] = None
+        updated_controller_basis_state["provisional_right_body_x"] = None
+        updated_controller_basis_state["provisional_left_ray_x"] = None
+        updated_controller_basis_state["provisional_right_ray_x"] = None
+        updated_controller_basis_state["final_left_body_x"] = None
+        updated_controller_basis_state["final_right_body_x"] = None
+        updated_controller_basis_state["final_left_ray_x"] = None
+        updated_controller_basis_state["final_right_ray_x"] = None
+        updated_controller_basis_state["resolved_from"] = "none"
+        print(
+            "[live_openxr_controller] immersive controller handedness reopen: "
+            f"sample={sample_id} reason={reason} "
+            "sticky_basis_reused_until_revalidated=1",
+            flush=True,
+        )
+        return updated_controller_basis_state
+
+    def _single_controller_handedness_candidate(
+        self,
+        source,
+        live_grip_position,
+        projected_body_x,
+        projected_body_valid,
+        projected_ray_x,
+        projected_ray_valid,
+        screen_center_x,
+    ):
+        live_x = float(np.asarray(live_grip_position, dtype=np.float32)[0])
+        if abs(live_x) < float(self.IMMERSIVE_CONTROLLER_SINGLE_LATERAL_MIN_M):
+            return None, None, live_x, None
+
+        projected_x = None
+        validation_mode = None
+        if projected_body_valid and projected_body_x is not None:
+            projected_x = float(projected_body_x)
+            validation_mode = f"single_{source}_body"
+        elif projected_ray_valid and projected_ray_x is not None:
+            projected_x = float(projected_ray_x)
+            validation_mode = f"single_{source}_ray"
+        if projected_x is None:
+            return None, validation_mode, live_x, None
+
+        projected_offset_x = float(projected_x - screen_center_x)
+        if (
+            abs(projected_offset_x)
+            < float(self.IMMERSIVE_CONTROLLER_SINGLE_PROJECTED_OFFSET_MIN_PX)
+        ):
+            return None, validation_mode, live_x, projected_offset_x
+        return (live_x * projected_offset_x) < 0.0, validation_mode, live_x, projected_offset_x
 
     def _controller_basis_interaction_started(
         self,
@@ -11968,6 +14133,7 @@ class InvPhyTrainerWarp:
         validation_mode=None,
         basis=None,
         lateral_flip_applied=None,
+        resolved_from=None,
         controller_runtime_state=None,
     ):
         updated_controller_basis_state = dict(controller_basis_state)
@@ -11987,6 +14153,10 @@ class InvPhyTrainerWarp:
             updated_controller_basis_state["lateral_flip_applied"] = bool(
                 lateral_flip_applied
             )
+        if resolved_from is not None:
+            updated_controller_basis_state["resolved_from"] = str(resolved_from)
+        updated_controller_basis_state["pending_revalidation"] = False
+        updated_controller_basis_state["pending_revalidation_reason"] = None
         return updated_controller_basis_state
 
     def _maybe_note_late_controller_seen_after_lock(
@@ -12041,38 +14211,71 @@ class InvPhyTrainerWarp:
             or controller_basis_state is None
         ):
             return controller_runtime_state, controller_basis_state
-        if controller_basis_state.get("state") == "locked":
-            return (
-                controller_runtime_state,
-                self._maybe_note_late_controller_seen_after_lock(
-                    controller_runtime_state,
-                    controller_basis_state,
-                ),
-            )
-
         sample_id = int(latest_controller_sample.sample)
-        updated_controller_basis_state = dict(controller_basis_state)
+        (
+            updated_controller_basis_state,
+            first_time_join_sources,
+            reconnect_sources,
+        ) = self._update_immersive_controller_source_presence_state(
+            controller_runtime_state,
+            controller_basis_state,
+            sample_id,
+        )
+        interaction_active = self._controller_basis_interaction_started(
+            controller_runtime_state,
+            controller_interaction_state,
+        )
+        stable_sources = list(
+            updated_controller_basis_state.get("current_stable_sources", [])
+        )
+        canonical_basis = updated_controller_basis_state["head_basis"].clone()
+
+        if updated_controller_basis_state.get("state") == "locked":
+            if reconnect_sources:
+                print(
+                    "[live_openxr_controller] immersive controller reconnect reusing "
+                    f"canonical sticky basis: sample={sample_id} sources={reconnect_sources} "
+                    f"stable_sources={stable_sources} "
+                    "resolved_from=canonical_global no_per_source_flip=1",
+                    flush=True,
+                )
+            if first_time_join_sources:
+                join_reason = (
+                    "during_active_interaction"
+                    if interaction_active
+                    else "while_idle"
+                )
+                print(
+                    "[live_openxr_controller] immersive controller first-time join "
+                    "reusing canonical global basis: "
+                    f"sample={sample_id} sources={first_time_join_sources} "
+                    f"stable_sources={stable_sources} reason={join_reason} "
+                    "no_per_source_flip=1",
+                    flush=True,
+                )
+            return controller_runtime_state, updated_controller_basis_state
+
         if updated_controller_basis_state.get("resolution_start_sample") is None:
             updated_controller_basis_state["resolution_start_sample"] = sample_id
             updated_controller_basis_state["resolution_deadline_sample"] = (
                 sample_id + int(self.IMMERSIVE_CONTROLLER_HANDNESS_MAX_VALID_SAMPLES)
             )
 
-        if self._controller_basis_interaction_started(
-            controller_runtime_state,
-            controller_interaction_state,
-        ):
-            updated_controller_basis_state = self._lock_immersive_controller_basis_state(
+        def _lock_timeout_default():
+            timed_out_state = self._lock_immersive_controller_basis_state(
                 updated_controller_basis_state,
                 sample_id=sample_id,
-                lock_reason="interaction_started",
-                validation_mode="interaction_started_default",
+                lock_reason="timeout_default",
+                validation_mode="canonical_timeout_default",
+                basis=canonical_basis,
+                lateral_flip_applied=False,
+                resolved_from="canonical_global",
                 controller_runtime_state=controller_runtime_state,
             )
             self._log_immersive_controller_handedness_resolution(
-                updated_controller_basis_state
+                timed_out_state
             )
-            return controller_runtime_state, updated_controller_basis_state
+            return controller_runtime_state, timed_out_state
 
         left_grip_position = controller_pose_position(
             latest_controller_sample.left,
@@ -12082,38 +14285,12 @@ class InvPhyTrainerWarp:
             latest_controller_sample.right,
             alignment_pose_role,
         )
-        if left_grip_position is None or right_grip_position is None:
-            if sample_id >= int(updated_controller_basis_state["resolution_deadline_sample"]):
-                updated_controller_basis_state = self._lock_immersive_controller_basis_state(
-                    updated_controller_basis_state,
-                    sample_id=sample_id,
-                    lock_reason="timeout_default",
-                    validation_mode="timeout_default",
-                    controller_runtime_state=controller_runtime_state,
-                )
-                self._log_immersive_controller_handedness_resolution(
-                    updated_controller_basis_state
-                )
-            return controller_runtime_state, updated_controller_basis_state
-
-        live_lateral_delta_x = float(
-            np.asarray(right_grip_position, dtype=np.float32)[0]
-            - np.asarray(left_grip_position, dtype=np.float32)[0]
-        )
-        if abs(live_lateral_delta_x) < 1e-5:
-            updated_controller_basis_state["live_lateral_delta_x"] = live_lateral_delta_x
-            if sample_id >= int(updated_controller_basis_state["resolution_deadline_sample"]):
-                updated_controller_basis_state = self._lock_immersive_controller_basis_state(
-                    updated_controller_basis_state,
-                    sample_id=sample_id,
-                    lock_reason="timeout_default",
-                    validation_mode="timeout_default",
-                    controller_runtime_state=controller_runtime_state,
-                )
-                self._log_immersive_controller_handedness_resolution(
-                    updated_controller_basis_state
-                )
-            return controller_runtime_state, updated_controller_basis_state
+        live_lateral_delta_x = None
+        if left_grip_position is not None and right_grip_position is not None:
+            live_lateral_delta_x = float(
+                np.asarray(right_grip_position, dtype=np.float32)[0]
+                - np.asarray(left_grip_position, dtype=np.float32)[0]
+            )
 
         provisional_left_body_x, _, provisional_left_body_valid = (
             self._project_controller_world_field_to_startup_screen_x(
@@ -12148,99 +14325,35 @@ class InvPhyTrainerWarp:
             )
         )
 
-        body_pair_valid = provisional_left_body_valid and provisional_right_body_valid
-        ray_pair_valid = provisional_left_ray_valid and provisional_right_ray_valid
         updated_controller_basis_state.update(
             {
                 "live_lateral_delta_x": live_lateral_delta_x,
+                "single_source_name": None,
+                "single_source_live_x": None,
+                "single_source_projected_offset_x": None,
                 "provisional_left_body_x": provisional_left_body_x,
                 "provisional_right_body_x": provisional_right_body_x,
                 "provisional_left_ray_x": provisional_left_ray_x,
                 "provisional_right_ray_x": provisional_right_ray_x,
             }
         )
-        if not body_pair_valid and not ray_pair_valid:
+        if not stable_sources:
             if sample_id >= int(updated_controller_basis_state["resolution_deadline_sample"]):
-                updated_controller_basis_state = self._lock_immersive_controller_basis_state(
-                    updated_controller_basis_state,
-                    sample_id=sample_id,
-                    lock_reason="timeout_default",
-                    validation_mode="timeout_default",
-                    controller_runtime_state=controller_runtime_state,
-                )
-                self._log_immersive_controller_handedness_resolution(
-                    updated_controller_basis_state
-                )
+                return _lock_timeout_default()
             return controller_runtime_state, updated_controller_basis_state
-
-        validation_mode = "dual_grip"
-        candidate_flip = None
-        if body_pair_valid:
-            projected_body_delta_x = float(
-                provisional_right_body_x - provisional_left_body_x
-            )
-            candidate_flip = (live_lateral_delta_x * projected_body_delta_x) < 0.0
-            validation_mode += "_body"
-        elif ray_pair_valid:
-            projected_ray_delta_x = float(
-                provisional_right_ray_x - provisional_left_ray_x
-            )
-            candidate_flip = (live_lateral_delta_x * projected_ray_delta_x) < 0.0
-            validation_mode += "_ray"
-        if candidate_flip is None:
-            if sample_id >= int(updated_controller_basis_state["resolution_deadline_sample"]):
-                updated_controller_basis_state = self._lock_immersive_controller_basis_state(
-                    updated_controller_basis_state,
-                    sample_id=sample_id,
-                    lock_reason="timeout_default",
-                    validation_mode="timeout_default",
-                    controller_runtime_state=controller_runtime_state,
-                )
-                self._log_immersive_controller_handedness_resolution(
-                    updated_controller_basis_state
-                )
-            return controller_runtime_state, updated_controller_basis_state
-
-        candidate_flip = bool(candidate_flip)
-        if updated_controller_basis_state.get("candidate_flip") == candidate_flip:
-            updated_controller_basis_state["candidate_streak"] = int(
-                updated_controller_basis_state.get("candidate_streak", 0)
-            ) + 1
-        else:
-            updated_controller_basis_state["candidate_flip"] = candidate_flip
-            updated_controller_basis_state["candidate_streak"] = 1
-        updated_controller_basis_state["validation_mode"] = f"pending_{validation_mode}"
-        updated_controller_basis_state["validation_sample_id"] = sample_id
-
-        if int(updated_controller_basis_state["candidate_streak"]) < int(
-            self.IMMERSIVE_CONTROLLER_HANDNESS_CONFIRM_STREAK
-        ):
-            if sample_id >= int(updated_controller_basis_state["resolution_deadline_sample"]):
-                updated_controller_basis_state = self._lock_immersive_controller_basis_state(
-                    updated_controller_basis_state,
-                    sample_id=sample_id,
-                    lock_reason="timeout_default",
-                    validation_mode="timeout_default",
-                    controller_runtime_state=controller_runtime_state,
-                )
-                self._log_immersive_controller_handedness_resolution(
-                    updated_controller_basis_state
-                )
-            return controller_runtime_state, updated_controller_basis_state
-
-        lateral_flip_applied = candidate_flip
-
-        resolved_basis = self._controller_basis_with_lateral_flip(
-            updated_controller_basis_state["head_basis"],
-            lateral_flip=lateral_flip_applied,
+        basis_changed = not torch.allclose(
+            canonical_basis,
+            updated_controller_basis_state["basis"],
+            rtol=1e-6,
+            atol=1e-6,
         )
-        if lateral_flip_applied:
+        if basis_changed:
             controller_runtime_state = self._recompute_live_controller_runtime_state_for_basis(
                 latest_controller_sample,
                 controller_runtime_state,
                 controller_source_anchor_centers,
                 w2c,
-                resolved_basis,
+                canonical_basis,
                 alignment_pose_role=alignment_pose_role,
                 controller_position_pose_role=controller_position_pose_role,
                 controller_ray_pose_role=controller_ray_pose_role,
@@ -12277,10 +14390,11 @@ class InvPhyTrainerWarp:
         updated_controller_basis_state = self._lock_immersive_controller_basis_state(
             updated_controller_basis_state,
             sample_id=sample_id,
-            lock_reason="dual_confirmed",
-            validation_mode=validation_mode,
-            basis=resolved_basis,
-            lateral_flip_applied=lateral_flip_applied,
+            lock_reason="canonical_global_locked",
+            validation_mode="canonical_global_basis",
+            basis=canonical_basis,
+            lateral_flip_applied=False,
+            resolved_from="canonical_global",
             controller_runtime_state=controller_runtime_state,
         )
         self._log_immersive_controller_handedness_resolution(
@@ -22491,6 +24605,7 @@ class InvPhyTrainerWarp:
         preview_vao = None
         preview_framebuffer_size = None
         preview_display_active = interactive_window_mode == "visible"
+        rope_game_state = None
         left_eye_frame = None
         right_eye_frame = None
         shared_scene_compose_cache = {}
@@ -23578,6 +25693,12 @@ class InvPhyTrainerWarp:
             )
             for source, runtime_meta in two_point_runtime["source_runtime"].items():
                 controller_attachment_metadata[source].update(runtime_meta)
+            controller_attachment_metadata = (
+                self._canonicalize_rope_family_controller_attachment_metadata(
+                    controller_attachment_metadata,
+                    default_anchor_names=resolved_default_anchor_names,
+                )
+            )
             ctrl_init_vertices = controller_runtime_base_target
 
             n_vert_single_obj = obj_init_vertices.shape[0]
@@ -24439,6 +26560,11 @@ class InvPhyTrainerWarp:
 
             _update_balanced_scene_input_cache_from_points(
                 scene_rest_state["x"][: self.num_all_points]
+            )
+            rope_game_state = self._make_rope_game_runtime_state(
+                scene_renderer,
+                layout,
+                scene_rest_state,
             )
 
             glfw.make_context_current(window)
@@ -25566,10 +27692,13 @@ class InvPhyTrainerWarp:
                             "Y" if source == "left" else "B"
                             for source in controller_reset_sources
                         ]
+                        reset_log_suffix = "; restoring the settled table pose"
+                        if rope_game_state is not None:
+                            reset_log_suffix = "; restarting the rope game course"
                         print(
                             "[live_openxr_controller] immersive reset requested via "
                             + "/".join(pressed_buttons)
-                            + "; restoring the settled table pose",
+                            + reset_log_suffix,
                             flush=True,
                         )
                         reset_target = self._reset_live_controller_runtime(
@@ -25601,6 +27730,11 @@ class InvPhyTrainerWarp:
                             reset_object_points
                         )
                         prev_x = scene_rest_state["x"].clone()
+                        if rope_game_state is not None:
+                            self._restart_rope_game_runtime_state(
+                                rope_game_state,
+                                now_wall=time.perf_counter(),
+                            )
                         controller_reset_triggered = True
                 else:
                     current_live_left_controller = None
@@ -26043,6 +28177,23 @@ class InvPhyTrainerWarp:
                 ) = _update_balanced_scene_input_cache_from_points(
                     object_points
                 )
+                rope_game_overlay_state = None
+                if rope_game_state is not None:
+                    self._evaluate_rope_game_runtime_state(
+                        rope_game_state,
+                        object_points,
+                        current_v[: self.num_all_points],
+                        layout.scene_up,
+                        controller_interaction_state=controller_interaction_state,
+                        now_wall=time.perf_counter(),
+                    )
+                    rope_game_overlay_state = self._build_rope_game_overlay_state(
+                        rope_game_state,
+                        left_eye_pose_world=last_left_eye_pose_world,
+                        right_eye_pose_world=last_right_eye_pose_world,
+                        left_intrinsic=left_intrinsic,
+                        right_intrinsic=right_intrinsic,
+                    )
                 controller_predefined_anchor_states = (
                     self._compute_predefined_interaction_anchor_states(
                         controller_predefined_anchor_defs,
@@ -27306,7 +29457,11 @@ class InvPhyTrainerWarp:
                             "overlay_projection_wall",
                             time.perf_counter() - overlay_projection_start,
                         )
-                    if left_eye_overlay_entries or immersive_support_entry_overlay_enabled:
+                    if (
+                        left_eye_overlay_entries
+                        or immersive_support_entry_overlay_enabled
+                        or rope_game_overlay_state is not None
+                    ):
                         overlay_draw_left_start = (
                             time.perf_counter() if render_profile_frame is not None else None
                         )
@@ -27322,13 +29477,23 @@ class InvPhyTrainerWarp:
                                 support_overlay_active_support_id,
                                 left_overlay_eye_render_state,
                             )
+                        if rope_game_overlay_state is not None:
+                            self._draw_rope_game_overlay(
+                                left_eye_frame,
+                                rope_game_overlay_state,
+                                left_overlay_eye_render_state,
+                            )
                         if overlay_draw_left_start is not None:
                             self._render_profile_add_wall_time(
                                 render_profile_frame,
                                 "overlay_draw_left_wall",
                                 time.perf_counter() - overlay_draw_left_start,
                             )
-                    if right_eye_overlay_entries or immersive_support_entry_overlay_enabled:
+                    if (
+                        right_eye_overlay_entries
+                        or immersive_support_entry_overlay_enabled
+                        or rope_game_overlay_state is not None
+                    ):
                         overlay_draw_right_start = (
                             time.perf_counter() if render_profile_frame is not None else None
                         )
@@ -27342,6 +29507,12 @@ class InvPhyTrainerWarp:
                                 right_eye_frame,
                                 support_overlay_cache,
                                 support_overlay_active_support_id,
+                                right_overlay_eye_render_state,
+                            )
+                        if rope_game_overlay_state is not None:
+                            self._draw_rope_game_overlay(
+                                right_eye_frame,
+                                rope_game_overlay_state,
                                 right_overlay_eye_render_state,
                             )
                         if overlay_draw_right_start is not None:
@@ -27550,6 +29721,9 @@ class InvPhyTrainerWarp:
                     support_overlay_enabled = bool(
                         immersive_support_entry_overlay_enabled
                     )
+                    rope_game_overlay_enabled = bool(
+                        rope_game_overlay_state is not None
+                    )
                     if immersive_support_entry_overlay_enabled:
                         support_overlay_entry = (
                             self._resolve_immersive_support_overlay_entry(
@@ -27702,10 +29876,17 @@ class InvPhyTrainerWarp:
                             if support_overlay_enabled
                             else None
                         ),
+                        "rope_game_overlay_enabled": rope_game_overlay_enabled,
+                        "rope_game_overlay_state": None
+                        if not rope_game_overlay_enabled
+                        else self._copy_immersive_packet_value(
+                            rope_game_overlay_state
+                        ),
                         "left_overlay_eye_render_state": None
                         if (
                             stable_present_pipeline_fast_path_enabled
                             and not support_overlay_enabled
+                            and not rope_game_overlay_enabled
                         )
                         else (
                             _copy_present_overlay_eye_render_state(
@@ -27716,6 +29897,7 @@ class InvPhyTrainerWarp:
                         if (
                             stable_present_pipeline_fast_path_enabled
                             and not support_overlay_enabled
+                            and not rope_game_overlay_enabled
                         )
                         else (
                             _copy_present_overlay_eye_render_state(

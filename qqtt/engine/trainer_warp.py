@@ -2877,6 +2877,9 @@ class _ImmersivePresentationWorkerLegacy:
                 "anchor_cycle_available": False,
                 "anchor_cycle_pressed": False,
                 "anchor_cycle_source": "",
+                "anchor_reset_available": False,
+                "anchor_reset_pressed": False,
+                "anchor_reset_source": "",
                 "snap_assist_available": False,
                 "snap_assist_pressed": False,
                 "snap_assist_source": "",
@@ -2907,6 +2910,9 @@ class _ImmersivePresentationWorkerLegacy:
                 "anchor_cycle_available": False,
                 "anchor_cycle_pressed": False,
                 "anchor_cycle_source": "",
+                "anchor_reset_available": False,
+                "anchor_reset_pressed": False,
+                "anchor_reset_source": "",
                 "snap_assist_available": False,
                 "snap_assist_pressed": False,
                 "snap_assist_source": "",
@@ -7573,6 +7579,20 @@ class InvPhyTrainerWarp:
         cycle_state_cache[source] = pressed
         return pressed and not previous
 
+    def _controller_anchor_reset_edge(
+        self,
+        source,
+        controller_world,
+        reset_state_cache,
+    ):
+        pressed = bool(
+            self._controller_input_available(controller_world, "anchor_reset_available")
+            and self._controller_input_pressed(controller_world, "anchor_reset_pressed")
+        )
+        previous = bool(reset_state_cache.get(source, False))
+        reset_state_cache[source] = pressed
+        return pressed and not previous
+
     def _controller_input_available(self, controller_state, field_name):
         if controller_state is None:
             return False
@@ -7669,12 +7689,31 @@ class InvPhyTrainerWarp:
         anchor_states,
         preview_state,
         cycle_edge,
+        reset_edge,
         interaction_state,
         controller_interaction_state,
     ):
         state = preview_state[source]
+        cycle_locked = bool(state.get("cycle_locked", False))
+        latched_anchor_name = state.get("selected_anchor_name")
+        if reset_edge:
+            if cycle_locked:
+                print(
+                    "[live_openxr_controller] "
+                    f"{source} anchor_cycle_reset unlocked=1 "
+                    f"anchor={latched_anchor_name} "
+                    f"active_interaction={int(bool(interaction_state is not None))}",
+                    flush=True,
+                )
+            state["cycle_locked"] = False
+            state["selected_rank_index"] = 0
+            state["selected_anchor_name"] = None
+            cycle_locked = False
+            latched_anchor_name = None
+            cycle_edge = False
         if interaction_state is not None:
             selected_anchor_name = interaction_state.get("anchor_name")
+            state["cycle_locked"] = cycle_locked
             state["visible"] = selected_anchor_name is not None
             state["selected_anchor_name"] = selected_anchor_name
             state["current_candidate_names"] = (
@@ -7723,8 +7762,6 @@ class InvPhyTrainerWarp:
             return None
 
         candidate_count = len(ranked_anchors)
-        cycle_locked = bool(state.get("cycle_locked", False))
-        latched_anchor_name = state.get("selected_anchor_name")
         ranked_anchor_names = [anchor["name"] for anchor in ranked_anchors]
         state["current_candidate_names"] = ranked_anchor_names
         state["current_candidate_count"] = candidate_count
@@ -7750,14 +7787,13 @@ class InvPhyTrainerWarp:
                 cycle_locked = True
                 selected_anchor = ranked_anchors[1]
             else:
-                non_nearest_anchors = ranked_anchors[1:]
-                if current_latched_rank_index is None or current_latched_rank_index == 0:
-                    next_non_nearest_index = 0
+                if current_latched_rank_index is None:
+                    selected_anchor = ranked_anchors[0]
                 else:
-                    next_non_nearest_index = (
-                        (current_latched_rank_index - 1 + 1) % len(non_nearest_anchors)
-                    )
-                selected_anchor = non_nearest_anchors[next_non_nearest_index]
+                    next_rank_index = (
+                        int(current_latched_rank_index) + 1
+                    ) % candidate_count
+                    selected_anchor = ranked_anchors[next_rank_index]
 
             if selected_anchor is not None:
                 latched_anchor_name = selected_anchor["name"]
@@ -7773,8 +7809,8 @@ class InvPhyTrainerWarp:
                 current_latched_rank_index = 0
             else:
                 selected_anchor = self._anchor_state_by_name(anchor_states, latched_anchor_name)
-                if selected_anchor is None and candidate_count >= 2:
-                    selected_anchor = ranked_anchors[1]
+                if selected_anchor is None and candidate_count >= 1:
+                    selected_anchor = ranked_anchors[0]
                     latched_anchor_name = selected_anchor["name"]
                     current_latched_rank_index = current_rank_index_by_name.get(
                         latched_anchor_name
@@ -9479,6 +9515,7 @@ class InvPhyTrainerWarp:
         controller_select_hold_state,
         controller_select_hold_state_cache,
         controller_anchor_cycle_state_cache,
+        controller_anchor_reset_state_cache,
         controller_snap_state_cache,
         controller_snap_edge_cache,
         controller_exit_hold_state,
@@ -9586,6 +9623,11 @@ class InvPhyTrainerWarp:
                 source,
                 controller_sample,
                 controller_anchor_cycle_state_cache,
+            )
+            self._log_controller_anchor_reset_transition(
+                source,
+                controller_sample,
+                controller_anchor_reset_state_cache,
             )
             self._log_controller_snap_transition(
                 source,
@@ -10211,6 +10253,106 @@ class InvPhyTrainerWarp:
         self._blend_rect(frame, x0, y1 - 1, x1, y1, color, blend=blend)
         self._blend_rect(frame, x0, y0, x0 + 1, y1, color, blend=blend)
         self._blend_rect(frame, x1 - 1, y0, x1, y1, color, blend=blend)
+
+    def _blend_split_square_marker(
+        self,
+        frame,
+        pixel,
+        upper_left_color,
+        lower_right_color,
+        radius,
+        blend=0.78,
+        divider_blend=0.94,
+    ):
+        height, width = frame.shape[:2]
+        x = int(round(float(pixel[0].item())))
+        y = int(round(float(pixel[1].item())))
+        if x < 0 or x >= width or y < 0 or y >= height:
+            return
+
+        x0 = x - radius
+        x1 = x + radius + 1
+        y0 = y - radius
+        y1 = y + radius + 1
+        self._blend_rect(frame, x0, y0, x1, y0 + 1, upper_left_color, blend=blend)
+        self._blend_rect(frame, x0, y0, x0 + 1, y1, upper_left_color, blend=blend)
+        self._blend_rect(frame, x0, y1 - 1, x1, y1, lower_right_color, blend=blend)
+        self._blend_rect(frame, x1 - 1, y0, x1, y1, lower_right_color, blend=blend)
+        divider_start = frame.new_tensor([float(x0), float(y0)], dtype=torch.float32)
+        divider_end = frame.new_tensor([float(x1 - 1), float(y1 - 1)], dtype=torch.float32)
+        self._draw_marker_line(
+            frame,
+            divider_start,
+            divider_end,
+            self.LIVE_CONTROLLER_SELECT_COLOR,
+            radius=0,
+            blend=divider_blend,
+        )
+
+    def _draw_live_controller_candidate_markers(self, frame, controller_overlays):
+        candidate_groups = {}
+        unnamed_candidate_count = 0
+        for overlay in controller_overlays:
+            if bool(overlay.get("active_contact_only", False)):
+                continue
+            if not bool(overlay.get("attach_candidate", False)):
+                continue
+            candidate_pixel = overlay.get("attach_candidate_pixel")
+            if candidate_pixel is None:
+                continue
+            anchor_name = overlay.get("attach_candidate_anchor_name")
+            if anchor_name is None:
+                group_key = (
+                    f"unnamed:{unnamed_candidate_count}:{overlay.get('source', 'unknown')}"
+                )
+                unnamed_candidate_count += 1
+            else:
+                group_key = f"anchor:{anchor_name}"
+            candidate_groups.setdefault(group_key, []).append(overlay)
+
+        for group_entries in candidate_groups.values():
+            if not group_entries:
+                continue
+            candidate_pixels = [entry["attach_candidate_pixel"] for entry in group_entries]
+            if len(candidate_pixels) == 1:
+                candidate_pixel = candidate_pixels[0]
+            else:
+                candidate_pixel = torch.stack(candidate_pixels, dim=0).mean(dim=0)
+
+            left_entry = next(
+                (entry for entry in group_entries if entry.get("source") == "left"),
+                None,
+            )
+            right_entry = next(
+                (entry for entry in group_entries if entry.get("source") == "right"),
+                None,
+            )
+            if left_entry is not None and right_entry is not None:
+                self._blend_split_square_marker(
+                    frame,
+                    candidate_pixel,
+                    self.LIVE_CONTROLLER_LEFT_COLOR,
+                    self.LIVE_CONTROLLER_RIGHT_COLOR,
+                    radius=self.LIVE_CONTROLLER_CANDIDATE_SQUARE_RADIUS,
+                    blend=0.86,
+                )
+            else:
+                entry = group_entries[0]
+                candidate_color = entry["color"]
+                self._blend_square_marker(
+                    frame,
+                    candidate_pixel,
+                    candidate_color,
+                    radius=self.LIVE_CONTROLLER_CANDIDATE_SQUARE_RADIUS,
+                    blend=0.86,
+                )
+            self._blend_marker(
+                frame,
+                candidate_pixel,
+                self.LIVE_CONTROLLER_SELECT_COLOR,
+                radius=1,
+                blend=0.98,
+            )
 
     def _bitmap_text_size(self, text, scale=1):
         glyph_width = 3 * scale
@@ -13860,6 +14002,9 @@ class InvPhyTrainerWarp:
             "anchor_cycle_available": controller_sample.anchor_cycle_available,
             "anchor_cycle_pressed": controller_sample.anchor_cycle_pressed,
             "anchor_cycle_source": controller_sample.anchor_cycle_source,
+            "anchor_reset_available": getattr(controller_sample, "anchor_reset_available", False),
+            "anchor_reset_pressed": getattr(controller_sample, "anchor_reset_pressed", False),
+            "anchor_reset_source": getattr(controller_sample, "anchor_reset_source", "none"),
             "snap_assist_available": controller_sample.snap_assist_available,
             "snap_assist_pressed": controller_sample.snap_assist_pressed,
             "snap_assist_source": controller_sample.snap_assist_source,
@@ -21229,16 +21374,13 @@ class InvPhyTrainerWarp:
         attach_anchor_world = remap_candidate["attach_anchor_world"]
         attach_radius = float(remap_candidate.get("attach_radius", 0.0))
         hit_distance = None
+        hit_distance_limit = (
+            self.LIVE_CONTROLLER_HIT_WORLD_RADIUS if hit_world is not None else None
+        )
+        hit_distance_passed = None
         if hit_world is not None and not explicit_preview_selected:
             hit_distance = float(torch.linalg.norm(attach_anchor_world - hit_world).item())
-            if hit_distance > self.LIVE_CONTROLLER_HIT_WORLD_RADIUS:
-                return (
-                    f"hit_anchor_mismatch({hit_distance:.4f}>"
-                    f"{self.LIVE_CONTROLLER_HIT_WORLD_RADIUS:.4f})",
-                    {
-                        "hit_distance": hit_distance,
-                    },
-                )
+            hit_distance_passed = hit_distance <= self.LIVE_CONTROLLER_HIT_WORLD_RADIUS
 
         projected_anchor_distance = float(
             interaction_state.get("projected_anchor_distance", 0.0)
@@ -21255,20 +21397,45 @@ class InvPhyTrainerWarp:
             explicit_preview_selected
             and projected_anchor_distance > strict_projected_anchor_distance_limit
         )
+        projected_anchor_distance_passed = bool(
+            projected_anchor_distance <= relaxed_projected_anchor_distance_limit
+        )
         if (
             not explicit_preview_selected
-            and projected_anchor_distance > relaxed_projected_anchor_distance_limit
+            and not (bool(hit_distance_passed) or projected_anchor_distance_passed)
         ):
+            hit_summary = (
+                "n/a"
+                if hit_distance is None or hit_distance_limit is None
+                else f"{hit_distance:.4f}>{hit_distance_limit:.4f}"
+            )
             return (
-                "projected_anchor_distance_exceeded("
-                f"{projected_anchor_distance:.4f}>"
+                "implicit_start_gate_failed("
+                f"hit={hit_summary}, "
+                f"projected={projected_anchor_distance:.4f}>"
                 f"{relaxed_projected_anchor_distance_limit:.4f})",
                 {
                     "projected_anchor_distance": projected_anchor_distance,
                     "projected_anchor_distance_limit": relaxed_projected_anchor_distance_limit,
+                    "projected_anchor_distance_passed": projected_anchor_distance_passed,
                     "projected_anchor_distance_bypassed": False,
+                    "hit_distance": hit_distance,
+                    "hit_distance_limit": hit_distance_limit,
+                    "hit_distance_passed": hit_distance_passed,
+                    "validation_path": "none",
                 },
             )
+
+        validation_path = "manual_preview"
+        if not explicit_preview_selected:
+            if bool(hit_distance_passed) and projected_anchor_distance_passed:
+                validation_path = "hit+ray"
+            elif bool(hit_distance_passed):
+                validation_path = "hit"
+            elif projected_anchor_distance_passed:
+                validation_path = "ray"
+            else:
+                validation_path = "none"
 
         if hit_world is not None and ray_direction is not None and not explicit_preview_selected:
             direction = ray_direction / ray_direction.norm().clamp_min(1e-6)
@@ -21279,16 +21446,30 @@ class InvPhyTrainerWarp:
                     f"{self.LIVE_CONTROLLER_MULTI_POINTS_BACK_DEPTH_THRESHOLD:.4f})",
                     {
                         "anchor_depth": anchor_depth,
+                        "projected_anchor_distance": projected_anchor_distance,
+                        "projected_anchor_distance_limit": relaxed_projected_anchor_distance_limit,
+                        "projected_anchor_distance_passed": projected_anchor_distance_passed,
+                        "projected_anchor_distance_bypassed": projected_anchor_distance_bypassed,
+                        "strict_projected_anchor_distance_limit": strict_projected_anchor_distance_limit,
+                        "explicit_preview_selected": bool(explicit_preview_selected),
+                        "hit_distance": hit_distance,
+                        "hit_distance_limit": hit_distance_limit,
+                        "hit_distance_passed": hit_distance_passed,
+                        "validation_path": validation_path,
                     },
                 )
 
         return None, {
             "projected_anchor_distance": projected_anchor_distance,
             "projected_anchor_distance_limit": relaxed_projected_anchor_distance_limit,
+            "projected_anchor_distance_passed": projected_anchor_distance_passed,
             "projected_anchor_distance_bypassed": projected_anchor_distance_bypassed,
             "strict_projected_anchor_distance_limit": strict_projected_anchor_distance_limit,
             "explicit_preview_selected": bool(explicit_preview_selected),
             "hit_distance": hit_distance,
+            "hit_distance_limit": hit_distance_limit,
+            "hit_distance_passed": hit_distance_passed,
+            "validation_path": validation_path,
         }
 
     def _log_controller_interaction_start_attempt(
@@ -21348,10 +21529,16 @@ class InvPhyTrainerWarp:
             if interaction_state is None
             else interaction_state.get("start_reference")
         )
+        explicit_preview_selected = (
+            None
+            if interaction_state is None
+            else int(bool(interaction_state.get("explicit_preview_selected", False)))
+        )
         print(
             "[live_openxr_controller] "
             f"{source} interaction_start=1 "
             f"mode={grab_start_mode} "
+            f"explicit_preview_selected={explicit_preview_selected} "
             f"preview_visible={preview_anchor_visible} "
             f"preview_anchor={preview_anchor_name} "
             f"preview_resolved={preview_anchor_resolved} "
@@ -21388,16 +21575,40 @@ class InvPhyTrainerWarp:
             if interaction_state is None
             else interaction_state.get("projected_anchor_distance")
         )
+        projected_anchor_distance_passed = (
+            None
+            if interaction_state is None
+            else interaction_state.get("projected_anchor_distance_passed")
+        )
         anchor_name = None if remap_candidate is None else remap_candidate.get("anchor_name")
         if anchor_name is None and interaction_state is not None:
             anchor_name = interaction_state.get("preview_anchor_name")
         grab_start_mode = None if interaction_state is None else interaction_state.get("grab_start_mode")
         start_reference = None if interaction_state is None else interaction_state.get("start_reference")
+        explicit_preview_selected = (
+            None
+            if interaction_state is None
+            else int(bool(interaction_state.get("explicit_preview_selected", False)))
+        )
+        hit_distance_passed = (
+            None
+            if interaction_state is None
+            else interaction_state.get("hit_distance_passed")
+        )
+        validation_path = (
+            None
+            if interaction_state is None
+            else interaction_state.get("validation_path")
+        )
         print(
             "[live_openxr_controller] "
             f"{source} interaction_{action}=1 "
             f"mode={grab_start_mode} "
+            f"explicit_preview_selected={explicit_preview_selected} "
             f"start_reference={start_reference} "
+            f"validation_path={validation_path} "
+            f"hit_gate={None if hit_distance_passed is None else int(bool(hit_distance_passed))} "
+            f"ray_gate={None if projected_anchor_distance_passed is None else int(bool(projected_anchor_distance_passed))} "
             f"anchor={anchor_name} "
             f"seed={seed_index} patch={patch_size} "
             f"hit_to_anchor={None if hit_distance is None else round(float(hit_distance), 4)} "
@@ -21787,6 +21998,9 @@ class InvPhyTrainerWarp:
             "anchor_cycle_available": controller_world["anchor_cycle_available"],
             "anchor_cycle_pressed": controller_world["anchor_cycle_pressed"],
             "anchor_cycle_source": controller_world["anchor_cycle_source"],
+            "anchor_reset_available": controller_world["anchor_reset_available"],
+            "anchor_reset_pressed": controller_world["anchor_reset_pressed"],
+            "anchor_reset_source": controller_world["anchor_reset_source"],
             "snap_assist_available": controller_world["snap_assist_available"],
             "snap_assist_pressed": controller_world["snap_assist_pressed"],
             "snap_assist_source": controller_world["snap_assist_source"],
@@ -22371,6 +22585,11 @@ class InvPhyTrainerWarp:
                             preview_state["current_candidate_count"] = len(ranked_anchors)
                 if snapped_anchor is None:
                     continue
+                explicit_preview_selected = bool(
+                    cycle_locked
+                    and selected_preview_anchor is not None
+                    and snapped_anchor.get("name") == selected_preview_anchor.get("name")
+                )
                 preview_anchor_visible = True
                 preview_anchor_resolved = True
                 remap_candidate = (
@@ -22385,6 +22604,7 @@ class InvPhyTrainerWarp:
                 if remap_candidate is None:
                     preview_interaction_state = {
                         "grab_start_mode": grab_start_mode,
+                        "explicit_preview_selected": explicit_preview_selected,
                         "preview_anchor_visible": preview_anchor_visible,
                         "preview_anchor_name": preview_anchor_name,
                         "preview_anchor_resolved": True,
@@ -22428,6 +22648,7 @@ class InvPhyTrainerWarp:
                         "preview_anchor_resolved": preview_anchor_resolved,
                         "hit_present": bool(hit_world is not None),
                         "cycle_locked": cycle_locked,
+                        "explicit_preview_selected": explicit_preview_selected,
                         "selected_rank_index": selected_rank_index,
                         "start_reference": (
                             "ray_hit" if hit_world is not None else "anchor_center"
@@ -22448,8 +22669,9 @@ class InvPhyTrainerWarp:
                     hit_world,
                     ray_direction_world,
                     controller_interaction_state=controller_interaction_state,
-                    explicit_preview_selected=True,
+                    explicit_preview_selected=explicit_preview_selected,
                 )
+                interaction_state.update(validation_debug)
                 if rejection_reason is not None:
                     self._log_controller_interaction_rejected(
                         source,
@@ -22462,6 +22684,7 @@ class InvPhyTrainerWarp:
                     print(
                         "[live_openxr_controller] "
                         f"{source} interaction_projected_anchor_bypass=1 "
+                        f"mode={grab_start_mode} "
                         f"anchor={remap_candidate['anchor_name']} "
                         f"projected_anchor={validation_debug['projected_anchor_distance']:.4f} "
                         f"strict_limit={validation_debug['strict_projected_anchor_distance_limit']:.4f} "
@@ -22494,7 +22717,7 @@ class InvPhyTrainerWarp:
                         "target_point_indices": remap_candidate.get("target_point_indices"),
                         "multi_points_debug": remap_candidate.get("multi_points_debug"),
                         "hit_to_anchor_distance": remap_candidate.get("hit_to_anchor_distance"),
-                        "explicit_preview_selected": True,
+                        "explicit_preview_selected": explicit_preview_selected,
                         "grab_start_mode": grab_start_mode,
                         "preview_anchor_visible": preview_anchor_visible,
                         "preview_anchor_name": preview_anchor_name,
@@ -22566,12 +22789,9 @@ class InvPhyTrainerWarp:
             origin_pixel = overlay["origin_pixel"]
             end_pixel = overlay["end_pixel"]
             hit_pixel = overlay["hit_pixel"]
-            candidate_pixel = overlay.get("attach_candidate_pixel")
             active_pixel = overlay.get("attach_active_pixel")
-            attach_candidate = overlay.get("attach_candidate", False)
             attachment_active = overlay.get("attachment_active", False)
             active_contact_only = bool(overlay.get("active_contact_only", False))
-            anchor_preview_entries = overlay.get("anchor_preview_entries", [])
 
             if not active_contact_only:
                 self._draw_marker_line(
@@ -22592,22 +22812,15 @@ class InvPhyTrainerWarp:
                     blend=0.85,
                 )
 
-            if not active_contact_only and attach_candidate and candidate_pixel is not None:
-                self._blend_square_marker(
-                    frame,
-                    candidate_pixel,
-                    self.LIVE_CONTROLLER_ATTACH_CANDIDATE_COLOR,
-                    radius=self.LIVE_CONTROLLER_CANDIDATE_SQUARE_RADIUS,
-                    blend=0.86,
-                )
-                self._blend_marker(
-                    frame,
-                    candidate_pixel,
-                    self.LIVE_CONTROLLER_SELECT_COLOR,
-                    radius=1,
-                    blend=0.98,
-                )
+        self._draw_live_controller_candidate_markers(frame, controller_overlays)
 
+        for overlay in controller_overlays:
+            color = overlay["color"]
+            origin_pixel = overlay["origin_pixel"]
+            active_pixel = overlay.get("attach_active_pixel")
+            attachment_active = overlay.get("attachment_active", False)
+            active_contact_only = bool(overlay.get("active_contact_only", False))
+            anchor_preview_entries = overlay.get("anchor_preview_entries", [])
             if not active_contact_only:
                 for preview_entry in anchor_preview_entries:
                     preview_pixel = preview_entry["pixel"]
@@ -22764,6 +22977,26 @@ class InvPhyTrainerWarp:
         print(
             "[live_openxr_controller] "
             f"{source} anchor_cycle available={int(state[0])} "
+            f"pressed={int(state[1])} source={state[2]}",
+            flush=True,
+        )
+        state_cache[source] = state
+
+    def _log_controller_anchor_reset_transition(self, source, controller_sample, state_cache):
+        if controller_sample is None:
+            return
+
+        state = (
+            bool(getattr(controller_sample, "anchor_reset_available", False)),
+            bool(getattr(controller_sample, "anchor_reset_pressed", False)),
+            str(getattr(controller_sample, "anchor_reset_source", "none")),
+        )
+        if state_cache.get(source) == state:
+            return
+
+        print(
+            "[live_openxr_controller] "
+            f"{source} anchor_reset available={int(state[0])} "
             f"pressed={int(state[1])} source={state[2]}",
             flush=True,
         )
@@ -23672,6 +23905,8 @@ class InvPhyTrainerWarp:
             "ray_end_world": ray_end_world,
             "preview_context_mode": preview_context_mode,
             "attach_candidate_world": None,
+            "attach_candidate_anchor_name": None,
+            "attach_candidate_cycle_locked": False,
             "attach_active_world": None,
             "active_overlay_world": None,
             "active_overlay_fallback_world": None,
@@ -23692,6 +23927,9 @@ class InvPhyTrainerWarp:
             "anchor_cycle_available": controller_world["anchor_cycle_available"],
             "anchor_cycle_pressed": controller_world["anchor_cycle_pressed"],
             "anchor_cycle_source": controller_world["anchor_cycle_source"],
+            "anchor_reset_available": controller_world["anchor_reset_available"],
+            "anchor_reset_pressed": controller_world["anchor_reset_pressed"],
+            "anchor_reset_source": controller_world["anchor_reset_source"],
             "snap_assist_available": controller_world["snap_assist_available"],
             "snap_assist_pressed": controller_world["snap_assist_pressed"],
             "snap_assist_source": controller_world["snap_assist_source"],
@@ -23926,6 +24164,10 @@ class InvPhyTrainerWarp:
             "end_pixel": end_pixel,
             "hit_pixel": projected_fields.get("hit_world"),
             "attach_candidate_pixel": projected_fields.get("attach_candidate_world"),
+            "attach_candidate_anchor_name": overlay_world.get("attach_candidate_anchor_name"),
+            "attach_candidate_cycle_locked": bool(
+                overlay_world.get("attach_candidate_cycle_locked", False)
+            ),
             "attach_active_pixel": attach_active_pixel,
             "attach_candidate": bool(overlay_world.get("attach_candidate", False)),
             "attachment_active": bool(overlay_world.get("attachment_active", False)),
@@ -23939,6 +24181,9 @@ class InvPhyTrainerWarp:
             "anchor_cycle_available": overlay_world["anchor_cycle_available"],
             "anchor_cycle_pressed": overlay_world["anchor_cycle_pressed"],
             "anchor_cycle_source": overlay_world["anchor_cycle_source"],
+            "anchor_reset_available": overlay_world["anchor_reset_available"],
+            "anchor_reset_pressed": overlay_world["anchor_reset_pressed"],
+            "anchor_reset_source": overlay_world["anchor_reset_source"],
             "snap_assist_available": overlay_world["snap_assist_available"],
             "snap_assist_pressed": overlay_world["snap_assist_pressed"],
             "snap_assist_source": overlay_world["snap_assist_source"],
@@ -24091,6 +24336,12 @@ class InvPhyTrainerWarp:
                     "attach_candidate_pixel": projected_fields.get(
                         "attach_candidate_world"
                     ),
+                    "attach_candidate_anchor_name": overlay_world.get(
+                        "attach_candidate_anchor_name"
+                    ),
+                    "attach_candidate_cycle_locked": bool(
+                        overlay_world.get("attach_candidate_cycle_locked", False)
+                    ),
                     "attach_active_pixel": attach_active_pixel,
                     "attach_candidate": bool(overlay_world.get("attach_candidate", False)),
                     "attachment_active": bool(
@@ -24108,6 +24359,9 @@ class InvPhyTrainerWarp:
                     "anchor_cycle_available": overlay_world["anchor_cycle_available"],
                     "anchor_cycle_pressed": overlay_world["anchor_cycle_pressed"],
                     "anchor_cycle_source": overlay_world["anchor_cycle_source"],
+                    "anchor_reset_available": overlay_world["anchor_reset_available"],
+                    "anchor_reset_pressed": overlay_world["anchor_reset_pressed"],
+                    "anchor_reset_source": overlay_world["anchor_reset_source"],
                     "snap_assist_available": overlay_world["snap_assist_available"],
                     "snap_assist_pressed": overlay_world["snap_assist_pressed"],
                     "snap_assist_source": overlay_world["snap_assist_source"],
@@ -25206,7 +25460,9 @@ class InvPhyTrainerWarp:
         controller_select_hold_state = {"left": {}, "right": {}}
         controller_select_hold_state_cache = {"left": None, "right": None}
         controller_anchor_cycle_state_cache = {"left": None, "right": None}
+        controller_anchor_reset_state_cache = {"left": None, "right": None}
         controller_anchor_cycle_edge_cache = {"left": False, "right": False}
+        controller_anchor_reset_edge_cache = {"left": False, "right": False}
         controller_snap_state_cache = {"left": None, "right": None}
         controller_snap_edge_cache = {"left": False, "right": False}
         controller_exit_hold_state = {"left": {}, "right": {}}
@@ -26401,6 +26657,7 @@ class InvPhyTrainerWarp:
                 controller_select_hold_state,
                 controller_select_hold_state_cache,
                 controller_anchor_cycle_state_cache,
+                controller_anchor_reset_state_cache,
                 controller_snap_state_cache,
                 controller_snap_edge_cache,
                 controller_exit_hold_state,
@@ -28280,6 +28537,7 @@ class InvPhyTrainerWarp:
                         controller_select_hold_state,
                         controller_select_hold_state_cache,
                         controller_anchor_cycle_state_cache,
+                        controller_anchor_reset_state_cache,
                         controller_snap_state_cache,
                         controller_snap_edge_cache,
                         controller_exit_hold_state,
@@ -28943,6 +29201,11 @@ class InvPhyTrainerWarp:
                             controller_world,
                             controller_anchor_cycle_edge_cache,
                         )
+                        reset_edge = self._controller_anchor_reset_edge(
+                            source,
+                            controller_world,
+                            controller_anchor_reset_edge_cache,
+                        )
                         selected_preview_anchor = self._update_controller_anchor_preview_state(
                             source,
                             controller_world,
@@ -28950,6 +29213,7 @@ class InvPhyTrainerWarp:
                             controller_predefined_anchor_states,
                             controller_anchor_preview_state,
                             cycle_edge,
+                            reset_edge,
                             controller_interaction_state[source],
                             controller_interaction_state,
                         )
@@ -29036,6 +29300,16 @@ class InvPhyTrainerWarp:
                             attach_candidate_anchor["center_world"]
                             if attach_candidate_anchor is not None and not interaction_active
                             else None
+                        )
+                        overlay_entry["attach_candidate_anchor_name"] = (
+                            attach_candidate_anchor["name"]
+                            if attach_candidate_anchor is not None and not interaction_active
+                            else None
+                        )
+                        overlay_entry["attach_candidate_cycle_locked"] = (
+                            bool(preview_state_entry.get("cycle_locked", False))
+                            if attach_candidate_anchor is not None and not interaction_active
+                            else False
                         )
                         overlay_entry["attachment_active"] = interaction_active
                         overlay_entry["active_contact_only"] = bool(

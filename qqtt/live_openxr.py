@@ -81,6 +81,9 @@ class ControllerPoseSample:
     anchor_cycle_available: bool
     anchor_cycle_pressed: bool
     anchor_cycle_source: str
+    anchor_reset_available: bool
+    anchor_reset_pressed: bool
+    anchor_reset_source: str
     snap_assist_available: bool
     snap_assist_pressed: bool
     snap_assist_source: str
@@ -260,6 +263,9 @@ def parse_controller_payload(payload: dict) -> ControllerPoseSample:
         anchor_cycle_available=bool(payload["anchor_cycle_available"]),
         anchor_cycle_pressed=bool(payload["anchor_cycle_pressed"]),
         anchor_cycle_source=str(payload["anchor_cycle_source"]),
+        anchor_reset_available=bool(payload.get("anchor_reset_available", False)),
+        anchor_reset_pressed=bool(payload.get("anchor_reset_pressed", False)),
+        anchor_reset_source=str(payload.get("anchor_reset_source", "none")),
         snap_assist_available=bool(payload["snap_assist_available"]),
         snap_assist_pressed=bool(payload["snap_assist_pressed"]),
         snap_assist_source=str(payload["snap_assist_source"]),

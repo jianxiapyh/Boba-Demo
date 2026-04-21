@@ -277,6 +277,30 @@ bool AppendAnchorCycleBindings(
     return true;
 }
 
+bool AppendAnchorResetBindings(
+    XrInstance instance,
+    XrAction anchor_reset_click_action,
+    const char* profile_string,
+    std::vector<XrActionSuggestedBinding>* bindings) {
+    if (std::strcmp(profile_string, "/interaction_profiles/oculus/touch_controller") != 0) {
+        return true;
+    }
+
+    const char* paths[] = {
+        "/user/hand/left/input/thumbstick/click",
+        "/user/hand/right/input/thumbstick/click",
+    };
+    bindings->reserve(bindings->size() + 2);
+    for (const char* path_string : paths) {
+        XrPath path = XR_NULL_PATH;
+        if (!StringToPath(instance, path_string, &path)) {
+            return false;
+        }
+        bindings->push_back({anchor_reset_click_action, path});
+    }
+    return true;
+}
+
 bool AppendSnapAssistBindings(
     XrInstance instance,
     XrAction snap_assist_click_action,
@@ -468,6 +492,7 @@ void PrintControllerJson(const char* prefix, const ControllerPoseSample& pose,
                          const ControllerPoseSample& aim,
                          const SelectStateSample& select,
                          const SelectStateSample& anchor_cycle,
+                         const SelectStateSample& anchor_reset,
                          const SelectStateSample& snap_assist,
                          const SelectStateSample& exit_value) {
     std::cout << "\"" << prefix << "\":{";
@@ -514,6 +539,9 @@ void PrintControllerJson(const char* prefix, const ControllerPoseSample& pose,
     std::cout << "\"anchor_cycle_available\":" << (anchor_cycle.available ? 1 : 0) << ",";
     std::cout << "\"anchor_cycle_pressed\":" << (anchor_cycle.pressed ? 1 : 0) << ",";
     std::cout << "\"anchor_cycle_source\":\"" << anchor_cycle.source << "\",";
+    std::cout << "\"anchor_reset_available\":" << (anchor_reset.available ? 1 : 0) << ",";
+    std::cout << "\"anchor_reset_pressed\":" << (anchor_reset.pressed ? 1 : 0) << ",";
+    std::cout << "\"anchor_reset_source\":\"" << anchor_reset.source << "\",";
     std::cout << "\"snap_assist_available\":" << (snap_assist.available ? 1 : 0) << ",";
     std::cout << "\"snap_assist_pressed\":" << (snap_assist.pressed ? 1 : 0) << ",";
     std::cout << "\"snap_assist_source\":\"" << snap_assist.source << "\",";
@@ -1361,6 +1389,7 @@ int main(int argc, char** argv) {
     XrAction select_click_action = XR_NULL_HANDLE;
     XrAction select_value_action = XR_NULL_HANDLE;
     XrAction anchor_cycle_click_action = XR_NULL_HANDLE;
+    XrAction anchor_reset_click_action = XR_NULL_HANDLE;
     XrAction snap_assist_click_action = XR_NULL_HANDLE;
     XrAction exit_value_action = XR_NULL_HANDLE;
     if (!create_action("grip_pose", "Grip Pose", XR_ACTION_TYPE_POSE_INPUT,
@@ -1372,6 +1401,8 @@ int main(int argc, char** argv) {
                        &select_value_action) ||
         !create_action("anchor_cycle_click", "Anchor Cycle Click",
                        XR_ACTION_TYPE_BOOLEAN_INPUT, &anchor_cycle_click_action) ||
+        !create_action("anchor_reset_click", "Anchor Reset Click",
+                       XR_ACTION_TYPE_BOOLEAN_INPUT, &anchor_reset_click_action) ||
         !create_action("snap_assist_click", "Snap Assist Click",
                        XR_ACTION_TYPE_BOOLEAN_INPUT, &snap_assist_click_action) ||
         !create_action("exit_value", "Exit Value", XR_ACTION_TYPE_FLOAT_INPUT,
@@ -1398,6 +1429,7 @@ int main(int argc, char** argv) {
             !AppendSelectBindings(instance, select_click_action, select_value_action, profile,
                                   &bindings) ||
             !AppendAnchorCycleBindings(instance, anchor_cycle_click_action, profile, &bindings) ||
+            !AppendAnchorResetBindings(instance, anchor_reset_click_action, profile, &bindings) ||
             !AppendSnapAssistBindings(instance, snap_assist_click_action, profile, &bindings) ||
             !AppendExitBindings(instance, exit_value_action, profile, &bindings) ||
             !SuggestBindingsForProfile(instance, profile, bindings)) {
@@ -1645,6 +1677,8 @@ int main(int argc, char** argv) {
         SelectStateSample select_right;
         SelectStateSample anchor_cycle_left;
         SelectStateSample anchor_cycle_right;
+        SelectStateSample anchor_reset_left;
+        SelectStateSample anchor_reset_right;
         SelectStateSample snap_assist_left;
         SelectStateSample snap_assist_right;
         SelectStateSample exit_left;
@@ -1661,6 +1695,10 @@ int main(int argc, char** argv) {
                                      left_hand_path, &anchor_cycle_left) ||
             !QueryBooleanActionState(instance, session, anchor_cycle_click_action,
                                      right_hand_path, &anchor_cycle_right) ||
+            !QueryBooleanActionState(instance, session, anchor_reset_click_action,
+                                     left_hand_path, &anchor_reset_left) ||
+            !QueryBooleanActionState(instance, session, anchor_reset_click_action,
+                                     right_hand_path, &anchor_reset_right) ||
             !QueryBooleanActionState(instance, session, snap_assist_click_action,
                                      left_hand_path, &snap_assist_left) ||
             !QueryBooleanActionState(instance, session, snap_assist_click_action,
@@ -1702,6 +1740,7 @@ int main(int argc, char** argv) {
             aim_left,
             select_left,
             anchor_cycle_left,
+            anchor_reset_left,
             snap_assist_left,
             exit_left
         );
@@ -1713,6 +1752,7 @@ int main(int argc, char** argv) {
             aim_right,
             select_right,
             anchor_cycle_right,
+            anchor_reset_right,
             snap_assist_right,
             exit_right
         );

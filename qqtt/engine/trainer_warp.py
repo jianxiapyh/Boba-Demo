@@ -1647,6 +1647,7 @@ class _ImmersivePresentationWorkerLegacy:
         self._stable_cover_left_frame = None
         self._stable_cover_right_frame = None
         self._stable_cover_preview_frame = None
+        self._stable_cover_cache_enabled = bool(owner._is_rope_family_case())
 
     @staticmethod
     def _attach_worker_cuda_context(cuda_device_index):
@@ -1683,6 +1684,9 @@ class _ImmersivePresentationWorkerLegacy:
         right_frame,
         preview_frame=None,
     ):
+        if not self._stable_cover_cache_enabled:
+            self._reset_stable_cover_frame_cache()
+            return
         if not torch.is_tensor(left_frame) or not torch.is_tensor(right_frame):
             self._reset_stable_cover_frame_cache()
             return
@@ -1707,6 +1711,8 @@ class _ImmersivePresentationWorkerLegacy:
         gaussian_blue_source_reject,
         compose_reject_metrics,
     ):
+        if not self._stable_cover_cache_enabled:
+            return None
         owner = self._owner
         cover_result = owner._publish_immersive_stable_cover_frame(
             self._immersive_bridge,
@@ -2983,6 +2989,7 @@ class _ImmersivePresentationWorkerLegacy:
             )
         worker_start = time.perf_counter()
         render_profile_enabled = bool(packet.get("render_profile_enabled", False))
+        stable_fast_path_enabled = bool(packet.get("stable_fast_path_enabled", False))
         worker_profile = {"_cuda_spans": []} if render_profile_enabled else None
         producer_ready_event = packet.get("producer_ready_event")
         presentation_complete_event = None
@@ -3010,16 +3017,37 @@ class _ImmersivePresentationWorkerLegacy:
         if control_stream is None or left_stream is None or right_stream is None:
             raise RuntimeError("Immersive presentation worker requires CUDA streams.")
 
-        left_compose_start_event = torch.cuda.Event(enable_timing=True)
-        left_compose_end_event = torch.cuda.Event(enable_timing=True)
-        right_compose_start_event = torch.cuda.Event(enable_timing=True)
-        right_compose_end_event = torch.cuda.Event(enable_timing=True)
-        left_overlay_start_event = torch.cuda.Event(enable_timing=True)
-        left_overlay_end_event = torch.cuda.Event(enable_timing=True)
-        right_overlay_start_event = torch.cuda.Event(enable_timing=True)
-        right_overlay_end_event = torch.cuda.Event(enable_timing=True)
-        parallel_wait_start_event = torch.cuda.Event(enable_timing=True)
-        parallel_wait_end_event = torch.cuda.Event(enable_timing=True)
+        timing_events_enabled = bool(render_profile_enabled)
+        left_compose_start_event = (
+            torch.cuda.Event(enable_timing=True) if timing_events_enabled else None
+        )
+        left_compose_end_event = (
+            torch.cuda.Event(enable_timing=True) if timing_events_enabled else None
+        )
+        right_compose_start_event = (
+            torch.cuda.Event(enable_timing=True) if timing_events_enabled else None
+        )
+        right_compose_end_event = (
+            torch.cuda.Event(enable_timing=True) if timing_events_enabled else None
+        )
+        left_overlay_start_event = (
+            torch.cuda.Event(enable_timing=True) if timing_events_enabled else None
+        )
+        left_overlay_end_event = (
+            torch.cuda.Event(enable_timing=True) if timing_events_enabled else None
+        )
+        right_overlay_start_event = (
+            torch.cuda.Event(enable_timing=True) if timing_events_enabled else None
+        )
+        right_overlay_end_event = (
+            torch.cuda.Event(enable_timing=True) if timing_events_enabled else None
+        )
+        parallel_wait_start_event = (
+            torch.cuda.Event(enable_timing=True) if timing_events_enabled else None
+        )
+        parallel_wait_end_event = (
+            torch.cuda.Event(enable_timing=True) if timing_events_enabled else None
+        )
         left_compose_metrics = None
         right_compose_metrics = None
         left_compose_artifact_analysis = None
@@ -3032,8 +3060,8 @@ class _ImmersivePresentationWorkerLegacy:
         right_compose_artifact_extra_metadata = None
         left_compose_artifact_pre_stabilization = None
         right_compose_artifact_pre_stabilization = None
-        left_overlay_eye_render_state = packet["left_overlay_eye_render_state"]
-        right_overlay_eye_render_state = packet["right_overlay_eye_render_state"]
+        left_overlay_eye_render_state = packet.get("left_overlay_eye_render_state")
+        right_overlay_eye_render_state = packet.get("right_overlay_eye_render_state")
         scene_pose_sample = None
         stable_compose_debug_enabled = bool(
             (not bool(packet.get("scene_depth_reproject_enabled", False)))
@@ -3063,7 +3091,8 @@ class _ImmersivePresentationWorkerLegacy:
                 worker_profile,
                 "compose_left_cuda",
             )
-            left_compose_start_event.record(left_stream)
+            if left_compose_start_event is not None:
+                left_compose_start_event.record(left_stream)
             if worker_profile is not None or stable_compose_debug_enabled:
                 (
                     left_eye_frame,
@@ -3097,7 +3126,8 @@ class _ImmersivePresentationWorkerLegacy:
                     return_depth=True,
                 )
                 left_compose_metrics = None
-            left_compose_end_event.record(left_stream)
+            if left_compose_end_event is not None:
+                left_compose_end_event.record(left_stream)
             owner._render_profile_end_cuda_span(
                 worker_profile,
                 left_compose_span,
@@ -3110,7 +3140,8 @@ class _ImmersivePresentationWorkerLegacy:
                 worker_profile,
                 "compose_right_cuda",
             )
-            right_compose_start_event.record(right_stream)
+            if right_compose_start_event is not None:
+                right_compose_start_event.record(right_stream)
             if worker_profile is not None or stable_compose_debug_enabled:
                 (
                     right_eye_frame,
@@ -3144,14 +3175,17 @@ class _ImmersivePresentationWorkerLegacy:
                     return_depth=True,
                 )
                 right_compose_metrics = None
-            right_compose_end_event.record(right_stream)
+            if right_compose_end_event is not None:
+                right_compose_end_event.record(right_stream)
             owner._render_profile_end_cuda_span(
                 worker_profile,
                 right_compose_span,
             )
 
-        left_compose_end_event.synchronize()
-        right_compose_end_event.synchronize()
+        if render_profile_enabled or stable_compose_debug_enabled:
+            current_stream = torch.cuda.current_stream()
+            current_stream.wait_stream(left_stream)
+            current_stream.wait_stream(right_stream)
         if stable_compose_debug_enabled:
             left_stabilized_compose = owner._stabilize_immersive_stable_compose_eye(
                 eye_label="left",
@@ -3352,154 +3386,8 @@ class _ImmersivePresentationWorkerLegacy:
                 },
                 "synthetic_source_state": None,
             }
-        synthetic_source_state = self._build_synthetic_source_state(
-            packet=packet,
-            left_eye_frame=left_eye_frame,
-            left_eye_frame_depth=left_eye_frame_depth,
-            right_eye_frame=right_eye_frame,
-            right_eye_frame_depth=right_eye_frame_depth,
-        )
-
-        publish_state = owner._resolve_immersive_scene_publish_state(
-            self._immersive_bridge,
-            scene_depth_reproject_enabled=bool(
-                packet.get("scene_depth_reproject_enabled", False)
-            ),
-            scene_source_sample_id=int(
-                packet.get(
-                    "scene_source_sample_id",
-                    packet.get("render_sample_id", -1),
-                )
-            ),
-            scene_source_left_eye_pose_world=packet["scene_source_left_eye_pose_world"],
-            scene_source_right_eye_pose_world=packet["scene_source_right_eye_pose_world"],
-            scene_source_left_intrinsic=packet["scene_source_left_intrinsic"],
-            scene_source_right_intrinsic=packet["scene_source_right_intrinsic"],
-            default_left_overlay_eye_render_state=packet["left_overlay_eye_render_state"],
-            default_right_overlay_eye_render_state=packet["right_overlay_eye_render_state"],
-            live_head_alignment=packet.get("live_head_alignment"),
-            head_pose_state=packet.get("head_pose_state"),
-            frame_index=int(packet["source_frame_index"]),
-            eye_width=self._eye_width,
-            eye_height=self._eye_height,
-        )
-        publish_sample = publish_state["publish_sample"]
-        if publish_state["apply_timewarp"]:
-            scene_pose_sample = publish_sample
-        default_left_overlay_eye_render_state = packet["left_overlay_eye_render_state"]
-        default_right_overlay_eye_render_state = packet["right_overlay_eye_render_state"]
-        left_overlay_eye_render_state = publish_state["left_overlay_eye_render_state"]
-        right_overlay_eye_render_state = publish_state["right_overlay_eye_render_state"]
-        timewarp_source_age_ms = max(
-            0.0,
-            (time.perf_counter() - float(packet["source_ready_wall_time_s"])) * 1000.0,
-        )
-        with self._condition:
-            stale_packet = int(self._latest_submitted_serial) > int(
-                packet.get("submit_serial", 0)
-            )
-        timewarp_decision = owner._evaluate_immersive_scene_timewarp_admission(
-            apply_requested=bool(publish_state["apply_timewarp"]),
-            queue_wait_ms=queue_wait_ms,
-            source_age_ms=timewarp_source_age_ms,
-            static_scene_reuse_age_frames=float(
-                packet.get("static_scene_reuse_age_frames", 0.0)
-            ),
-            stale_packet=stale_packet,
-        )
-        owner._record_immersive_scene_timewarp_skip_profile_metrics(
-            worker_profile,
-            timewarp_decision,
-        )
-        if bool(timewarp_decision["apply"]):
-            publish_sample_id = int(publish_state["publish_sample_id"])
-            timewarp_span = None
-            left_timewarp_stats = {}
-            right_timewarp_stats = {}
-            with torch.cuda.stream(control_stream):
-                timewarp_span = owner._render_profile_begin_cuda_span(
-                    worker_profile,
-                    "scene_timewarp_gpu_ms",
-                )
-            with torch.cuda.stream(left_stream):
-                try:
-                    (
-                        warped_left_eye_frame,
-                        warped_left_eye_depth,
-                        warped_left_valid_mask,
-                    ) = owner._latewarp_immersive_scene_eye(
-                        left_eye_frame,
-                        left_eye_frame_depth,
-                        packet["scene_source_left_eye_pose_world"],
-                        publish_state["publish_left_eye_pose_world"],
-                        packet["scene_source_left_intrinsic"],
-                        publish_state["publish_left_intrinsic"],
-                        self._eye_height,
-                        self._eye_width,
-                        "left_present",
-                        reproject_caches=self._scene_reproject_caches,
-                        render_profile_frame=None,
-                    )
-                    if (
-                        torch.is_tensor(warped_left_eye_frame)
-                        and torch.is_tensor(warped_left_eye_depth)
-                        and tuple(warped_left_eye_frame.shape)
-                        == (self._eye_height, self._eye_width, 4)
-                        and tuple(warped_left_eye_depth.shape)
-                        == (self._eye_height, self._eye_width)
-                        and owner._is_finite_tensor(warped_left_eye_frame)
-                        and owner._is_finite_tensor(warped_left_eye_depth)
-                    ):
-                        left_eye_frame = warped_left_eye_frame
-                        left_eye_frame_depth = warped_left_eye_depth
-                    else:
-                        scene_timewarp_fallback_left_used = 1.0
-                except Exception:
-                    scene_timewarp_fallback_left_used = 1.0
-            with torch.cuda.stream(right_stream):
-                try:
-                    (
-                        warped_right_eye_frame,
-                        warped_right_eye_depth,
-                        _,
-                    ) = owner._latewarp_immersive_scene_eye(
-                        right_eye_frame,
-                        right_eye_frame_depth,
-                        packet["scene_source_right_eye_pose_world"],
-                        publish_state["publish_right_eye_pose_world"],
-                        packet["scene_source_right_intrinsic"],
-                        publish_state["publish_right_intrinsic"],
-                        self._eye_height,
-                        self._eye_width,
-                        "right_present",
-                        reproject_caches=self._scene_reproject_caches,
-                        render_profile_frame=None,
-                    )
-                    if (
-                        torch.is_tensor(warped_right_eye_frame)
-                        and torch.is_tensor(warped_right_eye_depth)
-                        and tuple(warped_right_eye_frame.shape)
-                        == (self._eye_height, self._eye_width, 4)
-                        and tuple(warped_right_eye_depth.shape)
-                        == (self._eye_height, self._eye_width)
-                        and owner._is_finite_tensor(warped_right_eye_frame)
-                        and owner._is_finite_tensor(warped_right_eye_depth)
-                    ):
-                        right_eye_frame = warped_right_eye_frame
-                        right_eye_frame_depth = warped_right_eye_depth
-                    else:
-                        scene_timewarp_fallback_right_used = 1.0
-                except Exception:
-                    scene_timewarp_fallback_right_used = 1.0
-            with torch.cuda.stream(control_stream):
-                control_stream.wait_stream(left_stream)
-                control_stream.wait_stream(right_stream)
-                owner._render_profile_end_cuda_span(
-                    worker_profile,
-                    timewarp_span,
-                )
-            scene_timewarp_applied = 1.0
-        else:
+        if stable_fast_path_enabled:
+            synthetic_source_state = None
             publish_sample = None
             scene_pose_sample = None
             publish_sample_id = int(
@@ -3508,102 +3396,275 @@ class _ImmersivePresentationWorkerLegacy:
                     packet.get("render_sample_id", -1),
                 )
             )
-            left_overlay_eye_render_state = default_left_overlay_eye_render_state
-            right_overlay_eye_render_state = default_right_overlay_eye_render_state
-
-        if synthetic_source_state is not None:
-            scene_source_received_monotonic_s = packet.get(
-                "scene_source_received_monotonic_s"
-            )
-            if scene_pose_sample is not None:
-                publish_pose_received_monotonic_s = owner._sample_received_monotonic_s(
-                    scene_pose_sample
-                )
-                if publish_pose_received_monotonic_s is not None:
-                    scene_source_received_monotonic_s = float(
-                        publish_pose_received_monotonic_s
-                    )
-            actual_real_view_source = self._build_actual_real_view_source_bundle(
+            projected_overlay_entries = packet.get("projected_overlay_entries") or {
+                "left": [],
+                "right": [],
+            }
+        else:
+            synthetic_source_state = self._build_synthetic_source_state(
                 packet=packet,
                 left_eye_frame=left_eye_frame,
                 left_eye_frame_depth=left_eye_frame_depth,
                 right_eye_frame=right_eye_frame,
                 right_eye_frame_depth=right_eye_frame_depth,
-                publish_state=publish_state,
-                publish_sample_id=publish_sample_id,
-                left_overlay_eye_render_state=left_overlay_eye_render_state,
-                right_overlay_eye_render_state=right_overlay_eye_render_state,
-                real_timewarp_applied=bool(scene_timewarp_applied),
-                left_timewarp_fallback_used=bool(scene_timewarp_fallback_left_used),
-                right_timewarp_fallback_used=bool(scene_timewarp_fallback_right_used),
-                scene_source_received_monotonic_s=scene_source_received_monotonic_s,
             )
-            if bool(actual_real_view_source.get("synthetic_source_consistent", 0.0)):
-                synthetic_source_state = (
-                    self._rebase_synthetic_source_state_to_actual_real_view(
-                        synthetic_source_state,
-                        actual_real_view_source=actual_real_view_source,
+
+            publish_state = owner._resolve_immersive_scene_publish_state(
+                self._immersive_bridge,
+                scene_depth_reproject_enabled=bool(
+                    packet.get("scene_depth_reproject_enabled", False)
+                ),
+                scene_source_sample_id=int(
+                    packet.get(
+                        "scene_source_sample_id",
+                        packet.get("render_sample_id", -1),
+                    )
+                ),
+                scene_source_left_eye_pose_world=packet["scene_source_left_eye_pose_world"],
+                scene_source_right_eye_pose_world=packet["scene_source_right_eye_pose_world"],
+                scene_source_left_intrinsic=packet["scene_source_left_intrinsic"],
+                scene_source_right_intrinsic=packet["scene_source_right_intrinsic"],
+                default_left_overlay_eye_render_state=packet["left_overlay_eye_render_state"],
+                default_right_overlay_eye_render_state=packet["right_overlay_eye_render_state"],
+                live_head_alignment=packet.get("live_head_alignment"),
+                head_pose_state=packet.get("head_pose_state"),
+                frame_index=int(packet["source_frame_index"]),
+                eye_width=self._eye_width,
+                eye_height=self._eye_height,
+            )
+            publish_sample = publish_state["publish_sample"]
+            if publish_state["apply_timewarp"]:
+                scene_pose_sample = publish_sample
+            default_left_overlay_eye_render_state = packet["left_overlay_eye_render_state"]
+            default_right_overlay_eye_render_state = packet["right_overlay_eye_render_state"]
+            left_overlay_eye_render_state = publish_state["left_overlay_eye_render_state"]
+            right_overlay_eye_render_state = publish_state["right_overlay_eye_render_state"]
+            timewarp_source_age_ms = max(
+                0.0,
+                (time.perf_counter() - float(packet["source_ready_wall_time_s"])) * 1000.0,
+            )
+            with self._condition:
+                stale_packet = int(self._latest_submitted_serial) > int(
+                    packet.get("submit_serial", 0)
+                )
+            timewarp_decision = owner._evaluate_immersive_scene_timewarp_admission(
+                apply_requested=bool(publish_state["apply_timewarp"]),
+                queue_wait_ms=queue_wait_ms,
+                source_age_ms=timewarp_source_age_ms,
+                static_scene_reuse_age_frames=float(
+                    packet.get("static_scene_reuse_age_frames", 0.0)
+                ),
+                stale_packet=stale_packet,
+            )
+            owner._record_immersive_scene_timewarp_skip_profile_metrics(
+                worker_profile,
+                timewarp_decision,
+            )
+            if bool(timewarp_decision["apply"]):
+                publish_sample_id = int(publish_state["publish_sample_id"])
+                timewarp_span = None
+                left_timewarp_stats = {}
+                right_timewarp_stats = {}
+                with torch.cuda.stream(control_stream):
+                    timewarp_span = owner._render_profile_begin_cuda_span(
+                        worker_profile,
+                        "scene_timewarp_gpu_ms",
+                    )
+                with torch.cuda.stream(left_stream):
+                    try:
+                        (
+                            warped_left_eye_frame,
+                            warped_left_eye_depth,
+                            warped_left_valid_mask,
+                        ) = owner._latewarp_immersive_scene_eye(
+                            left_eye_frame,
+                            left_eye_frame_depth,
+                            packet["scene_source_left_eye_pose_world"],
+                            publish_state["publish_left_eye_pose_world"],
+                            packet["scene_source_left_intrinsic"],
+                            publish_state["publish_left_intrinsic"],
+                            self._eye_height,
+                            self._eye_width,
+                            "left_present",
+                            reproject_caches=self._scene_reproject_caches,
+                            render_profile_frame=None,
+                        )
+                        if (
+                            torch.is_tensor(warped_left_eye_frame)
+                            and torch.is_tensor(warped_left_eye_depth)
+                            and tuple(warped_left_eye_frame.shape)
+                            == (self._eye_height, self._eye_width, 4)
+                            and tuple(warped_left_eye_depth.shape)
+                            == (self._eye_height, self._eye_width)
+                            and owner._is_finite_tensor(warped_left_eye_frame)
+                            and owner._is_finite_tensor(warped_left_eye_depth)
+                        ):
+                            left_eye_frame = warped_left_eye_frame
+                            left_eye_frame_depth = warped_left_eye_depth
+                        else:
+                            scene_timewarp_fallback_left_used = 1.0
+                    except Exception:
+                        scene_timewarp_fallback_left_used = 1.0
+                with torch.cuda.stream(right_stream):
+                    try:
+                        (
+                            warped_right_eye_frame,
+                            warped_right_eye_depth,
+                            _,
+                        ) = owner._latewarp_immersive_scene_eye(
+                            right_eye_frame,
+                            right_eye_frame_depth,
+                            packet["scene_source_right_eye_pose_world"],
+                            publish_state["publish_right_eye_pose_world"],
+                            packet["scene_source_right_intrinsic"],
+                            publish_state["publish_right_intrinsic"],
+                            self._eye_height,
+                            self._eye_width,
+                            "right_present",
+                            reproject_caches=self._scene_reproject_caches,
+                            render_profile_frame=None,
+                        )
+                        if (
+                            torch.is_tensor(warped_right_eye_frame)
+                            and torch.is_tensor(warped_right_eye_depth)
+                            and tuple(warped_right_eye_frame.shape)
+                            == (self._eye_height, self._eye_width, 4)
+                            and tuple(warped_right_eye_depth.shape)
+                            == (self._eye_height, self._eye_width)
+                            and owner._is_finite_tensor(warped_right_eye_frame)
+                            and owner._is_finite_tensor(warped_right_eye_depth)
+                        ):
+                            right_eye_frame = warped_right_eye_frame
+                            right_eye_frame_depth = warped_right_eye_depth
+                        else:
+                            scene_timewarp_fallback_right_used = 1.0
+                    except Exception:
+                        scene_timewarp_fallback_right_used = 1.0
+                with torch.cuda.stream(control_stream):
+                    control_stream.wait_stream(left_stream)
+                    control_stream.wait_stream(right_stream)
+                    owner._render_profile_end_cuda_span(
+                        worker_profile,
+                        timewarp_span,
+                    )
+                scene_timewarp_applied = 1.0
+            else:
+                publish_sample = None
+                scene_pose_sample = None
+                publish_sample_id = int(
+                    packet.get(
+                        "scene_source_sample_id",
+                        packet.get("render_sample_id", -1),
                     )
                 )
-            else:
-                synthetic_source_state = None
+                left_overlay_eye_render_state = default_left_overlay_eye_render_state
+                right_overlay_eye_render_state = default_right_overlay_eye_render_state
 
-        with torch.cuda.stream(control_stream):
-            overlay_start = time.perf_counter()
-            projected_overlay_entries = owner._project_live_controller_world_overlays_batched(
-                packet.get("controller_overlay_entries") or [],
-                {
-                    "left": left_overlay_eye_render_state,
-                    "right": right_overlay_eye_render_state,
-                },
-                self._eye_height,
-                self._eye_width,
-            )
-            overlay_projection_wall_s = time.perf_counter() - overlay_start
-            if worker_profile is not None:
-                worker_profile["overlay_projection_wall"] = overlay_projection_wall_s
+            if synthetic_source_state is not None:
+                scene_source_received_monotonic_s = packet.get(
+                    "scene_source_received_monotonic_s"
+                )
+                if scene_pose_sample is not None:
+                    publish_pose_received_monotonic_s = owner._sample_received_monotonic_s(
+                        scene_pose_sample
+                    )
+                    if publish_pose_received_monotonic_s is not None:
+                        scene_source_received_monotonic_s = float(
+                            publish_pose_received_monotonic_s
+                        )
+                actual_real_view_source = self._build_actual_real_view_source_bundle(
+                    packet=packet,
+                    left_eye_frame=left_eye_frame,
+                    left_eye_frame_depth=left_eye_frame_depth,
+                    right_eye_frame=right_eye_frame,
+                    right_eye_frame_depth=right_eye_frame_depth,
+                    publish_state=publish_state,
+                    publish_sample_id=publish_sample_id,
+                    left_overlay_eye_render_state=left_overlay_eye_render_state,
+                    right_overlay_eye_render_state=right_overlay_eye_render_state,
+                    real_timewarp_applied=bool(scene_timewarp_applied),
+                    left_timewarp_fallback_used=bool(scene_timewarp_fallback_left_used),
+                    right_timewarp_fallback_used=bool(scene_timewarp_fallback_right_used),
+                    scene_source_received_monotonic_s=scene_source_received_monotonic_s,
+                )
+                if bool(actual_real_view_source.get("synthetic_source_consistent", 0.0)):
+                    synthetic_source_state = (
+                        self._rebase_synthetic_source_state_to_actual_real_view(
+                            synthetic_source_state,
+                            actual_real_view_source=actual_real_view_source,
+                        )
+                    )
+                else:
+                    synthetic_source_state = None
+
+            with torch.cuda.stream(control_stream):
+                overlay_start = time.perf_counter()
+                projected_overlay_entries = owner._project_live_controller_world_overlays_batched(
+                    packet.get("controller_overlay_entries") or [],
+                    {
+                        "left": left_overlay_eye_render_state,
+                        "right": right_overlay_eye_render_state,
+                    },
+                    self._eye_height,
+                    self._eye_width,
+                )
+                overlay_projection_wall_s = time.perf_counter() - overlay_start
+                if worker_profile is not None:
+                    worker_profile["overlay_projection_wall"] = overlay_projection_wall_s
 
         with torch.cuda.stream(left_stream):
             left_stream.wait_stream(control_stream)
-            left_overlay_start_event.record(left_stream)
+            if left_overlay_start_event is not None:
+                left_overlay_start_event.record(left_stream)
             left_eye_overlay_entries = projected_overlay_entries.get("left", [])
             if left_eye_overlay_entries:
                 owner._draw_live_controller_overlay(
                     left_eye_frame,
                     left_eye_overlay_entries,
                 )
-            if packet.get("support_overlay_enabled", False):
+            if (
+                packet.get("support_overlay_enabled", False)
+                and left_overlay_eye_render_state is not None
+            ):
                 owner._draw_immersive_support_entry_overlay(
                     left_eye_frame,
                     packet.get("support_overlay_cache"),
                     packet.get("support_overlay_active_support_id"),
                     left_overlay_eye_render_state,
                 )
-            left_overlay_end_event.record(left_stream)
+            if left_overlay_end_event is not None:
+                left_overlay_end_event.record(left_stream)
 
         with torch.cuda.stream(right_stream):
             right_stream.wait_stream(control_stream)
-            right_overlay_start_event.record(right_stream)
+            if right_overlay_start_event is not None:
+                right_overlay_start_event.record(right_stream)
             right_eye_overlay_entries = projected_overlay_entries.get("right", [])
             if right_eye_overlay_entries:
                 owner._draw_live_controller_overlay(
                     right_eye_frame,
                     right_eye_overlay_entries,
                 )
-            if packet.get("support_overlay_enabled", False):
+            if (
+                packet.get("support_overlay_enabled", False)
+                and right_overlay_eye_render_state is not None
+            ):
                 owner._draw_immersive_support_entry_overlay(
                     right_eye_frame,
                     packet.get("support_overlay_cache"),
                     packet.get("support_overlay_active_support_id"),
                     right_overlay_eye_render_state,
                 )
-            right_overlay_end_event.record(right_stream)
+            if right_overlay_end_event is not None:
+                right_overlay_end_event.record(right_stream)
 
         with torch.cuda.stream(control_stream):
-            parallel_wait_start_event.record(control_stream)
+            if parallel_wait_start_event is not None:
+                parallel_wait_start_event.record(control_stream)
             control_stream.wait_stream(left_stream)
             control_stream.wait_stream(right_stream)
-            parallel_wait_end_event.record(control_stream)
+            if parallel_wait_end_event is not None:
+                parallel_wait_end_event.record(control_stream)
             if left_eye_frame.dtype != torch.uint8:
                 left_eye_frame = left_eye_frame.clamp(0.0, 255.0).to(torch.uint8)
             if right_eye_frame.dtype != torch.uint8:
@@ -3643,13 +3704,13 @@ class _ImmersivePresentationWorkerLegacy:
             preview_frame = None
             preview_ready_event = None
             if self._preview_enabled:
-                preview_frame = left_eye_frame.clone()
+                preview_frame = left_eye_frame
                 preview_ready_event = torch.cuda.Event()
                 preview_ready_event.record(control_stream)
-            if torch.cuda.is_available():
+            if render_profile_enabled and torch.cuda.is_available():
                 presentation_complete_event = torch.cuda.Event()
                 presentation_complete_event.record(control_stream)
-        if presentation_complete_event is not None:
+        if render_profile_enabled and presentation_complete_event is not None:
             presentation_complete_event.synchronize()
         if not publish_ok:
             raise RuntimeError(
@@ -3818,7 +3879,9 @@ class _ImmersivePresentationWorkerLegacy:
                 else worker_profile,
                 "preview_frame": preview_frame,
                 "preview_ready_event": preview_ready_event,
-                "stable_cover_frame_snapshot": {
+                "stable_cover_frame_snapshot": None
+                if not self._stable_cover_cache_enabled
+                else {
                     "left_frame": self._stable_cover_left_frame,
                     "right_frame": self._stable_cover_right_frame,
                     "preview_frame": self._stable_cover_preview_frame,
@@ -20719,8 +20782,6 @@ class InvPhyTrainerWarp:
 
         current_stream.wait_stream(left_stream)
         current_stream.wait_stream(right_stream)
-        left_stream.synchronize()
-        right_stream.synchronize()
         return (
             left_gaussian_rgba,
             left_gaussian_depth,
@@ -22428,6 +22489,7 @@ class InvPhyTrainerWarp:
         preview_uploader = None
         preview_prog = None
         preview_vao = None
+        preview_framebuffer_size = None
         preview_display_active = interactive_window_mode == "visible"
         left_eye_frame = None
         right_eye_frame = None
@@ -22632,6 +22694,12 @@ class InvPhyTrainerWarp:
                 presentation_backend_kind = "legacy_single_worker"
             else:
                 presentation_backend_kind = "split_experimental"
+        stable_present_pipeline_fast_path_enabled = bool(
+            presentation_backend_kind == "legacy_single_worker"
+            and not profile_enabled
+            and immersive_timewarp_mode == "off"
+            and immersive_framegen_mode == "off"
+        )
         immersive_stable_present_policy_enabled = bool(
             immersive_present_pipeline_enabled
             and scene_depth_reproject_requested
@@ -22775,10 +22843,10 @@ class InvPhyTrainerWarp:
         render_timer = Timer("Immersive Rendering")
         total_timer = Timer("Immersive Total")
         component_times = {
-            "simulator": [],
-            "full_motion_interpolation": [],
-            "rendering": [],
-            "total": [],
+            "simulator": {"sum": 0.0, "count": 0},
+            "full_motion_interpolation": {"sum": 0.0, "count": 0},
+            "rendering": {"sum": 0.0, "count": 0},
+            "total": {"sum": 0.0, "count": 0},
         }
         render_stage_times = {
             "static_scene_branch_full_ms": [],
@@ -22800,7 +22868,26 @@ class InvPhyTrainerWarp:
             "scene_present_parallel_wait_ms": [],
             "scene_present_preview_ms": [],
             "scene_present_source_age_ms": [],
-        }
+        } if profile_enabled else {}
+
+        def _record_component_time(component_name, elapsed_s):
+            component_stats = component_times.get(component_name)
+            if component_stats is None:
+                return
+            component_stats["sum"] += float(elapsed_s)
+            component_stats["count"] += 1
+
+        def _average_component_time(component_name):
+            component_stats = component_times.get(component_name, {})
+            component_count = int(component_stats.get("count", 0))
+            if component_count <= 0:
+                return None
+            return float(component_stats.get("sum", 0.0)) / float(component_count)
+
+        def _record_render_stage_time(stage_key, elapsed_s):
+            if not profile_enabled:
+                return
+            render_stage_times[stage_key].append(float(elapsed_s))
         immersive_render_profile_keys = [
             "rendering",
             "static_scene_execute_wall_ms",
@@ -23098,6 +23185,7 @@ class InvPhyTrainerWarp:
                 width=eye_width,
                 height=eye_height,
             )
+            immersive_bridge.configure_runtime_diagnostics(enabled=profile_enabled)
             immersive_bridge.start()
             self._record_immersive_startup_milestone(
                 startup_timeline,
@@ -24355,6 +24443,20 @@ class InvPhyTrainerWarp:
 
             glfw.make_context_current(window)
             if preview_display_active:
+                def _preview_framebuffer_size_callback(_window, width, height):
+                    nonlocal preview_framebuffer_size
+                    preview_framebuffer_size = (
+                        max(1, int(width)),
+                        max(1, int(height)),
+                    )
+
+                glfw.set_framebuffer_size_callback(
+                    window,
+                    _preview_framebuffer_size_callback,
+                )
+                preview_framebuffer_size = tuple(
+                    int(value) for value in glfw.get_framebuffer_size(window)
+                )
                 preview_tex = gl.glGenTextures(1)
                 gl.glBindTexture(gl.GL_TEXTURE_2D, preview_tex)
                 gl.glTexParameteri(
@@ -24452,6 +24554,21 @@ class InvPhyTrainerWarp:
                     "width": int(eye_render_state["width"]),
                 }
 
+            def _ensure_preview_context_current():
+                if window is None:
+                    return
+                current_context = glfw.get_current_context()
+                if current_context != window:
+                    glfw.make_context_current(window)
+
+            def _get_preview_framebuffer_size():
+                nonlocal preview_framebuffer_size
+                if preview_framebuffer_size is None:
+                    preview_framebuffer_size = tuple(
+                        int(value) for value in glfw.get_framebuffer_size(window)
+                    )
+                return preview_framebuffer_size
+
             def _append_immersive_render_profile_row(frame_index, frame_profile):
                 if frame_profile is None:
                     return
@@ -24542,8 +24659,8 @@ class InvPhyTrainerWarp:
                 if int(packet.get("source_frame_index", -1)) <= 1:
                     return
                 presentation_dropped_count += 1
-                presentation_drop_ratio_samples.append(1.0)
                 if profile_enabled:
+                    presentation_drop_ratio_samples.append(1.0)
                     _finalize_present_profile_frame(
                         packet["source_frame_index"],
                         dropped=True,
@@ -25012,7 +25129,7 @@ class InvPhyTrainerWarp:
                 scene_pose_staleness_ms = float(
                     payload.get("scene_pose_staleness_ms_at_publish", 0.0)
                 )
-                if count_for_stats:
+                if count_for_stats and profile_enabled:
                     presentation_queue_wait_ms_samples.append(queue_wait_ms)
                     presentation_worker_ms_samples.append(worker_wall_ms)
                     presentation_compose_ms_samples.append(compose_wall_ms)
@@ -25029,35 +25146,45 @@ class InvPhyTrainerWarp:
                             scene_pose_staleness_ms
                         )
                     presentation_drop_ratio_samples.append(0.0)
-                    render_stage_times["compositing_ms"].append(
-                        compose_wall_ms / 1000.0
+                    _record_render_stage_time(
+                        "compositing_ms",
+                        compose_wall_ms / 1000.0,
                     )
-                    render_stage_times["overlay_publish_ms"].append(
-                        (overlay_wall_ms + publish_wall_ms) / 1000.0
+                    _record_render_stage_time(
+                        "overlay_publish_ms",
+                        (overlay_wall_ms + publish_wall_ms) / 1000.0,
                     )
-                    render_stage_times["scene_present_worker_ms"].append(
-                        worker_wall_ms / 1000.0
+                    _record_render_stage_time(
+                        "scene_present_worker_ms",
+                        worker_wall_ms / 1000.0,
                     )
-                    render_stage_times["scene_present_queue_wait_ms"].append(
-                        queue_wait_ms / 1000.0
+                    _record_render_stage_time(
+                        "scene_present_queue_wait_ms",
+                        queue_wait_ms / 1000.0,
                     )
-                    render_stage_times["scene_present_compose_left_ms"].append(
-                        compose_left_ms / 1000.0
+                    _record_render_stage_time(
+                        "scene_present_compose_left_ms",
+                        compose_left_ms / 1000.0,
                     )
-                    render_stage_times["scene_present_compose_right_ms"].append(
-                        compose_right_ms / 1000.0
+                    _record_render_stage_time(
+                        "scene_present_compose_right_ms",
+                        compose_right_ms / 1000.0,
                     )
-                    render_stage_times["scene_present_overlay_left_ms"].append(
-                        overlay_left_ms / 1000.0
+                    _record_render_stage_time(
+                        "scene_present_overlay_left_ms",
+                        overlay_left_ms / 1000.0,
                     )
-                    render_stage_times["scene_present_overlay_right_ms"].append(
-                        overlay_right_ms / 1000.0
+                    _record_render_stage_time(
+                        "scene_present_overlay_right_ms",
+                        overlay_right_ms / 1000.0,
                     )
-                    render_stage_times["scene_present_parallel_wait_ms"].append(
-                        parallel_wait_ms / 1000.0
+                    _record_render_stage_time(
+                        "scene_present_parallel_wait_ms",
+                        parallel_wait_ms / 1000.0,
                     )
-                    render_stage_times["scene_present_source_age_ms"].append(
-                        source_age_ms / 1000.0
+                    _record_render_stage_time(
+                        "scene_present_source_age_ms",
+                        source_age_ms / 1000.0,
                     )
                 if payload.get("preview_frame") is not None:
                     latest_preview_completion = payload
@@ -25163,9 +25290,9 @@ class InvPhyTrainerWarp:
                 preview_update_start = time.perf_counter()
                 if preview_ready_event is not None and torch.cuda.is_available():
                     torch.cuda.current_stream().wait_event(preview_ready_event)
-                glfw.make_context_current(window)
+                _ensure_preview_context_current()
                 preview_uploader.upload(preview_frame)
-                fb_width, fb_height = glfw.get_framebuffer_size(window)
+                fb_width, fb_height = _get_preview_framebuffer_size()
                 gl.glViewport(0, 0, fb_width, fb_height)
                 gl.glDisable(gl.GL_DEPTH_TEST)
                 gl.glClear(gl.GL_COLOR_BUFFER_BIT)
@@ -25181,10 +25308,11 @@ class InvPhyTrainerWarp:
                 preview_update_ms = 1000.0 * (
                     time.perf_counter() - preview_update_start
                 )
-                if frame_count > 1:
+                if profile_enabled and frame_count > 1:
                     presentation_preview_ms_samples.append(preview_update_ms)
-                    render_stage_times["scene_present_preview_ms"].append(
-                        preview_update_ms / 1000.0
+                    _record_render_stage_time(
+                        "scene_present_preview_ms",
+                        preview_update_ms / 1000.0,
                     )
                 if current_frame_profile is not None:
                     current_frame_profile["scene_present_preview_ms"] = (
@@ -25203,9 +25331,9 @@ class InvPhyTrainerWarp:
                 preview_window_start = (
                     time.perf_counter() if current_frame_profile is not None else None
                 )
-                glfw.make_context_current(window)
+                _ensure_preview_context_current()
                 preview_uploader.upload(preview_frame)
-                fb_width, fb_height = glfw.get_framebuffer_size(window)
+                fb_width, fb_height = _get_preview_framebuffer_size()
                 gl.glViewport(0, 0, fb_width, fb_height)
                 gl.glDisable(gl.GL_DEPTH_TEST)
                 gl.glClear(gl.GL_COLOR_BUFFER_BIT)
@@ -25883,7 +26011,7 @@ class InvPhyTrainerWarp:
                     ).clone()
                 sim_time = sim_timer.stop()
                 if frame_count > 1:
-                    component_times["simulator"].append(sim_time)
+                    _record_component_time("simulator", sim_time)
 
                 interp_timer.start()
                 current_pos, current_rot = lbs_with_rotation_reuse(
@@ -25894,7 +26022,7 @@ class InvPhyTrainerWarp:
                 gaussians._rotation = current_rot
                 interp_time = interp_timer.stop()
                 if frame_count > 1:
-                    component_times["full_motion_interpolation"].append(interp_time)
+                    _record_component_time("full_motion_interpolation", interp_time)
                 prev_x = x.clone()
 
                 object_points = x[: self.num_all_points]
@@ -27419,6 +27547,9 @@ class InvPhyTrainerWarp:
                 if presentation_backend_enabled:
                     support_overlay_active_support_id = None
                     support_overlay_cache = None
+                    support_overlay_enabled = bool(
+                        immersive_support_entry_overlay_enabled
+                    )
                     if immersive_support_entry_overlay_enabled:
                         support_overlay_entry = (
                             self._resolve_immersive_support_overlay_entry(
@@ -27436,6 +27567,19 @@ class InvPhyTrainerWarp:
                         support_overlay_cache = (
                             self._build_immersive_support_overlay_cache(scene_renderer)
                         )
+                    projected_overlay_entries = None
+                    if stable_present_pipeline_fast_path_enabled:
+                        projected_overlay_entries = (
+                            self._project_live_controller_world_overlays_batched(
+                                list(controller_overlay_by_source.values()),
+                                {
+                                    "left": left_overlay_eye_render_state,
+                                    "right": right_overlay_eye_render_state,
+                                },
+                                eye_height,
+                                eye_width,
+                            )
+                        )
                     producer_ready_event = None
                     if torch.cuda.is_available():
                         producer_ready_event = torch.cuda.Event()
@@ -27452,6 +27596,9 @@ class InvPhyTrainerWarp:
                         "render_sample_received_monotonic_s": (
                             render_sample_received_monotonic_s
                         ),
+                        "stable_fast_path_enabled": bool(
+                            stable_present_pipeline_fast_path_enabled
+                        ),
                         "static_scene_reuse_applied": bool(framegen_reuse_applied),
                         "static_scene_reuse_age_frames": float(
                             framegen_reuse_age_frames
@@ -27463,61 +27610,114 @@ class InvPhyTrainerWarp:
                         "scene_source_received_monotonic_s": (
                             scene_source_sample_received_monotonic_s
                         ),
-                        "scene_source_left_eye_pose_world": np.asarray(
+                        "scene_source_left_eye_pose_world": None
+                        if stable_present_pipeline_fast_path_enabled
+                        else np.asarray(
                             scene_source_left_eye_pose_world,
                             dtype=np.float32,
                         ).copy(),
-                        "scene_source_right_eye_pose_world": np.asarray(
+                        "scene_source_right_eye_pose_world": None
+                        if stable_present_pipeline_fast_path_enabled
+                        else np.asarray(
                             scene_source_right_eye_pose_world,
                             dtype=np.float32,
                         ).copy(),
-                        "scene_source_left_intrinsic": np.asarray(
+                        "scene_source_left_intrinsic": None
+                        if stable_present_pipeline_fast_path_enabled
+                        else np.asarray(
                             scene_source_left_intrinsic,
                             dtype=np.float32,
                         ).copy(),
-                        "scene_source_right_intrinsic": np.asarray(
+                        "scene_source_right_intrinsic": None
+                        if stable_present_pipeline_fast_path_enabled
+                        else np.asarray(
                             scene_source_right_intrinsic,
                             dtype=np.float32,
                         ).copy(),
                         "live_head_alignment": None
-                        if not scene_depth_reproject_enabled
+                        if (
+                            stable_present_pipeline_fast_path_enabled
+                            or not scene_depth_reproject_enabled
+                        )
                         else self._copy_immersive_packet_value(live_head_alignment),
                         "head_pose_state": None
-                        if not scene_depth_reproject_enabled
+                        if (
+                            stable_present_pipeline_fast_path_enabled
+                            or not scene_depth_reproject_enabled
+                        )
                         else self._copy_immersive_packet_value(head_pose_state),
                         "immersive_compose_mode": immersive_compose_mode,
                         "gaussian_compose_roi_padding": gaussian_compose_roi_padding,
-                        "left_scene_color": left_scene_color.clone(),
-                        "left_scene_depth": left_scene_depth.clone(),
-                        "right_scene_color": right_scene_color.clone(),
-                        "right_scene_depth": right_scene_depth.clone(),
-                        "left_gaussian_rgba": left_gaussian_rgba.clone(),
+                        "left_scene_color": left_scene_color
+                        if stable_present_pipeline_fast_path_enabled
+                        else left_scene_color.clone(),
+                        "left_scene_depth": left_scene_depth
+                        if stable_present_pipeline_fast_path_enabled
+                        else left_scene_depth.clone(),
+                        "right_scene_color": right_scene_color
+                        if stable_present_pipeline_fast_path_enabled
+                        else right_scene_color.clone(),
+                        "right_scene_depth": right_scene_depth
+                        if stable_present_pipeline_fast_path_enabled
+                        else right_scene_depth.clone(),
+                        "left_gaussian_rgba": left_gaussian_rgba
+                        if stable_present_pipeline_fast_path_enabled
+                        else left_gaussian_rgba.clone(),
                         "left_gaussian_depth": None
                         if left_gaussian_depth is None
-                        else left_gaussian_depth.clone(),
-                        "right_gaussian_rgba": right_gaussian_rgba.clone(),
+                        else (
+                            left_gaussian_depth
+                            if stable_present_pipeline_fast_path_enabled
+                            else left_gaussian_depth.clone()
+                        ),
+                        "right_gaussian_rgba": right_gaussian_rgba
+                        if stable_present_pipeline_fast_path_enabled
+                        else right_gaussian_rgba.clone(),
                         "right_gaussian_depth": None
                         if right_gaussian_depth is None
-                        else right_gaussian_depth.clone(),
-                        "controller_overlay_entries": copy.deepcopy(
+                        else (
+                            right_gaussian_depth
+                            if stable_present_pipeline_fast_path_enabled
+                            else right_gaussian_depth.clone()
+                        ),
+                        "projected_overlay_entries": projected_overlay_entries,
+                        "controller_overlay_entries": []
+                        if stable_present_pipeline_fast_path_enabled
+                        else copy.deepcopy(
                             list(controller_overlay_by_source.values())
                         ),
                         "compose_artifact_interaction_context": None
                         if compose_artifact_interaction_context is None
-                        else copy.deepcopy(compose_artifact_interaction_context),
-                        "support_overlay_enabled": bool(
-                            immersive_support_entry_overlay_enabled
+                        else (
+                            compose_artifact_interaction_context
+                            if stable_present_pipeline_fast_path_enabled
+                            else copy.deepcopy(compose_artifact_interaction_context)
                         ),
-                        "support_overlay_cache": support_overlay_cache,
+                        "support_overlay_enabled": support_overlay_enabled,
+                        "support_overlay_cache": None
+                        if not support_overlay_enabled
+                        else support_overlay_cache,
                         "support_overlay_active_support_id": (
                             support_overlay_active_support_id
+                            if support_overlay_enabled
+                            else None
                         ),
-                        "left_overlay_eye_render_state": (
+                        "left_overlay_eye_render_state": None
+                        if (
+                            stable_present_pipeline_fast_path_enabled
+                            and not support_overlay_enabled
+                        )
+                        else (
                             _copy_present_overlay_eye_render_state(
                                 left_overlay_eye_render_state
                             )
                         ),
-                        "right_overlay_eye_render_state": (
+                        "right_overlay_eye_render_state": None
+                        if (
+                            stable_present_pipeline_fast_path_enabled
+                            and not support_overlay_enabled
+                        )
+                        else (
                             _copy_present_overlay_eye_render_state(
                                 right_overlay_eye_render_state
                             )
@@ -27535,11 +27735,12 @@ class InvPhyTrainerWarp:
                     scene_present_submit_wall_s = (
                         time.perf_counter() - present_submit_start
                     )
-                    if frame_count > 1:
+                    if profile_enabled and frame_count > 1:
                         presentation_submit_ms_samples.append(
                             scene_present_submit_wall_s * 1000.0
                         )
-                        render_stage_times["scene_present_submit_ms"].append(
+                        _record_render_stage_time(
+                            "scene_present_submit_ms",
                             scene_present_submit_wall_s
                         )
                     _mark_dropped_present_packet(dropped_packet)
@@ -27700,42 +27901,51 @@ class InvPhyTrainerWarp:
                     )
                 render_time = time.perf_counter() - render_stage_start
                 if frame_count > 1:
-                    component_times["rendering"].append(render_time)
+                    _record_component_time("rendering", render_time)
                     static_scene_branch_full_s = (
                         float(static_scene_worker_wall_s)
                         if float(static_scene_worker_wall_s) > 0.0
                         else float(static_scene_render_wall_s)
                     )
-                    render_stage_times["static_scene_branch_full_ms"].append(
-                        static_scene_branch_full_s
+                    _record_render_stage_time(
+                        "static_scene_branch_full_ms",
+                        static_scene_branch_full_s,
                     )
-                    render_stage_times["compose_join_full_ms"].append(
+                    _record_render_stage_time(
+                        "compose_join_full_ms",
                         max(
                             static_scene_branch_full_s,
                             float(branch_b_ready_wall_s),
-                        )
+                        ),
                     )
-                    render_stage_times["static_scene_render_ms"].append(
-                        float(static_scene_render_wall_s)
+                    _record_render_stage_time(
+                        "static_scene_render_ms",
+                        float(static_scene_render_wall_s),
                     )
-                    render_stage_times["simulation_lbs_wall_ms"].append(
-                        float(simulation_lbs_wall_s)
+                    _record_render_stage_time(
+                        "simulation_lbs_wall_ms",
+                        float(simulation_lbs_wall_s),
                     )
-                    render_stage_times["gaussian_render_wall_ms"].append(
-                        float(gaussian_render_wall_s)
+                    _record_render_stage_time(
+                        "gaussian_render_wall_ms",
+                        float(gaussian_render_wall_s),
                     )
-                    render_stage_times["branch_b_ready_ms"].append(
-                        float(branch_b_ready_wall_s)
+                    _record_render_stage_time(
+                        "branch_b_ready_ms",
+                        float(branch_b_ready_wall_s),
                     )
-                    render_stage_times["pre_compose_ready_ms"].append(
-                        float(pre_compose_ready_wall_s)
+                    _record_render_stage_time(
+                        "pre_compose_ready_ms",
+                        float(pre_compose_ready_wall_s),
                     )
                     if not presentation_backend_enabled:
-                        render_stage_times["compositing_ms"].append(
-                            float(compositing_wall_s)
+                        _record_render_stage_time(
+                            "compositing_ms",
+                            float(compositing_wall_s),
                         )
-                        render_stage_times["overlay_publish_ms"].append(
-                            float(overlay_publish_wall_s)
+                        _record_render_stage_time(
+                            "overlay_publish_ms",
+                            float(overlay_publish_wall_s),
                         )
                 if render_profile_frame is not None:
                     render_profile_frame["rendering"] = float(render_time)
@@ -27796,7 +28006,7 @@ class InvPhyTrainerWarp:
 
                 total_time = time.perf_counter() - total_frame_start
                 if frame_count > 1:
-                    component_times["total"].append(total_time)
+                    _record_component_time("total", total_time)
 
                 if render_profile_frame is not None:
                     self._render_profile_capture_cuda_memory(render_profile_frame)
@@ -27814,7 +28024,7 @@ class InvPhyTrainerWarp:
                             static_scene_signature_change_count,
                         ),
                     )
-                if frame_count > 1 and framegen_metrics_enabled_for_frame:
+                if profile_enabled and frame_count > 1 and framegen_metrics_enabled_for_frame:
                     static_scene_reuse_applied_samples.append(
                         float(framegen_reuse_applied)
                     )
@@ -27920,15 +28130,15 @@ class InvPhyTrainerWarp:
                         pending_frame_index,
                         dropped=True,
                     )
-            if frame_count > 1 and component_times["total"]:
-                frames_used_for_stats = len(component_times["total"])
+            total_component_stats = component_times.get("total", {})
+            if frame_count > 1 and int(total_component_stats.get("count", 0)) > 0:
+                frames_used_for_stats = int(total_component_stats.get("count", 0))
                 summary_header = (
                     f"\n=== Immersive Summary (averaged over {frames_used_for_stats} frames) ==="
                 )
                 print(summary_header)
                 log_lines = [summary_header.lstrip("\n")]
-                total_frame_times = component_times["total"]
-                total_time_seconds = sum(total_frame_times)
+                total_time_seconds = float(total_component_stats.get("sum", 0.0))
                 source_fps = (
                     frames_used_for_stats / total_time_seconds
                     if total_time_seconds > 0.0
@@ -28003,7 +28213,11 @@ class InvPhyTrainerWarp:
                     synthetic_framegen_fps = (
                         float(synthetic_framegen_published_count) / total_time_seconds
                     )
-                average_frame_time = np.mean(total_frame_times)
+                average_frame_time = (
+                    total_time_seconds / float(frames_used_for_stats)
+                    if frames_used_for_stats > 0
+                    else 0.0
+                )
                 average_static_scene_reuse_ratio = 0.0
                 average_scene_pose_staleness_ms = None
                 average_static_scene_fresh_render_ratio = None
@@ -28554,19 +28768,6 @@ class InvPhyTrainerWarp:
                 )
                 _append_fps_line(
                     high_level_lines,
-                    "Frames Sent Out FPS",
-                    frames_sent_out_fps,
-                    "frames the app sends toward display each second",
-                )
-                if synthetic_framegen_fps is not None:
-                    _append_fps_line(
-                        high_level_lines,
-                        "Synthetic Framegen FPS",
-                        synthetic_framegen_fps,
-                        "extra in-between views warped from the previous real composed frame",
-                    )
-                _append_fps_line(
-                    high_level_lines,
                     "Viewer Render FPS",
                     viewer_render_fps,
                     "how often the headset/viewer tries to draw",
@@ -28577,43 +28778,11 @@ class InvPhyTrainerWarp:
                     viewer_source_frame_delta_fps,
                     "how often a newer image reaches the viewer",
                 )
-                _append_fps_line(
-                    high_level_lines,
-                    "Viewer New Frame Shown FPS",
-                    viewer_applied_update_fps,
-                    "how often the viewer actually switches to a newer image",
-                )
                 high_level_lines.append(
                     "Average Total Frame Time: "
                     f"{average_frame_time * 1000.0:.2f} ms "
                     "(average steady-state time per source frame)"
                 )
-                _append_fps_line(
-                    high_level_lines,
-                    "Fresh Static Scene Render FPS",
-                    fresh_static_scene_render_fps,
-                    "how often the room is freshly rendered instead of reused",
-                )
-                if static_scene_base_refresh_samples:
-                    _append_fps_line(
-                        high_level_lines,
-                        "Fresh Static Scene Base Render FPS",
-                        fresh_static_scene_base_render_fps,
-                        "how often full base room layers are freshly rerendered",
-                    )
-                if static_scene_overlay_refresh_samples:
-                    _append_fps_line(
-                        high_level_lines,
-                        "Fresh Static Scene Overlay Render FPS",
-                        fresh_static_scene_overlay_render_fps,
-                        "how often room overlay layers are freshly rerendered",
-                    )
-                if static_scene_reuse_applied_samples:
-                    high_level_lines.append(
-                        "Average Static Scene Reuse Ratio: "
-                        f"{average_static_scene_reuse_ratio * 100.0:.1f}% "
-                        "(how often the room/static scene is reused)"
-                    )
 
                 if startup_render_debug is not None:
                     startup_compose_line = (
@@ -29520,12 +29689,12 @@ class InvPhyTrainerWarp:
                     "full_motion_interpolation",
                     "rendering",
                 ):
-                    component_times_list = component_times.get(component_name, [])
-                    if component_times_list:
+                    component_avg = _average_component_time(component_name)
+                    if component_avg is not None:
                         component_summary_rows.append(
                             (
                                 component_name_labels.get(component_name, component_name),
-                                float(np.mean(component_times_list)),
+                                component_avg,
                             )
                         )
                 component_lines = ["Component Breakdown:"]
@@ -29535,52 +29704,54 @@ class InvPhyTrainerWarp:
                         component_summary_rows,
                     )
                 )
-                render_stage_rows = []
-                for stage_key, stage_label in (
-                    (
-                        "static_scene_branch_full_ms",
-                        "Parallel branch A: Static scene render (full branch time)",
-                    ),
-                    (
-                        "branch_b_ready_ms",
-                        "Parallel branch B: Spring-mass simulation + LBS + Gaussian render",
-                    ),
-                    (
-                        "compose_join_full_ms",
-                        "Join at compose: earliest start after both branches finish",
-                    ),
-                    ("simulation_lbs_wall_ms", "Spring-mass simulation + LBS"),
-                    ("gaussian_render_wall_ms", "Gaussian render"),
-                    ("compositing_ms", "Compositing"),
-                    ("overlay_publish_ms", "Overlay + publish"),
-                    ("scene_present_worker_ms", "Presentation worker"),
-                    ("scene_present_queue_wait_ms", "Presentation queue wait"),
-                    ("scene_present_submit_ms", "Presentation submit"),
-                    ("scene_present_compose_left_ms", "Presentation compose left"),
-                    ("scene_present_compose_right_ms", "Presentation compose right"),
-                    ("scene_present_overlay_left_ms", "Presentation overlay left"),
-                    ("scene_present_overlay_right_ms", "Presentation overlay right"),
-                    ("scene_present_parallel_wait_ms", "Presentation parallel wait"),
-                    ("scene_present_preview_ms", "Preview upload"),
-                    ("scene_present_source_age_ms", "Presentation source age"),
-                ):
-                    stage_samples = render_stage_times.get(stage_key, [])
-                    if stage_samples:
-                        render_stage_rows.append(
-                            (
-                                stage_label,
-                                float(np.mean(np.asarray(stage_samples, dtype=np.float64))),
+                render_stage_lines = []
+                if diagnostic_collection_enabled:
+                    render_stage_rows = []
+                    for stage_key, stage_label in (
+                        (
+                            "static_scene_branch_full_ms",
+                            "Parallel branch A: Static scene render (full branch time)",
+                        ),
+                        (
+                            "branch_b_ready_ms",
+                            "Parallel branch B: Spring-mass simulation + LBS + Gaussian render",
+                        ),
+                        (
+                            "compose_join_full_ms",
+                            "Join at compose: earliest start after both branches finish",
+                        ),
+                        ("simulation_lbs_wall_ms", "Spring-mass simulation + LBS"),
+                        ("gaussian_render_wall_ms", "Gaussian render"),
+                        ("compositing_ms", "Compositing"),
+                        ("overlay_publish_ms", "Overlay + publish"),
+                        ("scene_present_worker_ms", "Presentation worker"),
+                        ("scene_present_queue_wait_ms", "Presentation queue wait"),
+                        ("scene_present_submit_ms", "Presentation submit"),
+                        ("scene_present_compose_left_ms", "Presentation compose left"),
+                        ("scene_present_compose_right_ms", "Presentation compose right"),
+                        ("scene_present_overlay_left_ms", "Presentation overlay left"),
+                        ("scene_present_overlay_right_ms", "Presentation overlay right"),
+                        ("scene_present_parallel_wait_ms", "Presentation parallel wait"),
+                        ("scene_present_preview_ms", "Preview upload"),
+                        ("scene_present_source_age_ms", "Presentation source age"),
+                    ):
+                        stage_samples = render_stage_times.get(stage_key, [])
+                        if stage_samples:
+                            render_stage_rows.append(
+                                (
+                                    stage_label,
+                                    float(np.mean(np.asarray(stage_samples, dtype=np.float64))),
+                                )
                             )
-                        )
-                render_stage_lines = self._format_immersive_render_stage_breakdown_lines(
-                    average_frame_time,
-                    render_stage_rows,
-                )
+                    render_stage_lines = self._format_immersive_render_stage_breakdown_lines(
+                        average_frame_time,
+                        render_stage_rows,
+                    )
 
                 _append_section(high_level_lines)
                 _append_section(component_lines)
-                _append_section(render_stage_lines)
                 if diagnostic_collection_enabled:
+                    _append_section(render_stage_lines)
                     _append_section(diagnostics_lines)
                     render_profile_lines = self._render_profile_summary_lines(
                         "immersive",

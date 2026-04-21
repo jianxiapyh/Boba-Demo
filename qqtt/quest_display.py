@@ -86,6 +86,8 @@ class OpenXRFramePanelMirror:
         self._direct_commit_registered_slots: list[tuple[int, int]] = []
         self._bridge_publish_sample_indices = np.zeros((0,), dtype=np.int64)
         self._refresh_bridge_publish_sample_indices()
+        self._bridge_publish_sample_check_enabled = True
+        self._bridge_transition_trace_enabled = True
 
         self.binary_path = self.repo_root / "linux_pose_probe" / "boba_immersive_demo"
         self.build_script_path = self.repo_root / "linux_pose_probe" / "build_boba_immersive_demo.sh"
@@ -127,6 +129,8 @@ class OpenXRFramePanelMirror:
         self,
         frame_tensor: torch.Tensor,
     ) -> Optional[bytes]:
+        if not self._bridge_publish_sample_check_enabled:
+            return None
         sample_indices = self._bridge_publish_sample_indices
         if sample_indices.size == 0:
             return None
@@ -144,10 +148,56 @@ class OpenXRFramePanelMirror:
             dtype=np.uint8,
         ).tobytes()
 
+    def _capture_bridge_publish_sample_bytes_from_stereo_tensors(
+        self,
+        left_frame_tensor: torch.Tensor,
+        right_frame_tensor: torch.Tensor,
+    ) -> Optional[bytes]:
+        if not self._bridge_publish_sample_check_enabled:
+            return None
+        sample_indices = self._bridge_publish_sample_indices
+        if sample_indices.size == 0:
+            return None
+        left_flat = left_frame_tensor.contiguous().reshape(-1)
+        right_flat = right_frame_tensor.contiguous().reshape(-1)
+        left_count = int(left_flat.numel())
+        total_count = left_count + int(right_flat.numel())
+        if total_count < int(sample_indices[-1]) + 1:
+            return None
+        sample_tensors = []
+        left_mask = sample_indices < left_count
+        if np.any(left_mask):
+            left_indices = torch.as_tensor(
+                sample_indices[left_mask],
+                dtype=torch.long,
+                device=left_flat.device,
+            )
+            sample_tensors.append(left_flat.index_select(0, left_indices))
+        if np.any(~left_mask):
+            right_indices = torch.as_tensor(
+                sample_indices[~left_mask] - left_count,
+                dtype=torch.long,
+                device=right_flat.device,
+            )
+            sample_tensors.append(right_flat.index_select(0, right_indices))
+        if not sample_tensors:
+            return None
+        sample_tensor = (
+            sample_tensors[0]
+            if len(sample_tensors) == 1
+            else torch.cat(sample_tensors, dim=0)
+        )
+        return np.asarray(
+            sample_tensor.detach().cpu().numpy(),
+            dtype=np.uint8,
+        ).tobytes()
+
     def _capture_bridge_publish_sample_bytes_from_array(
         self,
         frame_array: np.ndarray,
     ) -> Optional[bytes]:
+        if not self._bridge_publish_sample_check_enabled:
+            return None
         sample_indices = self._bridge_publish_sample_indices
         if sample_indices.size == 0:
             return None
@@ -162,6 +212,8 @@ class OpenXRFramePanelMirror:
         expected_sample_bytes: Optional[bytes],
         actual_sample_bytes: Optional[bytes],
     ) -> None:
+        if not self._bridge_publish_sample_check_enabled:
+            return
         if expected_sample_bytes is None or actual_sample_bytes is None:
             return
         mismatch = expected_sample_bytes != actual_sample_bytes
@@ -173,6 +225,14 @@ class OpenXRFramePanelMirror:
                 self._steady_state_bridge_publish_sample_check_count += 1
                 if mismatch:
                     self._steady_state_bridge_publish_sample_mismatch_count += 1
+
+    def configure_runtime_diagnostics(self, *, enabled: bool) -> None:
+        enabled = bool(enabled)
+        with self._stage_condition:
+            self._bridge_publish_sample_check_enabled = enabled
+            self._bridge_transition_trace_enabled = enabled
+            if not enabled:
+                self._bridge_transition_trace.clear()
 
     def start(self) -> None:
         rebuilt_binary = self._ensure_binary()
@@ -791,8 +851,19 @@ class OpenXRFramePanelMirror:
             raise RuntimeError("Direct immersive commit path is not enabled")
         slot = int(pending["slot"])
         slot_view = self._slot_views[slot]
+        frame_tensors = pending.get("frame_tensors")
         frame_tensor = pending.get("frame_tensor")
-        if frame_tensor is None or not torch.is_tensor(frame_tensor):
+        if frame_tensors is not None:
+            if (
+                not isinstance(frame_tensors, (tuple, list))
+                or len(frame_tensors) != 2
+                or not torch.is_tensor(frame_tensors[0])
+                or not torch.is_tensor(frame_tensors[1])
+            ):
+                raise RuntimeError(
+                    "Direct immersive commit is missing stereo frame tensors"
+                )
+        elif frame_tensor is None or not torch.is_tensor(frame_tensor):
             raise RuntimeError("Direct immersive commit is missing frame tensor")
         start_event = torch.cuda.Event(enable_timing=True)
         end_event = torch.cuda.Event(enable_timing=True)
@@ -802,12 +873,27 @@ class OpenXRFramePanelMirror:
             if producer_ready_event is not None:
                 self._direct_commit_stream.wait_event(producer_ready_event)
             start_event.record(self._direct_commit_stream)
-            self._cudart_memcpy_device_to_host_async(
-                dst_ptr=int(slot_view.ctypes.data),
-                src_ptr=int(frame_tensor.data_ptr()),
-                size_bytes=int(slot_view.nbytes),
-                stream=self._direct_commit_stream,
-            )
+            if frame_tensors is not None:
+                left_frame_tensor, right_frame_tensor = frame_tensors
+                self._cudart_memcpy_device_to_host_async(
+                    dst_ptr=int(slot_view[0].ctypes.data),
+                    src_ptr=int(left_frame_tensor.data_ptr()),
+                    size_bytes=int(slot_view[0].nbytes),
+                    stream=self._direct_commit_stream,
+                )
+                self._cudart_memcpy_device_to_host_async(
+                    dst_ptr=int(slot_view[1].ctypes.data),
+                    src_ptr=int(right_frame_tensor.data_ptr()),
+                    size_bytes=int(slot_view[1].nbytes),
+                    stream=self._direct_commit_stream,
+                )
+            else:
+                self._cudart_memcpy_device_to_host_async(
+                    dst_ptr=int(slot_view.ctypes.data),
+                    src_ptr=int(frame_tensor.data_ptr()),
+                    size_bytes=int(slot_view.nbytes),
+                    stream=self._direct_commit_stream,
+                )
             end_event.record(self._direct_commit_stream)
         end_event.synchronize()
         wait_wall = time.perf_counter() - wait_start
@@ -1218,6 +1304,8 @@ class OpenXRFramePanelMirror:
         )
 
     def _trace_bridge_transition_locked(self, event: str, **fields: object) -> None:
+        if not self._bridge_transition_trace_enabled:
+            return
         tokens = [str(event)]
         for key, value in fields.items():
             if value is None:
@@ -2477,9 +2565,11 @@ class OpenXRImmersiveBridge(OpenXRFramePanelMirror):
                     f"{name} immersive frame dtype {frame.dtype} != torch.uint8"
                 )
 
-        stereo_frame = torch.stack([left_frame_rgba, right_frame_rgba], dim=0)
         expected_publish_sample_bytes = (
-            self._capture_bridge_publish_sample_bytes_from_tensor(stereo_frame)
+            self._capture_bridge_publish_sample_bytes_from_stereo_tensors(
+                left_frame_rgba,
+                right_frame_rgba,
+            )
         )
         process_check_start = time.perf_counter()
         if self.process is not None and self.process.poll() is not None:
@@ -2516,7 +2606,8 @@ class OpenXRImmersiveBridge(OpenXRFramePanelMirror):
         if self._staging_copy_stream is None:
             fallback_start = time.perf_counter()
             stage_array = self._cpu_stage_arrays[0]
-            np.copyto(stage_array, stereo_frame.cpu().numpy())
+            np.copyto(stage_array[0], left_frame_rgba.cpu().numpy())
+            np.copyto(stage_array[1], right_frame_rgba.cpu().numpy())
             commit_stats = self._commit_stage_array(
                 stage_array,
                 slot=slot,
@@ -2550,8 +2641,9 @@ class OpenXRImmersiveBridge(OpenXRFramePanelMirror):
         timing["pending_drain_block_wall"] = self._wait_for_stage_capacity(
             incoming_frame_id=frame_id
         )
-        timing["stage_enqueue_wall"] = self._enqueue_stage_copy(
-            frame_tensor=stereo_frame,
+        timing["stage_enqueue_wall"] = self._enqueue_stereo_stage_copy(
+            left_frame_tensor=left_frame_rgba,
+            right_frame_tensor=right_frame_rgba,
             slot=slot,
             frame_id=frame_id,
             submit_wall_s=submit_wall_s,
@@ -2560,6 +2652,114 @@ class OpenXRImmersiveBridge(OpenXRFramePanelMirror):
         timing["total_wall"] = time.perf_counter() - publish_start
         self._last_published_frame_id = frame_id
         return True, timing
+
+    def _enqueue_stereo_stage_copy(
+        self,
+        *,
+        left_frame_tensor: torch.Tensor,
+        right_frame_tensor: torch.Tensor,
+        slot: int,
+        frame_id: int,
+        submit_wall_s: Optional[float] = None,
+        expected_publish_sample_bytes: Optional[bytes] = None,
+    ) -> float:
+        if submit_wall_s is None:
+            submit_wall_s = time.perf_counter()
+        if self.FRESHNESS_FIRST_COMMIT:
+            with self._stage_condition:
+                self._raise_if_stage_commit_failed_locked()
+                reclaimed_count = self._reclaim_completed_retired_stage_copies_locked()
+                if reclaimed_count > 0:
+                    self._finalize_freshness_scheduler_mutation_locked(
+                        "reclaim_retired",
+                        reclaimed_count=reclaimed_count,
+                    )
+                if not self._free_stage_indices:
+                    raise RuntimeError(
+                        "Freshness-first immersive bridge ran out of staging buffers.\n"
+                        f"{self._scheduler_snapshot_locked()}\nrecent transitions:\n"
+                        + "\n".join(self._bridge_transition_trace)
+                    )
+                stage_index = self._free_stage_indices.popleft()
+        else:
+            stage_index = self._next_stage_index
+        left_copy_tensor = (
+            left_frame_tensor
+            if left_frame_tensor.is_contiguous()
+            else left_frame_tensor.contiguous()
+        )
+        right_copy_tensor = (
+            right_frame_tensor
+            if right_frame_tensor.is_contiguous()
+            else right_frame_tensor.contiguous()
+        )
+        stage_buffer = self._cpu_stage_buffers[stage_index]
+        stage_array = self._cpu_stage_arrays[stage_index]
+        producer_ready_event = torch.cuda.Event()
+        enqueue_start = time.perf_counter()
+        producer_ready_event.record(torch.cuda.current_stream())
+        copy_start_event = None
+        copy_end_event = None
+        if not self._direct_commit_enabled:
+            copy_start_event = torch.cuda.Event(enable_timing=True)
+            copy_end_event = torch.cuda.Event(enable_timing=True)
+            with torch.cuda.stream(self._staging_copy_stream):
+                self._staging_copy_stream.wait_event(producer_ready_event)
+                copy_start_event.record(self._staging_copy_stream)
+                stage_buffer[0].copy_(left_copy_tensor, non_blocking=True)
+                stage_buffer[1].copy_(right_copy_tensor, non_blocking=True)
+                copy_end_event.record(self._staging_copy_stream)
+        with self._stage_condition:
+            pending = {
+                "slot": slot,
+                "frame_id": frame_id,
+                "stage_index": stage_index,
+                "submit_wall_s": submit_wall_s,
+                "expected_publish_sample_bytes": expected_publish_sample_bytes,
+            }
+            if self._direct_commit_enabled:
+                pending.update(
+                    {
+                        "producer_ready_event": producer_ready_event,
+                        "frame_tensors": (left_copy_tensor, right_copy_tensor),
+                        "direct_commit": True,
+                    }
+                )
+            else:
+                pending.update(
+                    {
+                        "start_event": copy_start_event,
+                        "end_event": copy_end_event,
+                        "stage_array": stage_array,
+                        "direct_commit": False,
+                    }
+                )
+            if self.FRESHNESS_FIRST_COMMIT:
+                if self._active_stage_copy is None:
+                    self._mark_stage_copy_active_locked(pending)
+                    self._active_stage_copy = pending
+                    self._finalize_freshness_scheduler_mutation_locked(
+                        "enqueue_active",
+                        frame_id=frame_id,
+                        stage_index=stage_index,
+                    )
+                else:
+                    if self._pending_stage_copy is not None:
+                        self._retire_pending_stage_copy_locked(
+                            incoming_frame_id=frame_id,
+                            reason="enqueue_replace",
+                        )
+                    self._pending_stage_copy = pending
+                    self._finalize_freshness_scheduler_mutation_locked(
+                        "enqueue_pending",
+                        frame_id=frame_id,
+                        stage_index=stage_index,
+                    )
+            else:
+                self._pending_stage_copies.append(pending)
+                self._next_stage_index = (stage_index + 1) % self.STAGING_BUFFER_COUNT
+            self._stage_condition.notify_all()
+        return time.perf_counter() - enqueue_start
 
     def wait_for_sample(self, timeout: float = 10.0) -> LiveImmersiveSample:
         deadline = time.monotonic() + timeout

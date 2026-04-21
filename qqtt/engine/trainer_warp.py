@@ -1650,6 +1650,7 @@ class _ImmersivePresentationWorkerLegacy:
         self._stable_cover_left_frame = None
         self._stable_cover_right_frame = None
         self._stable_cover_preview_frame = None
+        self._stable_cover_committed_frame_count = 0
         self._stable_cover_cache_enabled = bool(owner._is_rope_family_case())
 
     @staticmethod
@@ -1679,6 +1680,7 @@ class _ImmersivePresentationWorkerLegacy:
         self._stable_cover_left_frame = None
         self._stable_cover_right_frame = None
         self._stable_cover_preview_frame = None
+        self._stable_cover_committed_frame_count = 0
 
     def _update_stable_cover_frame_cache(
         self,
@@ -1700,6 +1702,9 @@ class _ImmersivePresentationWorkerLegacy:
         self._stable_cover_preview_frame = (
             None if preview_frame is None else preview_frame.clone()
         )
+        self._stable_cover_committed_frame_count = int(
+            self._stable_cover_committed_frame_count
+        ) + 1
 
     def _build_stable_cover_publish_payload(
         self,
@@ -3741,6 +3746,69 @@ class _ImmersivePresentationWorkerLegacy:
                     pre_stabilization_composed_pre_overlay=right_compose_artifact_pre_stabilization,
                     extra_metadata=right_compose_artifact_extra_metadata,
                 )
+
+            idle_fullframe_flash_decision = (
+                owner._evaluate_immersive_idle_fullframe_flash_guard(
+                    left_eye_frame=left_eye_frame,
+                    right_eye_frame=right_eye_frame,
+                    committed_safe_cover_left_frame=self._stable_cover_left_frame,
+                    committed_safe_cover_right_frame=self._stable_cover_right_frame,
+                    committed_safe_cover_frame_count=self._stable_cover_committed_frame_count,
+                    interaction_context=compose_artifact_interaction_context,
+                    backend_kind="legacy_single_worker",
+                )
+            )
+            if bool(idle_fullframe_flash_decision.get("reject_publish", False)):
+                reject_source = str(
+                    idle_fullframe_flash_decision.get(
+                        "reject_source",
+                        "idle_fullframe_flash",
+                    )
+                ).strip().lower()
+                cover_publish_payload = self._build_stable_cover_publish_payload(
+                    source_frame_index=int(packet["source_frame_index"]),
+                    queue_wait_ms=float(queue_wait_ms),
+                    worker_start=worker_start,
+                    reject_source=reject_source,
+                    affected_sources=[],
+                    trigger_reasons=list(
+                        idle_fullframe_flash_decision.get("trigger_reasons") or []
+                    ),
+                    blue_scene_exposure_reject=False,
+                    gaussian_blue_source_reject=False,
+                    compose_reject_metrics={},
+                )
+                worker_wall_ms = 1000.0 * (time.perf_counter() - worker_start)
+                if cover_publish_payload is not None:
+                    cover_publish_payload["rollback_required"] = False
+                    cover_publish_payload["visual_only_reject"] = True
+                    cover_publish_payload["idle_fullframe_flash_metrics"] = (
+                        copy.deepcopy(idle_fullframe_flash_decision)
+                    )
+                    return {
+                        "payload": cover_publish_payload,
+                        "synthetic_source_state": None,
+                    }
+                return {
+                    "payload": {
+                        "payload_kind": "fullframe_flash_rejected",
+                        "presentation_backend_kind": "legacy_single_worker",
+                        "source_frame_index": int(packet["source_frame_index"]),
+                        "queue_wait_ms": float(queue_wait_ms),
+                        "worker_wall_ms": float(worker_wall_ms),
+                        "reject_source": reject_source,
+                        "rollback_required": False,
+                        "visual_only_reject": True,
+                        "cover_cache_hit": False,
+                        "cover_cache_missing": True,
+                        "idle_fullframe_flash_metrics": copy.deepcopy(
+                            idle_fullframe_flash_decision
+                        ),
+                        "preview_frame": None,
+                        "preview_ready_event": None,
+                    },
+                    "synthetic_source_state": None,
+                }
 
             publish_start = time.perf_counter()
             publish_ok, publish_stats = self._immersive_bridge.publish_stereo_frames(
@@ -6064,7 +6132,7 @@ class InvPhyTrainerWarp:
     LIVE_CONTROLLER_RAY_LENGTH = 0.65
     LIVE_CONTROLLER_ORIGIN_RADIUS = 3
     LIVE_CONTROLLER_HIT_RADIUS = 4
-    LIVE_CONTROLLER_ACTIVE_OVERLAY_HOLD_FRAMES = 2
+    LIVE_CONTROLLER_ACTIVE_OVERLAY_HOLD_FRAMES = 8
     LIVE_CONTROLLER_INDICATOR_RADIUS = 2
     LIVE_CONTROLLER_LEFT_COLOR = [255.0, 96.0, 96.0]
     LIVE_CONTROLLER_RIGHT_COLOR = [96.0, 160.0, 255.0]
@@ -6261,6 +6329,10 @@ class InvPhyTrainerWarp:
     IMMERSIVE_CONTROLLER_SOURCE_ABSENT_CONFIRM_SAMPLES = 6
     IMMERSIVE_CONTROLLER_SINGLE_LATERAL_MIN_M = 0.04
     IMMERSIVE_CONTROLLER_SINGLE_PROJECTED_OFFSET_MIN_PX = 40.0
+    IMMERSIVE_IDLE_FULLFRAME_FLASH_ARM_SAFE_COVER_FRAMES = 3
+    IMMERSIVE_IDLE_FULLFRAME_FLASH_NEAR_BLACK_MAX_RGB = 12.0
+    IMMERSIVE_IDLE_FULLFRAME_FLASH_MIN_NEAR_BLACK_RATIO = 0.85
+    IMMERSIVE_IDLE_FULLFRAME_FLASH_MAX_LUMA_RATIO = 0.25
     IMMERSIVE_STARTUP_KEEPALIVE_RGBA = [232, 232, 232, 255]
     IMMERSIVE_GAUSSIAN_COMPOSE_ROI_PADDING = 24
     TIMING_OVERLAY_TEXT_COLOR = [255.0, 255.0, 255.0]
@@ -8145,6 +8217,10 @@ class InvPhyTrainerWarp:
         left_controller_endpoint = self.num_all_points + self._controller_source_index(
             "left"
         )
+        left_restore_template_springs = left_meta["template_springs"].clone()
+        left_restore_template_rest_lengths = left_meta["template_rest_lengths"].clone()
+        right_restore_template_springs = right_meta["template_springs"].clone()
+        right_restore_template_rest_lengths = right_meta["template_rest_lengths"].clone()
         left_template_springs = right_template_springs.clone()
         left_template_springs[left_template_springs == right_controller_endpoint] = (
             left_controller_endpoint
@@ -8161,6 +8237,13 @@ class InvPhyTrainerWarp:
             "spring_capable_point_offsets"
         ].clone()
 
+        right_meta["restore_template_springs"] = right_restore_template_springs
+        right_meta["restore_template_rest_lengths"] = (
+            right_restore_template_rest_lengths
+        )
+        right_meta["restore_default_anchor_name"] = default_anchor_names.get("right")
+        right_meta["shared_template_active"] = True
+        right_meta["shared_template_canonical_source"] = "right"
         right_meta["template_springs"] = right_template_springs.clone()
         right_meta["template_rest_lengths"] = canonical_rest_lengths.clone()
         right_meta["spring_y_template"] = canonical_spring_y_template.clone()
@@ -8174,6 +8257,13 @@ class InvPhyTrainerWarp:
         if canonical_inactive_spring_y is not None:
             right_meta["inactive_spring_y"] = canonical_inactive_spring_y.clone()
 
+        left_meta["restore_template_springs"] = left_restore_template_springs
+        left_meta["restore_template_rest_lengths"] = (
+            left_restore_template_rest_lengths
+        )
+        left_meta["restore_default_anchor_name"] = default_anchor_names.get("left")
+        left_meta["shared_template_active"] = True
+        left_meta["shared_template_canonical_source"] = "right"
         left_meta["template_springs"] = left_template_springs
         left_meta["template_rest_lengths"] = canonical_rest_lengths.clone()
         left_meta["spring_y_template"] = canonical_spring_y_template.clone()
@@ -8194,6 +8284,10 @@ class InvPhyTrainerWarp:
             f"left_spring_count_post={int(left_meta['template_springs'].shape[0])} "
             f"right_spring_count_post={int(right_meta['template_springs'].shape[0])} "
             "default_anchor_names_preserved=1 "
+            "left_restore_topology_preserved=1 "
+            "right_restore_topology_preserved=1 "
+            f"left_restore_default_anchor={left_meta.get('restore_default_anchor_name')} "
+            f"right_restore_default_anchor={right_meta.get('restore_default_anchor_name')} "
             f"default_anchor_names={default_anchor_names}",
             flush=True,
         )
@@ -8214,20 +8308,9 @@ class InvPhyTrainerWarp:
             self.num_all_points,
             original_controller_source_masks,
         )
-        controller_rest_points = torch.stack(
-            [
-                original_controller_source_anchor_centers[0],
-                original_controller_source_anchor_centers[1],
-            ],
-            dim=0,
-        ).to(device=cfg.device, dtype=torch.float32)
         controller_source_masks = [
             torch.tensor([True, False], dtype=torch.bool, device=cfg.device),
             torch.tensor([False, True], dtype=torch.bool, device=cfg.device),
-        ]
-        controller_source_anchor_centers = [
-            controller_rest_points[0].clone(),
-            controller_rest_points[1].clone(),
         ]
 
         object_springs = self.init_springs[: self.num_object_springs].clone()
@@ -8249,23 +8332,80 @@ class InvPhyTrainerWarp:
             if default_anchor_names is not None
             else dict(case_profile["default_anchor_names"])
         )
+        rope_family_case = self._is_rope_family_case(case_profile["case_name"])
+        startup_rest_points_by_source = [None, None]
+        selected_default_anchor_by_source = {"left": None, "right": None}
+        startup_rest_debug = {}
 
         for source in ("left", "right"):
             source_index = self._controller_source_index(source)
+            fallback_center = original_controller_source_anchor_centers[source_index].clone().to(
+                device=cfg.device,
+                dtype=torch.float32,
+            )
             preferred_anchor_name = resolved_default_anchor_names.get(source)
-            default_anchor = (
+            preferred_anchor = (
                 self._anchor_state_by_name(anchor_states, preferred_anchor_name)
                 if preferred_anchor_name is not None
                 else None
             )
-            if default_anchor is None:
-                default_anchor = self._select_predefined_interaction_anchor(
-                    controller_source_anchor_centers[source_index],
+            selected_anchor = preferred_anchor
+            if selected_anchor is None:
+                selected_anchor = self._select_predefined_interaction_anchor(
+                    fallback_center,
                     anchor_states,
                     require_selection_radius=False,
                 )
-            if default_anchor is None:
+            if selected_anchor is None:
                 raise ValueError(f"No predefined anchor available for {source} controller")
+
+            startup_center = fallback_center
+            startup_mode = "recorded_center_fallback"
+            if rope_family_case and preferred_anchor is not None:
+                startup_center = preferred_anchor["center_world"].clone().to(
+                    device=cfg.device,
+                    dtype=torch.float32,
+                )
+                startup_mode = "default_anchor_center"
+
+            startup_rest_points_by_source[source_index] = startup_center
+            selected_default_anchor_by_source[source] = selected_anchor
+            startup_rest_debug[source] = {
+                "resolved_default_anchor_name": preferred_anchor_name,
+                "selected_anchor_name": selected_anchor["name"],
+                "startup_mode": startup_mode,
+                "startup_center": startup_center.detach().cpu().numpy().tolist(),
+                "fallback_center": fallback_center.detach().cpu().numpy().tolist(),
+            }
+
+        controller_rest_points = torch.stack(
+            [
+                startup_rest_points_by_source[0],
+                startup_rest_points_by_source[1],
+            ],
+            dim=0,
+        ).to(device=cfg.device, dtype=torch.float32)
+        controller_source_anchor_centers = [
+            controller_rest_points[0].clone(),
+            controller_rest_points[1].clone(),
+        ]
+
+        if rope_family_case:
+            print(
+                "[live_openxr_controller] rope startup rest placement: "
+                f"resolved_default_anchor_names={resolved_default_anchor_names} "
+                f"left_anchor={startup_rest_debug['left']['selected_anchor_name']} "
+                f"left_mode={startup_rest_debug['left']['startup_mode']} "
+                f"left_center={startup_rest_debug['left']['startup_center']} "
+                f"right_anchor={startup_rest_debug['right']['selected_anchor_name']} "
+                f"right_mode={startup_rest_debug['right']['startup_mode']} "
+                f"right_center={startup_rest_debug['right']['startup_center']}",
+                flush=True,
+            )
+
+        for source in ("left", "right"):
+            source_index = self._controller_source_index(source)
+            default_anchor = selected_default_anchor_by_source[source]
 
             object_indices = default_anchor["region_indices"].clone()
             controller_index = source_index
@@ -9736,6 +9876,99 @@ class InvPhyTrainerWarp:
         if x < 0.0 or x >= float(width) or y < 0.0 or y >= float(height):
             return None
         return pixels[0]
+
+    def _project_world_point_to_pixel_allow_offscreen(
+        self,
+        world_point,
+        intrinsic,
+        w2c,
+    ):
+        if world_point is None:
+            return None
+        if torch.is_tensor(intrinsic):
+            target_device = intrinsic.device
+            target_dtype = intrinsic.dtype
+        elif torch.is_tensor(w2c):
+            target_device = w2c.device
+            target_dtype = w2c.dtype
+        elif torch.is_tensor(world_point):
+            target_device = world_point.device
+            target_dtype = world_point.dtype
+        else:
+            target_device = torch.device(cfg.device)
+            target_dtype = torch.float32
+        world_point_t = torch.as_tensor(
+            world_point,
+            dtype=target_dtype,
+            device=target_device,
+        )
+        pixels, depth_valid = self._project_points_to_pixels(
+            world_point_t.unsqueeze(0), intrinsic, w2c
+        )
+        if not bool(depth_valid[0].item()):
+            return None
+        return pixels[0]
+
+    @staticmethod
+    def _clip_line_segment_to_viewport(start_pixel, end_pixel, height, width):
+        if start_pixel is None or end_pixel is None:
+            return None, None, False
+        if int(height) <= 0 or int(width) <= 0:
+            return None, None, False
+
+        x0 = float(start_pixel[0].item())
+        y0 = float(start_pixel[1].item())
+        x1 = float(end_pixel[0].item())
+        y1 = float(end_pixel[1].item())
+        dx = x1 - x0
+        dy = y1 - y0
+        t0 = 0.0
+        t1 = 1.0
+        x_max = float(width - 1)
+        y_max = float(height - 1)
+
+        for p, q in (
+            (-dx, x0),
+            (dx, x_max - x0),
+            (-dy, y0),
+            (dy, y_max - y0),
+        ):
+            if abs(p) < 1e-8:
+                if q < 0.0:
+                    return None, None, False
+                continue
+            r = q / p
+            if p < 0.0:
+                if r > t1:
+                    return None, None, False
+                if r > t0:
+                    t0 = r
+            else:
+                if r < t0:
+                    return None, None, False
+                if r < t1:
+                    t1 = r
+
+        if t1 < t0:
+            return None, None, False
+
+        clipped_start = start_pixel.new_tensor(
+            [x0 + t0 * dx, y0 + t0 * dy],
+            dtype=start_pixel.dtype,
+            device=start_pixel.device,
+        )
+        clipped_end = end_pixel.new_tensor(
+            [x0 + t1 * dx, y0 + t1 * dy],
+            dtype=end_pixel.dtype,
+            device=end_pixel.device,
+        )
+        clipped = bool(
+            abs(float(clipped_start[0].item()) - x0) > 1e-4
+            or abs(float(clipped_start[1].item()) - y0) > 1e-4
+            or abs(float(clipped_end[0].item()) - x1) > 1e-4
+            or abs(float(clipped_end[1].item()) - y1) > 1e-4
+        )
+        return clipped_start, clipped_end, clipped
 
     def _interaction_joint_if_valid(self, world_points, valid_mask, joint_index):
         if world_points is None or valid_mask is None:
@@ -14967,6 +15200,176 @@ class InvPhyTrainerWarp:
             "backend_kind": str(backend_kind).strip().lower(),
         }
 
+    @torch.no_grad()
+    def _compute_immersive_idle_fullframe_flash_eye_metrics(self, frame):
+        if not torch.is_tensor(frame) or frame.ndim != 3 or int(frame.shape[-1]) < 3:
+            return None
+        rgb = frame[..., :3].detach()
+        if rgb.dtype != torch.float32:
+            rgb = rgb.to(dtype=torch.float32)
+        max_rgb = rgb.max(dim=-1).values
+        near_black_ratio = float(
+            (
+                max_rgb
+                <= float(self.IMMERSIVE_IDLE_FULLFRAME_FLASH_NEAR_BLACK_MAX_RGB)
+            )
+            .to(dtype=torch.float32)
+            .mean()
+            .item()
+        )
+        mean_luma = float(
+            (
+                rgb[..., 0] * 0.2126
+                + rgb[..., 1] * 0.7152
+                + rgb[..., 2] * 0.0722
+            )
+            .mean()
+            .item()
+        )
+        return {
+            "near_black_ratio": float(near_black_ratio),
+            "mean_luma": float(mean_luma),
+        }
+
+    @torch.no_grad()
+    def _evaluate_immersive_idle_fullframe_flash_guard(
+        self,
+        *,
+        left_eye_frame,
+        right_eye_frame,
+        committed_safe_cover_left_frame,
+        committed_safe_cover_right_frame,
+        committed_safe_cover_frame_count,
+        interaction_context=None,
+        backend_kind,
+    ):
+        interaction_context = (
+            {} if interaction_context is None else copy.deepcopy(interaction_context)
+        )
+        interaction_window_active = bool(
+            interaction_context.get("interaction_window_active", False)
+        ) or bool(interaction_context.get("post_release_window_active", False))
+        guard_mode = "interaction" if interaction_window_active else "idle"
+        reject_source = f"{guard_mode}_fullframe_flash"
+        decision = {
+            "armed": False,
+            "reject_publish": False,
+            "reason": "uninitialized",
+            "guard_mode": str(guard_mode),
+            "reject_source": str(reject_source),
+            "backend_kind": str(backend_kind).strip().lower(),
+            "baseline_frame_count": int(max(committed_safe_cover_frame_count, 0)),
+            "interaction_context": interaction_context,
+            "near_black_ratio_threshold": float(
+                self.IMMERSIVE_IDLE_FULLFRAME_FLASH_MIN_NEAR_BLACK_RATIO
+            ),
+            "luma_ratio_threshold": float(
+                self.IMMERSIVE_IDLE_FULLFRAME_FLASH_MAX_LUMA_RATIO
+            ),
+            "metrics_by_eye": {},
+            "rejected_eyes": [],
+            "trigger_reasons": [],
+        }
+        if int(committed_safe_cover_frame_count) < int(
+            self.IMMERSIVE_IDLE_FULLFRAME_FLASH_ARM_SAFE_COVER_FRAMES
+        ):
+            decision["reason"] = "baseline_not_armed"
+            return decision
+        current_frames = {
+            "left": left_eye_frame,
+            "right": right_eye_frame,
+        }
+        baseline_frames = {
+            "left": committed_safe_cover_left_frame,
+            "right": committed_safe_cover_right_frame,
+        }
+        baseline_valid = True
+        rejected_eyes = []
+        for eye_label in ("left", "right"):
+            current_metrics = self._compute_immersive_idle_fullframe_flash_eye_metrics(
+                current_frames[eye_label]
+            )
+            baseline_metrics = self._compute_immersive_idle_fullframe_flash_eye_metrics(
+                baseline_frames[eye_label]
+            )
+            decision["metrics_by_eye"][eye_label] = {
+                "current": copy.deepcopy(current_metrics),
+                "baseline": copy.deepcopy(baseline_metrics),
+                "luma_ratio_to_baseline": None,
+                "reject": False,
+            }
+            if current_metrics is None or baseline_metrics is None:
+                baseline_valid = False
+                continue
+            baseline_near_black = bool(
+                float(baseline_metrics.get("near_black_ratio", 1.0))
+                >= float(self.IMMERSIVE_IDLE_FULLFRAME_FLASH_MIN_NEAR_BLACK_RATIO)
+            )
+            baseline_luma = max(
+                float(baseline_metrics.get("mean_luma", 0.0)),
+                1e-6,
+            )
+            luma_ratio = float(current_metrics.get("mean_luma", 0.0)) / baseline_luma
+            decision["metrics_by_eye"][eye_label][
+                "luma_ratio_to_baseline"
+            ] = float(luma_ratio)
+            eye_reject = bool(
+                (not baseline_near_black)
+                and float(current_metrics.get("near_black_ratio", 0.0))
+                >= float(self.IMMERSIVE_IDLE_FULLFRAME_FLASH_MIN_NEAR_BLACK_RATIO)
+                and luma_ratio
+                < float(self.IMMERSIVE_IDLE_FULLFRAME_FLASH_MAX_LUMA_RATIO)
+            )
+            decision["metrics_by_eye"][eye_label]["reject"] = bool(eye_reject)
+            if baseline_near_black:
+                baseline_valid = False
+            if eye_reject:
+                rejected_eyes.append(str(eye_label))
+        if not baseline_valid:
+            decision["reason"] = "baseline_invalid"
+            return decision
+        decision["armed"] = True
+        decision["rejected_eyes"] = list(rejected_eyes)
+        if len(rejected_eyes) == 2:
+            decision["reject_publish"] = True
+            decision["reason"] = "wholeframe_near_black_collapse"
+            decision["trigger_reasons"] = [str(reject_source)]
+        else:
+            decision["reason"] = "frame_ok"
+        return decision
+
+    def _format_immersive_idle_fullframe_flash_guard_summary(self, decision):
+        if not decision:
+            return ""
+        parts = [
+            f"backend={str(decision.get('backend_kind', '')).strip().lower()}",
+            f"mode={str(decision.get('guard_mode', '')).strip().lower()}",
+            f"reason={str(decision.get('reason', '')).strip().lower()}",
+            f"baseline_frames={int(decision.get('baseline_frame_count', 0))}",
+        ]
+        for eye_label in ("left", "right"):
+            eye_metrics = (decision.get("metrics_by_eye") or {}).get(eye_label) or {}
+            current_metrics = eye_metrics.get("current") or {}
+            baseline_metrics = eye_metrics.get("baseline") or {}
+            luma_ratio = eye_metrics.get("luma_ratio_to_baseline")
+            if current_metrics:
+                parts.append(
+                    f"{eye_label}_near_black={float(current_metrics.get('near_black_ratio', 0.0)):.3f}"
+                )
+                parts.append(
+                    f"{eye_label}_mean_luma={float(current_metrics.get('mean_luma', 0.0)):.2f}"
+                )
+            if baseline_metrics:
+                parts.append(
+                    f"{eye_label}_baseline_near_black={float(baseline_metrics.get('near_black_ratio', 0.0)):.3f}"
+                )
+                parts.append(
+                    f"{eye_label}_baseline_luma={float(baseline_metrics.get('mean_luma', 0.0)):.2f}"
+                )
+            if luma_ratio is not None:
+                parts.append(f"{eye_label}_luma_ratio={float(luma_ratio):.3f}")
+        return " ".join(parts)
+
     def _predict_immersive_eye_poses_for_sample(
         self,
         sample,
@@ -17791,6 +18194,8 @@ class InvPhyTrainerWarp:
             "pre_stabilization_post_release_occluded_fall_count": 0,
             "pre_stabilization_depth_suppression_count": 0,
             "stabilization_applied_count": 0,
+            "stabilization_applied_left_interaction_count": 0,
+            "stabilization_applied_right_interaction_count": 0,
             "stabilization_prevented_blue_exposure_count": 0,
             "stabilization_prevented_post_release_occluded_fall_count": 0,
             "stabilization_prevented_depth_suppression_count": 0,
@@ -18006,6 +18411,7 @@ class InvPhyTrainerWarp:
             "cooldown_active": cooldown_active,
             "active_sources": list(active_sources),
             "last_active_sources": list(last_interaction_sources),
+            "left_interaction_active": "left" in active_sources,
             "right_interaction_active": "right" in active_sources,
             "last_interaction_frame_index": last_interaction_frame_index,
             "cooldown_frames": cooldown_frames,
@@ -18435,7 +18841,7 @@ class InvPhyTrainerWarp:
         if (
             post_release_window_active
             and not interaction_active
-            and "right" in recent_release_sources
+            and recent_release_sources
             and raw_coverage_ratio
             >= float(self.IMMERSIVE_COMPOSE_POST_RELEASE_RAW_MIN_COVERAGE_RATIO)
             and gaussian_depth_positive_ratio >= 0.95
@@ -18469,6 +18875,9 @@ class InvPhyTrainerWarp:
             "cooldown_active": bool(interaction_context.get("cooldown_active", False)),
             "active_sources": list(interaction_context.get("active_sources", [])),
             "recent_release_sources": list(recent_release_sources),
+            "left_interaction_active": bool(
+                interaction_context.get("left_interaction_active", False)
+            ),
             "right_interaction_active": bool(
                 interaction_context.get("right_interaction_active", False)
             ),
@@ -18548,6 +18957,9 @@ class InvPhyTrainerWarp:
                     ),
                     "last_active_sources": list(
                         interaction_context.get("last_active_sources", [])
+                    ),
+                    "left_interaction_active": bool(
+                        interaction_context.get("left_interaction_active", False)
                     ),
                     "right_interaction_active": bool(
                         interaction_context.get("right_interaction_active", False)
@@ -18673,6 +19085,13 @@ class InvPhyTrainerWarp:
             return
         pre_reasons = set(pre_analysis.get("trigger_reasons") or [])
         final_reasons = set((final_analysis or {}).get("trigger_reasons") or [])
+        interaction_context = pre_analysis.get("interaction_context") or {}
+        active_sources = list(interaction_context.get("active_sources", []))
+        if not active_sources:
+            active_sources = list(interaction_context.get("last_active_sources", []))
+        recent_release_sources = list(
+            interaction_context.get("recent_release_sources", [])
+        )
         with state["lock"]:
             state["pre_stabilization_candidate_count"] += 1
             if "blue_scene_exposure" in pre_reasons:
@@ -18683,6 +19102,12 @@ class InvPhyTrainerWarp:
                 state["pre_stabilization_depth_suppression_count"] += 1
             if bool(stabilization_result.get("applied", False)):
                 state["stabilization_applied_count"] += 1
+                state["stabilization_applied_left_interaction_count"] += int(
+                    ("left" in active_sources) or ("left" in recent_release_sources)
+                )
+                state["stabilization_applied_right_interaction_count"] += int(
+                    ("right" in active_sources) or ("right" in recent_release_sources)
+                )
                 state["stabilization_wall_ms_total"] += float(
                     stabilization_result.get("repair_wall_ms", 0.0)
                 )
@@ -18772,7 +19197,7 @@ class InvPhyTrainerWarp:
         )
         interaction_active = bool(interaction_context.get("interaction_active", False))
         active_grab_candidate = bool(
-            "right" in active_interaction_sources
+            active_interaction_sources
             and (
                 "blue_scene_exposure" in trigger_reasons
                 or "scene_depth_suppressed" in trigger_reasons
@@ -18781,14 +19206,14 @@ class InvPhyTrainerWarp:
         post_release_candidate = bool(
             post_release_window_active
             and not interaction_active
-            and "right" in recent_release_sources
+            and recent_release_sources
             and (
                 "post_release_occluded_fall_blue_exposure" in trigger_reasons
                 or "scene_depth_suppressed" in trigger_reasons
             )
         )
         if not (active_grab_candidate or post_release_candidate):
-            result["repair_reason"] = "non_right_interaction_window"
+            result["repair_reason"] = "non_interaction_window"
             return result
         if not (
             "blue_scene_exposure" in trigger_reasons
@@ -19338,6 +19763,12 @@ class InvPhyTrainerWarp:
                 "stabilization_applied_count": int(
                     state.get("stabilization_applied_count", 0)
                 ),
+                "stabilization_applied_left_interaction_count": int(
+                    state.get("stabilization_applied_left_interaction_count", 0)
+                ),
+                "stabilization_applied_right_interaction_count": int(
+                    state.get("stabilization_applied_right_interaction_count", 0)
+                ),
                 "stabilization_prevented_blue_exposure_count": int(
                     state.get("stabilization_prevented_blue_exposure_count", 0)
                 ),
@@ -19436,6 +19867,9 @@ class InvPhyTrainerWarp:
             "active_overlay_fallback_count": 0,
             "active_overlay_held_marker_count": 0,
             "active_overlay_hold_expired_count": 0,
+            "active_overlay_ray_fallback_count": 0,
+            "controller_overlay_clipped_line_count": 0,
+            "controller_overlay_dropped_no_visible_segment_count": 0,
             "lock": threading.Lock(),
         }
 
@@ -19481,6 +19915,15 @@ class InvPhyTrainerWarp:
             active_overlay_hold_expired_count = int(
                 state["active_overlay_hold_expired_count"]
             )
+            active_overlay_ray_fallback_count = int(
+                state.get("active_overlay_ray_fallback_count", 0)
+            )
+            controller_overlay_clipped_line_count = int(
+                state.get("controller_overlay_clipped_line_count", 0)
+            )
+            controller_overlay_dropped_no_visible_segment_count = int(
+                state.get("controller_overlay_dropped_no_visible_segment_count", 0)
+            )
         tracked_contact_ratio = None
         if active_overlay_total_count > 0:
             tracked_contact_ratio = float(
@@ -19497,8 +19940,26 @@ class InvPhyTrainerWarp:
             "active_overlay_hold_expired_count": (
                 active_overlay_hold_expired_count
             ),
+            "active_overlay_ray_fallback_count": (
+                active_overlay_ray_fallback_count
+            ),
+            "controller_overlay_clipped_line_count": (
+                controller_overlay_clipped_line_count
+            ),
+            "controller_overlay_dropped_no_visible_segment_count": (
+                controller_overlay_dropped_no_visible_segment_count
+            ),
             "tracked_contact_ratio": tracked_contact_ratio,
         }
+
+    def _record_live_controller_active_overlay_counter(
+        self,
+        counter_name,
+        increment=1,
+    ):
+        state = self._get_live_controller_active_overlay_state()
+        with state["lock"]:
+            state[counter_name] = int(state.get(counter_name, 0)) + int(increment)
 
     @staticmethod
     def _count_immersive_selected_object_indices(selected_object_indices):
@@ -19590,6 +20051,7 @@ class InvPhyTrainerWarp:
             "active_sources": list(active_sources),
             "effective_sources": list(effective_sources),
             "source_details": source_details,
+            "left_interaction_active": "left" in effective_sources,
             "right_interaction_active": "right" in effective_sources,
             "last_interaction_frame_index": int(last_interaction_frame_index),
             "cooldown_frames": int(cooldown_frames),
@@ -21507,7 +21969,30 @@ class InvPhyTrainerWarp:
 
     def _restore_controller_attachment_remap(self, source, controller_attachment_metadata):
         source_meta = controller_attachment_metadata[source]
+        restore_template_springs = source_meta.get("restore_template_springs")
+        restore_template_rest_lengths = source_meta.get("restore_template_rest_lengths")
         if (
+            restore_template_springs is not None
+            and restore_template_rest_lengths is not None
+        ):
+            self.simulator.update_local_spring_subset(
+                source_meta["spring_indices"],
+                restore_template_springs,
+                restore_template_rest_lengths,
+            )
+            print(
+                "[live_openxr_controller] immersive controller restore topology: "
+                f"source={source} "
+                "source_local_restore_topology=1 "
+                "shared_template_active="
+                f"{int(bool(source_meta.get('shared_template_active', False)))} "
+                "canonical_source="
+                f"{source_meta.get('shared_template_canonical_source')} "
+                "default_anchor="
+                f"{source_meta.get('restore_default_anchor_name')}",
+                flush=True,
+            )
+        elif (
             "template_springs" in source_meta
             and "template_rest_lengths" in source_meta
         ):
@@ -21515,6 +22000,18 @@ class InvPhyTrainerWarp:
                 source_meta["spring_indices"],
                 source_meta["template_springs"],
                 source_meta["template_rest_lengths"],
+            )
+            print(
+                "[live_openxr_controller] immersive controller restore topology: "
+                f"source={source} "
+                "source_local_restore_topology=0 "
+                "shared_template_active="
+                f"{int(bool(source_meta.get('shared_template_active', False)))} "
+                "canonical_source="
+                f"{source_meta.get('shared_template_canonical_source')} "
+                "default_anchor="
+                f"{source_meta.get('restore_default_anchor_name')}",
+                flush=True,
             )
         inactive_spring_y = source_meta.get("inactive_spring_y")
         if inactive_spring_y is not None:
@@ -23273,6 +23770,89 @@ class InvPhyTrainerWarp:
 
             return active_pixel, active_pixel, resolved_source
 
+    def _resolve_live_controller_projected_overlay_geometry(
+        self,
+        overlay_world,
+        projected_fields,
+        *,
+        eye_label,
+        height,
+        width,
+    ):
+        attachment_active = bool(overlay_world.get("attachment_active", False))
+        active_contact_only = bool(overlay_world.get("active_contact_only", False))
+        raw_origin_pixel = projected_fields.get("origin_world")
+        raw_end_pixel = projected_fields.get("ray_end_world")
+        attach_active_pixel = None
+        resolved_active_overlay_source = None
+
+        if attachment_active:
+            (
+                _,
+                attach_active_pixel,
+                resolved_active_overlay_source,
+            ) = self._resolve_live_controller_active_overlay_pixels(
+                overlay_world,
+                projected_fields,
+                eye_label=eye_label,
+            )
+
+        if attachment_active and active_contact_only and attach_active_pixel is None:
+            active_contact_only = False
+            resolved_active_overlay_source = "ray_fallback"
+            self._record_live_controller_active_overlay_counter(
+                "active_overlay_ray_fallback_count"
+            )
+
+        clipped_origin_pixel = None
+        clipped_end_pixel = None
+        line_clipped = False
+        if raw_origin_pixel is not None and raw_end_pixel is not None:
+            (
+                clipped_origin_pixel,
+                clipped_end_pixel,
+                line_clipped,
+            ) = self._clip_line_segment_to_viewport(
+                raw_origin_pixel,
+                raw_end_pixel,
+                height,
+                width,
+            )
+            if clipped_origin_pixel is not None and line_clipped:
+                self._record_live_controller_active_overlay_counter(
+                    "controller_overlay_clipped_line_count"
+                )
+
+        line_visible = bool(
+            clipped_origin_pixel is not None and clipped_end_pixel is not None
+        )
+        marker_visible = bool(attach_active_pixel is not None)
+        if marker_visible and not line_visible:
+            active_contact_only = True
+
+        if not line_visible and not marker_visible:
+            self._record_live_controller_active_overlay_counter(
+                "controller_overlay_dropped_no_visible_segment_count"
+            )
+            return None
+
+        if active_contact_only and marker_visible:
+            return {
+                "origin_pixel": raw_origin_pixel,
+                "end_pixel": attach_active_pixel,
+                "attach_active_pixel": attach_active_pixel,
+                "active_contact_only": True,
+                "resolved_active_overlay_source": resolved_active_overlay_source,
+            }
+
+        return {
+            "origin_pixel": clipped_origin_pixel,
+            "end_pixel": clipped_end_pixel,
+            "attach_active_pixel": attach_active_pixel,
+            "active_contact_only": False,
+            "resolved_active_overlay_source": resolved_active_overlay_source,
+        }
+
     def _project_live_controller_world_overlay(
         self,
         overlay_world,
@@ -23285,19 +23865,15 @@ class InvPhyTrainerWarp:
             return None
 
         projected_fields = {
-            "origin_world": self._project_world_point_to_pixel(
+            "origin_world": self._project_world_point_to_pixel_allow_offscreen(
                 overlay_world.get("origin_world"),
                 intrinsic,
                 w2c,
-                height,
-                width,
             ),
-            "ray_end_world": self._project_world_point_to_pixel(
+            "ray_end_world": self._project_world_point_to_pixel_allow_offscreen(
                 overlay_world.get("ray_end_world"),
                 intrinsic,
                 w2c,
-                height,
-                width,
             ),
             "hit_world": self._project_world_point_to_pixel(
                 overlay_world.get("hit_world"),
@@ -23328,22 +23904,21 @@ class InvPhyTrainerWarp:
                 width,
             ),
         }
-        origin_pixel = projected_fields.get("origin_world")
-        end_pixel = projected_fields.get("ray_end_world")
-        attach_active_pixel = None
-        resolved_active_overlay_source = None
-        if bool(overlay_world.get("attachment_active", False)):
-            (
-                end_pixel,
-                attach_active_pixel,
-                resolved_active_overlay_source,
-            ) = self._resolve_live_controller_active_overlay_pixels(
-                overlay_world,
-                projected_fields,
-                eye_label="single",
-            )
-        if origin_pixel is None or end_pixel is None:
+        overlay_geometry = self._resolve_live_controller_projected_overlay_geometry(
+            overlay_world,
+            projected_fields,
+            eye_label="single",
+            height=height,
+            width=width,
+        )
+        if overlay_geometry is None:
             return None
+        origin_pixel = overlay_geometry["origin_pixel"]
+        end_pixel = overlay_geometry["end_pixel"]
+        attach_active_pixel = overlay_geometry["attach_active_pixel"]
+        resolved_active_overlay_source = overlay_geometry[
+            "resolved_active_overlay_source"
+        ]
 
         projected = {
             "source": overlay_world["source"],
@@ -23354,9 +23929,7 @@ class InvPhyTrainerWarp:
             "attach_active_pixel": attach_active_pixel,
             "attach_candidate": bool(overlay_world.get("attach_candidate", False)),
             "attachment_active": bool(overlay_world.get("attachment_active", False)),
-            "active_contact_only": bool(
-                overlay_world.get("active_contact_only", False)
-            ),
+            "active_contact_only": bool(overlay_geometry["active_contact_only"]),
             "active_overlay_source_resolved": resolved_active_overlay_source,
             "color": overlay_world["color"],
             "select_available": overlay_world["select_available"],
@@ -23477,11 +24050,13 @@ class InvPhyTrainerWarp:
         ]
         for point_idx, (overlay_idx, field_name, preview_idx) in enumerate(point_refs):
             for eye_idx in range(len(eye_items)):
-                pixel = (
-                    pixels_by_eye[eye_idx, point_idx]
-                    if bool(onscreen_by_eye[eye_idx, point_idx].item())
-                    else None
-                )
+                depth_valid = bool(depth_valid_by_eye[eye_idx, point_idx].item())
+                pixel = None
+                if depth_valid:
+                    if field_name in {"origin_world", "ray_end_world"}:
+                        pixel = pixels_by_eye[eye_idx, point_idx]
+                    elif bool(onscreen_by_eye[eye_idx, point_idx].item()):
+                        pixel = pixels_by_eye[eye_idx, point_idx]
                 if preview_idx is None:
                     projected_field_by_eye[eye_idx][overlay_idx][field_name] = pixel
                 else:
@@ -23491,22 +24066,23 @@ class InvPhyTrainerWarp:
             eye_entries = []
             for overlay_idx, overlay_world in enumerate(overlay_world_entries):
                 projected_fields = projected_field_by_eye[eye_idx][overlay_idx]
-                origin_pixel = projected_fields.get("origin_world")
-                end_pixel = projected_fields.get("ray_end_world")
-                attach_active_pixel = None
-                resolved_active_overlay_source = None
-                if bool(overlay_world.get("attachment_active", False)):
-                    (
-                        end_pixel,
-                        attach_active_pixel,
-                        resolved_active_overlay_source,
-                    ) = self._resolve_live_controller_active_overlay_pixels(
+                overlay_geometry = (
+                    self._resolve_live_controller_projected_overlay_geometry(
                         overlay_world,
                         projected_fields,
                         eye_label=eye_label,
+                        height=height,
+                        width=width,
                     )
-                if origin_pixel is None or end_pixel is None:
+                )
+                if overlay_geometry is None:
                     continue
+                origin_pixel = overlay_geometry["origin_pixel"]
+                end_pixel = overlay_geometry["end_pixel"]
+                attach_active_pixel = overlay_geometry["attach_active_pixel"]
+                resolved_active_overlay_source = overlay_geometry[
+                    "resolved_active_overlay_source"
+                ]
                 projected = {
                     "source": overlay_world["source"],
                     "origin_pixel": origin_pixel,
@@ -23521,7 +24097,7 @@ class InvPhyTrainerWarp:
                         overlay_world.get("attachment_active", False)
                     ),
                     "active_contact_only": bool(
-                        overlay_world.get("active_contact_only", False)
+                        overlay_geometry["active_contact_only"]
                     ),
                     "active_overlay_source_resolved": resolved_active_overlay_source,
                     "color": overlay_world["color"],
@@ -24919,8 +25495,12 @@ class InvPhyTrainerWarp:
         stable_cover_publish_count = 0
         stable_cover_publish_compose_reject_count = 0
         stable_cover_publish_source_corruption_count = 0
+        stable_cover_publish_idle_fullframe_flash_count = 0
+        stable_cover_publish_interaction_fullframe_flash_count = 0
         stable_cover_publish_missing_cache_count = 0
         stable_cover_publish_ms_samples = []
+        idle_fullframe_flash_reject_count = 0
+        interaction_fullframe_flash_reject_count = 0
         stable_rollback_preserved_interaction_count = 0
         stable_rollback_released_new_grab_count = 0
         stable_rollback_preserved_left_count = 0
@@ -26536,6 +27116,7 @@ class InvPhyTrainerWarp:
             committed_safe_cover_left_frame = None
             committed_safe_cover_right_frame = None
             committed_safe_preview_frame = None
+            committed_safe_cover_frame_count = 0
 
             def _update_balanced_scene_input_cache_from_points(object_points_t):
                 bounds_min_t = object_points_t.min(dim=0).values - 0.01
@@ -26847,6 +27428,7 @@ class InvPhyTrainerWarp:
                 nonlocal committed_safe_cover_left_frame
                 nonlocal committed_safe_cover_right_frame
                 nonlocal committed_safe_preview_frame
+                nonlocal committed_safe_cover_frame_count
                 if snapshot is None:
                     return
                 committed_safe_cover_left_frame = snapshot["left_frame"].clone()
@@ -26855,6 +27437,9 @@ class InvPhyTrainerWarp:
                 committed_safe_preview_frame = (
                     None if preview_frame is None else preview_frame.clone()
                 )
+                committed_safe_cover_frame_count = int(
+                    committed_safe_cover_frame_count
+                ) + 1
 
             def _restore_stable_committed_safe_anchor(affected_sources):
                 nonlocal current_target
@@ -26942,8 +27527,12 @@ class InvPhyTrainerWarp:
                 nonlocal stable_cover_publish_count
                 nonlocal stable_cover_publish_compose_reject_count
                 nonlocal stable_cover_publish_source_corruption_count
+                nonlocal stable_cover_publish_idle_fullframe_flash_count
+                nonlocal stable_cover_publish_interaction_fullframe_flash_count
                 nonlocal stable_cover_publish_missing_cache_count
                 nonlocal stable_cover_publish_ms_samples
+                nonlocal idle_fullframe_flash_reject_count
+                nonlocal interaction_fullframe_flash_reject_count
                 nonlocal stable_rollback_preserved_interaction_count
                 nonlocal stable_rollback_released_new_grab_count
                 nonlocal stable_rollback_preserved_left_count
@@ -26998,31 +27587,96 @@ class InvPhyTrainerWarp:
                 if payload_kind == "stable_cover_publish":
                     frame_index = int(payload.get("source_frame_index", -1))
                     presentation_pending_safe_snapshots.pop(frame_index, None)
+                    reject_source = str(
+                        payload.get("reject_source", "")
+                    ).strip().lower()
+                    rollback_required = bool(payload.get("rollback_required", True))
+                    idle_fullframe_metrics = copy.deepcopy(
+                        payload.get("idle_fullframe_flash_metrics") or {}
+                    )
                     if count_for_stats:
-                        stable_compose_reject_count += 1
+                        stable_compose_reject_count += int(
+                            reject_source == "compose_reject"
+                        )
+                        idle_fullframe_flash_reject_count += int(
+                            reject_source == "idle_fullframe_flash"
+                        )
+                        interaction_fullframe_flash_reject_count += int(
+                            reject_source == "interaction_fullframe_flash"
+                        )
                         stable_cover_publish_count += 1
                         stable_cover_publish_compose_reject_count += int(
-                            str(payload.get("reject_source", "")).strip().lower()
-                            == "compose_reject"
+                            reject_source == "compose_reject"
                         )
                         stable_cover_publish_source_corruption_count += int(
-                            str(payload.get("reject_source", "")).strip().lower()
-                            == "source_corruption"
+                            reject_source == "source_corruption"
+                        )
+                        stable_cover_publish_idle_fullframe_flash_count += int(
+                            reject_source == "idle_fullframe_flash"
+                        )
+                        stable_cover_publish_interaction_fullframe_flash_count += int(
+                            reject_source == "interaction_fullframe_flash"
                         )
                         stable_cover_publish_ms_samples.append(
                             float(payload.get("publish_wall_ms", 0.0))
                         )
-                        if bool(payload.get("blue_scene_exposure_reject", False)):
+                        if (
+                            reject_source == "compose_reject"
+                            and bool(payload.get("blue_scene_exposure_reject", False))
+                        ):
                             stable_compose_reject_blue_scene_exposure_count += 1
-                        if bool(payload.get("gaussian_blue_source_reject", False)):
+                        if (
+                            reject_source == "compose_reject"
+                            and bool(payload.get("gaussian_blue_source_reject", False))
+                        ):
                             stable_compose_reject_gaussian_blue_source_count += 1
-                    rollback_result = _restore_stable_committed_safe_anchor(
-                        payload.get("affected_sources", [])
-                    )
-                    stable_compose_reject_rollback_count += 1
-                    _record_stable_rollback_result(rollback_result)
+                    if rollback_required:
+                        rollback_result = _restore_stable_committed_safe_anchor(
+                            payload.get("affected_sources", [])
+                        )
+                        stable_compose_reject_rollback_count += 1
+                        _record_stable_rollback_result(rollback_result)
+                    if reject_source in {
+                        "idle_fullframe_flash",
+                        "interaction_fullframe_flash",
+                    }:
+                        print(
+                            "[quest_display] immersive fullframe flash guard: "
+                            f"cache_hit={int(bool(payload.get('cover_cache_hit', False)))} "
+                            + self._format_immersive_idle_fullframe_flash_guard_summary(
+                                idle_fullframe_metrics
+                            ),
+                            flush=True,
+                        )
                     if payload.get("preview_frame") is not None:
                         latest_preview_completion = payload
+                    if profile_enabled:
+                        _finalize_present_profile_frame(
+                            frame_index,
+                            dropped=True,
+                        )
+                    return
+                if payload_kind == "fullframe_flash_rejected":
+                    frame_index = int(payload.get("source_frame_index", -1))
+                    presentation_pending_safe_snapshots.pop(frame_index, None)
+                    reject_source = str(
+                        payload.get("reject_source", "")
+                    ).strip().lower()
+                    if count_for_stats:
+                        if reject_source == "idle_fullframe_flash":
+                            idle_fullframe_flash_reject_count += 1
+                        elif reject_source == "interaction_fullframe_flash":
+                            interaction_fullframe_flash_reject_count += 1
+                        if bool(payload.get("cover_cache_missing", False)):
+                            stable_cover_publish_missing_cache_count += 1
+                    print(
+                        "[quest_display] immersive fullframe flash guard: "
+                        f"cache_hit={int(bool(payload.get('cover_cache_hit', False)))} "
+                        + self._format_immersive_idle_fullframe_flash_guard_summary(
+                            payload.get("idle_fullframe_flash_metrics") or {}
+                        ),
+                        flush=True,
+                    )
                     if profile_enabled:
                         _finalize_present_profile_frame(
                             frame_index,
@@ -27487,6 +28141,7 @@ class InvPhyTrainerWarp:
                 nonlocal stable_cover_publish_count
                 nonlocal stable_cover_publish_compose_reject_count
                 nonlocal stable_cover_publish_source_corruption_count
+                nonlocal stable_cover_publish_idle_fullframe_flash_count
                 nonlocal stable_cover_publish_missing_cache_count
                 nonlocal stable_cover_publish_ms_samples
                 cover_result = self._publish_immersive_stable_cover_frame(
@@ -27498,15 +28153,20 @@ class InvPhyTrainerWarp:
                     backend_kind="main_thread_direct",
                 )
                 if count_for_stats:
+                    reject_source_normalized = str(reject_source).strip().lower()
                     if bool(cover_result.get("cache_hit", False)):
                         stable_cover_publish_count += 1
-                        if str(reject_source).strip().lower() == "compose_reject":
+                        if reject_source_normalized == "compose_reject":
                             stable_cover_publish_compose_reject_count += 1
-                        elif (
-                            str(reject_source).strip().lower()
-                            == "source_corruption"
-                        ):
+                        elif reject_source_normalized == "source_corruption":
                             stable_cover_publish_source_corruption_count += 1
+                        elif reject_source_normalized == "idle_fullframe_flash":
+                            stable_cover_publish_idle_fullframe_flash_count += 1
+                        elif (
+                            reject_source_normalized
+                            == "interaction_fullframe_flash"
+                        ):
+                            stable_cover_publish_interaction_fullframe_flash_count += 1
                         stable_cover_publish_ms_samples.append(
                             float(cover_result.get("publish_wall_ms", 0.0))
                         )
@@ -29981,6 +30641,48 @@ class InvPhyTrainerWarp:
                                 "scene_pose_staleness_savings_ms"
                             ] = scene_pose_staleness_savings_ms / 1000.0
 
+                    idle_fullframe_flash_decision = (
+                        self._evaluate_immersive_idle_fullframe_flash_guard(
+                            left_eye_frame=left_eye_frame,
+                            right_eye_frame=right_eye_frame,
+                            committed_safe_cover_left_frame=committed_safe_cover_left_frame,
+                            committed_safe_cover_right_frame=committed_safe_cover_right_frame,
+                            committed_safe_cover_frame_count=committed_safe_cover_frame_count,
+                            interaction_context=compose_artifact_interaction_context,
+                            backend_kind="main_thread_direct",
+                        )
+                    )
+                    if bool(idle_fullframe_flash_decision.get("reject_publish", False)):
+                        reject_source = str(
+                            idle_fullframe_flash_decision.get(
+                                "reject_source",
+                                "idle_fullframe_flash",
+                            )
+                        ).strip().lower()
+                        if frame_count > 1:
+                            if reject_source == "idle_fullframe_flash":
+                                idle_fullframe_flash_reject_count += 1
+                            else:
+                                interaction_fullframe_flash_reject_count += 1
+                        cover_publish_result = _maybe_publish_stable_cover_frame_direct(
+                            reject_source=reject_source,
+                            count_for_stats=bool(frame_count > 1),
+                        )
+                        print(
+                            "[quest_display] immersive fullframe flash guard: "
+                            f"cache_hit={int(bool(cover_publish_result.get('cache_hit', False)))} "
+                            + self._format_immersive_idle_fullframe_flash_guard_summary(
+                                idle_fullframe_flash_decision
+                            ),
+                            flush=True,
+                        )
+                        if bool(cover_publish_result.get("cache_hit", False)):
+                            _present_preview_frame_direct(
+                                cover_publish_result.get("preview_frame"),
+                                render_profile_frame,
+                            )
+                        continue
+
                     if not first_real_publish_done:
                         self._record_immersive_startup_milestone(
                             startup_timeline,
@@ -31367,6 +32069,14 @@ class InvPhyTrainerWarp:
                         f"{int(compose_artifact_debug_summary.get('stabilization_applied_count', 0))}"
                     )
                     diagnostics_lines.append(
+                        "Stable Compose Stabilization Applied Left Interaction Count: "
+                        f"{int(compose_artifact_debug_summary.get('stabilization_applied_left_interaction_count', 0))}"
+                    )
+                    diagnostics_lines.append(
+                        "Stable Compose Stabilization Applied Right Interaction Count: "
+                        f"{int(compose_artifact_debug_summary.get('stabilization_applied_right_interaction_count', 0))}"
+                    )
+                    diagnostics_lines.append(
                         "Stable Compose Stabilization Prevented Blue Exposure Count: "
                         f"{int(compose_artifact_debug_summary.get('stabilization_prevented_blue_exposure_count', 0))}"
                     )
@@ -31530,6 +32240,18 @@ class InvPhyTrainerWarp:
                         "active_overlay_hold_expired_count", 0
                     )
                     > 0
+                    or active_overlay_debug_summary.get(
+                        "active_overlay_ray_fallback_count", 0
+                    )
+                    > 0
+                    or active_overlay_debug_summary.get(
+                        "controller_overlay_clipped_line_count", 0
+                    )
+                    > 0
+                    or active_overlay_debug_summary.get(
+                        "controller_overlay_dropped_no_visible_segment_count", 0
+                    )
+                    > 0
                 ):
                     diagnostics_lines.append(
                         "Interaction Active Overlay Fallback Count: "
@@ -31542,6 +32264,18 @@ class InvPhyTrainerWarp:
                     diagnostics_lines.append(
                         "Interaction Active Overlay Hold Expired Count: "
                         f"{int(active_overlay_debug_summary.get('active_overlay_hold_expired_count', 0))}"
+                    )
+                    diagnostics_lines.append(
+                        "Interaction Active Overlay Ray Fallback Count: "
+                        f"{int(active_overlay_debug_summary.get('active_overlay_ray_fallback_count', 0))}"
+                    )
+                    diagnostics_lines.append(
+                        "Controller Overlay Clipped Line Count: "
+                        f"{int(active_overlay_debug_summary.get('controller_overlay_clipped_line_count', 0))}"
+                    )
+                    diagnostics_lines.append(
+                        "Controller Overlay Dropped No Visible Segment Count: "
+                        f"{int(active_overlay_debug_summary.get('controller_overlay_dropped_no_visible_segment_count', 0))}"
                     )
                     tracked_contact_ratio = active_overlay_debug_summary.get(
                         "tracked_contact_ratio"
@@ -31568,8 +32302,24 @@ class InvPhyTrainerWarp:
                         f"{int(stable_cover_publish_source_corruption_count)}"
                     )
                     diagnostics_lines.append(
+                        "Stable Cover Publish Idle Flash Count: "
+                        f"{int(stable_cover_publish_idle_fullframe_flash_count)}"
+                    )
+                    diagnostics_lines.append(
+                        "Stable Cover Publish Interaction Flash Count: "
+                        f"{int(stable_cover_publish_interaction_fullframe_flash_count)}"
+                    )
+                    diagnostics_lines.append(
                         "Stable Cover Publish Missing Cache Count: "
                         f"{int(stable_cover_publish_missing_cache_count)}"
+                    )
+                    diagnostics_lines.append(
+                        "Idle Fullframe Flash Reject Count: "
+                        f"{int(idle_fullframe_flash_reject_count)}"
+                    )
+                    diagnostics_lines.append(
+                        "Interaction Fullframe Flash Reject Count: "
+                        f"{int(interaction_fullframe_flash_reject_count)}"
                     )
                     diagnostics_lines.append(
                         "Stable Cover Publish Avg Ms: "

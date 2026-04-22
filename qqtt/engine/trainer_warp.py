@@ -6345,6 +6345,7 @@ class InvPhyTrainerWarp:
     IMMERSIVE_TUTORIAL_SAFE_WIDTH_FRACTION = 0.80
     IMMERSIVE_TUTORIAL_SAFE_HEIGHT_FRACTION = 0.80
     IMMERSIVE_TUTORIAL_SAMPLE_POLL_INTERVAL_SECONDS = 0.05
+    IMMERSIVE_STARTUP_SETTLE_STEPS_PER_TICK = 4
     IMMERSIVE_GAUSSIAN_COMPOSE_ROI_PADDING = 24
     TIMING_OVERLAY_TEXT_COLOR = [255.0, 255.0, 255.0]
     TIMING_OVERLAY_BG_COLOR = [0.0, 0.0, 0.0]
@@ -15411,6 +15412,23 @@ class InvPhyTrainerWarp:
             return latest_sample
         if bool(bootstrap_state.get("complete", False)):
             return current_sample
+        return self._progress_immersive_startup_bootstrap_substages(
+            bootstrap_state,
+            force=force,
+            startup_context=startup_context,
+        )
+
+    def _progress_immersive_startup_bootstrap_substages(
+        self,
+        bootstrap_state,
+        *,
+        force,
+        startup_context,
+    ):
+        bootstrap_output = bootstrap_state.setdefault("output", {})
+        current_sample = bootstrap_output.get("initial_sample")
+        if current_sample is None:
+            return None
 
         immersive_bridge = startup_context["immersive_bridge"]
         startup_keepalive_state = startup_context["startup_keepalive_state"]
@@ -15465,7 +15483,6 @@ class InvPhyTrainerWarp:
         controller_snap_edge_cache = startup_context["controller_snap_edge_cache"]
         controller_exit_hold_state = startup_context["controller_exit_hold_state"]
         controller_interaction_state = startup_context["controller_interaction_state"]
-        controller_anchor_preview_state = startup_context["controller_anchor_preview_state"]
         live_controller_case_profile = startup_context["live_controller_case_profile"]
         shared_scene_compose_cache = startup_context["shared_scene_compose_cache"]
         shared_scene_reproject_caches = startup_context["shared_scene_reproject_caches"]
@@ -15531,760 +15548,938 @@ class InvPhyTrainerWarp:
             startup_context["static_scene_layer_cache"],
         )
 
-        stage_index = int(bootstrap_state.get("stage_index", 0))
+        bootstrap_substages = (
+            "await_scene_renderer_prewarm",
+            "compute_live_head_alignment_and_initial_eye_state",
+            "build_layout",
+            "apply_scene_layout_and_check_readback_mode",
+            "validate_table_alignment_and_log_layout",
+            "apply_spawn_shift",
+            "build_center_view_and_resolve_rope_endpoints",
+            "assign_controller_sources_and_default_anchor_names",
+            "build_two_point_runtime_and_batch_buffers",
+            "init_simulator",
+            "build_rotation_cache",
+            "prime_live_controller_runtime_and_handedness",
+            "prepare_balanced_runtime_state",
+            "warmup_balanced_paths_and_seed_layer_cache",
+            "start_eye_workers_if_enabled",
+            "start_static_scene_worker_if_enabled",
+            "prepare_colliders_support_boxes_idle_lock_and_cuda_graph",
+            "settle_scene_rest_chunk",
+            "restore_settled_state_and_build_anchor_templates",
+            "validate_startup_scene_mode",
+            "startup_validation_prepare",
+            "startup_validation_scene_frames",
+            "startup_validation_left_eye",
+            "startup_validation_right_eye",
+            "startup_validation_finalize",
+        )
+        coarse_stage_to_substage_index = {
+            0: 0,
+            1: 1,
+            2: 9,
+            3: 17,
+            4: 20,
+            5: len(bootstrap_substages),
+        }
+        coarse_stage_index = int(bootstrap_state.get("stage_index", 0))
+        substage_index = int(
+            bootstrap_state.get(
+                "substage_index",
+                coarse_stage_to_substage_index.get(coarse_stage_index, 0),
+            )
+        )
+        settle_state = bootstrap_state.setdefault(
+            "settle_state",
+            {
+                "step_idx": 0,
+                "last_state": None,
+                "done": False,
+                "initialized": False,
+                "completion_notified": False,
+            },
+        )
+        validation_state = bootstrap_state.get("validation_state")
 
-        if stage_index <= 0:
-            prewarm_future = None
-            if scene_renderer_prewarm_state is not None:
-                prewarm_future = scene_renderer_prewarm_state.get("future")
-            if prewarm_future is not None and not prewarm_future.done() and not force:
-                return current_sample
-            scene_renderer, current_sample = self._await_immersive_scene_renderer_prewarm(
-                scene_renderer_prewarm_state,
-                immersive_bridge=immersive_bridge,
-                keepalive_state=startup_keepalive_state,
-                latest_sample=current_sample,
-                startup_timeline=startup_timeline,
+        def _refresh_substage_cursor():
+            bootstrap_state["substage_index"] = substage_index
+            bootstrap_state["substage_name"] = (
+                "complete"
+                if substage_index >= len(bootstrap_substages)
+                else bootstrap_substages[substage_index]
             )
-            bootstrap_output["scene_renderer"] = scene_renderer
-            bootstrap_output["scene_analysis_cache_debug"] = (
-                scene_renderer.scene_analysis_cache_debug()
-            )
-            scene_analysis_cache_debug = bootstrap_output["scene_analysis_cache_debug"]
-            print(
-                "[quest_display] immersive scene analysis cache: "
-                f"status={scene_analysis_cache_debug.get('status')} "
-                f"reason={scene_analysis_cache_debug.get('reason')} "
-                f"schema={scene_analysis_cache_debug.get('schema')} "
-                f"input_hash={scene_analysis_cache_debug.get('input_hash')} "
-                f"path={scene_analysis_cache_debug.get('path')}",
-                flush=True,
-            )
-            print(
-                "[quest_display] immersive bridge target eye resolution="
-                f"{eye_width}x{eye_height}",
-                flush=True,
-            )
-            print(
-                "[quest_display] immersive render config: "
-                f"preset={immersive_render_options['preset']} "
-                f"scene_render_scale={immersive_render_options['scene_render_scale']:.3f} "
-                f"scene_resolution={scene_width}x{scene_height} "
-                f"scene_stereo_mode={bootstrap_output['active_scene_stereo_mode']} "
-                f"overlay_mode={immersive_render_options['overlay_mode']} "
-                f"lighting_mode={immersive_render_options['lighting_mode']}",
-                flush=True,
-            )
-            if bootstrap_output["active_scene_stereo_mode"] == "mono_head_center":
-                print(
-                    "[quest_display] immersive scene stereo approximation active: "
-                    "mono_head_center reuses one room render across both eyes and is known "
-                    "to produce near-geometry stereo artifacts",
-                    flush=True,
-                )
-            elif bootstrap_output["active_scene_stereo_mode"] == "reproject_from_center":
-                print(
-                    "[quest_display] immersive scene stereo approximation active: "
-                    "reproject_from_center renders the room once and reprojects it into "
-                    "left/right eyes",
-                    flush=True,
-                )
-            elif (
-                bootstrap_output["active_scene_stereo_mode"]
-                == self.IMMERSIVE_BALANCED_INTERNAL_STEREO_MODE
-            ):
-                print(
-                    "[quest_display] immersive scene stereo approximation active: "
-                    "balanced renders the room background separately for each eye and "
-                    "renders only a per-eye table ROI to keep the table crisp",
-                    flush=True,
-                )
-            print(
-                "[quest_display] runtime recommended eye sizes: "
-                f"left={current_sample.left_eye.recommended_width}x{current_sample.left_eye.recommended_height} "
-                f"right={current_sample.right_eye.recommended_width}x{current_sample.right_eye.recommended_height}",
-                flush=True,
-            )
-            print(
-                "[quest_display] immersive startup sample: "
-                + self._format_immersive_sample_startup_state(current_sample),
-                flush=True,
-            )
-            bootstrap_output["initial_sample"] = current_sample
-            bootstrap_state["stage_index"] = 1
-            if not force:
-                return current_sample
-            stage_index = 1
 
-        if stage_index <= 1:
-            current_sample = bootstrap_output["initial_sample"]
-            scene_renderer = bootstrap_output["scene_renderer"]
-            active_scene_stereo_mode = bootstrap_output["active_scene_stereo_mode"]
-            head_pose_state = bootstrap_output["head_pose_state"]
-            obj_init_vertices = bootstrap_output["obj_init_vertices"]
-            recorded_base_target = bootstrap_output["recorded_base_target"]
-            recorded_anchor_centers = bootstrap_output["recorded_anchor_centers"]
-            original_controller_source_anchor_centers = bootstrap_output[
-                "original_controller_source_anchor_centers"
-            ]
-            original_controller_source_masks = bootstrap_output[
-                "original_controller_source_masks"
-            ]
-            controller_predefined_anchor_defs = bootstrap_output[
-                "controller_predefined_anchor_defs"
-            ]
-            trained_spring_Y_for_sim = bootstrap_output["trained_spring_Y_for_sim"]
-
-            live_head_alignment = self._compute_immersive_head_alignment(current_sample)
-            if live_head_alignment is None:
-                raise RuntimeError(
-                    "Immersive mode did not receive a valid eye pose for startup.\n"
-                    f"last_sample: {self._format_immersive_sample_startup_state(current_sample)}"
-                )
+        def _complete_substage(name, *, stage_index=None):
+            nonlocal substage_index
             print(
-                "[quest_display] immersive scene frame: "
-                f"up={live_head_alignment['scene_up'].tolist()} "
-                f"forward={live_head_alignment['scene_forward'].tolist()} "
-                f"right={live_head_alignment['scene_right'].tolist()} "
-                f"det={live_head_alignment['basis_det']:.5f} "
-                f"ortho_err={live_head_alignment['basis_orthogonality_error']:.6f}",
+                "[quest_display] immersive startup bootstrap substage complete: "
+                f"{name}",
                 flush=True,
             )
-            immersive_controller_basis_state = (
-                self._make_immersive_controller_basis_state(
-                    live_head_alignment["basis"],
-                    intrinsic,
-                )
-            )
-            print(
-                "[live_openxr_controller] immersive controller handedness validation "
-                "pending until both controllers have valid grip poses",
-                flush=True,
-            )
-            (
-                initial_left_eye_pose_world,
-                initial_right_eye_pose_world,
-                head_pose_state,
-            ) = self._update_immersive_head_pose_state(
-                current_sample,
-                live_head_alignment,
-                head_pose_state,
-                frame_index=0,
-            )
-            valid_eye_poses = [
-                pose
-                for pose in (
-                    initial_left_eye_pose_world,
-                    initial_right_eye_pose_world,
-                )
-                if pose is not None
-            ]
-            if not valid_eye_poses:
-                raise RuntimeError(
-                    "Immersive mode needs at least one valid eye pose from the Quest runtime."
-                )
-            initial_left_intrinsic = (
-                self._eye_sample_intrinsic(current_sample.left_eye, eye_width, eye_height)
-                if current_sample.left_eye is not None
-                and current_sample.left_eye.pose_valid
-                else None
-            )
-            initial_right_intrinsic = (
-                self._eye_sample_intrinsic(current_sample.right_eye, eye_width, eye_height)
-                if current_sample.right_eye is not None
-                and current_sample.right_eye.pose_valid
-                else None
-            )
-            head_position = np.mean(
-                [pose[:3, 3] for pose in valid_eye_poses], axis=0
-            ).astype(np.float32)
-            head_forward = np.mean(
-                [self._eye_forward_world(pose) for pose in valid_eye_poses],
-                axis=0,
-            ).astype(np.float32)
-            forward_norm = float(np.linalg.norm(head_forward))
-            if forward_norm < 1e-5:
-                head_forward = np.array([0.0, 1.0, 0.0], dtype=np.float32)
-            else:
-                head_forward /= forward_norm
-
-            layout = make_simple_lab_layout(
-                head_position,
-                head_forward,
-                scene_up=live_head_alignment["scene_up"],
-            )
-            self._record_immersive_startup_milestone(
-                startup_timeline,
-                "layout_ready",
-                immersive_bridge,
-            )
+            bootstrap_state["last_completed_substage"] = str(name)
             self._maybe_publish_immersive_startup_keepalive(
                 immersive_bridge,
                 startup_keepalive_state,
-                reason="layout_ready",
+                reason=f"bootstrap_{name}",
                 startup_timeline=startup_timeline,
-                force=True,
+                force=not force,
             )
-            scene_renderer.set_layout(layout)
-            scene_execute_renderer = scene_renderer
-            self._record_immersive_startup_milestone(
-                startup_timeline,
-                "scene_layout_applied",
-                immersive_bridge,
-            )
-            self._maybe_publish_immersive_startup_keepalive(
-                immersive_bridge,
-                startup_keepalive_state,
-                reason="scene_layout_applied",
-                startup_timeline=startup_timeline,
-            )
-            main_renderer_readback_mode = str(scene_renderer.pyrender_readback_mode())
-            main_renderer_readback_reason = scene_renderer.pyrender_readback_reason()
-            print(
-                f"[quest_display] main_renderer_readback_mode={main_renderer_readback_mode}",
-                flush=True,
-            )
-            if main_renderer_readback_reason:
+            substage_index += 1
+            if stage_index is not None:
+                bootstrap_state["stage_index"] = int(stage_index)
+            _refresh_substage_cursor()
+
+        _refresh_substage_cursor()
+        while substage_index < len(bootstrap_substages):
+            current_sample = bootstrap_output.get("initial_sample")
+            if current_sample is None:
+                return None
+            substage_name = bootstrap_substages[substage_index]
+
+            if substage_name == "await_scene_renderer_prewarm":
+                prewarm_future = None
+                if scene_renderer_prewarm_state is not None:
+                    prewarm_future = scene_renderer_prewarm_state.get("future")
+                if prewarm_future is not None and not prewarm_future.done() and not force:
+                    return current_sample
+                scene_renderer, current_sample = self._await_immersive_scene_renderer_prewarm(
+                    scene_renderer_prewarm_state,
+                    immersive_bridge=immersive_bridge,
+                    keepalive_state=startup_keepalive_state,
+                    latest_sample=current_sample,
+                    startup_timeline=startup_timeline,
+                )
+                bootstrap_output["scene_renderer"] = scene_renderer
+                bootstrap_output["initial_sample"] = current_sample
+                bootstrap_output["scene_analysis_cache_debug"] = (
+                    scene_renderer.scene_analysis_cache_debug()
+                )
+                scene_analysis_cache_debug = bootstrap_output["scene_analysis_cache_debug"]
                 print(
-                    f"[quest_display] main_renderer_readback_reason={main_renderer_readback_reason}",
+                    "[quest_display] immersive scene analysis cache: "
+                    f"status={scene_analysis_cache_debug.get('status')} "
+                    f"reason={scene_analysis_cache_debug.get('reason')} "
+                    f"schema={scene_analysis_cache_debug.get('schema')} "
+                    f"input_hash={scene_analysis_cache_debug.get('input_hash')} "
+                    f"path={scene_analysis_cache_debug.get('path')}",
                     flush=True,
                 )
-            if main_renderer_readback_mode != "gl_cuda_interop":
-                raise RuntimeError(
-                    "Quest immersive runtime requires pyrender_readback_mode=gl_cuda_interop "
-                    "so scene/background/table compose stays tensor-only."
+                print(
+                    "[quest_display] immersive bridge target eye resolution="
+                    f"{eye_width}x{eye_height}",
+                    flush=True,
                 )
-            table_alignment_debug = scene_renderer.table_alignment_debug()
-            table_surface_center_world = self._scene_table_surface_center_world(layout)
-            if table_alignment_debug is not None:
-                collider_top_plane_height = float(
-                    table_alignment_debug["collider_top_plane_height"]
+                print(
+                    "[quest_display] immersive render config: "
+                    f"preset={immersive_render_options['preset']} "
+                    f"scene_render_scale={immersive_render_options['scene_render_scale']:.3f} "
+                    f"scene_resolution={scene_width}x{scene_height} "
+                    f"scene_stereo_mode={bootstrap_output['active_scene_stereo_mode']} "
+                    f"overlay_mode={immersive_render_options['overlay_mode']} "
+                    f"lighting_mode={immersive_render_options['lighting_mode']}",
+                    flush=True,
                 )
-                world_surface_plane_height = float(
-                    table_alignment_debug["world_surface_plane_height"]
-                )
-                table_surface_center_world = np.asarray(
-                    table_alignment_debug["world_surface_center"],
-                    dtype=np.float32,
-                )
-                if (
-                    abs(world_surface_plane_height - collider_top_plane_height)
-                    > self.IMMERSIVE_STARTUP_PLANE_EPS
+                if bootstrap_output["active_scene_stereo_mode"] == "mono_head_center":
+                    print(
+                        "[quest_display] immersive scene stereo approximation active: "
+                        "mono_head_center reuses one room render across both eyes and is known "
+                        "to produce near-geometry stereo artifacts",
+                        flush=True,
+                    )
+                elif bootstrap_output["active_scene_stereo_mode"] == "reproject_from_center":
+                    print(
+                        "[quest_display] immersive scene stereo approximation active: "
+                        "reproject_from_center renders the room once and reprojects it into "
+                        "left/right eyes",
+                        flush=True,
+                    )
+                elif (
+                    bootstrap_output["active_scene_stereo_mode"]
+                    == self.IMMERSIVE_BALANCED_INTERNAL_STEREO_MODE
                 ):
+                    print(
+                        "[quest_display] immersive scene stereo approximation active: "
+                        "balanced renders the room background separately for each eye and "
+                        "renders only a per-eye table ROI to keep the table crisp",
+                        flush=True,
+                    )
+                print(
+                    "[quest_display] runtime recommended eye sizes: "
+                    f"left={current_sample.left_eye.recommended_width}x{current_sample.left_eye.recommended_height} "
+                    f"right={current_sample.right_eye.recommended_width}x{current_sample.right_eye.recommended_height}",
+                    flush=True,
+                )
+                print(
+                    "[quest_display] immersive startup sample: "
+                    + self._format_immersive_sample_startup_state(current_sample),
+                    flush=True,
+                )
+                _complete_substage(substage_name, stage_index=1)
+                if not force:
+                    return current_sample
+                continue
+
+            if substage_name == "compute_live_head_alignment_and_initial_eye_state":
+                live_head_alignment = self._compute_immersive_head_alignment(current_sample)
+                if live_head_alignment is None:
                     raise RuntimeError(
-                        "Immersive scene table alignment validation failed: "
-                        f"{table_alignment_debug}"
+                        "Immersive mode did not receive a valid eye pose for startup.\n"
+                        f"last_sample: {self._format_immersive_sample_startup_state(current_sample)}"
                     )
                 print(
-                    "[quest_display] table alignment: "
-                    f"asset_transform={table_alignment_debug['asset_transform']} "
-                    f"surface_normal={table_alignment_debug['world_surface_normal']} "
-                    f"normal_alignment={table_alignment_debug['surface_normal_alignment']:.4f} "
-                    f"surface_center={table_alignment_debug['world_surface_center']} "
-                    f"surface_plane={world_surface_plane_height:.4f} "
-                    f"collider_plane={collider_top_plane_height:.4f} "
-                    f"active_table_patches={table_alignment_debug.get('active_table_support_patch_count', 'n/a')} "
-                    f"support_slabs={table_alignment_debug.get('support_slab_count', 'n/a')} "
-                    f"blocker_boxes={table_alignment_debug.get('blocker_box_count', 'n/a')} "
-                    f"collider_boxes={table_alignment_debug.get('collider_box_count', 'n/a')}",
+                    "[quest_display] immersive scene frame: "
+                    f"up={live_head_alignment['scene_up'].tolist()} "
+                    f"forward={live_head_alignment['scene_forward'].tolist()} "
+                    f"right={live_head_alignment['scene_right'].tolist()} "
+                    f"det={live_head_alignment['basis_det']:.5f} "
+                    f"ortho_err={live_head_alignment['basis_orthogonality_error']:.6f}",
                     flush=True,
+                )
+                immersive_controller_basis_state = (
+                    self._make_immersive_controller_basis_state(
+                        live_head_alignment["basis"],
+                        intrinsic,
+                    )
                 )
                 print(
-                    "[quest_display] table timewarp partition: "
-                    f"table_component_ids={table_alignment_debug.get('table_render_component_ids', [])} "
-                    "background_excludes_active_table="
-                    f"{int(bool(table_alignment_debug.get('background_excludes_active_table', False)))} "
-                    "table_bounds_source="
-                    f"{table_alignment_debug.get('table_render_bounds_source', 'unknown')} "
-                    "table_render_bounds="
-                    f"{table_alignment_debug.get('table_render_world_bounds', 'n/a')}",
+                    "[live_openxr_controller] immersive controller handedness validation "
+                    "pending until both controllers have valid grip poses",
                     flush=True,
                 )
-            print(
-                "[quest_display] immersive layout: "
-                f"head_position={head_position.tolist()} "
-                f"table_top_center={layout.table_top_center.tolist()}",
-                flush=True,
-            )
-
-            spawn_shift = self._compute_scene_spawn_shift(
-                obj_init_vertices,
-                table_surface_center_world,
-            )
-            spawn_shift = spawn_shift.to(device=cfg.device, dtype=torch.float32)
-            obj_init_vertices = obj_init_vertices + spawn_shift
-            recorded_base_target = recorded_base_target + spawn_shift
-            gaussians._xyz = gaussians._xyz + spawn_shift
-            recorded_anchor_centers = [
-                center + spawn_shift for center in recorded_anchor_centers
-            ]
-            original_controller_source_anchor_centers = [
-                center + spawn_shift
-                for center in original_controller_source_anchor_centers
-            ]
-            self._record_immersive_startup_milestone(
-                startup_timeline,
-                "spawn_shift_done",
-                immersive_bridge,
-            )
-            self._maybe_publish_immersive_startup_keepalive(
-                immersive_bridge,
-                startup_keepalive_state,
-                reason="spawn_shift_done",
-                startup_timeline=startup_timeline,
-            )
-            immersive_center_eye_pose_world, immersive_center_intrinsic = (
-                self._build_immersive_center_scene_view(
+                (
                     initial_left_eye_pose_world,
                     initial_right_eye_pose_world,
-                    initial_left_intrinsic,
-                    initial_right_intrinsic,
+                    head_pose_state,
+                ) = self._update_immersive_head_pose_state(
+                    current_sample,
+                    live_head_alignment,
+                    bootstrap_output["head_pose_state"],
+                    frame_index=0,
                 )
-            )
-            immersive_center_w2c = self._camera_pose_world_to_cv_w2c(
-                immersive_center_eye_pose_world
-            )
-            controller_predefined_anchor_defs, rope_endpoint_naming_debug = (
-                self._resolve_rope_endpoint_anchor_defs(
-                    controller_predefined_anchor_defs,
-                    immersive_center_intrinsic,
-                    immersive_center_w2c,
+                valid_eye_poses = [
+                    pose
+                    for pose in (
+                        initial_left_eye_pose_world,
+                        initial_right_eye_pose_world,
+                    )
+                    if pose is not None
+                ]
+                if not valid_eye_poses:
+                    raise RuntimeError(
+                        "Immersive mode needs at least one valid eye pose from the Quest runtime."
+                    )
+                initial_left_intrinsic = (
+                    self._eye_sample_intrinsic(current_sample.left_eye, eye_width, eye_height)
+                    if current_sample.left_eye is not None
+                    and current_sample.left_eye.pose_valid
+                    else None
                 )
-            )
-            if self._is_rope_family_case(rope_endpoint_naming_debug.get("case_name")):
+                initial_right_intrinsic = (
+                    self._eye_sample_intrinsic(current_sample.right_eye, eye_width, eye_height)
+                    if current_sample.right_eye is not None
+                    and current_sample.right_eye.pose_valid
+                    else None
+                )
+                bootstrap_output.update(
+                    {
+                        "head_pose_state": head_pose_state,
+                        "live_head_alignment": live_head_alignment,
+                        "immersive_controller_basis_state": immersive_controller_basis_state,
+                        "initial_left_eye_pose_world": initial_left_eye_pose_world,
+                        "initial_right_eye_pose_world": initial_right_eye_pose_world,
+                        "initial_left_intrinsic": initial_left_intrinsic,
+                        "initial_right_intrinsic": initial_right_intrinsic,
+                    }
+                )
+                _complete_substage(substage_name)
+                if not force:
+                    return current_sample
+                continue
+
+            if substage_name == "build_layout":
+                valid_eye_poses = [
+                    pose
+                    for pose in (
+                        bootstrap_output["initial_left_eye_pose_world"],
+                        bootstrap_output["initial_right_eye_pose_world"],
+                    )
+                    if pose is not None
+                ]
+                head_position = np.mean(
+                    [pose[:3, 3] for pose in valid_eye_poses], axis=0
+                ).astype(np.float32)
+                head_forward = np.mean(
+                    [self._eye_forward_world(pose) for pose in valid_eye_poses],
+                    axis=0,
+                ).astype(np.float32)
+                forward_norm = float(np.linalg.norm(head_forward))
+                if forward_norm < 1e-5:
+                    head_forward = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+                else:
+                    head_forward /= forward_norm
+                layout = make_simple_lab_layout(
+                    head_position,
+                    head_forward,
+                    scene_up=bootstrap_output["live_head_alignment"]["scene_up"],
+                )
+                self._record_immersive_startup_milestone(
+                    startup_timeline,
+                    "layout_ready",
+                    immersive_bridge,
+                )
+                self._maybe_publish_immersive_startup_keepalive(
+                    immersive_bridge,
+                    startup_keepalive_state,
+                    reason="layout_ready",
+                    startup_timeline=startup_timeline,
+                    force=True,
+                )
+                bootstrap_output["layout"] = layout
+                _complete_substage(substage_name)
+                if not force:
+                    return current_sample
+                continue
+
+            if substage_name == "apply_scene_layout_and_check_readback_mode":
+                scene_renderer = bootstrap_output["scene_renderer"]
+                layout = bootstrap_output["layout"]
+                scene_renderer.set_layout(layout)
+                scene_execute_renderer = scene_renderer
+                self._record_immersive_startup_milestone(
+                    startup_timeline,
+                    "scene_layout_applied",
+                    immersive_bridge,
+                )
+                self._maybe_publish_immersive_startup_keepalive(
+                    immersive_bridge,
+                    startup_keepalive_state,
+                    reason="scene_layout_applied",
+                    startup_timeline=startup_timeline,
+                )
+                main_renderer_readback_mode = str(scene_renderer.pyrender_readback_mode())
+                main_renderer_readback_reason = scene_renderer.pyrender_readback_reason()
                 print(
-                    "[quest_display] immersive rope endpoint naming: "
-                    f"endpoint_projected_x={rope_endpoint_naming_debug['endpoint_projected_x']} "
-                    f"naming_valid={int(bool(rope_endpoint_naming_debug['naming_valid']))} "
-                    f"fallback={int(bool(rope_endpoint_naming_debug['fallback_used']))}",
+                    f"[quest_display] main_renderer_readback_mode={main_renderer_readback_mode}",
                     flush=True,
                 )
-            startup_controller_source_assignment = (
-                self._assign_startup_controller_sources_by_screen_x(
-                    original_controller_source_masks,
-                    original_controller_source_anchor_centers,
-                    immersive_center_intrinsic,
-                    immersive_center_w2c,
-                    recorded_anchor_centers=recorded_anchor_centers,
-                    assignment_camera="immersive_center_view",
+                if main_renderer_readback_reason:
+                    print(
+                        f"[quest_display] main_renderer_readback_reason={main_renderer_readback_reason}",
+                        flush=True,
+                    )
+                if main_renderer_readback_mode != "gl_cuda_interop":
+                    raise RuntimeError(
+                        "Quest immersive runtime requires pyrender_readback_mode=gl_cuda_interop "
+                        "so scene/background/table compose stays tensor-only."
+                    )
+                bootstrap_output["scene_execute_renderer"] = scene_execute_renderer
+                _complete_substage(substage_name)
+                if not force:
+                    return current_sample
+                continue
+
+            if substage_name == "validate_table_alignment_and_log_layout":
+                scene_renderer = bootstrap_output["scene_renderer"]
+                layout = bootstrap_output["layout"]
+                table_alignment_debug = scene_renderer.table_alignment_debug()
+                table_surface_center_world = self._scene_table_surface_center_world(layout)
+                if table_alignment_debug is not None:
+                    collider_top_plane_height = float(
+                        table_alignment_debug["collider_top_plane_height"]
+                    )
+                    world_surface_plane_height = float(
+                        table_alignment_debug["world_surface_plane_height"]
+                    )
+                    table_surface_center_world = np.asarray(
+                        table_alignment_debug["world_surface_center"],
+                        dtype=np.float32,
+                    )
+                    if (
+                        abs(world_surface_plane_height - collider_top_plane_height)
+                        > self.IMMERSIVE_STARTUP_PLANE_EPS
+                    ):
+                        raise RuntimeError(
+                            "Immersive scene table alignment validation failed: "
+                            f"{table_alignment_debug}"
+                        )
+                    print(
+                        "[quest_display] table alignment: "
+                        f"asset_transform={table_alignment_debug['asset_transform']} "
+                        f"surface_normal={table_alignment_debug['world_surface_normal']} "
+                        f"normal_alignment={table_alignment_debug['surface_normal_alignment']:.4f} "
+                        f"surface_center={table_alignment_debug['world_surface_center']} "
+                        f"surface_plane={world_surface_plane_height:.4f} "
+                        f"collider_plane={collider_top_plane_height:.4f} "
+                        f"active_table_patches={table_alignment_debug.get('active_table_support_patch_count', 'n/a')} "
+                        f"support_slabs={table_alignment_debug.get('support_slab_count', 'n/a')} "
+                        f"blocker_boxes={table_alignment_debug.get('blocker_box_count', 'n/a')} "
+                        f"collider_boxes={table_alignment_debug.get('collider_box_count', 'n/a')}",
+                        flush=True,
+                    )
+                    print(
+                        "[quest_display] table timewarp partition: "
+                        f"table_component_ids={table_alignment_debug.get('table_render_component_ids', [])} "
+                        "background_excludes_active_table="
+                        f"{int(bool(table_alignment_debug.get('background_excludes_active_table', False)))} "
+                        "table_bounds_source="
+                        f"{table_alignment_debug.get('table_render_bounds_source', 'unknown')} "
+                        "table_render_bounds="
+                        f"{table_alignment_debug.get('table_render_world_bounds', 'n/a')}",
+                        flush=True,
+                    )
+                print(
+                    "[quest_display] immersive layout: "
+                    f"head_position={np.mean([pose[:3, 3] for pose in [bootstrap_output['initial_left_eye_pose_world'], bootstrap_output['initial_right_eye_pose_world']] if pose is not None], axis=0).astype(np.float32).tolist()} "
+                    f"table_top_center={layout.table_top_center.tolist()}",
+                    flush=True,
                 )
-            )
-            original_controller_source_masks = startup_controller_source_assignment[
-                "controller_source_masks"
-            ]
-            original_controller_source_anchor_centers = startup_controller_source_assignment[
-                "controller_source_anchor_centers"
-            ]
-            recorded_anchor_centers = startup_controller_source_assignment[
-                "recorded_anchor_centers"
-            ]
-            self._log_startup_controller_source_assignment(
-                "[quest_display] immersive",
-                startup_controller_source_assignment,
-            )
-            startup_predefined_anchor_states = (
-                self._compute_predefined_interaction_anchor_states(
-                    controller_predefined_anchor_defs,
+                bootstrap_output["table_surface_center_world"] = table_surface_center_world
+                _complete_substage(substage_name)
+                if not force:
+                    return current_sample
+                continue
+
+            if substage_name == "apply_spawn_shift":
+                obj_init_vertices = bootstrap_output["obj_init_vertices"]
+                spawn_shift = self._compute_scene_spawn_shift(
                     obj_init_vertices,
+                    bootstrap_output["table_surface_center_world"],
                 )
-            )
-            resolved_default_anchor_names, anchor_mapping_debug = (
-                self._resolve_case_default_controller_anchor_names(
-                    startup_predefined_anchor_states,
-                    original_controller_source_anchor_centers,
-                    immersive_center_intrinsic,
-                    immersive_center_w2c,
+                spawn_shift = spawn_shift.to(device=cfg.device, dtype=torch.float32)
+                obj_init_vertices = obj_init_vertices + spawn_shift
+                recorded_base_target = bootstrap_output["recorded_base_target"] + spawn_shift
+                gaussians._xyz = gaussians._xyz + spawn_shift
+                recorded_anchor_centers = [
+                    center + spawn_shift
+                    for center in bootstrap_output["recorded_anchor_centers"]
+                ]
+                original_controller_source_anchor_centers = [
+                    center + spawn_shift
+                    for center in bootstrap_output["original_controller_source_anchor_centers"]
+                ]
+                self._record_immersive_startup_milestone(
+                    startup_timeline,
+                    "spawn_shift_done",
+                    immersive_bridge,
                 )
-            )
-            self._log_case_controller_anchor_mapping(
-                "[quest_display] immersive",
-                anchor_mapping_debug,
-            )
-            print(
-                "[live_openxr_controller] immersive controller case profile: "
-                f"case={live_controller_case_profile['case_name']} "
-                "default_translation_scale="
-                f"{live_controller_case_profile['controller_translation_scale_default']:.2f} "
-                "translation_scale_multiplier="
-                f"{live_controller_case_profile['controller_translation_scale_multiplier']:.2f} "
-                "effective_translation_scale="
-                f"{live_controller_case_profile['controller_translation_scale']:.2f} "
-                f"post_select_grab_mode={live_controller_case_profile['post_select_grab_mode']}",
-                flush=True,
-            )
-            two_point_runtime = self._build_two_point_live_controller_runtime(
-                obj_init_vertices,
-                trained_spring_Y_for_sim,
-                original_controller_source_masks,
-                original_controller_source_anchor_centers,
-                controller_predefined_anchor_defs,
-                default_anchor_names=resolved_default_anchor_names,
-            )
-            controller_runtime_base_target = two_point_runtime["controller_rest_points"].clone()
-            controller_source_masks = two_point_runtime["controller_source_masks"]
-            controller_source_anchor_centers = two_point_runtime[
-                "controller_source_anchor_centers"
-            ]
-            init_springs_for_sim = two_point_runtime["init_springs"]
-            init_rest_lengths_for_sim = two_point_runtime["init_rest_lengths"]
-            trained_spring_Y_for_sim = two_point_runtime["spring_y"]
-            controller_attachment_metadata = self._build_controller_attachment_metadata(
-                init_springs_for_sim,
-                init_rest_lengths_for_sim,
-                self.num_all_points,
-                controller_source_masks,
-            )
-            for source, runtime_meta in two_point_runtime["source_runtime"].items():
-                controller_attachment_metadata[source].update(runtime_meta)
-            controller_attachment_metadata = (
-                self._canonicalize_rope_family_controller_attachment_metadata(
-                    controller_attachment_metadata,
-                    default_anchor_names=resolved_default_anchor_names,
+                self._maybe_publish_immersive_startup_keepalive(
+                    immersive_bridge,
+                    startup_keepalive_state,
+                    reason="spawn_shift_done",
+                    startup_timeline=startup_timeline,
                 )
-            )
-            ctrl_init_vertices = controller_runtime_base_target
-            n_vert_single_obj = obj_init_vertices.shape[0]
-            n_vert_single_ctrl = ctrl_init_vertices.shape[0]
-            n_springs_single_obj = int(self.num_object_springs)
-            n_spring_single_ctrl = int(
-                init_springs_for_sim.shape[0] - self.num_object_springs
-            )
-            base_ctrl_vert_offset = n_vert_single_obj
-            self.batch_init_vertices = torch.cat(
-                [obj_init_vertices, ctrl_init_vertices], dim=0
-            )
-            self.batch_init_velocities = (
-                self.init_velocities.clone() if self.init_velocities is not None else None
-            )
-            self.batch_controller_points = controller_runtime_base_target.unsqueeze(0).repeat(
-                self.frame_len, 1, 1
-            )
-
-            bootstrap_output.update(
-                {
-                    "initial_sample": current_sample,
-                    "active_scene_stereo_mode": active_scene_stereo_mode,
-                    "head_pose_state": head_pose_state,
-                    "live_head_alignment": live_head_alignment,
-                    "immersive_controller_basis_state": immersive_controller_basis_state,
-                    "initial_left_eye_pose_world": initial_left_eye_pose_world,
-                    "initial_right_eye_pose_world": initial_right_eye_pose_world,
-                    "initial_left_intrinsic": initial_left_intrinsic,
-                    "initial_right_intrinsic": initial_right_intrinsic,
-                    "layout": layout,
-                    "scene_execute_renderer": scene_execute_renderer,
-                    "table_surface_center_world": table_surface_center_world,
-                    "spawn_shift": spawn_shift,
-                    "obj_init_vertices": obj_init_vertices,
-                    "recorded_base_target": recorded_base_target,
-                    "recorded_anchor_centers": recorded_anchor_centers,
-                    "original_controller_source_anchor_centers": original_controller_source_anchor_centers,
-                    "original_controller_source_masks": original_controller_source_masks,
-                    "controller_predefined_anchor_defs": controller_predefined_anchor_defs,
-                    "controller_runtime_base_target": controller_runtime_base_target,
-                    "controller_source_masks": controller_source_masks,
-                    "controller_source_anchor_centers": controller_source_anchor_centers,
-                    "trained_spring_Y_for_sim": trained_spring_Y_for_sim,
-                    "init_springs_for_sim": init_springs_for_sim,
-                    "init_rest_lengths_for_sim": init_rest_lengths_for_sim,
-                    "controller_attachment_metadata": controller_attachment_metadata,
-                    "base_ctrl_vert_offset": base_ctrl_vert_offset,
-                    "n_vert_single_obj": n_vert_single_obj,
-                    "n_vert_single_ctrl": n_vert_single_ctrl,
-                    "n_springs_single_obj": n_springs_single_obj,
-                    "n_spring_single_ctrl": n_spring_single_ctrl,
-                }
-            )
-            bootstrap_state["stage_index"] = 2
-            if not force:
-                return current_sample
-            stage_index = 2
-
-        if stage_index <= 2:
-            current_sample = bootstrap_output["initial_sample"]
-            layout = bootstrap_output["layout"]
-            base_ctrl_vert_offset = int(bootstrap_output["base_ctrl_vert_offset"])
-            n_vert_single_obj = int(bootstrap_output["n_vert_single_obj"])
-            n_vert_single_ctrl = int(bootstrap_output["n_vert_single_ctrl"])
-            n_springs_single_obj = int(bootstrap_output["n_springs_single_obj"])
-            n_spring_single_ctrl = int(bootstrap_output["n_spring_single_ctrl"])
-            init_springs_for_sim = bootstrap_output["init_springs_for_sim"]
-            init_rest_lengths_for_sim = bootstrap_output["init_rest_lengths_for_sim"]
-            trained_spring_Y_for_sim = bootstrap_output["trained_spring_Y_for_sim"]
-            controller_source_anchor_centers = bootstrap_output[
-                "controller_source_anchor_centers"
-            ]
-            controller_runtime_base_target = bootstrap_output[
-                "controller_runtime_base_target"
-            ]
-            active_scene_stereo_mode = bootstrap_output["active_scene_stereo_mode"]
-            scene_renderer = bootstrap_output["scene_renderer"]
-            scene_execute_renderer = bootstrap_output["scene_execute_renderer"]
-            immersive_controller_basis_state = bootstrap_output[
-                "immersive_controller_basis_state"
-            ]
-            initial_left_eye_pose_world = bootstrap_output[
-                "initial_left_eye_pose_world"
-            ]
-            initial_right_eye_pose_world = bootstrap_output[
-                "initial_right_eye_pose_world"
-            ]
-            initial_left_intrinsic = bootstrap_output["initial_left_intrinsic"]
-            initial_right_intrinsic = bootstrap_output["initial_right_intrinsic"]
-
-            self._record_immersive_startup_milestone(
-                startup_timeline,
-                "sim_init_begin",
-                immersive_bridge,
-            )
-            self.simulator = SpringMassSystemWarp(
-                init_springs=init_springs_for_sim,
-                init_rest_lengths=init_rest_lengths_for_sim,
-                init_masses=startup_context["init_masses_for_sim"],
-                init_masks=self.init_masks,
-                init_vertices=self.batch_init_vertices,
-                init_velocities=self.batch_init_velocities,
-                dt=cfg.dt,
-                num_substeps=cfg.num_substeps,
-                dashpot_damping=cfg.dashpot_damping,
-                drag_damping=cfg.drag_damping,
-                collision_dist=cfg.collision_dist,
-                reverse_z=cfg.reverse_z,
-                spring_Y_max=cfg.spring_Y_max,
-                spring_Y_min=cfg.spring_Y_min,
-                self_collision=cfg.self_collision,
-                collide_elas=startup_context["trained_collide_elas"],
-                collide_fric=startup_context["trained_collide_fric"],
-                collide_object_elas=startup_context["trained_collide_object_elas"],
-                collide_object_fric=startup_context["trained_collide_object_fric"],
-                spring_Y=trained_spring_Y_for_sim,
-                object_massnodes_total=base_ctrl_vert_offset,
-                object_massnodes_single=n_vert_single_obj,
-                object_springs_total=n_springs_single_obj,
-                object_springs_single=n_springs_single_obj,
-                controller_massnodes_single=n_vert_single_ctrl,
-                controller_springs_single=n_spring_single_ctrl,
-                controller_rest_location=self.batch_controller_points[0],
-                number_of_instance=1,
-                use_ground_plane=False,
-            )
-            self.simulator.set_init_state(
-                self.simulator.wp_init_vertices, self.simulator.wp_init_velocities
-            )
-            self._record_immersive_startup_milestone(
-                startup_timeline,
-                "sim_init_done",
-                immersive_bridge,
-            )
-            self._maybe_publish_immersive_startup_keepalive(
-                immersive_bridge,
-                startup_keepalive_state,
-                reason="sim_init_done",
-                startup_timeline=startup_timeline,
-            )
-            prev_x = wp.to_torch(
-                self.simulator.wp_states[0].wp_x, requires_grad=False
-            ).clone()
-            current_pos = gaussians.get_xyz
-            current_rot = gaussians.get_rotation
-            relations_single = get_topk_indices(prev_x, K=3)
-            weights_single, weights_indices_single = knn_weights_sparse(
-                prev_x,
-                current_pos,
-                K=3,
-            )
-            rotation_cache = build_rotation_reuse_cache(
-                weights_indices=weights_indices_single,
-                weights=weights_single,
-                relations=relations_single,
-                mass_nodes_rest=prev_x,
-                gaussians_xyz_rest=current_pos,
-                gaussians_quat_rest=current_rot,
-                device=cfg.device,
-                mass_node_per_instance=n_vert_single_obj,
-                gaussians_per_instance=current_pos.shape[0],
-                number_of_instance=1,
-            )
-            spawn_support_center = self._validate_scene_spawn_alignment(
-                self.batch_init_vertices[: self.num_all_points],
-                layout,
-                context="spawn shift",
-                table_surface_center_world=bootstrap_output["table_surface_center_world"],
-            )
-            _, _, spawn_xy_error, spawn_z_error = self._scene_spawn_alignment_metrics(
-                self.batch_init_vertices[: self.num_all_points],
-                layout,
-                table_surface_center_world=bootstrap_output["table_surface_center_world"],
-            )
-            print(
-                "[quest_display] immersive spawn shift: "
-                f"shift={bootstrap_output['spawn_shift'].detach().cpu().numpy().tolist()} "
-                f"support_center={spawn_support_center.detach().cpu().numpy().tolist()} "
-                f"xy_error={spawn_xy_error:.4f} z_error={spawn_z_error:.4f}",
-                flush=True,
-            )
-            live_controller_alignment = None
-            live_controller_alignment_mode = "unset"
-            controller_runtime_state = self._update_live_controller_runtime_from_sample(
-                current_sample,
-                live_controller_alignment,
-                live_controller_alignment_mode,
-                controller_source_anchor_centers,
-                w2c,
-                controller_select_state_cache,
-                controller_select_hold_state,
-                controller_select_hold_state_cache,
-                controller_anchor_cycle_state_cache,
-                controller_anchor_reset_state_cache,
-                controller_snap_state_cache,
-                controller_snap_edge_cache,
-                controller_exit_hold_state,
-                basis_override=immersive_controller_basis_state["basis"],
-                collect_reset_edges=False,
-                collect_exit_holds=False,
-                alignment_pose_role="grip",
-                controller_position_pose_role="grip",
-                controller_ray_pose_role="aim",
-            )
-            (
-                controller_runtime_state,
-                immersive_controller_basis_state,
-            ) = self._maybe_resolve_immersive_controller_handedness(
-                current_sample,
-                controller_runtime_state,
-                immersive_controller_basis_state,
-                controller_source_anchor_centers,
-                intrinsic,
-                w2c,
-                controller_interaction_state=controller_interaction_state,
-                alignment_pose_role="grip",
-                controller_position_pose_role="grip",
-                controller_ray_pose_role="aim",
-            )
-            live_controller_alignment = controller_runtime_state["alignment"]
-            live_controller_alignment_mode = controller_runtime_state["alignment_mode"]
-            if live_controller_alignment is None:
-                print(
-                    "[live_openxr_controller] immersive controller alignment still pending "
-                    "after scene spawn shift",
-                    flush=True,
+                bootstrap_output.update(
+                    {
+                        "spawn_shift": spawn_shift,
+                        "obj_init_vertices": obj_init_vertices,
+                        "recorded_base_target": recorded_base_target,
+                        "recorded_anchor_centers": recorded_anchor_centers,
+                        "original_controller_source_anchor_centers": original_controller_source_anchor_centers,
+                    }
                 )
-            else:
-                print(
-                    "[live_openxr_controller] immersive controller alignment ready "
-                    f"after scene spawn shift mode={live_controller_alignment_mode}",
-                    flush=True,
-                )
-            current_live_left_controller = controller_runtime_state["left_controller"]
-            current_live_right_controller = controller_runtime_state["right_controller"]
-            print(
-                "[live_openxr_controller] immersive using shared 2D controller runtime",
-                flush=True,
-            )
-            last_left_eye_pose_world = initial_left_eye_pose_world
-            last_right_eye_pose_world = initial_right_eye_pose_world
-            if last_left_eye_pose_world is None:
-                last_left_eye_pose_world = last_right_eye_pose_world
-            if last_right_eye_pose_world is None:
-                last_right_eye_pose_world = last_left_eye_pose_world
+                _complete_substage(substage_name)
+                if not force:
+                    return current_sample
+                continue
 
-            balanced_eye_workers = bootstrap_output["balanced_eye_workers"]
-            balanced_eye_parallel_enabled = bootstrap_output[
-                "balanced_eye_parallel_enabled"
-            ]
-            static_scene_worker = bootstrap_output["static_scene_worker"]
-            static_scene_overlap_enabled = bootstrap_output[
-                "static_scene_overlap_enabled"
-            ]
-            scene_depth_reproject_enabled = bootstrap_output[
-                "scene_depth_reproject_enabled"
-            ]
-            static_scene_layer_cache = bootstrap_output["static_scene_layer_cache"]
-
-            if (
-                active_scene_stereo_mode
-                == self.IMMERSIVE_BALANCED_INTERNAL_STEREO_MODE
-            ):
-                self._immersive_balanced_runtime_state = (
-                    self._prepare_immersive_balanced_runtime_state(
-                        layout,
-                        last_left_eye_pose_world,
-                        last_right_eye_pose_world,
-                        initial_left_intrinsic,
-                        initial_right_intrinsic,
-                        eye_width,
-                        eye_height,
-                        scene_width,
-                        scene_height,
-                        static_scene_mode=immersive_static_scene_mode,
+            if substage_name == "build_center_view_and_resolve_rope_endpoints":
+                immersive_center_eye_pose_world, immersive_center_intrinsic = (
+                    self._build_immersive_center_scene_view(
+                        bootstrap_output["initial_left_eye_pose_world"],
+                        bootstrap_output["initial_right_eye_pose_world"],
+                        bootstrap_output["initial_left_intrinsic"],
+                        bootstrap_output["initial_right_intrinsic"],
                     )
                 )
-                self._immersive_balanced_runtime_state[
-                    "support_entry_overlay_enabled"
-                ] = bool(immersive_support_entry_overlay_enabled)
-                worker_validation_request = (
-                    self._build_immersive_balanced_scene_render_plan(
-                        scene_renderer,
-                        None,
-                        None,
-                        None,
-                        last_left_eye_pose_world,
-                        last_right_eye_pose_world,
-                        initial_left_intrinsic,
-                        initial_right_intrinsic,
-                        eye_width,
-                        eye_height,
-                        scene_width,
-                        scene_height,
-                        active_interaction=False,
-                        render_profile_frame=None,
+                immersive_center_w2c = self._camera_pose_world_to_cv_w2c(
+                    immersive_center_eye_pose_world
+                )
+                controller_predefined_anchor_defs, rope_endpoint_naming_debug = (
+                    self._resolve_rope_endpoint_anchor_defs(
+                        bootstrap_output["controller_predefined_anchor_defs"],
+                        immersive_center_intrinsic,
+                        immersive_center_w2c,
                     )
                 )
-                balanced_warmup_kwargs = (
-                    self._build_immersive_balanced_renderer_warmup_kwargs(
-                        scene_renderer,
-                        worker_validation_request,
+                if self._is_rope_family_case(rope_endpoint_naming_debug.get("case_name")):
+                    print(
+                        "[quest_display] immersive rope endpoint naming: "
+                        f"endpoint_projected_x={rope_endpoint_naming_debug['endpoint_projected_x']} "
+                        f"naming_valid={int(bool(rope_endpoint_naming_debug['naming_valid']))} "
+                        f"fallback={int(bool(rope_endpoint_naming_debug['fallback_used']))}",
+                        flush=True,
+                    )
+                bootstrap_output.update(
+                    {
+                        "controller_predefined_anchor_defs": controller_predefined_anchor_defs,
+                        "immersive_center_intrinsic": immersive_center_intrinsic,
+                        "immersive_center_w2c": immersive_center_w2c,
+                    }
+                )
+                _complete_substage(substage_name)
+                if not force:
+                    return current_sample
+                continue
+
+            if substage_name == "assign_controller_sources_and_default_anchor_names":
+                startup_controller_source_assignment = (
+                    self._assign_startup_controller_sources_by_screen_x(
+                        bootstrap_output["original_controller_source_masks"],
+                        bootstrap_output["original_controller_source_anchor_centers"],
+                        bootstrap_output["immersive_center_intrinsic"],
+                        bootstrap_output["immersive_center_w2c"],
+                        recorded_anchor_centers=bootstrap_output["recorded_anchor_centers"],
+                        assignment_camera="immersive_center_view",
                     )
                 )
-                balanced_main_warmup_paths = []
-                balanced_worker_warmup_paths = []
-                if balanced_warmup_kwargs is not None:
-                    balanced_main_warmup_paths = (
-                        scene_renderer.warmup_balanced_runtime_paths(
-                            **balanced_warmup_kwargs
-                        )
-                    )
-                startup_layer_seed_request = {
-                    eye_label: [
-                        IMMERSIVE_BALANCED_LAYER_BACKGROUND_BASE,
-                        IMMERSIVE_BALANCED_LAYER_FULL_BASE,
-                        IMMERSIVE_BALANCED_LAYER_TABLE_BASE,
+                original_controller_source_masks = startup_controller_source_assignment[
+                    "controller_source_masks"
+                ]
+                original_controller_source_anchor_centers = (
+                    startup_controller_source_assignment[
+                        "controller_source_anchor_centers"
                     ]
-                    for eye_label in ("left", "right")
-                }
-                if (
-                    str(
-                        worker_validation_request.get(
-                            "static_scene_mode",
-                            self.IMMERSIVE_STATIC_SCENE_MODE_BALANCED_FOCUS,
-                        )
-                    ).strip().lower()
-                    == self.IMMERSIVE_STATIC_SCENE_MODE_BALANCED_FOCUS
-                ) or (
-                    str(immersive_static_scene_mode).strip().lower()
-                    == self.IMMERSIVE_STATIC_SCENE_MODE_BALANCED_SUPPORT_FOCUS
-                ):
-                    for eye_label in ("left", "right"):
-                        startup_layer_seed_request[eye_label].append(
-                            IMMERSIVE_BALANCED_LAYER_TABLE_OVERLAY
-                        )
-                static_scene_layer_cache = self._seed_immersive_static_scene_layer_cache(
-                    renderer=scene_execute_renderer,
-                    render_plan=worker_validation_request,
-                    head_pose_state=bootstrap_output["head_pose_state"],
-                    requested_layers_by_eye=startup_layer_seed_request,
                 )
-                if not static_scene_overlap_requested:
+                recorded_anchor_centers = startup_controller_source_assignment[
+                    "recorded_anchor_centers"
+                ]
+                self._log_startup_controller_source_assignment(
+                    "[quest_display] immersive",
+                    startup_controller_source_assignment,
+                )
+                startup_predefined_anchor_states = (
+                    self._compute_predefined_interaction_anchor_states(
+                        bootstrap_output["controller_predefined_anchor_defs"],
+                        bootstrap_output["obj_init_vertices"],
+                    )
+                )
+                resolved_default_anchor_names, anchor_mapping_debug = (
+                    self._resolve_case_default_controller_anchor_names(
+                        startup_predefined_anchor_states,
+                        original_controller_source_anchor_centers,
+                        bootstrap_output["immersive_center_intrinsic"],
+                        bootstrap_output["immersive_center_w2c"],
+                    )
+                )
+                self._log_case_controller_anchor_mapping(
+                    "[quest_display] immersive",
+                    anchor_mapping_debug,
+                )
+                print(
+                    "[live_openxr_controller] immersive controller case profile: "
+                    f"case={live_controller_case_profile['case_name']} "
+                    "default_translation_scale="
+                    f"{live_controller_case_profile['controller_translation_scale_default']:.2f} "
+                    "translation_scale_multiplier="
+                    f"{live_controller_case_profile['controller_translation_scale_multiplier']:.2f} "
+                    "effective_translation_scale="
+                    f"{live_controller_case_profile['controller_translation_scale']:.2f} "
+                    f"post_select_grab_mode={live_controller_case_profile['post_select_grab_mode']}",
+                    flush=True,
+                )
+                bootstrap_output.update(
+                    {
+                        "original_controller_source_masks": original_controller_source_masks,
+                        "original_controller_source_anchor_centers": original_controller_source_anchor_centers,
+                        "recorded_anchor_centers": recorded_anchor_centers,
+                        "resolved_default_anchor_names": resolved_default_anchor_names,
+                    }
+                )
+                _complete_substage(substage_name)
+                if not force:
+                    return current_sample
+                continue
+
+            if substage_name == "build_two_point_runtime_and_batch_buffers":
+                two_point_runtime = self._build_two_point_live_controller_runtime(
+                    bootstrap_output["obj_init_vertices"],
+                    bootstrap_output["trained_spring_Y_for_sim"],
+                    bootstrap_output["original_controller_source_masks"],
+                    bootstrap_output["original_controller_source_anchor_centers"],
+                    bootstrap_output["controller_predefined_anchor_defs"],
+                    default_anchor_names=bootstrap_output["resolved_default_anchor_names"],
+                )
+                controller_runtime_base_target = two_point_runtime[
+                    "controller_rest_points"
+                ].clone()
+                controller_source_masks = two_point_runtime["controller_source_masks"]
+                controller_source_anchor_centers = two_point_runtime[
+                    "controller_source_anchor_centers"
+                ]
+                init_springs_for_sim = two_point_runtime["init_springs"]
+                init_rest_lengths_for_sim = two_point_runtime["init_rest_lengths"]
+                trained_spring_Y_for_sim = two_point_runtime["spring_y"]
+                controller_attachment_metadata = self._build_controller_attachment_metadata(
+                    init_springs_for_sim,
+                    init_rest_lengths_for_sim,
+                    self.num_all_points,
+                    controller_source_masks,
+                )
+                for source, runtime_meta in two_point_runtime["source_runtime"].items():
+                    controller_attachment_metadata[source].update(runtime_meta)
+                controller_attachment_metadata = (
+                    self._canonicalize_rope_family_controller_attachment_metadata(
+                        controller_attachment_metadata,
+                        default_anchor_names=bootstrap_output["resolved_default_anchor_names"],
+                    )
+                )
+                ctrl_init_vertices = controller_runtime_base_target
+                n_vert_single_obj = bootstrap_output["obj_init_vertices"].shape[0]
+                n_vert_single_ctrl = ctrl_init_vertices.shape[0]
+                n_springs_single_obj = int(self.num_object_springs)
+                n_spring_single_ctrl = int(
+                    init_springs_for_sim.shape[0] - self.num_object_springs
+                )
+                base_ctrl_vert_offset = n_vert_single_obj
+                self.batch_init_vertices = torch.cat(
+                    [bootstrap_output["obj_init_vertices"], ctrl_init_vertices], dim=0
+                )
+                self.batch_init_velocities = (
+                    self.init_velocities.clone()
+                    if self.init_velocities is not None
+                    else None
+                )
+                self.batch_controller_points = controller_runtime_base_target.unsqueeze(0).repeat(
+                    self.frame_len, 1, 1
+                )
+                bootstrap_output.update(
+                    {
+                        "controller_runtime_base_target": controller_runtime_base_target,
+                        "controller_source_masks": controller_source_masks,
+                        "controller_source_anchor_centers": controller_source_anchor_centers,
+                        "trained_spring_Y_for_sim": trained_spring_Y_for_sim,
+                        "init_springs_for_sim": init_springs_for_sim,
+                        "init_rest_lengths_for_sim": init_rest_lengths_for_sim,
+                        "controller_attachment_metadata": controller_attachment_metadata,
+                        "base_ctrl_vert_offset": base_ctrl_vert_offset,
+                        "n_vert_single_obj": n_vert_single_obj,
+                        "n_vert_single_ctrl": n_vert_single_ctrl,
+                        "n_springs_single_obj": n_springs_single_obj,
+                        "n_spring_single_ctrl": n_spring_single_ctrl,
+                    }
+                )
+                _complete_substage(substage_name, stage_index=2)
+                if not force:
+                    return current_sample
+                continue
+
+            if substage_name == "init_simulator":
+                self._record_immersive_startup_milestone(
+                    startup_timeline,
+                    "sim_init_begin",
+                    immersive_bridge,
+                )
+                self.simulator = SpringMassSystemWarp(
+                    init_springs=bootstrap_output["init_springs_for_sim"],
+                    init_rest_lengths=bootstrap_output["init_rest_lengths_for_sim"],
+                    init_masses=startup_context["init_masses_for_sim"],
+                    init_masks=self.init_masks,
+                    init_vertices=self.batch_init_vertices,
+                    init_velocities=self.batch_init_velocities,
+                    dt=cfg.dt,
+                    num_substeps=cfg.num_substeps,
+                    dashpot_damping=cfg.dashpot_damping,
+                    drag_damping=cfg.drag_damping,
+                    collision_dist=cfg.collision_dist,
+                    reverse_z=cfg.reverse_z,
+                    spring_Y_max=cfg.spring_Y_max,
+                    spring_Y_min=cfg.spring_Y_min,
+                    self_collision=cfg.self_collision,
+                    collide_elas=startup_context["trained_collide_elas"],
+                    collide_fric=startup_context["trained_collide_fric"],
+                    collide_object_elas=startup_context["trained_collide_object_elas"],
+                    collide_object_fric=startup_context["trained_collide_object_fric"],
+                    spring_Y=bootstrap_output["trained_spring_Y_for_sim"],
+                    object_massnodes_total=int(bootstrap_output["base_ctrl_vert_offset"]),
+                    object_massnodes_single=int(bootstrap_output["n_vert_single_obj"]),
+                    object_springs_total=int(bootstrap_output["n_springs_single_obj"]),
+                    object_springs_single=int(bootstrap_output["n_springs_single_obj"]),
+                    controller_massnodes_single=int(bootstrap_output["n_vert_single_ctrl"]),
+                    controller_springs_single=int(bootstrap_output["n_spring_single_ctrl"]),
+                    controller_rest_location=self.batch_controller_points[0],
+                    number_of_instance=1,
+                    use_ground_plane=False,
+                )
+                self.simulator.set_init_state(
+                    self.simulator.wp_init_vertices, self.simulator.wp_init_velocities
+                )
+                self._record_immersive_startup_milestone(
+                    startup_timeline,
+                    "sim_init_done",
+                    immersive_bridge,
+                )
+                self._maybe_publish_immersive_startup_keepalive(
+                    immersive_bridge,
+                    startup_keepalive_state,
+                    reason="sim_init_done",
+                    startup_timeline=startup_timeline,
+                )
+                _complete_substage(substage_name)
+                if not force:
+                    return current_sample
+                continue
+
+            if substage_name == "build_rotation_cache":
+                prev_x = wp.to_torch(
+                    self.simulator.wp_states[0].wp_x, requires_grad=False
+                ).clone()
+                current_pos = gaussians.get_xyz
+                current_rot = gaussians.get_rotation
+                relations_single = get_topk_indices(prev_x, K=3)
+                weights_single, weights_indices_single = knn_weights_sparse(
+                    prev_x,
+                    current_pos,
+                    K=3,
+                )
+                rotation_cache = build_rotation_reuse_cache(
+                    weights_indices=weights_indices_single,
+                    weights=weights_single,
+                    relations=relations_single,
+                    mass_nodes_rest=prev_x,
+                    gaussians_xyz_rest=current_pos,
+                    gaussians_quat_rest=current_rot,
+                    device=cfg.device,
+                    mass_node_per_instance=int(bootstrap_output["n_vert_single_obj"]),
+                    gaussians_per_instance=current_pos.shape[0],
+                    number_of_instance=1,
+                )
+                spawn_support_center = self._validate_scene_spawn_alignment(
+                    self.batch_init_vertices[: self.num_all_points],
+                    bootstrap_output["layout"],
+                    context="spawn shift",
+                    table_surface_center_world=bootstrap_output["table_surface_center_world"],
+                )
+                _, _, spawn_xy_error, spawn_z_error = self._scene_spawn_alignment_metrics(
+                    self.batch_init_vertices[: self.num_all_points],
+                    bootstrap_output["layout"],
+                    table_surface_center_world=bootstrap_output["table_surface_center_world"],
+                )
+                print(
+                    "[quest_display] immersive spawn shift: "
+                    f"shift={bootstrap_output['spawn_shift'].detach().cpu().numpy().tolist()} "
+                    f"support_center={spawn_support_center.detach().cpu().numpy().tolist()} "
+                    f"xy_error={spawn_xy_error:.4f} z_error={spawn_z_error:.4f}",
+                    flush=True,
+                )
+                bootstrap_output["rotation_cache"] = rotation_cache
+                _complete_substage(substage_name)
+                if not force:
+                    return current_sample
+                continue
+
+            if substage_name == "prime_live_controller_runtime_and_handedness":
+                live_controller_alignment = None
+                live_controller_alignment_mode = "unset"
+                controller_runtime_state = self._update_live_controller_runtime_from_sample(
+                    current_sample,
+                    live_controller_alignment,
+                    live_controller_alignment_mode,
+                    bootstrap_output["controller_source_anchor_centers"],
+                    w2c,
+                    controller_select_state_cache,
+                    controller_select_hold_state,
+                    controller_select_hold_state_cache,
+                    controller_anchor_cycle_state_cache,
+                    controller_anchor_reset_state_cache,
+                    controller_snap_state_cache,
+                    controller_snap_edge_cache,
+                    controller_exit_hold_state,
+                    basis_override=bootstrap_output["immersive_controller_basis_state"][
+                        "basis"
+                    ],
+                    collect_reset_edges=False,
+                    collect_exit_holds=False,
+                    alignment_pose_role="grip",
+                    controller_position_pose_role="grip",
+                    controller_ray_pose_role="aim",
+                )
+                (
+                    controller_runtime_state,
+                    immersive_controller_basis_state,
+                ) = self._maybe_resolve_immersive_controller_handedness(
+                    current_sample,
+                    controller_runtime_state,
+                    bootstrap_output["immersive_controller_basis_state"],
+                    bootstrap_output["controller_source_anchor_centers"],
+                    intrinsic,
+                    w2c,
+                    controller_interaction_state=controller_interaction_state,
+                    alignment_pose_role="grip",
+                    controller_position_pose_role="grip",
+                    controller_ray_pose_role="aim",
+                )
+                live_controller_alignment = controller_runtime_state["alignment"]
+                live_controller_alignment_mode = controller_runtime_state["alignment_mode"]
+                if live_controller_alignment is None:
+                    print(
+                        "[live_openxr_controller] immersive controller alignment still pending "
+                        "after scene spawn shift",
+                        flush=True,
+                    )
+                else:
+                    print(
+                        "[live_openxr_controller] immersive controller alignment ready "
+                        f"after scene spawn shift mode={live_controller_alignment_mode}",
+                        flush=True,
+                    )
+                current_live_left_controller = controller_runtime_state["left_controller"]
+                current_live_right_controller = controller_runtime_state["right_controller"]
+                print(
+                    "[live_openxr_controller] immersive using shared 2D controller runtime",
+                    flush=True,
+                )
+                last_left_eye_pose_world = bootstrap_output["initial_left_eye_pose_world"]
+                last_right_eye_pose_world = bootstrap_output["initial_right_eye_pose_world"]
+                if last_left_eye_pose_world is None:
+                    last_left_eye_pose_world = last_right_eye_pose_world
+                if last_right_eye_pose_world is None:
+                    last_right_eye_pose_world = last_left_eye_pose_world
+                bootstrap_output.update(
+                    {
+                        "immersive_controller_basis_state": immersive_controller_basis_state,
+                        "current_live_left_controller": current_live_left_controller,
+                        "current_live_right_controller": current_live_right_controller,
+                        "live_controller_alignment": live_controller_alignment,
+                        "live_controller_alignment_mode": live_controller_alignment_mode,
+                        "last_left_eye_pose_world": last_left_eye_pose_world,
+                        "last_right_eye_pose_world": last_right_eye_pose_world,
+                    }
+                )
+                _complete_substage(substage_name)
+                if not force:
+                    return current_sample
+                continue
+
+            if substage_name == "prepare_balanced_runtime_state":
+                bootstrap_output["worker_validation_request"] = None
+                bootstrap_output["balanced_warmup_kwargs"] = None
+                bootstrap_output["balanced_main_warmup_paths"] = []
+                bootstrap_output["balanced_worker_warmup_paths"] = []
+                if (
+                    bootstrap_output["active_scene_stereo_mode"]
+                    == self.IMMERSIVE_BALANCED_INTERNAL_STEREO_MODE
+                ):
+                    self._immersive_balanced_runtime_state = (
+                        self._prepare_immersive_balanced_runtime_state(
+                            bootstrap_output["layout"],
+                            bootstrap_output["last_left_eye_pose_world"],
+                            bootstrap_output["last_right_eye_pose_world"],
+                            bootstrap_output["initial_left_intrinsic"],
+                            bootstrap_output["initial_right_intrinsic"],
+                            eye_width,
+                            eye_height,
+                            scene_width,
+                            scene_height,
+                            static_scene_mode=immersive_static_scene_mode,
+                        )
+                    )
+                    self._immersive_balanced_runtime_state[
+                        "support_entry_overlay_enabled"
+                    ] = bool(immersive_support_entry_overlay_enabled)
+                    worker_validation_request = (
+                        self._build_immersive_balanced_scene_render_plan(
+                            bootstrap_output["scene_renderer"],
+                            None,
+                            None,
+                            None,
+                            bootstrap_output["last_left_eye_pose_world"],
+                            bootstrap_output["last_right_eye_pose_world"],
+                            bootstrap_output["initial_left_intrinsic"],
+                            bootstrap_output["initial_right_intrinsic"],
+                            eye_width,
+                            eye_height,
+                            scene_width,
+                            scene_height,
+                            active_interaction=False,
+                            render_profile_frame=None,
+                        )
+                    )
+                    balanced_warmup_kwargs = (
+                        self._build_immersive_balanced_renderer_warmup_kwargs(
+                            bootstrap_output["scene_renderer"],
+                            worker_validation_request,
+                        )
+                    )
+                    bootstrap_output["worker_validation_request"] = (
+                        worker_validation_request
+                    )
+                    bootstrap_output["balanced_warmup_kwargs"] = balanced_warmup_kwargs
+                else:
+                    self._immersive_balanced_runtime_state = None
+                _complete_substage(substage_name)
+                if not force:
+                    return current_sample
+                continue
+
+            if substage_name == "warmup_balanced_paths_and_seed_layer_cache":
+                if (
+                    bootstrap_output["active_scene_stereo_mode"]
+                    == self.IMMERSIVE_BALANCED_INTERNAL_STEREO_MODE
+                    and bootstrap_output.get("worker_validation_request") is not None
+                ):
+                    balanced_main_warmup_paths = []
+                    if bootstrap_output.get("balanced_warmup_kwargs") is not None:
+                        balanced_main_warmup_paths = (
+                            bootstrap_output["scene_renderer"].warmup_balanced_runtime_paths(
+                                **bootstrap_output["balanced_warmup_kwargs"]
+                            )
+                        )
+                    worker_validation_request = bootstrap_output["worker_validation_request"]
+                    startup_layer_seed_request = {
+                        eye_label: [
+                            IMMERSIVE_BALANCED_LAYER_BACKGROUND_BASE,
+                            IMMERSIVE_BALANCED_LAYER_FULL_BASE,
+                            IMMERSIVE_BALANCED_LAYER_TABLE_BASE,
+                        ]
+                        for eye_label in ("left", "right")
+                    }
+                    if (
+                        str(
+                            worker_validation_request.get(
+                                "static_scene_mode",
+                                self.IMMERSIVE_STATIC_SCENE_MODE_BALANCED_FOCUS,
+                            )
+                        ).strip().lower()
+                        == self.IMMERSIVE_STATIC_SCENE_MODE_BALANCED_FOCUS
+                    ) or (
+                        str(immersive_static_scene_mode).strip().lower()
+                        == self.IMMERSIVE_STATIC_SCENE_MODE_BALANCED_SUPPORT_FOCUS
+                    ):
+                        for eye_label in ("left", "right"):
+                            startup_layer_seed_request[eye_label].append(
+                                IMMERSIVE_BALANCED_LAYER_TABLE_OVERLAY
+                            )
+                    static_scene_layer_cache = (
+                        self._seed_immersive_static_scene_layer_cache(
+                            renderer=bootstrap_output["scene_execute_renderer"],
+                            render_plan=worker_validation_request,
+                            head_pose_state=bootstrap_output["head_pose_state"],
+                            requested_layers_by_eye=startup_layer_seed_request,
+                        )
+                    )
+                    bootstrap_output["balanced_main_warmup_paths"] = (
+                        balanced_main_warmup_paths
+                    )
+                    bootstrap_output["static_scene_layer_cache"] = (
+                        static_scene_layer_cache
+                    )
+                _complete_substage(substage_name)
+                if not force:
+                    return current_sample
+                continue
+
+            if substage_name == "start_eye_workers_if_enabled":
+                balanced_eye_workers = bootstrap_output["balanced_eye_workers"]
+                balanced_eye_parallel_enabled = bootstrap_output[
+                    "balanced_eye_parallel_enabled"
+                ]
+                if (
+                    bootstrap_output["active_scene_stereo_mode"]
+                    == self.IMMERSIVE_BALANCED_INTERNAL_STEREO_MODE
+                    and bootstrap_output.get("worker_validation_request") is not None
+                    and not static_scene_overlap_requested
+                ):
                     left_eye_worker = None
                     right_eye_worker = None
                     try:
@@ -16296,15 +16491,15 @@ class InvPhyTrainerWarp:
                             lighting_mode=immersive_render_options["lighting_mode"],
                             balanced_render_backend="pyrender",
                             static_scene_mode=immersive_static_scene_mode,
-                            layout=layout,
+                            layout=bootstrap_output["layout"],
                             cuda_device_index=int(torch.cuda.current_device()),
                         )
                         left_eye_worker.start(
                             validation_request=_build_immersive_balanced_scene_eye_request(
-                                worker_validation_request,
+                                bootstrap_output["worker_validation_request"],
                                 "left",
                             ),
-                            warmup_kwargs=balanced_warmup_kwargs,
+                            warmup_kwargs=bootstrap_output["balanced_warmup_kwargs"],
                         )
                         right_eye_worker = _ImmersiveBalancedSceneEyeRenderWorker(
                             eye_label="right",
@@ -16314,15 +16509,15 @@ class InvPhyTrainerWarp:
                             lighting_mode=immersive_render_options["lighting_mode"],
                             balanced_render_backend="pyrender",
                             static_scene_mode=immersive_static_scene_mode,
-                            layout=layout,
+                            layout=bootstrap_output["layout"],
                             cuda_device_index=int(torch.cuda.current_device()),
                         )
                         right_eye_worker.start(
                             validation_request=_build_immersive_balanced_scene_eye_request(
-                                worker_validation_request,
+                                bootstrap_output["worker_validation_request"],
                                 "right",
                             ),
-                            warmup_kwargs=balanced_warmup_kwargs,
+                            warmup_kwargs=bootstrap_output["balanced_warmup_kwargs"],
                         )
                         balanced_eye_workers = {
                             "left": left_eye_worker,
@@ -16345,7 +16540,29 @@ class InvPhyTrainerWarp:
                             f"{type(exc).__name__}: {exc}",
                             flush=True,
                         )
-                if static_scene_overlap_requested:
+                bootstrap_output["balanced_eye_workers"] = balanced_eye_workers
+                bootstrap_output["balanced_eye_parallel_enabled"] = (
+                    balanced_eye_parallel_enabled
+                )
+                _complete_substage(substage_name)
+                if not force:
+                    return current_sample
+                continue
+
+            if substage_name == "start_static_scene_worker_if_enabled":
+                static_scene_worker = bootstrap_output["static_scene_worker"]
+                static_scene_overlap_enabled = bootstrap_output[
+                    "static_scene_overlap_enabled"
+                ]
+                scene_depth_reproject_enabled = bootstrap_output[
+                    "scene_depth_reproject_enabled"
+                ]
+                if (
+                    bootstrap_output["active_scene_stereo_mode"]
+                    == self.IMMERSIVE_BALANCED_INTERNAL_STEREO_MODE
+                    and bootstrap_output.get("worker_validation_request") is not None
+                    and static_scene_overlap_requested
+                ):
                     try:
                         static_scene_worker = _ImmersiveStaticSceneRenderWorker(
                             scene_assets_root=scene_assets_root,
@@ -16354,14 +16571,14 @@ class InvPhyTrainerWarp:
                             lighting_mode=immersive_render_options["lighting_mode"],
                             balanced_render_backend="pyrender",
                             static_scene_mode=immersive_static_scene_mode,
-                            layout=layout,
+                            layout=bootstrap_output["layout"],
                             cuda_device_index=int(torch.cuda.current_device()),
                         )
                         worker_startup_debug = static_scene_worker.start(
-                            validation_request=worker_validation_request,
-                            warmup_kwargs=balanced_warmup_kwargs,
+                            validation_request=bootstrap_output["worker_validation_request"],
+                            warmup_kwargs=bootstrap_output["balanced_warmup_kwargs"],
                         )
-                        balanced_worker_warmup_paths = list(
+                        bootstrap_output["balanced_worker_warmup_paths"] = list(
                             worker_startup_debug.get("warmup_paths") or []
                         )
                         static_scene_overlap_enabled = True
@@ -16392,234 +16609,206 @@ class InvPhyTrainerWarp:
                             f"{type(exc).__name__}: {exc}",
                             flush=True,
                         )
-            print(
-                "[quest_display] immersive gaussian render: "
-                f"mode={immersive_gaussian_render_mode}",
-                flush=True,
-            )
-            if (
-                static_scene_overlap_requested
-                and immersive_gaussian_render_mode == "stereo_parallel"
-            ):
-                print(
-                    "[quest_display] immersive gaussian render overlap path: "
-                    "mode=stereo_parallel branch_b=main_thread_cuda_streams",
-                    flush=True,
+                bootstrap_output["static_scene_worker"] = static_scene_worker
+                bootstrap_output["static_scene_overlap_enabled"] = (
+                    static_scene_overlap_enabled
                 )
-            if presentation_backend_enabled:
-                pipeline_source = (
-                    "explicit_flag"
-                    if immersive_present_pipeline_enabled
-                    else "framegen_auto"
+                bootstrap_output["scene_depth_reproject_enabled"] = (
+                    scene_depth_reproject_enabled
                 )
-                print(
-                    "[quest_display] immersive presentation pipeline: "
-                    "mode=cross_frame_present latest_wins=1 "
-                    f"source={pipeline_source} backend={presentation_backend_kind}",
-                    flush=True,
-                )
-            self._set_scene_collider_boxes(layout)
-            if layout.support_surface_boxes is not None:
-                support_surface_boxes_np = np.asarray(
-                    layout.support_surface_boxes,
-                    dtype=np.float32,
-                )
-            else:
-                support_surface_boxes_np = np.array(
-                    [
-                        [layout.table_box.mins, layout.table_box.maxs],
-                        [layout.floor_box.mins, layout.floor_box.maxs],
-                    ],
-                    dtype=np.float32,
-                )
-            support_surface_boxes_t = torch.as_tensor(
-                support_surface_boxes_np,
-                dtype=torch.float32,
-                device=cfg.device,
-            )
-            idle_lock_case_profile = self._idle_lock_case_profile()
-            idle_lock_state = self._make_idle_lock_state()
-            if self.simulator.object_collision_flag:
-                self.simulator.create_resting_case()
-            self.simulator.create_cuda_graph()
+                _complete_substage(substage_name)
+                if not force:
+                    return current_sample
+                continue
 
-            bootstrap_output.update(
-                {
-                    "immersive_controller_basis_state": immersive_controller_basis_state,
-                    "rotation_cache": rotation_cache,
-                    "current_live_left_controller": current_live_left_controller,
-                    "current_live_right_controller": current_live_right_controller,
-                    "live_controller_alignment": live_controller_alignment,
-                    "live_controller_alignment_mode": live_controller_alignment_mode,
-                    "last_left_eye_pose_world": last_left_eye_pose_world,
-                    "last_right_eye_pose_world": last_right_eye_pose_world,
-                    "active_scene_stereo_mode": active_scene_stereo_mode,
-                    "support_surface_boxes_t": support_surface_boxes_t,
-                    "idle_lock_case_profile": idle_lock_case_profile,
-                    "idle_lock_state": idle_lock_state,
-                    "balanced_eye_workers": balanced_eye_workers,
-                    "balanced_eye_parallel_enabled": balanced_eye_parallel_enabled,
-                    "static_scene_worker": static_scene_worker,
-                    "static_scene_overlap_enabled": static_scene_overlap_enabled,
-                    "scene_depth_reproject_enabled": scene_depth_reproject_enabled,
-                    "static_scene_layer_cache": static_scene_layer_cache,
-                }
-            )
-            bootstrap_state["stage_index"] = 3
-            if not force:
-                return current_sample
-            stage_index = 3
-
-        if stage_index <= 3:
-            current_sample = bootstrap_output["initial_sample"]
-            active_scene_stereo_mode = bootstrap_output["active_scene_stereo_mode"]
-            current_target = bootstrap_output["controller_runtime_base_target"].clone()
-            prev_target = current_target.clone()
-            scene_rest_state = self._settle_scene_rest_state(
-                current_target.clone(),
-                progress_callback=lambda reason: self._maybe_publish_immersive_startup_keepalive(
-                    immersive_bridge,
-                    startup_keepalive_state,
-                    reason=reason,
-                    startup_timeline=startup_timeline,
-                ),
-            )
-            self._record_immersive_startup_milestone(
-                startup_timeline,
-                "settled_rest_done",
-                immersive_bridge,
-            )
-            self._restore_sim_state(scene_rest_state)
-            x = wp.to_torch(
-                self.simulator.wp_states[0].wp_x,
-                requires_grad=False,
-            ).clone()
-            current_pos, current_rot = lbs_with_rotation_reuse(
-                current_mass_nodes=x,
-                cache=bootstrap_output["rotation_cache"],
-            )
-            gaussians._xyz = current_pos
-            gaussians._rotation = current_rot
-            prev_x = x.clone()
-            settled_support_center = self._validate_scene_spawn_alignment(
-                x[: self.num_all_points],
-                bootstrap_output["layout"],
-                context="settled rest state",
-                table_surface_center_world=bootstrap_output["table_surface_center_world"],
-            )
-            _, _, settled_xy_error, settled_z_error = self._scene_spawn_alignment_metrics(
-                x[: self.num_all_points],
-                bootstrap_output["layout"],
-                table_surface_center_world=bootstrap_output["table_surface_center_world"],
-            )
-            settled_bounds_min = (
-                x[: self.num_all_points].min(dim=0).values.detach().cpu().numpy().tolist()
-            )
-            settled_bounds_max = (
-                x[: self.num_all_points].max(dim=0).values.detach().cpu().numpy().tolist()
-            )
-            print(
-                "[quest_display] immersive settled rest state: "
-                f"support_center={settled_support_center.detach().cpu().numpy().tolist()} "
-                f"xy_error={settled_xy_error:.4f} z_error={settled_z_error:.4f} "
-                f"bounds_min={settled_bounds_min} bounds_max={settled_bounds_max}",
-                flush=True,
-            )
-            startup_support_fraction = self._scene_support_fraction(
-                x[: self.num_all_points],
-                bootstrap_output["support_surface_boxes_t"],
-                bootstrap_output["layout"].scene_up,
-            )
-            self._set_idle_lock_state(
-                bootstrap_output["idle_lock_state"],
-                scene_rest_state,
-                x[: self.num_all_points],
-                action="seeded",
-                reason="startup_validated",
-                support_fraction=startup_support_fraction,
-            )
-            controller_anchor_templates = self._build_predefined_controller_anchor_templates(
-                bootstrap_output["controller_runtime_base_target"],
-                x[: self.num_all_points],
-                bootstrap_output["controller_source_masks"],
-                bootstrap_output["controller_source_anchor_centers"],
-                bootstrap_output["controller_attachment_metadata"],
-                bootstrap_output["controller_predefined_anchor_defs"],
-            )
-            startup_scene_validation_mode = "assembled_scene"
-            if active_scene_stereo_mode == "reproject_from_center":
-                reproject_valid, reproject_debug = (
-                    self._validate_immersive_reprojected_scene_startup(
-                        bootstrap_output["layout"],
-                        bootstrap_output["scene_renderer"],
-                        current_sample.left_eye,
-                        current_sample.right_eye,
-                        bootstrap_output["last_left_eye_pose_world"],
-                        bootstrap_output["last_right_eye_pose_world"],
-                        eye_width,
-                        eye_height,
-                        scene_width,
-                        scene_height,
-                        gaussians,
-                        shared_scene_compose_cache=shared_scene_compose_cache,
-                        reproject_caches=shared_scene_reproject_caches,
-                        scene_stereo_mode=active_scene_stereo_mode,
-                    )
-                )
-                print(
-                    "[quest_display] immersive reprojection startup validation: "
-                    + str(reproject_debug),
-                    flush=True,
-                )
-                if not reproject_valid:
-                    active_scene_stereo_mode = "per_eye"
-                    startup_scene_validation_mode = "assembled_per_eye_fallback"
+            if substage_name == "prepare_colliders_support_boxes_idle_lock_and_cuda_graph":
+                if bootstrap_output["active_scene_stereo_mode"] == self.IMMERSIVE_BALANCED_INTERNAL_STEREO_MODE:
                     print(
-                        "[quest_display] immersive reprojection startup validation failed; "
-                        "falling back to per_eye room rendering for this run",
+                        "[quest_display] immersive gaussian render: "
+                        f"mode={immersive_gaussian_render_mode}",
                         flush=True,
                     )
                 else:
-                    startup_scene_validation_mode = "assembled_reproject_from_center"
-            elif (
-                active_scene_stereo_mode
-                == self.IMMERSIVE_BALANCED_INTERNAL_STEREO_MODE
-            ):
-                balanced_side_wall_mode = "disabled"
-                balanced_static_scene_mode = (
-                    self.IMMERSIVE_STATIC_SCENE_MODE_BALANCED_FOCUS
-                )
-                if self._immersive_balanced_runtime_state is not None:
-                    balanced_side_wall_mode = str(
-                        self._immersive_balanced_runtime_state.get(
-                            "side_wall_mode",
-                            "disabled",
-                        )
+                    print(
+                        "[quest_display] immersive gaussian render: "
+                        f"mode={immersive_gaussian_render_mode}",
+                        flush=True,
                     )
-                    balanced_static_scene_mode = str(
-                        self._immersive_balanced_runtime_state.get(
-                            "static_scene_mode",
-                            self.IMMERSIVE_STATIC_SCENE_MODE_BALANCED_FOCUS,
-                        )
+                if (
+                    static_scene_overlap_requested
+                    and immersive_gaussian_render_mode == "stereo_parallel"
+                ):
+                    print(
+                        "[quest_display] immersive gaussian render overlap path: "
+                        "mode=stereo_parallel branch_b=main_thread_cuda_streams",
+                        flush=True,
                     )
-                if balanced_side_wall_mode == "disabled":
-                    if (
-                        balanced_static_scene_mode
-                        == self.IMMERSIVE_STATIC_SCENE_MODE_BALANCED_FOCUS
-                    ):
-                        startup_scene_validation_mode = (
-                            "assembled_balanced_per_eye_background_table_roi"
-                        )
-                    elif (
-                        balanced_static_scene_mode
-                        == self.IMMERSIVE_STATIC_SCENE_MODE_BALANCED_SUPPORT_FOCUS
-                    ):
-                        startup_scene_validation_mode = (
-                            "assembled_balanced_per_eye_background_support_roi"
-                        )
+                if presentation_backend_enabled:
+                    pipeline_source = (
+                        "explicit_flag"
+                        if immersive_present_pipeline_enabled
+                        else "framegen_auto"
+                    )
+                    print(
+                        "[quest_display] immersive presentation pipeline: "
+                        "mode=cross_frame_present latest_wins=1 "
+                        f"source={pipeline_source} backend={presentation_backend_kind}",
+                        flush=True,
+                    )
+                self._set_scene_collider_boxes(bootstrap_output["layout"])
+                if bootstrap_output["layout"].support_surface_boxes is not None:
+                    support_surface_boxes_np = np.asarray(
+                        bootstrap_output["layout"].support_surface_boxes,
+                        dtype=np.float32,
+                    )
                 else:
-                    balanced_edge_valid, balanced_edge_debug = (
-                        self._validate_immersive_balanced_edge_warp_startup(
+                    support_surface_boxes_np = np.array(
+                        [
+                            [
+                                bootstrap_output["layout"].table_box.mins,
+                                bootstrap_output["layout"].table_box.maxs,
+                            ],
+                            [
+                                bootstrap_output["layout"].floor_box.mins,
+                                bootstrap_output["layout"].floor_box.maxs,
+                            ],
+                        ],
+                        dtype=np.float32,
+                    )
+                support_surface_boxes_t = torch.as_tensor(
+                    support_surface_boxes_np,
+                    dtype=torch.float32,
+                    device=cfg.device,
+                )
+                idle_lock_case_profile = self._idle_lock_case_profile()
+                idle_lock_state = self._make_idle_lock_state()
+                if self.simulator.object_collision_flag:
+                    self.simulator.create_resting_case()
+                self.simulator.create_cuda_graph()
+                bootstrap_output.update(
+                    {
+                        "support_surface_boxes_t": support_surface_boxes_t,
+                        "idle_lock_case_profile": idle_lock_case_profile,
+                        "idle_lock_state": idle_lock_state,
+                    }
+                )
+                _complete_substage(substage_name, stage_index=3)
+                if not force:
+                    return current_sample
+                continue
+
+            if substage_name == "settle_scene_rest_chunk":
+                bootstrap_output.setdefault(
+                    "current_target",
+                    bootstrap_output["controller_runtime_base_target"].clone(),
+                )
+                bootstrap_output.setdefault(
+                    "prev_target",
+                    bootstrap_output["current_target"].clone(),
+                )
+                settle_state = self._advance_immersive_scene_rest_settle(
+                    settle_state,
+                    bootstrap_output["current_target"].clone(),
+                    progress_callback=lambda reason: self._maybe_publish_immersive_startup_keepalive(
+                        immersive_bridge,
+                        startup_keepalive_state,
+                        reason=reason,
+                        startup_timeline=startup_timeline,
+                    ),
+                    max_steps=self.IMMERSIVE_STARTUP_SETTLE_STEPS_PER_TICK,
+                )
+                bootstrap_state["settle_state"] = settle_state
+                if not bool(settle_state.get("done", False)):
+                    return current_sample
+                bootstrap_output["scene_rest_state"] = settle_state.get("last_state")
+                self._record_immersive_startup_milestone(
+                    startup_timeline,
+                    "settled_rest_done",
+                    immersive_bridge,
+                )
+                _complete_substage(substage_name)
+                if not force:
+                    return current_sample
+                continue
+
+            if substage_name == "restore_settled_state_and_build_anchor_templates":
+                scene_rest_state = bootstrap_output["scene_rest_state"]
+                self._restore_sim_state(scene_rest_state)
+                x = wp.to_torch(
+                    self.simulator.wp_states[0].wp_x,
+                    requires_grad=False,
+                ).clone()
+                current_pos, current_rot = lbs_with_rotation_reuse(
+                    current_mass_nodes=x,
+                    cache=bootstrap_output["rotation_cache"],
+                )
+                gaussians._xyz = current_pos
+                gaussians._rotation = current_rot
+                settled_support_center = self._validate_scene_spawn_alignment(
+                    x[: self.num_all_points],
+                    bootstrap_output["layout"],
+                    context="settled rest state",
+                    table_surface_center_world=bootstrap_output["table_surface_center_world"],
+                )
+                _, _, settled_xy_error, settled_z_error = self._scene_spawn_alignment_metrics(
+                    x[: self.num_all_points],
+                    bootstrap_output["layout"],
+                    table_surface_center_world=bootstrap_output["table_surface_center_world"],
+                )
+                settled_bounds_min = (
+                    x[: self.num_all_points].min(dim=0).values.detach().cpu().numpy().tolist()
+                )
+                settled_bounds_max = (
+                    x[: self.num_all_points].max(dim=0).values.detach().cpu().numpy().tolist()
+                )
+                print(
+                    "[quest_display] immersive settled rest state: "
+                    f"support_center={settled_support_center.detach().cpu().numpy().tolist()} "
+                    f"xy_error={settled_xy_error:.4f} z_error={settled_z_error:.4f} "
+                    f"bounds_min={settled_bounds_min} bounds_max={settled_bounds_max}",
+                    flush=True,
+                )
+                startup_support_fraction = self._scene_support_fraction(
+                    x[: self.num_all_points],
+                    bootstrap_output["support_surface_boxes_t"],
+                    bootstrap_output["layout"].scene_up,
+                )
+                self._set_idle_lock_state(
+                    bootstrap_output["idle_lock_state"],
+                    scene_rest_state,
+                    x[: self.num_all_points],
+                    action="seeded",
+                    reason="startup_validated",
+                    support_fraction=startup_support_fraction,
+                )
+                controller_anchor_templates = (
+                    self._build_predefined_controller_anchor_templates(
+                        bootstrap_output["controller_runtime_base_target"],
+                        x[: self.num_all_points],
+                        bootstrap_output["controller_source_masks"],
+                        bootstrap_output["controller_source_anchor_centers"],
+                        bootstrap_output["controller_attachment_metadata"],
+                        bootstrap_output["controller_predefined_anchor_defs"],
+                    )
+                )
+                bootstrap_output.update(
+                    {
+                        "x": x,
+                        "controller_anchor_templates": controller_anchor_templates,
+                    }
+                )
+                _complete_substage(substage_name)
+                if not force:
+                    return current_sample
+                continue
+
+            if substage_name == "validate_startup_scene_mode":
+                active_scene_stereo_mode = bootstrap_output["active_scene_stereo_mode"]
+                startup_scene_validation_mode = "assembled_scene"
+                if active_scene_stereo_mode == "reproject_from_center":
+                    reproject_valid, reproject_debug = (
+                        self._validate_immersive_reprojected_scene_startup(
+                            bootstrap_output["layout"],
                             bootstrap_output["scene_renderer"],
                             current_sample.left_eye,
                             current_sample.right_eye,
@@ -16629,120 +16818,286 @@ class InvPhyTrainerWarp:
                             eye_height,
                             scene_width,
                             scene_height,
+                            gaussians,
                             shared_scene_compose_cache=shared_scene_compose_cache,
                             reproject_caches=shared_scene_reproject_caches,
+                            scene_stereo_mode=active_scene_stereo_mode,
                         )
                     )
                     print(
-                        "[quest_display] immersive balanced side-strip startup validation: "
-                        + str(balanced_edge_debug),
+                        "[quest_display] immersive reprojection startup validation: "
+                        + str(reproject_debug),
                         flush=True,
                     )
-                    if not balanced_edge_valid:
-                        startup_scene_validation_mode = (
-                            "assembled_balanced_center_background_side_strip_replace_fallback"
+                    if not reproject_valid:
+                        active_scene_stereo_mode = "per_eye"
+                        startup_scene_validation_mode = "assembled_per_eye_fallback"
+                        print(
+                            "[quest_display] immersive reprojection startup validation failed; "
+                            "falling back to per_eye room rendering for this run",
+                            flush=True,
                         )
                     else:
                         startup_scene_validation_mode = (
-                            "assembled_balanced_center_background_side_strip_replace_table_roi"
+                            "assembled_reproject_from_center"
                         )
+                elif (
+                    active_scene_stereo_mode
+                    == self.IMMERSIVE_BALANCED_INTERNAL_STEREO_MODE
+                ):
+                    balanced_side_wall_mode = "disabled"
+                    balanced_static_scene_mode = (
+                        self.IMMERSIVE_STATIC_SCENE_MODE_BALANCED_FOCUS
+                    )
+                    if self._immersive_balanced_runtime_state is not None:
+                        balanced_side_wall_mode = str(
+                            self._immersive_balanced_runtime_state.get(
+                                "side_wall_mode",
+                                "disabled",
+                            )
+                        )
+                        balanced_static_scene_mode = str(
+                            self._immersive_balanced_runtime_state.get(
+                                "static_scene_mode",
+                                self.IMMERSIVE_STATIC_SCENE_MODE_BALANCED_FOCUS,
+                            )
+                        )
+                    if balanced_side_wall_mode == "disabled":
+                        if (
+                            balanced_static_scene_mode
+                            == self.IMMERSIVE_STATIC_SCENE_MODE_BALANCED_FOCUS
+                        ):
+                            startup_scene_validation_mode = (
+                                "assembled_balanced_per_eye_background_table_roi"
+                            )
+                        elif (
+                            balanced_static_scene_mode
+                            == self.IMMERSIVE_STATIC_SCENE_MODE_BALANCED_SUPPORT_FOCUS
+                        ):
+                            startup_scene_validation_mode = (
+                                "assembled_balanced_per_eye_background_support_roi"
+                            )
+                    else:
+                        balanced_edge_valid, balanced_edge_debug = (
+                            self._validate_immersive_balanced_edge_warp_startup(
+                                bootstrap_output["scene_renderer"],
+                                current_sample.left_eye,
+                                current_sample.right_eye,
+                                bootstrap_output["last_left_eye_pose_world"],
+                                bootstrap_output["last_right_eye_pose_world"],
+                                eye_width,
+                                eye_height,
+                                scene_width,
+                                scene_height,
+                                shared_scene_compose_cache=shared_scene_compose_cache,
+                                reproject_caches=shared_scene_reproject_caches,
+                            )
+                        )
+                        print(
+                            "[quest_display] immersive balanced side-strip startup validation: "
+                            + str(balanced_edge_debug),
+                            flush=True,
+                        )
+                        if not balanced_edge_valid:
+                            startup_scene_validation_mode = (
+                                "assembled_balanced_center_background_side_strip_replace_fallback"
+                            )
+                        else:
+                            startup_scene_validation_mode = (
+                                "assembled_balanced_center_background_side_strip_replace_table_roi"
+                            )
+                bootstrap_output["active_scene_stereo_mode"] = active_scene_stereo_mode
+                bootstrap_output["startup_scene_validation_mode"] = (
+                    startup_scene_validation_mode
+                )
+                _complete_substage(substage_name, stage_index=4)
+                if not force:
+                    return current_sample
+                continue
 
-            bootstrap_output.update(
-                {
-                    "current_target": current_target,
-                    "prev_target": prev_target,
-                    "scene_rest_state": scene_rest_state,
-                    "x": x,
-                    "controller_anchor_templates": controller_anchor_templates,
-                    "startup_scene_validation_mode": startup_scene_validation_mode,
-                    "active_scene_stereo_mode": active_scene_stereo_mode,
-                }
-            )
-            bootstrap_state["stage_index"] = 4
-            if not force:
-                return current_sample
-            stage_index = 4
-
-        if stage_index <= 4:
-            current_sample = bootstrap_output["initial_sample"]
-            active_scene_stereo_mode = bootstrap_output["active_scene_stereo_mode"]
-            gaussian_compose_roi_padding = (
-                int(self.IMMERSIVE_GAUSSIAN_COMPOSE_ROI_PADDING)
-                if active_scene_stereo_mode
-                == self.IMMERSIVE_BALANCED_INTERNAL_STEREO_MODE
-                else None
-            )
-            self._record_immersive_startup_milestone(
-                startup_timeline,
-                "startup_validation_begin",
-                immersive_bridge,
-            )
-            startup_render_debug = self._validate_immersive_startup_render(
-                bootstrap_output["live_head_alignment"],
-                bootstrap_output["layout"],
-                bootstrap_output["scene_renderer"],
-                bootstrap_output["scene_execute_renderer"],
-                current_sample.left_eye,
-                current_sample.right_eye,
-                bootstrap_output["last_left_eye_pose_world"],
-                bootstrap_output["last_right_eye_pose_world"],
-                eye_width,
-                eye_height,
-                gaussians,
-                render_pipe,
-                background_black,
-                background_white,
-                diagnostic_view_render_path,
-                save_success_bundle=profile_enabled,
-                scene_stereo_mode=active_scene_stereo_mode,
-                scene_width=scene_width,
-                scene_height=scene_height,
-                reproject_caches=shared_scene_reproject_caches,
-                gaussian_compose_roi_padding=gaussian_compose_roi_padding,
-                progress_callback=lambda reason: self._maybe_publish_immersive_startup_keepalive(
+            if substage_name == "startup_validation_prepare":
+                self._record_immersive_startup_milestone(
+                    startup_timeline,
+                    "startup_validation_begin",
+                    immersive_bridge,
+                )
+                self._maybe_publish_immersive_startup_keepalive(
                     immersive_bridge,
                     startup_keepalive_state,
-                    reason=reason,
+                    reason="startup_validation_enter",
                     startup_timeline=startup_timeline,
-                ),
-            )
-            self._record_immersive_startup_milestone(
-                startup_timeline,
-                "startup_validation_done",
-                immersive_bridge,
-            )
-            self._maybe_publish_immersive_startup_keepalive(
-                immersive_bridge,
-                startup_keepalive_state,
-                reason="startup_validation_done",
-                startup_timeline=startup_timeline,
-            )
-            startup_render_debug["requested_scene_stereo_mode"] = (
-                immersive_render_options["scene_stereo_mode"]
-            )
-            startup_render_debug["active_scene_stereo_mode"] = active_scene_stereo_mode
-            startup_render_debug["startup_scene_validation_mode"] = (
-                bootstrap_output["startup_scene_validation_mode"]
-            )
-            immersive_compose_mode = str(
-                startup_render_debug.get("recommended_compose_mode", "depth_aware")
-            )
-            print(
-                "[quest_display] immersive startup render validation: "
-                + str(startup_render_debug),
-                flush=True,
-            )
-            if immersive_compose_mode != "depth_aware":
+                    force=not force,
+                )
+                gaussian_compose_roi_padding = (
+                    int(self.IMMERSIVE_GAUSSIAN_COMPOSE_ROI_PADDING)
+                    if bootstrap_output["active_scene_stereo_mode"]
+                    == self.IMMERSIVE_BALANCED_INTERNAL_STEREO_MODE
+                    else None
+                )
+                validation_state = self._make_immersive_startup_validation_state(
+                    head_alignment=bootstrap_output["live_head_alignment"],
+                    layout=bootstrap_output["layout"],
+                    scene_renderer=bootstrap_output["scene_renderer"],
+                    left_eye_sample=current_sample.left_eye,
+                    right_eye_sample=current_sample.right_eye,
+                    left_eye_pose_world=bootstrap_output["last_left_eye_pose_world"],
+                    right_eye_pose_world=bootstrap_output["last_right_eye_pose_world"],
+                    eye_width=eye_width,
+                    eye_height=eye_height,
+                    gaussians=gaussians,
+                    scene_stereo_mode=bootstrap_output["active_scene_stereo_mode"],
+                    scene_width=scene_width,
+                    scene_height=scene_height,
+                )
+                validation_state["gaussian_compose_roi_padding"] = (
+                    gaussian_compose_roi_padding
+                )
+                bootstrap_state["validation_state"] = validation_state
+                _complete_substage(substage_name)
+                if not force:
+                    return current_sample
+                continue
+
+            if substage_name == "startup_validation_scene_frames":
+                validation_state = bootstrap_state["validation_state"]
+                validation_state = self._render_immersive_startup_validation_scene_frames(
+                    validation_state,
+                    layout=bootstrap_output["layout"],
+                    scene_renderer=bootstrap_output["scene_renderer"],
+                    scene_execute_renderer=bootstrap_output["scene_execute_renderer"],
+                    reproject_caches=shared_scene_reproject_caches,
+                )
+                bootstrap_state["validation_state"] = validation_state
+                self._maybe_publish_immersive_startup_keepalive(
+                    immersive_bridge,
+                    startup_keepalive_state,
+                    reason="startup_validation_scene_frames_ready",
+                    startup_timeline=startup_timeline,
+                    force=not force,
+                )
+                _complete_substage(substage_name)
+                if not force:
+                    return current_sample
+                continue
+
+            if substage_name == "startup_validation_left_eye":
+                validation_state = bootstrap_state["validation_state"]
+                self._maybe_publish_immersive_startup_keepalive(
+                    immersive_bridge,
+                    startup_keepalive_state,
+                    reason="startup_validation_eye_left_begin",
+                    startup_timeline=startup_timeline,
+                    force=not force,
+                )
+                validation_state = self._process_immersive_startup_validation_eye(
+                    validation_state,
+                    "left",
+                    scene_renderer=bootstrap_output["scene_renderer"],
+                    gaussians=gaussians,
+                    render_pipe=render_pipe,
+                    background_black=background_black,
+                    background_white=background_white,
+                    gaussian_compose_roi_padding=validation_state.get(
+                        "gaussian_compose_roi_padding"
+                    ),
+                )
+                bootstrap_state["validation_state"] = validation_state
+                _complete_substage(substage_name)
+                if not force:
+                    return current_sample
+                continue
+
+            if substage_name == "startup_validation_right_eye":
+                validation_state = bootstrap_state["validation_state"]
+                self._maybe_publish_immersive_startup_keepalive(
+                    immersive_bridge,
+                    startup_keepalive_state,
+                    reason="startup_validation_eye_right_begin",
+                    startup_timeline=startup_timeline,
+                    force=not force,
+                )
+                validation_state = self._process_immersive_startup_validation_eye(
+                    validation_state,
+                    "right",
+                    scene_renderer=bootstrap_output["scene_renderer"],
+                    gaussians=gaussians,
+                    render_pipe=render_pipe,
+                    background_black=background_black,
+                    background_white=background_white,
+                    gaussian_compose_roi_padding=validation_state.get(
+                        "gaussian_compose_roi_padding"
+                    ),
+                )
+                bootstrap_state["validation_state"] = validation_state
+                _complete_substage(substage_name)
+                if not force:
+                    return current_sample
+                continue
+
+            if substage_name == "startup_validation_finalize":
+                validation_state = self._finalize_immersive_startup_validation_state(
+                    bootstrap_state["validation_state"],
+                    debug_output_dir=diagnostic_view_render_path,
+                    save_success_bundle=profile_enabled,
+                )
+                startup_render_debug = validation_state["startup_render_debug"]
+                self._maybe_publish_immersive_startup_keepalive(
+                    immersive_bridge,
+                    startup_keepalive_state,
+                    reason="startup_validation_complete",
+                    startup_timeline=startup_timeline,
+                    force=not force,
+                )
+                self._record_immersive_startup_milestone(
+                    startup_timeline,
+                    "startup_validation_done",
+                    immersive_bridge,
+                )
+                self._maybe_publish_immersive_startup_keepalive(
+                    immersive_bridge,
+                    startup_keepalive_state,
+                    reason="startup_validation_done",
+                    startup_timeline=startup_timeline,
+                )
+                startup_render_debug["requested_scene_stereo_mode"] = (
+                    immersive_render_options["scene_stereo_mode"]
+                )
+                startup_render_debug["active_scene_stereo_mode"] = (
+                    bootstrap_output["active_scene_stereo_mode"]
+                )
+                startup_render_debug["startup_scene_validation_mode"] = (
+                    bootstrap_output["startup_scene_validation_mode"]
+                )
+                immersive_compose_mode = str(
+                    startup_render_debug.get("recommended_compose_mode", "depth_aware")
+                )
                 print(
-                    "[quest_display] immersive startup compose validation failed; "
-                    "falling back to alpha_overlay object compositing for this run",
+                    "[quest_display] immersive startup render validation: "
+                    + str(startup_render_debug),
                     flush=True,
                 )
-            bootstrap_output["startup_render_debug"] = startup_render_debug
-            bootstrap_output["immersive_compose_mode"] = immersive_compose_mode
-            bootstrap_output["active_scene_stereo_mode"] = active_scene_stereo_mode
-            bootstrap_state["stage_index"] = 5
-            bootstrap_state["complete"] = True
+                if immersive_compose_mode != "depth_aware":
+                    print(
+                        "[quest_display] immersive startup compose validation failed; "
+                        "falling back to alpha_overlay object compositing for this run",
+                        flush=True,
+                    )
+                bootstrap_state["validation_state"] = validation_state
+                bootstrap_output["startup_render_debug"] = startup_render_debug
+                bootstrap_output["immersive_compose_mode"] = immersive_compose_mode
+                bootstrap_state["stage_index"] = 5
+                bootstrap_state["complete"] = True
+                substage_index += 1
+                _refresh_substage_cursor()
+                return bootstrap_output["initial_sample"]
+
+            raise RuntimeError(
+                f"Unknown immersive startup bootstrap substage: {substage_name}"
+            )
+
+        bootstrap_state["stage_index"] = 5
+        bootstrap_state["complete"] = True
+        _refresh_substage_cursor()
         return bootstrap_output["initial_sample"]
 
     def _set_immersive_startup_keepalive_frames(
@@ -23036,6 +23391,696 @@ class InvPhyTrainerWarp:
             progress_callback("startup_validation_complete")
         return startup_debug
 
+    def _make_immersive_startup_validation_state(
+        self,
+        *,
+        head_alignment,
+        layout,
+        scene_renderer,
+        left_eye_sample,
+        right_eye_sample,
+        left_eye_pose_world,
+        right_eye_pose_world,
+        eye_width,
+        eye_height,
+        gaussians,
+        scene_stereo_mode="per_eye",
+        scene_width=None,
+        scene_height=None,
+    ):
+        if scene_width is None:
+            scene_width = int(scene_renderer.width)
+        if scene_height is None:
+            scene_height = int(scene_renderer.height)
+        table_top_center = np.asarray(layout.table_top_center, dtype=np.float32)
+        object_points = gaussians.get_xyz.detach()
+        object_center = object_points.mean(dim=0).detach().cpu().numpy().astype(np.float32)
+        object_support_center = (
+            self._object_support_patch_center(object_points)
+            .detach()
+            .cpu()
+            .numpy()
+            .astype(np.float32)
+        )
+        object_bounds_min = (
+            object_points.min(dim=0).values.detach().cpu().numpy().astype(np.float32)
+        )
+        object_bounds_max = (
+            object_points.max(dim=0).values.detach().cpu().numpy().astype(np.float32)
+        )
+        startup_debug = {
+            "table_top_center": table_top_center.tolist(),
+            "object_center": object_center.tolist(),
+            "object_support_center": object_support_center.tolist(),
+            "object_bounds_min": object_bounds_min.tolist(),
+            "object_bounds_max": object_bounds_max.tolist(),
+            "head_alignment_basis_det": head_alignment["basis_det"],
+            "head_alignment_orthogonality_error": head_alignment[
+                "basis_orthogonality_error"
+            ],
+            "scene_up": np.asarray(
+                head_alignment["scene_up"], dtype=np.float32
+            ).tolist(),
+            "scene_forward": np.asarray(
+                head_alignment["scene_forward"], dtype=np.float32
+            ).tolist(),
+            "scene_right": np.asarray(
+                head_alignment["scene_right"], dtype=np.float32
+            ).tolist(),
+        }
+        left_intrinsic = (
+            self._eye_sample_intrinsic(left_eye_sample, eye_width, eye_height)
+            if left_eye_sample is not None and left_eye_sample.pose_valid
+            else None
+        )
+        right_intrinsic = (
+            self._eye_sample_intrinsic(right_eye_sample, eye_width, eye_height)
+            if right_eye_sample is not None and right_eye_sample.pose_valid
+            else None
+        )
+        table_world_bounds = scene_renderer.table_world_bounds()
+        balanced_runtime_state = getattr(self, "_immersive_balanced_runtime_state", None)
+        balanced_static_scene_mode = (
+            self.IMMERSIVE_STATIC_SCENE_MODE_BALANCED_FOCUS
+            if balanced_runtime_state is None
+            else str(
+                balanced_runtime_state.get(
+                    "static_scene_mode",
+                    self.IMMERSIVE_STATIC_SCENE_MODE_BALANCED_FOCUS,
+                )
+            )
+        )
+        balanced_center_eye_pose_world = None
+        balanced_background_intrinsic = None
+        balanced_near_reference_depth_m = None
+        balanced_far_reference_depth_m = None
+        if scene_stereo_mode == self.IMMERSIVE_BALANCED_INTERNAL_STEREO_MODE:
+            balanced_table_world_bounds = scene_renderer.table_world_bounds()
+            if balanced_table_world_bounds is not None:
+                table_world_bounds = balanced_table_world_bounds
+            startup_debug["balanced_background_mode"] = (
+                "per_eye_full_scene"
+                if balanced_runtime_state is None
+                else str(
+                    balanced_runtime_state.get(
+                        "background_mode",
+                        "per_eye_full_scene",
+                    )
+                )
+            )
+            startup_debug["balanced_side_wall_mode"] = (
+                "disabled"
+                if balanced_runtime_state is None
+                else str(
+                    balanced_runtime_state.get(
+                        "side_wall_mode",
+                        "disabled",
+                    )
+                )
+            )
+            startup_debug["balanced_static_scene_mode"] = balanced_static_scene_mode
+            if (
+                balanced_static_scene_mode
+                == self.IMMERSIVE_STATIC_SCENE_MODE_BALANCED_FOCUS
+            ):
+                startup_debug["balanced_focus_mode"] = "table_roi"
+                startup_debug["balanced_table_roi_render_scale"] = float(
+                    self.IMMERSIVE_BALANCED_TABLE_ROI_SUPERSAMPLE_SCALE
+                    if balanced_runtime_state is None
+                    else balanced_runtime_state.get(
+                        "table_roi_render_scale",
+                        self.IMMERSIVE_BALANCED_TABLE_ROI_SUPERSAMPLE_SCALE,
+                    )
+                )
+            elif (
+                balanced_static_scene_mode
+                == self.IMMERSIVE_STATIC_SCENE_MODE_BALANCED_SUPPORT_FOCUS
+            ):
+                startup_debug["balanced_focus_mode"] = "support_roi"
+                startup_debug["balanced_support_roi_render_scale"] = float(
+                    self.IMMERSIVE_BALANCED_TABLE_ROI_SUPERSAMPLE_SCALE
+                    if balanced_runtime_state is None
+                    else balanced_runtime_state.get(
+                        "support_roi_render_scale",
+                        self.IMMERSIVE_BALANCED_TABLE_ROI_SUPERSAMPLE_SCALE,
+                    )
+                )
+            else:
+                raise ValueError(
+                    f"Unsupported immersive static scene mode: {balanced_static_scene_mode}"
+                )
+            if balanced_runtime_state is not None:
+                balanced_near_reference_depth_m = float(
+                    balanced_runtime_state.get("near_reference_depth_m", 0.0)
+                )
+                balanced_far_reference_depth_m = float(
+                    balanced_runtime_state.get("far_reference_depth_m", 0.0)
+                )
+                startup_debug["balanced_near_reference_depth_m"] = (
+                    balanced_near_reference_depth_m
+                )
+                startup_debug["balanced_far_reference_depth_m"] = (
+                    balanced_far_reference_depth_m
+                )
+            if (
+                (left_intrinsic is not None or right_intrinsic is not None)
+                and (left_eye_pose_world is not None or right_eye_pose_world is not None)
+            ):
+                balanced_center_eye_pose_world, center_intrinsic = (
+                    self._build_immersive_center_scene_view(
+                        left_eye_pose_world,
+                        right_eye_pose_world,
+                        left_intrinsic,
+                        right_intrinsic,
+                    )
+                )
+                if balanced_runtime_state is not None:
+                    balanced_background_intrinsic = np.asarray(
+                        balanced_runtime_state["background_intrinsic"],
+                        dtype=np.float32,
+                    )
+                else:
+                    balanced_background_intrinsic, _, _ = (
+                        self._build_immersive_balanced_background_intrinsic(
+                            center_intrinsic,
+                            eye_width,
+                            eye_height,
+                        )
+                    )
+                    balanced_near_reference_depth_m = (
+                        self._compute_immersive_balanced_background_reference_depth(
+                            layout,
+                            balanced_center_eye_pose_world,
+                        )
+                    )
+                    (
+                        balanced_far_reference_depth_m,
+                        _,
+                    ) = self._compute_immersive_balanced_far_reference_depth(
+                        layout,
+                        balanced_center_eye_pose_world,
+                    )
+                    startup_debug["balanced_near_reference_depth_m"] = (
+                        balanced_near_reference_depth_m
+                    )
+                    startup_debug["balanced_far_reference_depth_m"] = (
+                        balanced_far_reference_depth_m
+                    )
+        return {
+            "phase": "prepare",
+            "debug_renders": {},
+            "startup_debug": startup_debug,
+            "gaussian_visible_any": False,
+            "projection_failures": [],
+            "suppressed_by_scene_depth_eyes": [],
+            "invalid_scene_depth_eyes": [],
+            "left_eye_sample": left_eye_sample,
+            "right_eye_sample": right_eye_sample,
+            "left_eye_pose_world": left_eye_pose_world,
+            "right_eye_pose_world": right_eye_pose_world,
+            "left_intrinsic": left_intrinsic,
+            "right_intrinsic": right_intrinsic,
+            "table_top_center": table_top_center,
+            "object_center": object_center,
+            "object_support_center": object_support_center,
+            "object_bounds_min": object_bounds_min,
+            "object_bounds_max": object_bounds_max,
+            "table_world_bounds": table_world_bounds,
+            "balanced_runtime_state": balanced_runtime_state,
+            "balanced_static_scene_mode": balanced_static_scene_mode,
+            "balanced_center_eye_pose_world": balanced_center_eye_pose_world,
+            "balanced_background_intrinsic": balanced_background_intrinsic,
+            "balanced_near_reference_depth_m": balanced_near_reference_depth_m,
+            "balanced_far_reference_depth_m": balanced_far_reference_depth_m,
+            "rendered_scene_by_eye": {},
+            "scene_stereo_mode": scene_stereo_mode,
+            "scene_width": int(scene_width),
+            "scene_height": int(scene_height),
+            "eye_width": int(eye_width),
+            "eye_height": int(eye_height),
+        }
+
+    def _render_immersive_startup_validation_scene_frames(
+        self,
+        validation_state,
+        *,
+        layout,
+        scene_renderer,
+        scene_execute_renderer,
+        reproject_caches=None,
+    ):
+        left_intrinsic = validation_state.get("left_intrinsic")
+        right_intrinsic = validation_state.get("right_intrinsic")
+        left_eye_pose_world = validation_state.get("left_eye_pose_world")
+        right_eye_pose_world = validation_state.get("right_eye_pose_world")
+        if (
+            left_intrinsic is not None
+            and right_intrinsic is not None
+            and left_eye_pose_world is not None
+            and right_eye_pose_world is not None
+        ):
+            (
+                left_scene_color,
+                left_scene_depth,
+                right_scene_color,
+                right_scene_depth,
+            ) = self._render_immersive_scene_frames_for_mode(
+                scene_renderer,
+                scene_execute_renderer,
+                validation_state["scene_stereo_mode"],
+                layout,
+                validation_state["object_support_center"],
+                validation_state["object_bounds_min"],
+                validation_state["object_bounds_max"],
+                False,
+                left_eye_pose_world,
+                right_eye_pose_world,
+                left_intrinsic,
+                right_intrinsic,
+                validation_state["eye_width"],
+                validation_state["eye_height"],
+                validation_state["scene_width"],
+                validation_state["scene_height"],
+                shared_scene_compose_cache=None,
+                reproject_caches=reproject_caches,
+                render_profile_frame=None,
+            )
+            validation_state["rendered_scene_by_eye"] = {
+                "left": (left_scene_color, left_scene_depth),
+                "right": (right_scene_color, right_scene_depth),
+            }
+        else:
+            validation_state["rendered_scene_by_eye"] = {}
+        validation_state["phase"] = "scene_frames_done"
+        return validation_state
+
+    def _process_immersive_startup_validation_eye(
+        self,
+        validation_state,
+        eye_name,
+        *,
+        scene_renderer,
+        gaussians,
+        render_pipe,
+        background_black,
+        background_white,
+        gaussian_compose_roi_padding=None,
+    ):
+        eye_sample = validation_state.get(f"{eye_name}_eye_sample")
+        eye_pose_world = validation_state.get(f"{eye_name}_eye_pose_world")
+        if eye_sample is None or not eye_sample.pose_valid or eye_pose_world is None:
+            return validation_state
+
+        eye_width = int(validation_state["eye_width"])
+        eye_height = int(validation_state["eye_height"])
+        scene_width = int(validation_state["scene_width"])
+        scene_height = int(validation_state["scene_height"])
+        intrinsic = self._eye_sample_intrinsic(eye_sample, eye_width, eye_height)
+        w2c_cv = self._camera_pose_world_to_cv_w2c(eye_pose_world)
+        startup_debug = validation_state["startup_debug"]
+        debug_renders = validation_state["debug_renders"]
+
+        startup_debug[f"{eye_name}_eye_pose_world"] = eye_pose_world.tolist()
+        table_projection = self._project_world_point_into_eye(
+            validation_state["table_top_center"],
+            intrinsic,
+            w2c_cv,
+            eye_width,
+            eye_height,
+        )
+        object_projection = self._project_world_point_into_eye(
+            validation_state["object_center"],
+            intrinsic,
+            w2c_cv,
+            eye_width,
+            eye_height,
+        )
+        startup_debug[f"{eye_name}_table_projection"] = {
+            "depth": table_projection["depth"],
+            "pixel": None
+            if table_projection["pixel"] is None
+            else table_projection["pixel"].astype(np.float32).tolist(),
+            "in_bounds": bool(table_projection["in_bounds"]),
+        }
+        startup_debug[f"{eye_name}_object_projection"] = {
+            "depth": object_projection["depth"],
+            "pixel": None
+            if object_projection["pixel"] is None
+            else object_projection["pixel"].astype(np.float32).tolist(),
+            "in_bounds": bool(object_projection["in_bounds"]),
+        }
+
+        if (
+            validation_state["scene_stereo_mode"]
+            == self.IMMERSIVE_BALANCED_INTERNAL_STEREO_MODE
+        ):
+            balanced_runtime_state = validation_state["balanced_runtime_state"]
+            balanced_static_scene_mode = validation_state["balanced_static_scene_mode"]
+            table_world_bounds = validation_state["table_world_bounds"]
+            if (
+                balanced_static_scene_mode
+                == self.IMMERSIVE_STATIC_SCENE_MODE_BALANCED_FOCUS
+            ):
+                (
+                    table_roi_bounds,
+                    table_roi_ratio,
+                    table_fullframe_fallback,
+                    table_hysteresis_bounds,
+                ) = self._resolve_immersive_balanced_table_render_roi(
+                    table_world_bounds[0] if table_world_bounds is not None else None,
+                    table_world_bounds[1] if table_world_bounds is not None else None,
+                    intrinsic,
+                    w2c_cv,
+                    eye_width,
+                    eye_height,
+                    prev_bounds=(
+                        balanced_runtime_state.get("table_roi_state", {}).get(eye_name)
+                        if balanced_runtime_state is not None
+                        else None
+                    ),
+                )
+                startup_debug[f"{eye_name}_table_roi_ratio"] = float(table_roi_ratio)
+                startup_debug[f"{eye_name}_table_fullframe_fallback"] = bool(
+                    table_fullframe_fallback
+                )
+                startup_debug[f"{eye_name}_table_roi_bounds"] = (
+                    None if table_roi_bounds is None else [int(v) for v in table_roi_bounds]
+                )
+                startup_debug[f"{eye_name}_table_roi_hysteresis_bounds"] = (
+                    None
+                    if table_hysteresis_bounds is None
+                    else [int(v) for v in table_hysteresis_bounds]
+                )
+            elif (
+                balanced_static_scene_mode
+                == self.IMMERSIVE_STATIC_SCENE_MODE_BALANCED_SUPPORT_FOCUS
+            ):
+                startup_debug[f"{eye_name}_support_roi_ratio"] = 0.0
+                startup_debug[f"{eye_name}_support_fullframe_fallback"] = False
+                startup_debug[f"{eye_name}_support_roi_bounds"] = None
+            else:
+                (
+                    focus_roi_bounds,
+                    focus_roi_ratio,
+                    focus_fullframe_fallback,
+                    focus_debug,
+                ) = self._resolve_immersive_balanced_focus_render_roi(
+                    validation_state["object_bounds_min"],
+                    validation_state["object_bounds_max"],
+                    intrinsic,
+                    w2c_cv,
+                    eye_width,
+                    eye_height,
+                    active_interaction=False,
+                    prev_bounds=(
+                        balanced_runtime_state.get("focus_roi_state", {}).get(eye_name)
+                        if balanced_runtime_state is not None
+                        else None
+                    ),
+                )
+                startup_debug[f"{eye_name}_focus_roi_ratio"] = float(focus_roi_ratio)
+                startup_debug[f"{eye_name}_focus_fullframe_fallback"] = bool(
+                    focus_fullframe_fallback
+                )
+                startup_debug[f"{eye_name}_focus_roi_bounds"] = (
+                    None if focus_roi_bounds is None else [int(v) for v in focus_roi_bounds]
+                )
+                startup_debug[f"{eye_name}_focus_roi_hysteresis_bounds"] = (
+                    None
+                    if focus_debug.get("hysteresis_bounds") is None
+                    else [int(v) for v in focus_debug["hysteresis_bounds"]]
+                )
+                startup_debug[f"{eye_name}_focus_center_roi_bounds"] = (
+                    None
+                    if focus_debug.get("center_roi_bounds") is None
+                    else [int(v) for v in focus_debug["center_roi_bounds"]]
+                )
+                startup_debug[f"{eye_name}_focus_object_roi_bounds"] = (
+                    None
+                    if focus_debug.get("object_roi_bounds") is None
+                    else [int(v) for v in focus_debug["object_roi_bounds"]]
+                )
+            if (
+                balanced_runtime_state is not None
+                and balanced_runtime_state.get("side_wall_mode")
+                in {
+                    "per_eye_roi",
+                    "per_eye_roi_replace",
+                    "edge_warp_roi",
+                    "warp_first_hybrid",
+                }
+                and validation_state["balanced_center_eye_pose_world"] is not None
+                and validation_state["balanced_background_intrinsic"] is not None
+                and validation_state["balanced_near_reference_depth_m"] is not None
+                and validation_state["balanced_far_reference_depth_m"] is not None
+            ):
+                near_shift_dx_px, near_shift_dy_px, _ = (
+                    self._compute_immersive_balanced_background_shift(
+                        validation_state["balanced_center_eye_pose_world"],
+                        eye_pose_world,
+                        validation_state["balanced_background_intrinsic"],
+                        intrinsic,
+                        validation_state["balanced_near_reference_depth_m"],
+                    )
+                )
+                far_shift_dx_px, far_shift_dy_px, _ = (
+                    self._compute_immersive_balanced_background_shift(
+                        validation_state["balanced_center_eye_pose_world"],
+                        eye_pose_world,
+                        validation_state["balanced_background_intrinsic"],
+                        intrinsic,
+                        validation_state["balanced_far_reference_depth_m"],
+                    )
+                )
+                startup_debug[f"{eye_name}_balanced_near_shift_px"] = {
+                    "dx": float(near_shift_dx_px),
+                    "dy": float(near_shift_dy_px),
+                }
+                startup_debug[f"{eye_name}_balanced_far_shift_px"] = {
+                    "dx": float(far_shift_dx_px),
+                    "dy": float(far_shift_dy_px),
+                }
+                side_roi_total = 0.0
+                side_fullframe_fallback = False
+                side_wall_anchor_edges = {}
+                side_wall_strip_bounds = {}
+                for side_name in ("left", "right"):
+                    wall_bounds = scene_renderer.wall_world_bounds(side_name)
+                    if wall_bounds is None:
+                        continue
+                    prev_side_bounds = None
+                    if balanced_runtime_state is not None:
+                        prev_side_bounds = (
+                            balanced_runtime_state.get("side_wall_roi_state", {})
+                            .get(eye_name, {})
+                            .get(side_name)
+                        )
+                    side_roi_bounds, side_roi_ratio, side_ff, side_debug = (
+                        self._resolve_immersive_balanced_side_wall_strip_roi(
+                            wall_bounds[0],
+                            wall_bounds[1],
+                            intrinsic,
+                            w2c_cv,
+                            eye_width,
+                            eye_height,
+                            prev_bounds=prev_side_bounds,
+                        )
+                    )
+                    startup_debug[f"{eye_name}_{side_name}_wall_roi_ratio"] = float(
+                        side_roi_ratio
+                    )
+                    startup_debug[f"{eye_name}_{side_name}_side_wall_anchor_edge"] = (
+                        side_debug.get("anchor_edge")
+                    )
+                    side_wall_anchor_edges[side_name] = side_debug.get("anchor_edge")
+                    startup_debug[f"{eye_name}_{side_name}_side_wall_strip_bounds"] = (
+                        None
+                        if side_debug.get("hysteresis_bounds") is None
+                        else [int(v) for v in side_debug["hysteresis_bounds"]]
+                    )
+                    side_wall_strip_bounds[side_name] = (
+                        None
+                        if side_debug.get("hysteresis_bounds") is None
+                        else [int(v) for v in side_debug["hysteresis_bounds"]]
+                    )
+                    startup_debug[f"{eye_name}_{side_name}_wall_roi_bounds"] = (
+                        None
+                        if side_roi_bounds is None
+                        else [int(v) for v in side_roi_bounds]
+                    )
+                    startup_debug[f"{eye_name}_{side_name}_wall_fullframe_fallback"] = bool(
+                        side_ff
+                    )
+                    side_roi_total += float(side_roi_ratio)
+                    side_fullframe_fallback = side_fullframe_fallback or bool(side_ff)
+                startup_debug[f"{eye_name}_side_wall_roi_ratio"] = float(
+                    min(side_roi_total, 1.0)
+                )
+                startup_debug[f"{eye_name}_side_wall_anchor_edge"] = dict(
+                    side_wall_anchor_edges
+                )
+                startup_debug[f"{eye_name}_side_wall_strip_bounds"] = dict(
+                    side_wall_strip_bounds
+                )
+                startup_debug[f"{eye_name}_side_wall_fullframe_fallback"] = bool(
+                    side_fullframe_fallback
+                )
+
+        if not table_projection["in_bounds"] or not object_projection["in_bounds"]:
+            validation_state["projection_failures"].append(eye_name)
+
+        precomputed_scene = validation_state["rendered_scene_by_eye"].get(eye_name)
+        if precomputed_scene is None:
+            scene_intrinsic = self._scale_intrinsic_for_resolution(
+                intrinsic,
+                eye_width,
+                eye_height,
+                scene_width,
+                scene_height,
+            )
+            scene_color, scene_depth = scene_renderer.render_eye(
+                eye_pose_world,
+                scene_intrinsic,
+                width=scene_width,
+                height=scene_height,
+            )
+        else:
+            scene_color, scene_depth = precomputed_scene
+        view, _ = self._create_gs_view(w2c_cv, intrinsic, eye_height, eye_width)
+        gaussian_rgba, gaussian_depth = self._render_gaussian_rgba(
+            view,
+            gaussians,
+            render_pipe,
+            background_black,
+            background_white,
+            use_gsplat=True,
+        )
+        gaussian_depth = self._normalize_gaussian_depth(gaussian_depth)
+        composed, compose_metrics, compose_debug_maps = self._compose_immersive_eye_frame(
+            scene_color,
+            scene_depth,
+            gaussian_rgba,
+            gaussian_depth,
+            collect_debug=True,
+            collect_debug_maps=True,
+            compose_roi_padding=gaussian_compose_roi_padding,
+        )
+        debug_renders[f"{eye_name}_scene"] = scene_color
+        debug_renders[f"{eye_name}_scene_depth"] = (
+            self._visualize_immersive_depth_debug_image(compose_debug_maps["scene_depth"])
+        )
+        debug_renders[f"{eye_name}_gaussian_rgba"] = (
+            (
+                gaussian_rgba.detach().permute(1, 2, 0).contiguous().clamp(0.0, 1.0)
+                * 255.0
+            ).to(torch.uint8)
+        )
+        debug_renders[f"{eye_name}_gaussian_alpha"] = (
+            self._visualize_immersive_alpha_debug_image(compose_debug_maps["raw_alpha"])
+        )
+        debug_renders[f"{eye_name}_visible_alpha"] = (
+            self._visualize_immersive_alpha_debug_image(
+                compose_debug_maps["visible_alpha"]
+            )
+        )
+        debug_renders[f"{eye_name}_composed"] = composed
+        gaussian_alpha = gaussian_rgba[3]
+        gaussian_alpha_max = float(gaussian_alpha.max().item())
+        gaussian_depth_nonzero = (
+            int((gaussian_depth > 0.0).sum().item()) if gaussian_depth is not None else 0
+        )
+        startup_debug[f"{eye_name}_gaussian_alpha_max"] = gaussian_alpha_max
+        startup_debug[f"{eye_name}_gaussian_depth_nonzero"] = gaussian_depth_nonzero
+        startup_debug[f"{eye_name}_scene_depth_metrics"] = {
+            "finite_ratio": float(compose_metrics["scene_depth_finite_ratio"]),
+            "positive_ratio": float(compose_metrics["scene_depth_positive_ratio"]),
+            "valid_min": float(compose_metrics["scene_depth_valid_min"]),
+            "valid_max": float(compose_metrics["scene_depth_valid_max"]),
+            "invalid": bool(compose_metrics["scene_depth_invalid"]),
+        }
+        startup_debug[f"{eye_name}_compose_metrics"] = {
+            "compose_mode": str(compose_metrics["compose_mode"]),
+            "raw_gaussian_coverage_ratio": float(
+                compose_metrics["raw_gaussian_coverage_ratio"]
+            ),
+            "visible_gaussian_coverage_ratio": float(
+                compose_metrics["visible_gaussian_coverage_ratio"]
+            ),
+            "visible_retention_ratio": float(
+                compose_metrics["visible_retention_ratio"]
+            ),
+            "scene_depth_suppressed": bool(compose_metrics["scene_depth_suppressed"]),
+            "composed_luma_mean": float(compose_metrics["composed_luma_mean"]),
+            "composed_luma_variance": float(compose_metrics["composed_luma_variance"]),
+        }
+        if gaussian_alpha_max > self.IMMERSIVE_STARTUP_ALPHA_EPS or gaussian_depth_nonzero > 0:
+            validation_state["gaussian_visible_any"] = True
+        if compose_metrics.get("scene_depth_invalid", False):
+            validation_state["invalid_scene_depth_eyes"].append(eye_name)
+        if compose_metrics.get("scene_depth_suppressed", False):
+            validation_state["suppressed_by_scene_depth_eyes"].append(eye_name)
+        validation_state["phase"] = f"eye_{eye_name}_done"
+        return validation_state
+
+    def _finalize_immersive_startup_validation_state(
+        self,
+        validation_state,
+        *,
+        debug_output_dir,
+        save_success_bundle=False,
+    ):
+        startup_debug = validation_state["startup_debug"]
+        startup_debug["projection_failures"] = validation_state["projection_failures"]
+        startup_debug["scene_depth_invalid_eyes"] = validation_state[
+            "invalid_scene_depth_eyes"
+        ]
+        startup_debug["suppressed_by_scene_depth_eyes"] = validation_state[
+            "suppressed_by_scene_depth_eyes"
+        ]
+        compose_fallback_required = bool(
+            validation_state["invalid_scene_depth_eyes"]
+            or validation_state["suppressed_by_scene_depth_eyes"]
+        )
+        startup_debug["compose_fallback_required"] = compose_fallback_required
+        startup_debug["recommended_compose_mode"] = (
+            "alpha_overlay" if compose_fallback_required else "depth_aware"
+        )
+        if (
+            validation_state["projection_failures"]
+            or not validation_state["gaussian_visible_any"]
+        ):
+            failure_dir = (
+                os.path.join(debug_output_dir, "startup_failure")
+                if debug_output_dir is not None
+                else None
+            )
+            self._save_immersive_startup_debug_bundle(
+                failure_dir,
+                validation_state["debug_renders"],
+                startup_debug,
+            )
+            startup_debug["validation_failed"] = True
+            startup_debug["validation_warning"] = (
+                "initial_sample_out_of_view"
+                if validation_state["projection_failures"]
+                else "initial_sample_gaussian_not_visible"
+            )
+            print(
+                "[quest_display] immersive startup render validation warning: "
+                f"{startup_debug['validation_warning']}; continuing so the live demo can recover "
+                "as the headset pose settles",
+                flush=True,
+            )
+        elif (save_success_bundle or compose_fallback_required) and debug_output_dir is not None:
+            self._save_immersive_startup_debug_bundle(
+                os.path.join(debug_output_dir, "startup_debug"),
+                validation_state["debug_renders"],
+                startup_debug,
+            )
+        validation_state["startup_render_debug"] = startup_debug
+        validation_state["phase"] = "complete"
+        return validation_state
+
     def _sources_pending_grab_start_validation(self, controller_interaction_state):
         sources = []
         for source in ("left", "right"):
@@ -23569,6 +24614,72 @@ class InvPhyTrainerWarp:
         if progress_callback is not None:
             progress_callback("settle_complete")
         return last_state
+
+    def _advance_immersive_scene_rest_settle(
+        self,
+        settle_state,
+        rest_target,
+        *,
+        progress_callback=None,
+        max_steps=None,
+    ):
+        if settle_state is None:
+            settle_state = {}
+        if max_steps is None:
+            max_steps = int(self.IMMERSIVE_STARTUP_SETTLE_STEPS_PER_TICK)
+        max_steps = max(1, int(max_steps))
+        if not bool(settle_state.get("initialized", False)):
+            self.simulator.set_controller_interactive(rest_target, rest_target)
+            settle_state["initialized"] = True
+            settle_state["step_idx"] = int(settle_state.get("step_idx", 0))
+            settle_state["last_state"] = settle_state.get("last_state")
+            settle_state["done"] = bool(settle_state.get("done", False))
+            settle_state["completion_notified"] = bool(
+                settle_state.get("completion_notified", False)
+            )
+        if bool(settle_state.get("done", False)):
+            if progress_callback is not None and not bool(
+                settle_state.get("completion_notified", False)
+            ):
+                progress_callback("settle_complete")
+                settle_state["completion_notified"] = True
+            return settle_state
+
+        step_idx = int(settle_state.get("step_idx", 0))
+        last_state = settle_state.get("last_state")
+        done = False
+        for _ in range(max_steps):
+            if step_idx >= int(self.IMMERSIVE_SCENE_REST_SETTLE_STEPS):
+                done = True
+                break
+            if progress_callback is not None:
+                progress_callback(f"settle_step_{step_idx}")
+            if self.simulator.object_collision_flag:
+                self.simulator.update_collision_graph()
+            wp.capture_launch(self.simulator.forward_graph)
+            wp.synchronize()
+            x = wp.to_torch(self.simulator.wp_states[-1].wp_x, requires_grad=False).clone()
+            v = wp.to_torch(self.simulator.wp_states[-1].wp_v, requires_grad=False).clone()
+            last_state = {"x": x, "v": v}
+            self._restore_sim_state(last_state)
+            step_idx += 1
+            max_speed = float(torch.linalg.norm(v, dim=1).max().item())
+            if max_speed <= self.IMMERSIVE_SCENE_REST_VELOCITY_EPS:
+                done = True
+                break
+        if step_idx >= int(self.IMMERSIVE_SCENE_REST_SETTLE_STEPS):
+            done = True
+        if last_state is None:
+            last_state = self._capture_sim_state()
+        settle_state["step_idx"] = step_idx
+        settle_state["last_state"] = last_state
+        settle_state["done"] = bool(done)
+        if bool(done) and progress_callback is not None and not bool(
+            settle_state.get("completion_notified", False)
+        ):
+            progress_callback("settle_complete")
+            settle_state["completion_notified"] = True
+        return settle_state
 
     def _snap_to_scene_rest_if_idle(self, scene_rest_state, controller_interaction_state):
         if scene_rest_state is None:
@@ -27997,6 +29108,16 @@ class InvPhyTrainerWarp:
             )
             startup_bootstrap_state = {
                 "stage_index": 0,
+                "substage_index": 0,
+                "substage_name": None,
+                "settle_state": {
+                    "step_idx": 0,
+                    "last_state": None,
+                    "done": False,
+                    "initialized": False,
+                    "completion_notified": False,
+                },
+                "validation_state": None,
                 "complete": False,
                 "output": {"initial_sample": initial_sample},
             }

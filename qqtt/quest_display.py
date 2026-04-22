@@ -29,13 +29,15 @@ from qqtt.live_openxr import (
 
 
 class OpenXRFramePanelMirror:
-    HEADER_STRUCT = struct.Struct("<8sIIIIIIQQ16x")
+    HEADER_STRUCT = struct.Struct("<8sIIIIIIQQII8x")
     HEADER_MAGIC = b"BOBAQST1"
-    HEADER_VERSION = 1
+    HEADER_VERSION = 2
     SLOT_COUNT = 2
     STAGING_BUFFER_COUNT = 2
     FRESHNESS_FIRST_COMMIT = False
     BRIDGE_PUBLISH_SAMPLE_BYTE_COUNT = 16
+    PRESENTATION_MODE_STEREO_FULLSCREEN = 0
+    PRESENTATION_MODE_MONO_PANEL = 1
 
     def __init__(self, repo_root: Path, width: int, height: int):
         self.repo_root = Path(repo_root)
@@ -72,6 +74,7 @@ class OpenXRFramePanelMirror:
         self._next_stage_index = 0
         self._active_stage_copy: Optional[dict] = None
         self._pending_stage_copy: Optional[dict] = None
+        self._reserved_stage_copies: dict[int, dict] = {}
         self._retired_stage_copies: list[dict] = []
         self._free_stage_indices: deque[int] = deque(range(self.STAGING_BUFFER_COUNT))
         self._next_commit_slot = 0
@@ -108,6 +111,24 @@ class OpenXRFramePanelMirror:
         self._reset_viewer_render_stats()
         self._reset_bridge_commit_stats()
         self._reset_steady_state_metrics_epoch()
+
+    def _normalize_presentation_mode(self, presentation_mode=None) -> int:
+        if presentation_mode is None:
+            return int(self.PRESENTATION_MODE_STEREO_FULLSCREEN)
+        if isinstance(presentation_mode, str):
+            mode_key = presentation_mode.strip().lower()
+            if mode_key in ("stereo_fullscreen", "stereo", "fullscreen"):
+                return int(self.PRESENTATION_MODE_STEREO_FULLSCREEN)
+            if mode_key in ("mono_panel", "panel", "mono"):
+                return int(self.PRESENTATION_MODE_MONO_PANEL)
+            raise ValueError(f"Unsupported immersive presentation mode: {presentation_mode}")
+        mode_value = int(presentation_mode)
+        if mode_value not in (
+            int(self.PRESENTATION_MODE_STEREO_FULLSCREEN),
+            int(self.PRESENTATION_MODE_MONO_PANEL),
+        ):
+            raise ValueError(f"Unsupported immersive presentation mode: {presentation_mode}")
+        return mode_value
 
     def _refresh_bridge_publish_sample_indices(self) -> None:
         total_bytes = max(0, int(self.frame_bytes))
@@ -319,6 +340,7 @@ class OpenXRFramePanelMirror:
             self._pending_stage_copies.clear()
             self._active_stage_copy = None
             self._pending_stage_copy = None
+            self._reserved_stage_copies = {}
             self._retired_stage_copies = []
             self._free_stage_indices = deque(range(self.STAGING_BUFFER_COUNT))
             self._next_stage_index = 0
@@ -475,6 +497,7 @@ class OpenXRFramePanelMirror:
         frame_id: int,
         *,
         expected_publish_sample_bytes: Optional[bytes] = None,
+        presentation_mode: Optional[int] = None,
     ) -> dict[str, float]:
         copy_start = time.perf_counter()
         slot_view = self._slot_views[slot]
@@ -488,7 +511,11 @@ class OpenXRFramePanelMirror:
             actual_sample_bytes=actual_publish_sample_bytes,
         )
         header_start = time.perf_counter()
-        self._write_header(latest_frame_id=frame_id, latest_slot=slot)
+        self._write_header(
+            latest_frame_id=frame_id,
+            latest_slot=slot,
+            presentation_mode=presentation_mode,
+        )
         header_wall = time.perf_counter() - header_start
         return {
             "cpu_mmap_copy_wall": copy_wall,
@@ -512,6 +539,7 @@ class OpenXRFramePanelMirror:
             expected_publish_sample_bytes=pending.get(
                 "expected_publish_sample_bytes"
             ),
+            presentation_mode=pending.get("presentation_mode"),
         )
         submit_to_commit_start_ms = float(
             pending.get("submit_to_commit_start_ms", 0.0)
@@ -592,90 +620,107 @@ class OpenXRFramePanelMirror:
     ) -> float:
         if submit_wall_s is None:
             submit_wall_s = time.perf_counter()
+        stage_index: Optional[int] = None
         if self.FRESHNESS_FIRST_COMMIT:
             with self._stage_condition:
-                self._raise_if_stage_commit_failed_locked()
-                reclaimed_count = self._reclaim_completed_retired_stage_copies_locked()
-                if reclaimed_count > 0:
-                    self._finalize_freshness_scheduler_mutation_locked(
-                        "reclaim_retired",
-                        reclaimed_count=reclaimed_count,
-                    )
-                if not self._free_stage_indices:
-                    raise RuntimeError(
-                        "Freshness-first immersive bridge ran out of staging buffers.\n"
-                        f"{self._scheduler_snapshot_locked()}\nrecent transitions:\n"
-                        + "\n".join(self._bridge_transition_trace)
-                    )
-                stage_index = self._free_stage_indices.popleft()
+                stage_index = self._reserve_freshness_stage_copy_locked(
+                    frame_id=frame_id,
+                    slot=slot,
+                )
         else:
             stage_index = self._next_stage_index
-        stage_buffer = self._cpu_stage_buffers[stage_index]
-        stage_array = self._cpu_stage_arrays[stage_index]
-        producer_ready_event = torch.cuda.Event()
-        enqueue_start = time.perf_counter()
-        producer_ready_event.record(torch.cuda.current_stream())
-        copy_start_event = None
-        copy_end_event = None
-        if not self._direct_commit_enabled:
-            copy_start_event = torch.cuda.Event(enable_timing=True)
-            copy_end_event = torch.cuda.Event(enable_timing=True)
-            with torch.cuda.stream(self._staging_copy_stream):
-                self._staging_copy_stream.wait_event(producer_ready_event)
-                copy_start_event.record(self._staging_copy_stream)
-                stage_buffer.copy_(frame_tensor, non_blocking=True)
-                copy_end_event.record(self._staging_copy_stream)
-        with self._stage_condition:
-            pending = {
-                "slot": slot,
-                "frame_id": frame_id,
-                "stage_index": stage_index,
-                "submit_wall_s": submit_wall_s,
-                "expected_publish_sample_bytes": expected_publish_sample_bytes,
-            }
-            if self._direct_commit_enabled:
-                pending.update(
-                    {
-                        "producer_ready_event": producer_ready_event,
-                        "frame_tensor": frame_tensor.contiguous(),
-                        "direct_commit": True,
-                    }
-                )
-            else:
-                pending.update(
-                    {
-                        "start_event": copy_start_event,
-                        "end_event": copy_end_event,
-                        "stage_array": stage_array,
-                        "direct_commit": False,
-                    }
-                )
-            if self.FRESHNESS_FIRST_COMMIT:
-                if self._active_stage_copy is None:
-                    self._mark_stage_copy_active_locked(pending)
-                    self._active_stage_copy = pending
-                    self._finalize_freshness_scheduler_mutation_locked(
-                        "enqueue_active",
-                        frame_id=frame_id,
-                        stage_index=stage_index,
+        try:
+            stage_buffer = self._cpu_stage_buffers[stage_index]
+            stage_array = self._cpu_stage_arrays[stage_index]
+            producer_ready_event = torch.cuda.Event()
+            enqueue_start = time.perf_counter()
+            producer_ready_event.record(torch.cuda.current_stream())
+            copy_start_event = None
+            copy_end_event = None
+            if not self._direct_commit_enabled:
+                copy_start_event = torch.cuda.Event(enable_timing=True)
+                copy_end_event = torch.cuda.Event(enable_timing=True)
+                with torch.cuda.stream(self._staging_copy_stream):
+                    self._staging_copy_stream.wait_event(producer_ready_event)
+                    copy_start_event.record(self._staging_copy_stream)
+                    stage_buffer.copy_(frame_tensor, non_blocking=True)
+                    copy_end_event.record(self._staging_copy_stream)
+            with self._stage_condition:
+                pending = {
+                    "slot": slot,
+                    "frame_id": frame_id,
+                    "stage_index": stage_index,
+                    "submit_wall_s": submit_wall_s,
+                    "expected_publish_sample_bytes": expected_publish_sample_bytes,
+                }
+                if self._direct_commit_enabled:
+                    pending.update(
+                        {
+                            "producer_ready_event": producer_ready_event,
+                            "frame_tensor": frame_tensor.contiguous(),
+                            "direct_commit": True,
+                        }
                     )
                 else:
-                    if self._pending_stage_copy is not None:
-                        self._retire_pending_stage_copy_locked(
-                            incoming_frame_id=frame_id,
-                            reason="enqueue_replace",
-                        )
-                    self._pending_stage_copy = pending
-                    self._finalize_freshness_scheduler_mutation_locked(
-                        "enqueue_pending",
-                        frame_id=frame_id,
-                        stage_index=stage_index,
+                    pending.update(
+                        {
+                            "start_event": copy_start_event,
+                            "end_event": copy_end_event,
+                            "stage_array": stage_array,
+                            "direct_commit": False,
+                        }
                     )
-            else:
-                self._pending_stage_copies.append(pending)
-                self._next_stage_index = (stage_index + 1) % self.STAGING_BUFFER_COUNT
-            self._stage_condition.notify_all()
-        return time.perf_counter() - enqueue_start
+                if self.FRESHNESS_FIRST_COMMIT:
+                    if self._active_stage_copy is None:
+                        reserved = self._reserved_stage_copies.pop(stage_index, None)
+                        if reserved is None:
+                            raise RuntimeError(
+                                "freshness bridge invariant failed: reserved stage missing "
+                                f"during enqueue_active (stage_index={stage_index})\n"
+                                f"{self._scheduler_snapshot_locked()}\nrecent transitions:\n"
+                                + "\n".join(self._bridge_transition_trace)
+                            )
+                        self._mark_stage_copy_active_locked(pending)
+                        self._active_stage_copy = pending
+                        self._finalize_freshness_scheduler_mutation_locked(
+                            "enqueue_active",
+                            frame_id=frame_id,
+                            stage_index=stage_index,
+                        )
+                    else:
+                        if self._pending_stage_copy is not None:
+                            self._retire_pending_stage_copy_locked(
+                                incoming_frame_id=frame_id,
+                                reason="enqueue_replace",
+                            )
+                        reserved = self._reserved_stage_copies.pop(stage_index, None)
+                        if reserved is None:
+                            raise RuntimeError(
+                                "freshness bridge invariant failed: reserved stage missing "
+                                f"during enqueue_pending (stage_index={stage_index})\n"
+                                f"{self._scheduler_snapshot_locked()}\nrecent transitions:\n"
+                                + "\n".join(self._bridge_transition_trace)
+                            )
+                        self._pending_stage_copy = pending
+                        self._finalize_freshness_scheduler_mutation_locked(
+                            "enqueue_pending",
+                            frame_id=frame_id,
+                            stage_index=stage_index,
+                        )
+                else:
+                    self._pending_stage_copies.append(pending)
+                    self._next_stage_index = (stage_index + 1) % self.STAGING_BUFFER_COUNT
+                self._stage_condition.notify_all()
+            return time.perf_counter() - enqueue_start
+        except BaseException:
+            if self.FRESHNESS_FIRST_COMMIT and stage_index is not None:
+                with self._stage_condition:
+                    self._abort_reserved_stage_copy_locked(
+                        stage_index=stage_index,
+                        frame_id=frame_id,
+                        reason="enqueue_prepare_exception",
+                    )
+            raise
 
     @staticmethod
     def _cudart_status_code(result) -> int:
@@ -909,6 +954,7 @@ class OpenXRFramePanelMirror:
         self._write_header(
             latest_frame_id=int(pending["frame_id"]),
             latest_slot=slot,
+            presentation_mode=pending.get("presentation_mode"),
         )
         header_wall = time.perf_counter() - header_start
         submit_to_commit_start_ms = float(
@@ -1269,6 +1315,13 @@ class OpenXRFramePanelMirror:
     def _free_stage_index_locked(self, stage_index: int, *, context: str) -> None:
         if stage_index < 0:
             return
+        if self.FRESHNESS_FIRST_COMMIT and stage_index in self._reserved_stage_copies:
+            trace = "\n".join(self._bridge_transition_trace)
+            raise RuntimeError(
+                "freshness bridge invariant failed: reserved stage released directly "
+                f"(stage_index={stage_index}) during {context}\n"
+                f"{self._scheduler_snapshot_locked()}\nrecent transitions:\n{trace}"
+            )
         if stage_index in self._free_stage_indices:
             if self.FRESHNESS_FIRST_COMMIT:
                 trace = "\n".join(self._bridge_transition_trace)
@@ -1289,6 +1342,12 @@ class OpenXRFramePanelMirror:
         return f"f{frame_id}@stage{stage_index}/slot{slot}"
 
     def _scheduler_snapshot_locked(self) -> str:
+        reserved = ", ".join(
+            self._stage_copy_brief_locked(pending)
+            for _, pending in sorted(self._reserved_stage_copies.items())
+        )
+        if not reserved:
+            reserved = "none"
         retired = ", ".join(
             self._stage_copy_brief_locked(pending) for pending in self._retired_stage_copies
         )
@@ -1299,6 +1358,7 @@ class OpenXRFramePanelMirror:
         return (
             f"active={self._stage_copy_brief_locked(self._active_stage_copy)} "
             f"pending={self._stage_copy_brief_locked(self._pending_stage_copy)} "
+            f"reserved=[{reserved}] "
             f"retired=[{retired}] "
             f"free={free_stage_indices}"
         )
@@ -1321,6 +1381,7 @@ class OpenXRFramePanelMirror:
         buckets = {
             "active": [self._active_stage_copy] if self._active_stage_copy is not None else [],
             "pending": [self._pending_stage_copy] if self._pending_stage_copy is not None else [],
+            "reserved": list(self._reserved_stage_copies.values()),
             "retired_copying": list(self._retired_stage_copies),
         }
         for bucket_name, entries in buckets.items():
@@ -1367,6 +1428,7 @@ class OpenXRFramePanelMirror:
         current_depth = int(self._active_stage_copy is not None) + int(
             self._pending_stage_copy is not None
         )
+        reserved_depth = len(self._reserved_stage_copies)
         self._bridge_commit_queue_max_depth = max(
             self._bridge_commit_queue_max_depth,
             current_depth,
@@ -1378,7 +1440,7 @@ class OpenXRFramePanelMirror:
         )
         self._bridge_physical_in_use_max_depth = max(
             self._bridge_physical_in_use_max_depth,
-            current_depth + retired_depth,
+            current_depth + reserved_depth + retired_depth,
         )
         self._bridge_free_stage_min = min(
             self._bridge_free_stage_min,
@@ -1396,7 +1458,7 @@ class OpenXRFramePanelMirror:
             )
             self._steady_state_bridge_physical_in_use_max_depth = max(
                 self._steady_state_bridge_physical_in_use_max_depth,
-                current_depth + retired_depth,
+                current_depth + reserved_depth + retired_depth,
             )
             self._steady_state_bridge_free_stage_min = min(
                 self._steady_state_bridge_free_stage_min,
@@ -1415,6 +1477,61 @@ class OpenXRFramePanelMirror:
         if self._stage_commit_failure is None:
             return
         raise RuntimeError(self._stage_commit_failure)
+
+    def _reserve_freshness_stage_copy_locked(
+        self,
+        *,
+        frame_id: int,
+        slot: int,
+    ) -> int:
+        self._raise_if_stage_commit_failed_locked()
+        reclaimed_count = self._reclaim_completed_retired_stage_copies_locked()
+        if reclaimed_count > 0:
+            self._finalize_freshness_scheduler_mutation_locked(
+                "reclaim_retired",
+                reclaimed_count=reclaimed_count,
+            )
+        if not self._free_stage_indices:
+            raise RuntimeError(
+                "Freshness-first immersive bridge ran out of staging buffers.\n"
+                f"{self._scheduler_snapshot_locked()}\nrecent transitions:\n"
+                + "\n".join(self._bridge_transition_trace)
+            )
+        stage_index = int(self._free_stage_indices.popleft())
+        self._reserved_stage_copies[stage_index] = {
+            "frame_id": int(frame_id),
+            "slot": int(slot),
+            "stage_index": int(stage_index),
+        }
+        self._finalize_freshness_scheduler_mutation_locked(
+            "reserve_stage",
+            frame_id=frame_id,
+            slot=slot,
+            stage_index=stage_index,
+        )
+        return stage_index
+
+    def _abort_reserved_stage_copy_locked(
+        self,
+        *,
+        stage_index: int,
+        frame_id: Optional[int],
+        reason: str,
+    ) -> bool:
+        reserved = self._reserved_stage_copies.pop(int(stage_index), None)
+        if reserved is None:
+            return False
+        self._free_stage_index_locked(
+            int(stage_index),
+            context=f"reservation_abort:{reason}",
+        )
+        self._finalize_freshness_scheduler_mutation_locked(
+            "reservation_abort",
+            frame_id=frame_id,
+            reason=reason,
+            stage_index=stage_index,
+        )
+        return True
 
     def _retire_stage_copy_locked(self, pending: dict, *, context: str) -> bool:
         end_event = pending.get("end_event")
@@ -1632,6 +1749,7 @@ class OpenXRFramePanelMirror:
                 if (
                     self._active_stage_copy is None
                     and self._pending_stage_copy is None
+                    and not self._reserved_stage_copies
                     and not self._retired_stage_copies
                 ):
                     return True
@@ -1832,8 +1950,17 @@ class OpenXRFramePanelMirror:
             )
             self._slot_views[-1].fill(0)
 
-    def _write_header(self, latest_frame_id: int, latest_slot: int) -> None:
+    def _write_header(
+        self,
+        latest_frame_id: int,
+        latest_slot: int,
+        *,
+        presentation_mode=None,
+    ) -> None:
         assert self._shared_mmap is not None
+        normalized_presentation_mode = self._normalize_presentation_mode(
+            presentation_mode
+        )
         self.HEADER_STRUCT.pack_into(
             self._shared_mmap,
             0,
@@ -1846,6 +1973,8 @@ class OpenXRFramePanelMirror:
             self.SLOT_COUNT,
             int(latest_frame_id),
             int(latest_slot),
+            int(normalized_presentation_mode),
+            0,
         )
 
     def _read_stdout(self) -> None:
@@ -2538,6 +2667,7 @@ class OpenXRImmersiveBridge(OpenXRFramePanelMirror):
         self,
         left_frame_rgba: torch.Tensor,
         right_frame_rgba: torch.Tensor,
+        presentation_mode=None,
     ) -> tuple[bool, dict[str, float]]:
         timing = {
             "process_check_wall": 0.0,
@@ -2570,6 +2700,9 @@ class OpenXRImmersiveBridge(OpenXRFramePanelMirror):
                 left_frame_rgba,
                 right_frame_rgba,
             )
+        )
+        normalized_presentation_mode = self._normalize_presentation_mode(
+            presentation_mode
         )
         process_check_start = time.perf_counter()
         if self.process is not None and self.process.poll() is not None:
@@ -2613,6 +2746,7 @@ class OpenXRImmersiveBridge(OpenXRFramePanelMirror):
                 slot=slot,
                 frame_id=frame_id,
                 expected_publish_sample_bytes=expected_publish_sample_bytes,
+                presentation_mode=normalized_presentation_mode,
             )
             timing["fallback_copy_wall"] = time.perf_counter() - fallback_start
             timing["cpu_mmap_copy_wall"] += commit_stats["cpu_mmap_copy_wall"]
@@ -2648,6 +2782,7 @@ class OpenXRImmersiveBridge(OpenXRFramePanelMirror):
             frame_id=frame_id,
             submit_wall_s=submit_wall_s,
             expected_publish_sample_bytes=expected_publish_sample_bytes,
+            presentation_mode=normalized_presentation_mode,
         )
         timing["total_wall"] = time.perf_counter() - publish_start
         self._last_published_frame_id = frame_id
@@ -2662,104 +2797,125 @@ class OpenXRImmersiveBridge(OpenXRFramePanelMirror):
         frame_id: int,
         submit_wall_s: Optional[float] = None,
         expected_publish_sample_bytes: Optional[bytes] = None,
+        presentation_mode: Optional[int] = None,
     ) -> float:
         if submit_wall_s is None:
             submit_wall_s = time.perf_counter()
+        stage_index: Optional[int] = None
         if self.FRESHNESS_FIRST_COMMIT:
             with self._stage_condition:
-                self._raise_if_stage_commit_failed_locked()
-                reclaimed_count = self._reclaim_completed_retired_stage_copies_locked()
-                if reclaimed_count > 0:
-                    self._finalize_freshness_scheduler_mutation_locked(
-                        "reclaim_retired",
-                        reclaimed_count=reclaimed_count,
-                    )
-                if not self._free_stage_indices:
-                    raise RuntimeError(
-                        "Freshness-first immersive bridge ran out of staging buffers.\n"
-                        f"{self._scheduler_snapshot_locked()}\nrecent transitions:\n"
-                        + "\n".join(self._bridge_transition_trace)
-                    )
-                stage_index = self._free_stage_indices.popleft()
+                stage_index = self._reserve_freshness_stage_copy_locked(
+                    frame_id=frame_id,
+                    slot=slot,
+                )
         else:
             stage_index = self._next_stage_index
-        left_copy_tensor = (
-            left_frame_tensor
-            if left_frame_tensor.is_contiguous()
-            else left_frame_tensor.contiguous()
-        )
-        right_copy_tensor = (
-            right_frame_tensor
-            if right_frame_tensor.is_contiguous()
-            else right_frame_tensor.contiguous()
-        )
-        stage_buffer = self._cpu_stage_buffers[stage_index]
-        stage_array = self._cpu_stage_arrays[stage_index]
-        producer_ready_event = torch.cuda.Event()
-        enqueue_start = time.perf_counter()
-        producer_ready_event.record(torch.cuda.current_stream())
-        copy_start_event = None
-        copy_end_event = None
-        if not self._direct_commit_enabled:
-            copy_start_event = torch.cuda.Event(enable_timing=True)
-            copy_end_event = torch.cuda.Event(enable_timing=True)
-            with torch.cuda.stream(self._staging_copy_stream):
-                self._staging_copy_stream.wait_event(producer_ready_event)
-                copy_start_event.record(self._staging_copy_stream)
-                stage_buffer[0].copy_(left_copy_tensor, non_blocking=True)
-                stage_buffer[1].copy_(right_copy_tensor, non_blocking=True)
-                copy_end_event.record(self._staging_copy_stream)
-        with self._stage_condition:
-            pending = {
-                "slot": slot,
-                "frame_id": frame_id,
-                "stage_index": stage_index,
-                "submit_wall_s": submit_wall_s,
-                "expected_publish_sample_bytes": expected_publish_sample_bytes,
-            }
-            if self._direct_commit_enabled:
-                pending.update(
-                    {
-                        "producer_ready_event": producer_ready_event,
-                        "frame_tensors": (left_copy_tensor, right_copy_tensor),
-                        "direct_commit": True,
-                    }
-                )
-            else:
-                pending.update(
-                    {
-                        "start_event": copy_start_event,
-                        "end_event": copy_end_event,
-                        "stage_array": stage_array,
-                        "direct_commit": False,
-                    }
-                )
-            if self.FRESHNESS_FIRST_COMMIT:
-                if self._active_stage_copy is None:
-                    self._mark_stage_copy_active_locked(pending)
-                    self._active_stage_copy = pending
-                    self._finalize_freshness_scheduler_mutation_locked(
-                        "enqueue_active",
-                        frame_id=frame_id,
-                        stage_index=stage_index,
+        try:
+            left_copy_tensor = (
+                left_frame_tensor
+                if left_frame_tensor.is_contiguous()
+                else left_frame_tensor.contiguous()
+            )
+            right_copy_tensor = (
+                right_frame_tensor
+                if right_frame_tensor.is_contiguous()
+                else right_frame_tensor.contiguous()
+            )
+            stage_buffer = self._cpu_stage_buffers[stage_index]
+            stage_array = self._cpu_stage_arrays[stage_index]
+            producer_ready_event = torch.cuda.Event()
+            enqueue_start = time.perf_counter()
+            producer_ready_event.record(torch.cuda.current_stream())
+            copy_start_event = None
+            copy_end_event = None
+            if not self._direct_commit_enabled:
+                copy_start_event = torch.cuda.Event(enable_timing=True)
+                copy_end_event = torch.cuda.Event(enable_timing=True)
+                with torch.cuda.stream(self._staging_copy_stream):
+                    self._staging_copy_stream.wait_event(producer_ready_event)
+                    copy_start_event.record(self._staging_copy_stream)
+                    stage_buffer[0].copy_(left_copy_tensor, non_blocking=True)
+                    stage_buffer[1].copy_(right_copy_tensor, non_blocking=True)
+                    copy_end_event.record(self._staging_copy_stream)
+            with self._stage_condition:
+                pending = {
+                    "slot": slot,
+                    "frame_id": frame_id,
+                    "stage_index": stage_index,
+                    "submit_wall_s": submit_wall_s,
+                    "expected_publish_sample_bytes": expected_publish_sample_bytes,
+                    "presentation_mode": self._normalize_presentation_mode(
+                        presentation_mode
+                    ),
+                }
+                if self._direct_commit_enabled:
+                    pending.update(
+                        {
+                            "producer_ready_event": producer_ready_event,
+                            "frame_tensors": (left_copy_tensor, right_copy_tensor),
+                            "direct_commit": True,
+                        }
                     )
                 else:
-                    if self._pending_stage_copy is not None:
-                        self._retire_pending_stage_copy_locked(
-                            incoming_frame_id=frame_id,
-                            reason="enqueue_replace",
-                        )
-                    self._pending_stage_copy = pending
-                    self._finalize_freshness_scheduler_mutation_locked(
-                        "enqueue_pending",
-                        frame_id=frame_id,
-                        stage_index=stage_index,
+                    pending.update(
+                        {
+                            "start_event": copy_start_event,
+                            "end_event": copy_end_event,
+                            "stage_array": stage_array,
+                            "direct_commit": False,
+                        }
                     )
-            else:
-                self._pending_stage_copies.append(pending)
-                self._next_stage_index = (stage_index + 1) % self.STAGING_BUFFER_COUNT
-            self._stage_condition.notify_all()
-        return time.perf_counter() - enqueue_start
+                if self.FRESHNESS_FIRST_COMMIT:
+                    if self._active_stage_copy is None:
+                        reserved = self._reserved_stage_copies.pop(stage_index, None)
+                        if reserved is None:
+                            raise RuntimeError(
+                                "freshness bridge invariant failed: reserved stage missing "
+                                f"during enqueue_active (stage_index={stage_index})\n"
+                                f"{self._scheduler_snapshot_locked()}\nrecent transitions:\n"
+                                + "\n".join(self._bridge_transition_trace)
+                            )
+                        self._mark_stage_copy_active_locked(pending)
+                        self._active_stage_copy = pending
+                        self._finalize_freshness_scheduler_mutation_locked(
+                            "enqueue_active",
+                            frame_id=frame_id,
+                            stage_index=stage_index,
+                        )
+                    else:
+                        if self._pending_stage_copy is not None:
+                            self._retire_pending_stage_copy_locked(
+                                incoming_frame_id=frame_id,
+                                reason="enqueue_replace",
+                            )
+                        reserved = self._reserved_stage_copies.pop(stage_index, None)
+                        if reserved is None:
+                            raise RuntimeError(
+                                "freshness bridge invariant failed: reserved stage missing "
+                                f"during enqueue_pending (stage_index={stage_index})\n"
+                                f"{self._scheduler_snapshot_locked()}\nrecent transitions:\n"
+                                + "\n".join(self._bridge_transition_trace)
+                            )
+                        self._pending_stage_copy = pending
+                        self._finalize_freshness_scheduler_mutation_locked(
+                            "enqueue_pending",
+                            frame_id=frame_id,
+                            stage_index=stage_index,
+                        )
+                else:
+                    self._pending_stage_copies.append(pending)
+                    self._next_stage_index = (stage_index + 1) % self.STAGING_BUFFER_COUNT
+                self._stage_condition.notify_all()
+            return time.perf_counter() - enqueue_start
+        except BaseException:
+            if self.FRESHNESS_FIRST_COMMIT and stage_index is not None:
+                with self._stage_condition:
+                    self._abort_reserved_stage_copy_locked(
+                        stage_index=stage_index,
+                        frame_id=frame_id,
+                        reason="enqueue_prepare_exception",
+                    )
+            raise
 
     def wait_for_sample(self, timeout: float = 10.0) -> LiveImmersiveSample:
         deadline = time.monotonic() + timeout

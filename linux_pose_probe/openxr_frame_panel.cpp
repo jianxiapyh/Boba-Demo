@@ -33,7 +33,7 @@ namespace {
 
 constexpr int kPanelWindowWidth = 64;
 constexpr int kPanelWindowHeight = 64;
-constexpr uint32_t kExpectedHeaderVersion = 1;
+constexpr uint32_t kExpectedHeaderVersion = 2;
 #ifdef BOBA_IMMERSIVE_BRIDGE
 constexpr const char* kExpectedSharedFrameMagic = "BOBAQIM1";
 constexpr const char* kBinaryUsageName = "boba_immersive_bridge";
@@ -50,6 +50,8 @@ constexpr float kNearZ = 0.02f;
 constexpr float kFarZ = 100.0f;
 constexpr float kSelectPressedThreshold = 0.75f;
 constexpr float kExitPressedThreshold = 0.85f;
+constexpr uint32_t kPresentationModeStereoFullscreen = 0u;
+constexpr uint32_t kPresentationModeMonoPanel = 1u;
 volatile std::sig_atomic_t g_stop_requested = 0;
 
 struct SharedFrameHeader {
@@ -62,7 +64,9 @@ struct SharedFrameHeader {
     uint32_t slot_count;
     uint64_t latest_frame_id;
     uint64_t latest_slot;
-    uint8_t padding[16];
+    uint32_t presentation_mode;
+    uint32_t reserved0;
+    uint8_t padding[8];
 };
 
 static_assert(sizeof(SharedFrameHeader) == 64, "SharedFrameHeader size mismatch");
@@ -140,6 +144,19 @@ bool HasExtension(const std::vector<XrExtensionProperties>& extensions, const ch
     }
     return false;
 }
+
+#ifdef BOBA_IMMERSIVE_BRIDGE
+const char* PresentationModeLabel(uint32_t presentation_mode) {
+    switch (presentation_mode) {
+        case kPresentationModeStereoFullscreen:
+            return "stereo_fullscreen";
+        case kPresentationModeMonoPanel:
+            return "mono_panel";
+        default:
+            return "unknown";
+    }
+}
+#endif
 
 void HandleSignal(int) {
     g_stop_requested = 1;
@@ -686,6 +703,7 @@ bool UpdateDisplayFrameIfNeeded(const SharedFrameFile& file, uint64_t* latest_fr
 #ifdef BOBA_IMMERSIVE_BRIDGE
 bool UpdateStereoFramesIfNeeded(const SharedFrameFile& file, uint64_t* latest_frame_id,
                                 uint64_t* frame_id_delta,
+                                uint32_t* presentation_mode,
                                 std::vector<uint8_t>* left_eye_rgba,
                                 std::vector<uint8_t>* right_eye_rgba) {
     const SharedFrameHeader header = *file.header;
@@ -711,6 +729,17 @@ bool UpdateStereoFramesIfNeeded(const SharedFrameFile& file, uint64_t* latest_fr
     left_eye_rgba->assign(source, source + eye_frame_bytes);
     right_eye_rgba->assign(source + eye_frame_bytes, source + header.frame_bytes);
     *latest_frame_id = header.latest_frame_id;
+    if (presentation_mode != nullptr) {
+        const uint32_t header_presentation_mode = header.presentation_mode;
+        if (header_presentation_mode == kPresentationModeMonoPanel ||
+            header_presentation_mode == kPresentationModeStereoFullscreen) {
+            *presentation_mode = header_presentation_mode;
+        } else {
+            std::cerr << "Invalid immersive presentation_mode in shared frame header: "
+                      << header_presentation_mode << ", defaulting to stereo_fullscreen\n";
+            *presentation_mode = kPresentationModeStereoFullscreen;
+        }
+    }
     if (frame_id_delta != nullptr) {
         *frame_id_delta =
             (header.latest_frame_id > previous_frame_id)
@@ -1602,17 +1631,20 @@ int main(int argc, char** argv) {
     auto last_source_update_log_time = std::chrono::steady_clock::time_point{};
     auto first_render_frame_time = std::chrono::steady_clock::time_point{};
     auto last_render_log_time = std::chrono::steady_clock::time_point{};
-#ifdef BOBA_IMMERSIVE_BRIDGE
-    std::vector<uint8_t> display_rgba_left(eye_frame_bytes, 0);
-    std::vector<uint8_t> display_rgba_right(eye_frame_bytes, 0);
-#else
-    std::vector<uint8_t> display_rgba(shared_frame.header->frame_bytes, 0);
     const float panel_height_meters =
         kPanelWidthMeters *
         (static_cast<float>(shared_frame.header->height) /
          static_cast<float>(shared_frame.header->width));
     Mat4 panel_model = IdentityMatrix();
     bool panel_anchor_initialized = false;
+#ifdef BOBA_IMMERSIVE_BRIDGE
+    std::vector<uint8_t> display_rgba_left(eye_frame_bytes, 0);
+    std::vector<uint8_t> display_rgba_right(eye_frame_bytes, 0);
+    uint32_t current_presentation_mode = kPresentationModeStereoFullscreen;
+    uint32_t logged_presentation_mode = current_presentation_mode;
+    uint32_t previous_presentation_mode = current_presentation_mode;
+#else
+    std::vector<uint8_t> display_rgba(shared_frame.header->frame_bytes, 0);
 #endif
     XrActiveActionSet active_action_set{action_set, XR_NULL_PATH};
     XrActionsSyncInfo sync_info = MakeXrStruct<XrActionsSyncInfo>(XR_TYPE_ACTIONS_SYNC_INFO);
@@ -1810,7 +1842,9 @@ int main(int argc, char** argv) {
             }
 #ifdef BOBA_IMMERSIVE_BRIDGE
             uint64_t source_frame_delta = 0;
+            previous_presentation_mode = current_presentation_mode;
             if (UpdateStereoFramesIfNeeded(shared_frame, &latest_frame_id, &source_frame_delta,
+                                           &current_presentation_mode,
                                            &display_rgba_left, &display_rgba_right)) {
                 ++applied_source_update_count;
                 source_frame_delta_count += source_frame_delta;
@@ -1822,6 +1856,15 @@ int main(int argc, char** argv) {
                     last_source_update_log_time = now;
                     logged_applied_source_update_count = 0;
                     logged_source_frame_delta_count = 0;
+                }
+                if (current_presentation_mode != logged_presentation_mode) {
+                    std::cerr << "Immersive bridge presentation mode: "
+                              << PresentationModeLabel(current_presentation_mode) << "\n";
+                    logged_presentation_mode = current_presentation_mode;
+                }
+                if (current_presentation_mode == kPresentationModeMonoPanel &&
+                    previous_presentation_mode != kPresentationModeMonoPanel) {
+                    panel_anchor_initialized = false;
                 }
                 if (latest_frame_id == 1 || latest_frame_id >= logged_source_frame_id + 120) {
                     std::cerr << "Immersive bridge received source frame " << latest_frame_id
@@ -1889,8 +1932,13 @@ int main(int argc, char** argv) {
             glBindTexture(GL_TEXTURE_2D, 0);
 #endif
 
-#ifndef BOBA_IMMERSIVE_BRIDGE
-            if (!panel_anchor_initialized && view_count_output > 0) {
+            const bool render_as_world_locked_panel =
+#ifdef BOBA_IMMERSIVE_BRIDGE
+                current_presentation_mode == kPresentationModeMonoPanel;
+#else
+                true;
+#endif
+            if (render_as_world_locked_panel && !panel_anchor_initialized && view_count_output > 0) {
                 const Mat4 initial_head_pose = PoseMatrix(views[0].pose);
                 panel_model = Multiply(
                     initial_head_pose,
@@ -1903,7 +1951,6 @@ int main(int argc, char** argv) {
                           << " width=" << kPanelWidthMeters
                           << " height=" << panel_height_meters << "\n";
             }
-#endif
 
             projection_layer.space = local_space;
             projection_layer.viewCount = view_count_output;
@@ -1947,16 +1994,17 @@ int main(int argc, char** argv) {
                     std::cerr << "Framebuffer incomplete for view " << view_index << "\n";
                     exit_requested = true;
                 } else {
-#ifdef BOBA_IMMERSIVE_BRIDGE
-                    const Mat4 mvp_matrix = ScaleMatrix(2.0f, 2.0f, 1.0f);
-#else
-                    const Mat4 view_matrix =
-                        InverseRigidTransform(PoseMatrix(views[view_index].pose));
-                    const Mat4 projection_matrix =
-                        ProjectionMatrix(views[view_index].fov, kNearZ, kFarZ);
-                    const Mat4 mvp_matrix =
-                        Multiply(projection_matrix, Multiply(view_matrix, panel_model));
-#endif
+                    Mat4 mvp_matrix = IdentityMatrix();
+                    if (render_as_world_locked_panel) {
+                        const Mat4 view_matrix =
+                            InverseRigidTransform(PoseMatrix(views[view_index].pose));
+                        const Mat4 projection_matrix =
+                            ProjectionMatrix(views[view_index].fov, kNearZ, kFarZ);
+                        mvp_matrix =
+                            Multiply(projection_matrix, Multiply(view_matrix, panel_model));
+                    } else {
+                        mvp_matrix = ScaleMatrix(2.0f, 2.0f, 1.0f);
+                    }
                     glViewport(0, 0, static_cast<GLsizei>(swapchain_view.width),
                                static_cast<GLsizei>(swapchain_view.height));
                     glDisable(GL_DEPTH_TEST);
@@ -1968,10 +2016,12 @@ int main(int argc, char** argv) {
                     glActiveTexture(GL_TEXTURE0);
                     glBindTexture(
                         GL_TEXTURE_2D,
+                        render_as_world_locked_panel
+                            ? source_textures[0]
 #ifdef BOBA_IMMERSIVE_BRIDGE
-                        source_textures[std::min<uint32_t>(view_index, 1u)]
+                            : source_textures[std::min<uint32_t>(view_index, 1u)]
 #else
-                        source_textures[0]
+                            : source_textures[0]
 #endif
                     );
                     glUniform1i(source_location, 0);

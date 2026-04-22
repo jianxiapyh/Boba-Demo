@@ -21,6 +21,10 @@ COMPAT_DEMO_CASE_ALIASES = {
     "hq_rope_0": "hq_rope",
 }
 SUPPORTED_DEMO_CASE_ARGUMENTS = PUBLIC_DEMO_CASES + tuple(COMPAT_DEMO_CASE_ALIASES.keys())
+SHARED_TUTORIAL_SLIDES = (
+    "controls_overview.png",
+    "interaction_tips.png",
+)
 DEMO_CASE_WORLD_SCALE = {
     "hq_rope": 0.3932700391790796,
 }
@@ -55,6 +59,28 @@ def manifest_file_path(manifest_dir: Path, manifest: dict, key: str) -> str:
     if relative_path is None:
         raise KeyError(f"Manifest is missing required key: {key}")
     return str((manifest_dir / relative_path).resolve())
+
+
+def resolve_demo_case_tutorial_slides(manifest_dir: Path, manifest: dict, case_name: str) -> list[str]:
+    tutorial_dir = REPO_ROOT / "assets" / "tutorial"
+    slide_paths = [tutorial_dir / slide_name for slide_name in SHARED_TUTORIAL_SLIDES]
+    extra_slides = manifest.get("tutorial_extra_slides", [])
+    if extra_slides is None:
+        extra_slides = []
+    if not isinstance(extra_slides, list):
+        raise TypeError(
+            f"Manifest key 'tutorial_extra_slides' for case '{case_name}' must be a list."
+        )
+    for relative_path in extra_slides:
+        slide_paths.append((manifest_dir / str(relative_path)).resolve())
+
+    missing_paths = [str(path) for path in slide_paths if not Path(path).exists()]
+    if missing_paths:
+        raise FileNotFoundError(
+            "Immersive tutorial slide assets are missing for "
+            f"case '{case_name}': " + ", ".join(missing_paths)
+        )
+    return [str(Path(path).resolve()) for path in slide_paths]
 
 
 def demo_case_world_scale(case_name: str) -> float:
@@ -452,6 +478,11 @@ def main(argv: list[str] | None = None):
         None
         if case_manifest.get("game_course") is None
         else manifest_file_path(manifest_dir, case_manifest, "game_course")
+    )
+    cfg.demo_tutorial_slide_paths = resolve_demo_case_tutorial_slides(
+        manifest_dir,
+        case_manifest,
+        canonical_case_name,
     )
 
     base_dir = f"./temp_experiments/{canonical_case_name}"

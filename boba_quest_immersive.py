@@ -519,6 +519,7 @@ def main(argv: list[str] | None = None):
     gaussians_path = manifest_file_path(manifest_dir, case_manifest, "gaussian_ply")
 
     logger.set_log_file(path=base_dir, name="inference_log")
+    cfg.live_openxr_verbose_console_diagnostics = bool(args.profile)
 
     trainer = InvPhyTrainerWarp(
         data_path=manifest_file_path(manifest_dir, case_manifest, "final_data"),

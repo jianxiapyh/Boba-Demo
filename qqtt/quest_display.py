@@ -2002,7 +2002,30 @@ class OpenXRFramePanelMirror:
             self._stderr_tail.append(line)
             self._maybe_parse_viewer_source_stats_line(line)
             self._maybe_parse_viewer_render_stats_line(line)
-            print(f"[quest_display_viewer:stderr] {line.rstrip()}", flush=True)
+            if self._should_echo_viewer_stderr_line(line):
+                print(f"[quest_display_viewer:stderr] {line.rstrip()}", flush=True)
+
+    @staticmethod
+    def _is_routine_viewer_stderr_line(line: str) -> bool:
+        stripped = str(line).strip()
+        return stripped.startswith(
+            (
+                "Immersive bridge received source frame",
+                "Immersive bridge viewer_source_stats",
+                "Immersive bridge viewer_render_stats",
+                "Immersive bridge presentation mode:",
+                "Panel received source frame",
+                "Presentation path:",
+                "OpenGL version:",
+                "Session state ->",
+                "Opened shared frame file",
+            )
+        )
+
+    def _should_echo_viewer_stderr_line(self, line: str) -> bool:
+        if self._bridge_transition_trace_enabled:
+            return True
+        return not self._is_routine_viewer_stderr_line(line)
 
     @staticmethod
     def _parse_stats_payload(line: str, stats_prefix: str) -> Optional[dict[str, str]]:

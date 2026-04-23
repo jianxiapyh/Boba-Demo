@@ -6443,15 +6443,17 @@ class InvPhyTrainerWarp:
         else:
             raise ValueError(f"Data type {cfg.data_type} not supported")
 
+        self._immersive_verbose_console_diagnostics_enabled = bool(
+            getattr(cfg, "live_openxr_verbose_console_diagnostics", False)
+        )
         self.controller_points_group = (
             self.dataset.controller_points.unsqueeze(0).contiguous()
         )
-        print(
+        self._log_live_openxr_controller_info(
             "[live_openxr_controller] controller trace source=final_data_single_trace "
             f"trajectories={int(self.controller_points_group.shape[0])} "
             f"frames={int(self.controller_points_group.shape[1])} "
             f"points_per_frame={int(self.controller_points_group.shape[2])}",
-            flush=True,
         )
         self._immersive_controller_translation_scale_multiplier = 1.0
         self.check_controller_group_same_start(
@@ -6479,6 +6481,17 @@ class InvPhyTrainerWarp:
 
         #pyh move gaussian to a class variable
         self.gaussians =  None
+
+    def _set_immersive_verbose_console_diagnostics_enabled(self, enabled):
+        self._immersive_verbose_console_diagnostics_enabled = bool(enabled)
+
+    def _should_log_immersive_verbose_console_diagnostics(self):
+        return bool(getattr(self, "_immersive_verbose_console_diagnostics_enabled", False))
+
+    def _log_live_openxr_controller_info(self, message):
+        if not self._should_log_immersive_verbose_console_diagnostics():
+            return
+        print(message, flush=True)
 
     def check_controller_group_same_start(self, controller_points_group: torch.Tensor,
                                         atol: float = 1e-6,
@@ -7704,12 +7717,11 @@ class InvPhyTrainerWarp:
         latched_anchor_name = state.get("selected_anchor_name")
         if reset_edge:
             if cycle_locked:
-                print(
+                self._log_live_openxr_controller_info(
                     "[live_openxr_controller] "
                     f"{source} anchor_cycle_reset unlocked=1 "
                     f"anchor={latched_anchor_name} "
                     f"active_interaction={int(bool(interaction_state is not None))}",
-                    flush=True,
                 )
             state["cycle_locked"] = False
             state["selected_rank_index"] = 0
@@ -7783,11 +7795,10 @@ class InvPhyTrainerWarp:
 
         if cycle_edge:
             if candidate_count < 2:
-                print(
+                self._log_live_openxr_controller_info(
                     "[live_openxr_controller] "
                     f"{source} anchor_cycle_target unavailable reason=no_alternate_target "
                     f"candidates={candidate_count}",
-                    flush=True,
                 )
             elif not cycle_locked:
                 cycle_locked = True
@@ -7839,11 +7850,10 @@ class InvPhyTrainerWarp:
         state["visible"] = True
 
         if cycle_edge and candidate_count >= 2:
-            print(
+            self._log_live_openxr_controller_info(
                 "[live_openxr_controller] "
                 f"{source} anchor_cycle_target selected={selected_anchor['name']} "
                 f"rank={selected_rank_index + 1}/{candidate_count}",
-                flush=True,
             )
         return selected_anchor
 
@@ -8178,12 +8188,11 @@ class InvPhyTrainerWarp:
         left_meta = controller_attachment_metadata.get("left")
         right_meta = controller_attachment_metadata.get("right")
         if left_meta is None or right_meta is None:
-            print(
+            self._log_live_openxr_controller_info(
                 log_prefix
                 + "skipped=1 reason=missing_source_metadata "
                 f"sources={sorted(controller_attachment_metadata.keys())} "
                 f"default_anchor_names={default_anchor_names}",
-                flush=True,
             )
             return controller_attachment_metadata
 
@@ -8433,7 +8442,7 @@ class InvPhyTrainerWarp:
         ]
 
         if rope_family_case:
-            print(
+            self._log_live_openxr_controller_info(
                 "[live_openxr_controller] rope startup rest placement: "
                 f"resolved_default_anchor_names={resolved_default_anchor_names} "
                 f"left_anchor={startup_rest_debug['left']['selected_anchor_name']} "
@@ -8442,7 +8451,6 @@ class InvPhyTrainerWarp:
                 f"right_anchor={startup_rest_debug['right']['selected_anchor_name']} "
                 f"right_mode={startup_rest_debug['right']['startup_mode']} "
                 f"right_center={startup_rest_debug['right']['startup_center']}",
-                flush=True,
             )
 
         for source in ("left", "right"):
@@ -12017,10 +12025,223 @@ class InvPhyTrainerWarp:
             lines.append(f"{label:<{label_width}}  {avg_time:>{time_width}}  {share:>{share_width}}")
         return lines
 
+    def _resolve_immersive_timing_summary_context(
+        self,
+        *,
+        requested_timewarp_mode,
+        requested_static_scene_overlap_mode,
+        requested_framegen_mode,
+        requested_gaussian_render_mode,
+        requested_present_pipeline_enabled,
+        effective_static_scene_overlap_enabled,
+        effective_scene_depth_reproject_enabled,
+        effective_framegen_mode,
+        effective_gaussian_render_mode,
+        presentation_backend_enabled,
+        presentation_backend_kind,
+        balanced_eye_parallel_enabled,
+    ):
+        requested_flags = {
+            "immersive_timewarp": str(requested_timewarp_mode).strip().lower(),
+            "immersive_static_scene_overlap": str(
+                requested_static_scene_overlap_mode
+            ).strip().lower(),
+            "immersive_framegen": str(requested_framegen_mode).strip().lower(),
+            "immersive_gaussian_render": str(
+                requested_gaussian_render_mode
+            ).strip().lower(),
+            "immersive_present_pipeline": (
+                "on" if bool(requested_present_pipeline_enabled) else "off"
+            ),
+        }
+        effective_framegen_mode = str(effective_framegen_mode).strip().lower()
+        effective_gaussian_render_mode = str(effective_gaussian_render_mode).strip().lower()
+        top_level_overlap_active = bool(effective_static_scene_overlap_enabled)
+        scene_timewarp_active = bool(effective_scene_depth_reproject_enabled)
+        framegen_active = effective_framegen_mode in {"static", "adaptive"}
+        presentation_backend_label = (
+            str(presentation_backend_kind).strip().lower()
+            if presentation_backend_enabled and presentation_backend_kind is not None
+            else "direct_main_thread"
+        )
+
+        if top_level_overlap_active and (framegen_active or scene_timewarp_active):
+            summary_shape = "overlap_timewarp_framegen"
+            flow_line = (
+                "Flow: Branch A (Static scene render) || "
+                "Branch B (Sim+LBS+Gaussian render) -> "
+                "Timewarp/framegen -> Presentation worker"
+            )
+        elif top_level_overlap_active and presentation_backend_enabled:
+            summary_shape = "overlap_presentation_worker"
+            flow_line = (
+                "Flow: Branch A (Static scene render) || "
+                "Branch B (Sim+LBS+Gaussian render) -> "
+                "Presentation submit -> Presentation worker"
+            )
+        elif top_level_overlap_active:
+            summary_shape = "overlap_direct"
+            flow_line = (
+                "Flow: Branch A (Static scene render) || "
+                "Branch B (Sim+LBS+Gaussian render) -> "
+                "Compositing -> Overlay+publish"
+            )
+        elif framegen_active or scene_timewarp_active:
+            summary_shape = "direct_timewarp_framegen"
+            flow_line = (
+                "Flow: Sim+LBS -> Static scene render -> Gaussian render -> "
+                "Timewarp/framegen -> Presentation worker"
+            )
+        elif presentation_backend_enabled:
+            summary_shape = "direct_presentation_worker"
+            flow_line = (
+                "Flow: Sim+LBS -> Static scene render -> Gaussian render -> "
+                "Presentation submit -> Presentation worker"
+            )
+        else:
+            summary_shape = "direct"
+            flow_line = (
+                "Flow: Sim+LBS -> Static scene render -> Gaussian render -> "
+                "Compositing -> Overlay+publish"
+            )
+
+        return {
+            "requested_flags": requested_flags,
+            "summary_shape": summary_shape,
+            "flow_line": flow_line,
+            "top_level_overlap_active": top_level_overlap_active,
+            "scene_timewarp_active": scene_timewarp_active,
+            "framegen_active": framegen_active,
+            "effective_framegen_mode": effective_framegen_mode,
+            "effective_gaussian_render_mode": effective_gaussian_render_mode,
+            "presentation_backend_enabled": bool(presentation_backend_enabled),
+            "presentation_backend_label": presentation_backend_label,
+            "internal_static_scene_eye_parallelism": bool(
+                balanced_eye_parallel_enabled
+            ),
+        }
+
+    def _format_immersive_timing_configuration_lines(self, summary_context):
+        requested_flags = dict(summary_context.get("requested_flags") or {})
+        framegen_mode = (
+            summary_context.get("effective_framegen_mode", "off")
+            if summary_context.get("framegen_active", False)
+            else "off"
+        )
+        lines = ["Timing Configuration:"]
+        lines.append(
+            "Requested flags: "
+            f"timewarp={requested_flags.get('immersive_timewarp', 'off')} "
+            f"static_scene_overlap={requested_flags.get('immersive_static_scene_overlap', 'off')} "
+            f"framegen={requested_flags.get('immersive_framegen', 'off')} "
+            f"gaussian_render={requested_flags.get('immersive_gaussian_render', 'serial')} "
+            f"present_pipeline={requested_flags.get('immersive_present_pipeline', 'off')}"
+        )
+        lines.append(
+            "Derived execution: "
+            f"shape={summary_context.get('summary_shape', 'direct')} "
+            f"top_level_overlap={'on' if summary_context.get('top_level_overlap_active', False) else 'off'} "
+            f"gaussian={summary_context.get('effective_gaussian_render_mode', 'serial')} "
+            f"presentation_backend={summary_context.get('presentation_backend_label', 'direct_main_thread')} "
+            f"timewarp={'on' if summary_context.get('scene_timewarp_active', False) else 'off'} "
+            f"framegen={framegen_mode} "
+            f"internal_static_scene_eye_parallelism="
+            f"{'on' if summary_context.get('internal_static_scene_eye_parallelism', False) else 'off'}"
+        )
+        return lines
+
+    def _immersive_timing_stage_specs(self, summary_context):
+        stage_specs = []
+        if summary_context.get("top_level_overlap_active", False):
+            stage_specs.extend(
+                [
+                    (
+                        "static_scene_branch_full_ms",
+                        "Parallel branch A: Static scene render (full branch time)",
+                    ),
+                    (
+                        "branch_b_ready_ms",
+                        "Parallel branch B: Spring-mass simulation + LBS + Gaussian render",
+                    ),
+                    (
+                        "compose_join_full_ms",
+                        "Join at compose: earliest start after both branches finish",
+                    ),
+                ]
+            )
+        else:
+            stage_specs.extend(
+                [
+                    ("simulation_lbs_wall_ms", "Spring-mass simulation + LBS"),
+                    ("static_scene_render_ms", "Static scene render"),
+                    ("gaussian_render_wall_ms", "Gaussian render"),
+                ]
+            )
+        stage_specs.extend(
+            [
+                ("compositing_ms", "Compositing"),
+                ("overlay_publish_ms", "Overlay + publish"),
+            ]
+        )
+        if summary_context.get("presentation_backend_enabled", False):
+            stage_specs.extend(
+                [
+                    ("scene_present_submit_ms", "Presentation submit"),
+                    ("scene_present_queue_wait_ms", "Presentation queue wait"),
+                    ("scene_present_worker_ms", "Presentation worker"),
+                    ("scene_present_parallel_wait_ms", "Presentation parallel wait"),
+                    ("scene_present_preview_ms", "Preview upload"),
+                    ("scene_present_source_age_ms", "Presentation source age"),
+                ]
+            )
+        return stage_specs
+
+    def _render_profile_metric_display_label(self, key, summary_context=None):
+        if (
+            summary_context is not None
+            and key == "branch_b_ready_ms"
+            and not summary_context.get("top_level_overlap_active", False)
+        ):
+            return "Simulation + LBS + Gaussian render (combined)"
+        return key
+
+    def _render_profile_time_key_hidden(self, key, summary_context=None):
+        if summary_context is None:
+            return False
+        if key == "rendering":
+            return True
+        if not summary_context.get("top_level_overlap_active", False) and key in {
+            "static_scene_branch_full_ms",
+            "compose_join_full_ms",
+            "pre_compose_ready_ms",
+            "overlap_wait_wall_ms",
+            "static_scene_worker_wall_ms",
+        }:
+            return True
+        if (
+            not summary_context.get("presentation_backend_enabled", False)
+            and key.startswith("scene_present_")
+        ):
+            return True
+        if (
+            not summary_context.get("scene_timewarp_active", False)
+            and (
+                key == "scene_timewarp_gpu_ms"
+                or key.startswith("scene_reproject_")
+                or key.startswith("scene_warp_")
+            )
+        ):
+            return True
+        return False
+
     def _format_immersive_render_stage_breakdown_lines(
         self,
         average_frame_time,
         stage_rows,
+        *,
+        title="Render Stage Breakdown:",
+        stage_column_title="Render Stage",
+        flow_line=None,
     ):
         if not stage_rows:
             return []
@@ -12038,346 +12259,210 @@ class InvPhyTrainerWarp:
                     f"{time_share_percentage:.1f}%",
                 )
             )
-        label_width = max(len("Render Stage"), *(len(row[0]) for row in formatted_rows))
+        label_width = max(len(stage_column_title), *(len(row[0]) for row in formatted_rows))
         time_width = max(len("Avg Time"), *(len(row[1]) for row in formatted_rows))
         share_width = max(len("Share"), *(len(row[2]) for row in formatted_rows))
-        lines = [
-            "Render Stage Breakdown:",
-            f"{'Render Stage':<{label_width}}  {'Avg Time':>{time_width}}  {'Share':>{share_width}}",
-        ]
+        lines = [title]
+        if flow_line:
+            lines.append(flow_line)
+        lines.append(
+            f"{stage_column_title:<{label_width}}  {'Avg Time':>{time_width}}  {'Share':>{share_width}}"
+        )
         for label, avg_time, share in formatted_rows:
             lines.append(
                 f"{label:<{label_width}}  {avg_time:>{time_width}}  {share:>{share_width}}"
             )
         return lines
 
-    def _render_profile_time_hierarchy(self):
-        return [
+    def _render_profile_time_hierarchy(self, summary_context=None):
+        static_scene_children = [
+            ("static_scene_execute_wall_ms", "static_scene_execute_wall_ms", []),
+            ("static_scene_assemble_wall_ms", "static_scene_assemble_wall_ms", []),
+            ("render_eye_intrinsics_setup_wall", "render_eye_intrinsics_setup_wall", []),
+            ("scene_render_eye_left_total_ms", "scene_render_eye_left_total_ms", []),
+            ("scene_render_eye_right_total_ms", "scene_render_eye_right_total_ms", []),
+            ("scene_render_eye_left_dispatch_ms", "scene_render_eye_left_dispatch_ms", []),
+            ("scene_render_eye_right_dispatch_ms", "scene_render_eye_right_dispatch_ms", []),
             (
-                "rendering",
-                "Rendering stage",
+                "scene_render_eye_left_queue_wait_ms",
+                "scene_render_eye_left_queue_wait_ms",
+                [],
+            ),
+            (
+                "scene_render_eye_right_queue_wait_ms",
+                "scene_render_eye_right_queue_wait_ms",
+                [],
+            ),
+            ("scene_render_parallel_dispatch_ms", "scene_render_parallel_dispatch_ms", []),
+            ("scene_render_parallel_wait_ms", "scene_render_parallel_wait_ms", []),
+            (
+                "scene_render_parallel_join_overhead_ms",
+                "scene_render_parallel_join_overhead_ms (derived)",
+                [],
+            ),
+            ("scene_render_left_wall", "scene_render_left_wall", []),
+            ("scene_render_right_wall", "scene_render_right_wall", []),
+            ("scene_render_center_wall", "scene_render_center_wall", []),
+            (
+                "scene_render_background_center_wall",
+                "scene_render_background_center_wall",
+                [],
+            ),
+            ("scene_prepare_background_eye_wall", "scene_prepare_background_eye_wall", []),
+            ("scene_render_far_center_wall", "scene_render_far_center_wall", []),
+            ("scene_render_near_center_wall", "scene_render_near_center_wall", []),
+            ("scene_render_side_left_wall", "scene_render_side_left_wall", []),
+            ("scene_render_side_right_wall", "scene_render_side_right_wall", []),
+            (
+                "scene_render_table_base_left_wall",
+                "scene_render_table_base_left_wall",
+                [],
+            ),
+            (
+                "scene_render_table_base_right_wall",
+                "scene_render_table_base_right_wall",
+                [],
+            ),
+            ("scene_render_table_left_wall", "scene_render_table_left_wall", []),
+            ("scene_render_table_right_wall", "scene_render_table_right_wall", []),
+            ("scene_render_focus_left_wall", "scene_render_focus_left_wall", []),
+            ("scene_render_focus_right_wall", "scene_render_focus_right_wall", []),
+        ]
+        node_children_by_key = {
+            "static_scene_render_ms": static_scene_children,
+            "gaussian_render_wall_ms": [
+                ("gaussian_render_left_cuda", "gaussian_render_left_cuda", []),
+                ("gaussian_render_right_cuda", "gaussian_render_right_cuda", []),
+                (
+                    "gaussian_render_stereo_batched_cuda",
+                    "gaussian_render_stereo_batched_cuda",
+                    [],
+                ),
+            ],
+            "compositing_ms": [
+                ("compose_left_cuda", "compose_left_cuda", []),
+                ("compose_right_cuda", "compose_right_cuda", []),
+                (
+                    "scene_compose_table_base_left_cuda",
+                    "scene_compose_table_base_left_cuda",
+                    [],
+                ),
+                (
+                    "scene_compose_table_base_right_cuda",
+                    "scene_compose_table_base_right_cuda",
+                    [],
+                ),
+                ("scene_compose_table_left_cuda", "scene_compose_table_left_cuda", []),
+                ("scene_compose_table_right_cuda", "scene_compose_table_right_cuda", []),
+                ("scene_compose_focus_left_cuda", "scene_compose_focus_left_cuda", []),
+                ("scene_compose_focus_right_cuda", "scene_compose_focus_right_cuda", []),
+                ("scene_compose_side_left_cuda", "scene_compose_side_left_cuda", []),
+                ("scene_compose_side_right_cuda", "scene_compose_side_right_cuda", []),
+            ],
+            "overlay_publish_ms": [
+                ("overlay_projection_wall", "overlay_projection_wall", []),
+                ("overlay_draw_left_wall", "overlay_draw_left_wall", []),
+                ("overlay_draw_right_wall", "overlay_draw_right_wall", []),
+                ("publish_total_wall", "publish_total_wall", []),
+                ("publish_process_check_wall", "publish_process_check_wall", []),
+                (
+                    "publish_pending_drain_nonblock_wall",
+                    "publish_pending_drain_nonblock_wall",
+                    [],
+                ),
+                (
+                    "publish_pending_drain_block_wall",
+                    "publish_pending_drain_block_wall",
+                    [],
+                ),
+                ("publish_gpu_to_cpu_wait_wall", "publish_gpu_to_cpu_wait_wall", []),
+                ("publish_gpu_to_cpu_copy_cuda", "publish_gpu_to_cpu_copy_cuda", []),
+                ("publish_cpu_mmap_copy_wall", "publish_cpu_mmap_copy_wall", []),
+                ("publish_header_write_wall", "publish_header_write_wall", []),
+                ("publish_stage_enqueue_wall", "publish_stage_enqueue_wall", []),
+                ("publish_fallback_copy_wall", "publish_fallback_copy_wall", []),
+            ],
+            "scene_present_worker_ms": [
+                ("scene_present_submit_ms", "scene_present_submit_ms", []),
+                ("scene_present_queue_wait_ms", "scene_present_queue_wait_ms", []),
+                ("scene_present_compose_ms", "scene_present_compose_ms", []),
+                ("scene_present_compose_left_ms", "scene_present_compose_left_ms", []),
+                ("scene_present_compose_right_ms", "scene_present_compose_right_ms", []),
+                ("scene_present_overlay_ms", "scene_present_overlay_ms", []),
+                ("scene_present_overlay_left_ms", "scene_present_overlay_left_ms", []),
+                ("scene_present_overlay_right_ms", "scene_present_overlay_right_ms", []),
+                ("scene_present_parallel_wait_ms", "scene_present_parallel_wait_ms", []),
+                ("scene_present_publish_ms", "scene_present_publish_ms", []),
+                ("scene_present_preview_ms", "scene_present_preview_ms", []),
+                ("scene_present_source_age_ms", "scene_present_source_age_ms", []),
+            ],
+            "scene_timewarp_gpu_ms": [
+                ("scene_reproject_left_cuda", "scene_reproject_left_cuda", []),
+                ("scene_reproject_right_cuda", "scene_reproject_right_cuda", []),
+                (
+                    "scene_reproject_hole_fill_left_cuda",
+                    "scene_reproject_hole_fill_left_cuda",
+                    [],
+                ),
+                (
+                    "scene_reproject_hole_fill_right_cuda",
+                    "scene_reproject_hole_fill_right_cuda",
+                    [],
+                ),
+                (
+                    "scene_reproject_background_left_cuda",
+                    "scene_reproject_background_left_cuda",
+                    [],
+                ),
+                (
+                    "scene_reproject_background_right_cuda",
+                    "scene_reproject_background_right_cuda",
+                    [],
+                ),
+                (
+                    "scene_reproject_background_hole_fill_left_cuda",
+                    "scene_reproject_background_hole_fill_left_cuda",
+                    [],
+                ),
+                (
+                    "scene_reproject_background_hole_fill_right_cuda",
+                    "scene_reproject_background_hole_fill_right_cuda",
+                    [],
+                ),
+                ("scene_warp_far_left_cuda", "scene_warp_far_left_cuda", []),
+                ("scene_warp_far_right_cuda", "scene_warp_far_right_cuda", []),
+                ("scene_warp_near_left_cuda", "scene_warp_near_left_cuda", []),
+                ("scene_warp_near_right_cuda", "scene_warp_near_right_cuda", []),
+            ],
+        }
+        hierarchy = []
+        hidden_top_level_keys = {
+            "scene_present_submit_ms",
+            "scene_present_queue_wait_ms",
+            "scene_present_parallel_wait_ms",
+            "scene_present_preview_ms",
+            "scene_present_source_age_ms",
+        }
+        for key, label in self._immersive_timing_stage_specs(summary_context or {}):
+            if key in hidden_top_level_keys:
+                continue
+            hierarchy.append((key, label, list(node_children_by_key.get(key, []))))
+        if summary_context is None or summary_context.get("scene_timewarp_active", False):
+            hierarchy.append(
+                (
+                    "scene_timewarp_gpu_ms",
+                    "Scene timewarp GPU",
+                    list(node_children_by_key.get("scene_timewarp_gpu_ms", [])),
+                )
+            )
+        if summary_context is None or summary_context.get("top_level_overlap_active", False):
+            hierarchy.extend(
                 [
-                    (
-                        "static_scene_render_ms",
-                        "static_scene_render_ms",
-                        [
-                            (
-                                "static_scene_execute_wall_ms",
-                                "static_scene_execute_wall_ms",
-                                [],
-                            ),
-                            (
-                                "static_scene_assemble_wall_ms",
-                                "static_scene_assemble_wall_ms",
-                                [],
-                            ),
-                            (
-                                "render_eye_intrinsics_setup_wall",
-                                "render_eye_intrinsics_setup_wall",
-                                [],
-                            ),
-                            (
-                                "scene_render_eye_left_total_ms",
-                                "scene_render_eye_left_total_ms",
-                                [],
-                            ),
-                            (
-                                "scene_render_eye_right_total_ms",
-                                "scene_render_eye_right_total_ms",
-                                [],
-                            ),
-                            (
-                                "scene_render_eye_left_dispatch_ms",
-                                "scene_render_eye_left_dispatch_ms",
-                                [],
-                            ),
-                            (
-                                "scene_render_eye_right_dispatch_ms",
-                                "scene_render_eye_right_dispatch_ms",
-                                [],
-                            ),
-                            (
-                                "scene_render_eye_left_queue_wait_ms",
-                                "scene_render_eye_left_queue_wait_ms",
-                                [],
-                            ),
-                            (
-                                "scene_render_eye_right_queue_wait_ms",
-                                "scene_render_eye_right_queue_wait_ms",
-                                [],
-                            ),
-                            (
-                                "scene_render_parallel_dispatch_ms",
-                                "scene_render_parallel_dispatch_ms",
-                                [],
-                            ),
-                            (
-                                "scene_render_parallel_wait_ms",
-                                "scene_render_parallel_wait_ms",
-                                [],
-                            ),
-                            (
-                                "scene_render_parallel_join_overhead_ms",
-                                "scene_render_parallel_join_overhead_ms (derived)",
-                                [],
-                            ),
-                            ("scene_render_left_wall", "scene_render_left_wall", []),
-                            ("scene_render_right_wall", "scene_render_right_wall", []),
-                            ("scene_render_center_wall", "scene_render_center_wall", []),
-                            (
-                                "scene_render_background_center_wall",
-                                "scene_render_background_center_wall",
-                                [],
-                            ),
-                            (
-                                "scene_prepare_background_eye_wall",
-                                "scene_prepare_background_eye_wall",
-                                [],
-                            ),
-                            ("scene_render_far_center_wall", "scene_render_far_center_wall", []),
-                            ("scene_render_near_center_wall", "scene_render_near_center_wall", []),
-                            ("scene_render_side_left_wall", "scene_render_side_left_wall", []),
-                            ("scene_render_side_right_wall", "scene_render_side_right_wall", []),
-                            (
-                                "scene_render_table_base_left_wall",
-                                "scene_render_table_base_left_wall",
-                                [],
-                            ),
-                            (
-                                "scene_render_table_base_right_wall",
-                                "scene_render_table_base_right_wall",
-                                [],
-                            ),
-                            ("scene_render_table_left_wall", "scene_render_table_left_wall", []),
-                            ("scene_render_table_right_wall", "scene_render_table_right_wall", []),
-                            ("scene_render_focus_left_wall", "scene_render_focus_left_wall", []),
-                            ("scene_render_focus_right_wall", "scene_render_focus_right_wall", []),
-                        ],
-                    ),
-                    ("branch_b_ready_ms", "branch_b_ready_ms", []),
-                    ("pre_compose_ready_ms", "pre_compose_ready_ms", []),
-                    ("simulation_lbs_wall_ms", "simulation_lbs_wall_ms", []),
-                    (
-                        "gaussian_render_wall_ms",
-                        "gaussian_render_wall_ms",
-                        [
-                            ("gaussian_render_left_cuda", "gaussian_render_left_cuda", []),
-                            ("gaussian_render_right_cuda", "gaussian_render_right_cuda", []),
-                            (
-                                "gaussian_render_stereo_batched_cuda",
-                                "gaussian_render_stereo_batched_cuda",
-                                [],
-                            ),
-                        ],
-                    ),
-                    (
-                        "compositing_ms",
-                        "compositing_ms",
-                        [
-                            ("compose_left_cuda", "compose_left_cuda", []),
-                            ("compose_right_cuda", "compose_right_cuda", []),
-                            (
-                                "scene_compose_table_base_left_cuda",
-                                "scene_compose_table_base_left_cuda",
-                                [],
-                            ),
-                            (
-                                "scene_compose_table_base_right_cuda",
-                                "scene_compose_table_base_right_cuda",
-                                [],
-                            ),
-                            (
-                                "scene_compose_table_left_cuda",
-                                "scene_compose_table_left_cuda",
-                                [],
-                            ),
-                            (
-                                "scene_compose_table_right_cuda",
-                                "scene_compose_table_right_cuda",
-                                [],
-                            ),
-                            (
-                                "scene_compose_focus_left_cuda",
-                                "scene_compose_focus_left_cuda",
-                                [],
-                            ),
-                            (
-                                "scene_compose_focus_right_cuda",
-                                "scene_compose_focus_right_cuda",
-                                [],
-                            ),
-                            (
-                                "scene_compose_side_left_cuda",
-                                "scene_compose_side_left_cuda",
-                                [],
-                            ),
-                            (
-                                "scene_compose_side_right_cuda",
-                                "scene_compose_side_right_cuda",
-                                [],
-                            ),
-                        ],
-                    ),
-                    (
-                        "overlay_publish_ms",
-                        "overlay_publish_ms",
-                        [
-                            ("overlay_projection_wall", "overlay_projection_wall", []),
-                            ("overlay_draw_left_wall", "overlay_draw_left_wall", []),
-                            ("overlay_draw_right_wall", "overlay_draw_right_wall", []),
-                            ("publish_total_wall", "publish_total_wall", []),
-                            (
-                                "publish_process_check_wall",
-                                "publish_process_check_wall",
-                                [],
-                            ),
-                            (
-                                "publish_pending_drain_nonblock_wall",
-                                "publish_pending_drain_nonblock_wall",
-                                [],
-                            ),
-                            (
-                                "publish_pending_drain_block_wall",
-                                "publish_pending_drain_block_wall",
-                                [],
-                            ),
-                            (
-                                "publish_gpu_to_cpu_wait_wall",
-                                "publish_gpu_to_cpu_wait_wall",
-                                [],
-                            ),
-                            (
-                                "publish_gpu_to_cpu_copy_cuda",
-                                "publish_gpu_to_cpu_copy_cuda",
-                                [],
-                            ),
-                            ("publish_cpu_mmap_copy_wall", "publish_cpu_mmap_copy_wall", []),
-                            (
-                                "publish_header_write_wall",
-                                "publish_header_write_wall",
-                                [],
-                            ),
-                            (
-                                "publish_stage_enqueue_wall",
-                                "publish_stage_enqueue_wall",
-                                [],
-                            ),
-                            (
-                                "publish_fallback_copy_wall",
-                                "publish_fallback_copy_wall",
-                                [],
-                            ),
-                        ],
-                    ),
-                    (
-                        "scene_present_worker_ms",
-                        "scene_present_worker_ms",
-                        [
-                            ("scene_present_submit_ms", "scene_present_submit_ms", []),
-                            (
-                                "scene_present_queue_wait_ms",
-                                "scene_present_queue_wait_ms",
-                                [],
-                            ),
-                            (
-                                "scene_present_compose_ms",
-                                "scene_present_compose_ms",
-                                [],
-                            ),
-                            (
-                                "scene_present_compose_left_ms",
-                                "scene_present_compose_left_ms",
-                                [],
-                            ),
-                            (
-                                "scene_present_compose_right_ms",
-                                "scene_present_compose_right_ms",
-                                [],
-                            ),
-                            (
-                                "scene_present_overlay_ms",
-                                "scene_present_overlay_ms",
-                                [],
-                            ),
-                            (
-                                "scene_present_overlay_left_ms",
-                                "scene_present_overlay_left_ms",
-                                [],
-                            ),
-                            (
-                                "scene_present_overlay_right_ms",
-                                "scene_present_overlay_right_ms",
-                                [],
-                            ),
-                            (
-                                "scene_present_parallel_wait_ms",
-                                "scene_present_parallel_wait_ms",
-                                [],
-                            ),
-                            (
-                                "scene_present_publish_ms",
-                                "scene_present_publish_ms",
-                                [],
-                            ),
-                            (
-                                "scene_present_preview_ms",
-                                "scene_present_preview_ms",
-                                [],
-                            ),
-                            (
-                                "scene_present_source_age_ms",
-                                "scene_present_source_age_ms",
-                                [],
-                            ),
-                        ],
-                    ),
-                    (
-                        "scene_timewarp_gpu_ms",
-                        "scene_timewarp_gpu_ms",
-                        [
-                            ("scene_reproject_left_cuda", "scene_reproject_left_cuda", []),
-                            ("scene_reproject_right_cuda", "scene_reproject_right_cuda", []),
-                            (
-                                "scene_reproject_hole_fill_left_cuda",
-                                "scene_reproject_hole_fill_left_cuda",
-                                [],
-                            ),
-                            (
-                                "scene_reproject_hole_fill_right_cuda",
-                                "scene_reproject_hole_fill_right_cuda",
-                                [],
-                            ),
-                            (
-                                "scene_reproject_background_left_cuda",
-                                "scene_reproject_background_left_cuda",
-                                [],
-                            ),
-                            (
-                                "scene_reproject_background_right_cuda",
-                                "scene_reproject_background_right_cuda",
-                                [],
-                            ),
-                            (
-                                "scene_reproject_background_hole_fill_left_cuda",
-                                "scene_reproject_background_hole_fill_left_cuda",
-                                [],
-                            ),
-                            (
-                                "scene_reproject_background_hole_fill_right_cuda",
-                                "scene_reproject_background_hole_fill_right_cuda",
-                                [],
-                            ),
-                            ("scene_warp_far_left_cuda", "scene_warp_far_left_cuda", []),
-                            ("scene_warp_far_right_cuda", "scene_warp_far_right_cuda", []),
-                            ("scene_warp_near_left_cuda", "scene_warp_near_left_cuda", []),
-                            ("scene_warp_near_right_cuda", "scene_warp_near_right_cuda", []),
-                        ],
-                    ),
                     ("overlap_wait_wall_ms", "overlap_wait_wall_ms", []),
                     ("static_scene_worker_wall_ms", "static_scene_worker_wall_ms", []),
-                ],
+                ]
             )
-        ]
+        return hierarchy
 
     def _render_profile_section_lines(self, title, rows):
         if not rows:
@@ -12396,12 +12481,15 @@ class InvPhyTrainerWarp:
             )
         return lines
 
-    def _render_profile_time_section_rows(self, rows_by_key):
+    def _render_profile_time_section_rows(self, rows_by_key, summary_context=None):
         used_keys = set()
         section_rows = []
+        hierarchy = self._render_profile_time_hierarchy(summary_context)
 
         def add_node(node, depth):
             key, label, children = node
+            if self._render_profile_time_key_hidden(key, summary_context):
+                return
             row = rows_by_key.get(key)
             if row is None:
                 return
@@ -12416,7 +12504,10 @@ class InvPhyTrainerWarp:
                 )
             )
             available_children = [
-                child for child in children if rows_by_key.get(child[0]) is not None
+                child
+                for child in children
+                if rows_by_key.get(child[0]) is not None
+                and not self._render_profile_time_key_hidden(child[0], summary_context)
             ]
             available_children.sort(
                 key=lambda child: rows_by_key[child[0]]["avg_value"],
@@ -12425,22 +12516,21 @@ class InvPhyTrainerWarp:
             for child in available_children:
                 add_node(child, depth + 1)
 
-        top_nodes = [
-            node
-            for node in self._render_profile_time_hierarchy()
-            if rows_by_key.get(node[0]) is not None
-        ]
-        top_nodes.sort(key=lambda node: rows_by_key[node[0]]["avg_value"], reverse=True)
+        top_nodes = [node for node in hierarchy if rows_by_key.get(node[0]) is not None]
         for node in top_nodes:
             add_node(node, depth=0)
 
         other_time_rows = []
         for key, row in rows_by_key.items():
-            if row["group"] != "time" or key in used_keys:
+            if (
+                row["group"] != "time"
+                or key in used_keys
+                or self._render_profile_time_key_hidden(key, summary_context)
+            ):
                 continue
             other_time_rows.append(
                 (
-                    key,
+                    row.get("display_label", key),
                     row["avg_text"],
                     row["p95_text"],
                     row["max_text"],
@@ -12459,7 +12549,13 @@ class InvPhyTrainerWarp:
             return None
         return float(np.mean(np.asarray(values, dtype=np.float64)))
 
-    def _render_profile_summary_lines(self, mode, render_profile_series, ordered_keys):
+    def _render_profile_summary_lines(
+        self,
+        mode,
+        render_profile_series,
+        ordered_keys,
+        summary_context=None,
+    ):
         if not render_profile_series:
             return []
         sample_count = 0
@@ -12486,10 +12582,17 @@ class InvPhyTrainerWarp:
                 "avg_text": self._format_render_profile_stat(key, avg_value),
                 "p95_text": self._format_render_profile_stat(key, p95_value),
                 "max_text": self._format_render_profile_stat(key, max_value),
+                "display_label": self._render_profile_metric_display_label(
+                    key,
+                    summary_context=summary_context,
+                ),
             }
         if not rows_by_key:
             return lines
-        time_rows, other_time_rows = self._render_profile_time_section_rows(rows_by_key)
+        time_rows, other_time_rows = self._render_profile_time_section_rows(
+            rows_by_key,
+            summary_context=summary_context,
+        )
         if time_rows:
             lines.extend(self._render_profile_section_lines("Timing metrics", time_rows))
         if other_time_rows:
@@ -14274,7 +14377,7 @@ class InvPhyTrainerWarp:
             .numpy()
             .tolist()
         )
-        print(
+        self._log_live_openxr_controller_info(
             "[live_openxr_controller] immersive controller handedness validation: "
             f"sample={controller_basis_state['validation_sample_id']} "
             f"state={controller_basis_state.get('state', 'unknown')} "
@@ -14371,12 +14474,11 @@ class InvPhyTrainerWarp:
                         for candidate in ("left", "right")
                         if candidate in stable_sources
                     ]
-                    print(
+                    self._log_live_openxr_controller_info(
                         "[live_openxr_controller] immersive controller source presence: "
                         f"sample={sample_id} source={source} event={event} "
                         f"stable_sources={ordered_stable_sources} "
                         f"seen_sources_ever={seen_sources_ever}",
-                        flush=True,
                     )
             else:
                 absent_counts[source] = int(absent_counts.get(source, 0)) + 1
@@ -14392,12 +14494,11 @@ class InvPhyTrainerWarp:
                         for candidate in ("left", "right")
                         if candidate in stable_sources
                     ]
-                    print(
+                    self._log_live_openxr_controller_info(
                         "[live_openxr_controller] immersive controller source presence: "
                         f"sample={sample_id} source={source} event=absent "
                         f"stable_sources={ordered_stable_sources} "
                         f"seen_sources_ever={seen_sources_ever}",
-                        flush=True,
                     )
 
         updated_controller_basis_state["source_present_counts"] = present_counts
@@ -14448,11 +14549,10 @@ class InvPhyTrainerWarp:
         updated_controller_basis_state["final_left_ray_x"] = None
         updated_controller_basis_state["final_right_ray_x"] = None
         updated_controller_basis_state["resolved_from"] = "none"
-        print(
+        self._log_live_openxr_controller_info(
             "[live_openxr_controller] immersive controller handedness reopen: "
             f"sample={sample_id} reason={reason} "
             "sticky_basis_reused_until_revalidated=1",
-            flush=True,
         )
         return updated_controller_basis_state
 
@@ -14565,11 +14665,10 @@ class InvPhyTrainerWarp:
             if source in locked_active_sources or source in seen_after_lock:
                 continue
             seen_after_lock.append(source)
-            print(
+            self._log_live_openxr_controller_info(
                 "[live_openxr_controller] "
                 f"immersive late_controller_seen_after_lock source={source} "
                 "basis_reused=1",
-                flush=True,
             )
         updated_controller_basis_state["late_controller_seen_after_lock"] = (
             seen_after_lock
@@ -14616,12 +14715,11 @@ class InvPhyTrainerWarp:
 
         if updated_controller_basis_state.get("state") == "locked":
             if reconnect_sources:
-                print(
+                self._log_live_openxr_controller_info(
                     "[live_openxr_controller] immersive controller reconnect reusing "
                     f"canonical sticky basis: sample={sample_id} sources={reconnect_sources} "
                     f"stable_sources={stable_sources} "
                     "resolved_from=canonical_global no_per_source_flip=1",
-                    flush=True,
                 )
             if first_time_join_sources:
                 join_reason = (
@@ -14629,13 +14727,12 @@ class InvPhyTrainerWarp:
                     if interaction_active
                     else "while_idle"
                 )
-                print(
+                self._log_live_openxr_controller_info(
                     "[live_openxr_controller] immersive controller first-time join "
                     "reusing canonical global basis: "
                     f"sample={sample_id} sources={first_time_join_sources} "
                     f"stable_sources={stable_sources} reason={join_reason} "
                     "no_per_source_flip=1",
-                    flush=True,
                 )
             return controller_runtime_state, updated_controller_basis_state
 
@@ -15742,10 +15839,9 @@ class InvPhyTrainerWarp:
                         intrinsic,
                     )
                 )
-                print(
+                self._log_live_openxr_controller_info(
                     "[live_openxr_controller] immersive controller handedness validation "
                     "pending until both controllers have valid grip poses",
-                    flush=True,
                 )
                 (
                     initial_left_eye_pose_world,
@@ -16066,7 +16162,7 @@ class InvPhyTrainerWarp:
                     "[quest_display] immersive",
                     anchor_mapping_debug,
                 )
-                print(
+                self._log_live_openxr_controller_info(
                     "[live_openxr_controller] immersive controller case profile: "
                     f"case={live_controller_case_profile['case_name']} "
                     "default_translation_scale="
@@ -16076,7 +16172,6 @@ class InvPhyTrainerWarp:
                     "effective_translation_scale="
                     f"{live_controller_case_profile['controller_translation_scale']:.2f} "
                     f"post_select_grab_mode={live_controller_case_profile['post_select_grab_mode']}",
-                    flush=True,
                 )
                 bootstrap_output.update(
                     {
@@ -16312,22 +16407,19 @@ class InvPhyTrainerWarp:
                 live_controller_alignment = controller_runtime_state["alignment"]
                 live_controller_alignment_mode = controller_runtime_state["alignment_mode"]
                 if live_controller_alignment is None:
-                    print(
+                    self._log_live_openxr_controller_info(
                         "[live_openxr_controller] immersive controller alignment still pending "
                         "after scene spawn shift",
-                        flush=True,
                     )
                 else:
-                    print(
+                    self._log_live_openxr_controller_info(
                         "[live_openxr_controller] immersive controller alignment ready "
                         f"after scene spawn shift mode={live_controller_alignment_mode}",
-                        flush=True,
                     )
                 current_live_left_controller = controller_runtime_state["left_controller"]
                 current_live_right_controller = controller_runtime_state["right_controller"]
-                print(
+                self._log_live_openxr_controller_info(
                     "[live_openxr_controller] immersive using shared 2D controller runtime",
-                    flush=True,
                 )
                 last_left_eye_pose_world = bootstrap_output["initial_left_eye_pose_world"]
                 last_right_eye_pose_world = bootstrap_output["initial_right_eye_pose_world"]
@@ -24289,7 +24381,7 @@ class InvPhyTrainerWarp:
             if interaction_state is None
             else int(bool(interaction_state.get("explicit_preview_selected", False)))
         )
-        print(
+        self._log_live_openxr_controller_info(
             "[live_openxr_controller] "
             f"{source} interaction_start=1 "
             f"mode={grab_start_mode} "
@@ -24355,7 +24447,7 @@ class InvPhyTrainerWarp:
             if interaction_state is None
             else interaction_state.get("validation_path")
         )
-        print(
+        self._log_live_openxr_controller_info(
             "[live_openxr_controller] "
             f"{source} interaction_{action}=1 "
             f"mode={grab_start_mode} "
@@ -25015,7 +25107,7 @@ class InvPhyTrainerWarp:
                 restore_template_springs,
                 restore_template_rest_lengths,
             )
-            print(
+            self._log_live_openxr_controller_info(
                 "[live_openxr_controller] immersive controller restore topology: "
                 f"source={source} "
                 "source_local_restore_topology=1 "
@@ -25025,7 +25117,6 @@ class InvPhyTrainerWarp:
                 f"{source_meta.get('shared_template_canonical_source')} "
                 "default_anchor="
                 f"{source_meta.get('restore_default_anchor_name')}",
-                flush=True,
             )
         elif (
             "template_springs" in source_meta
@@ -25036,7 +25127,7 @@ class InvPhyTrainerWarp:
                 source_meta["template_springs"],
                 source_meta["template_rest_lengths"],
             )
-            print(
+            self._log_live_openxr_controller_info(
                 "[live_openxr_controller] immersive controller restore topology: "
                 f"source={source} "
                 "source_local_restore_topology=0 "
@@ -25046,7 +25137,6 @@ class InvPhyTrainerWarp:
                 f"{source_meta.get('shared_template_canonical_source')} "
                 "default_anchor="
                 f"{source_meta.get('restore_default_anchor_name')}",
-                flush=True,
             )
         inactive_spring_y = source_meta.get("inactive_spring_y")
         if inactive_spring_y is not None:
@@ -25502,7 +25592,7 @@ class InvPhyTrainerWarp:
                     )
                     continue
                 if validation_debug.get("projected_anchor_distance_bypassed", False):
-                    print(
+                    self._log_live_openxr_controller_info(
                         "[live_openxr_controller] "
                         f"{source} interaction_projected_anchor_bypass=1 "
                         f"mode={grab_start_mode} "
@@ -25510,7 +25600,6 @@ class InvPhyTrainerWarp:
                         f"projected_anchor={validation_debug['projected_anchor_distance']:.4f} "
                         f"strict_limit={validation_debug['strict_projected_anchor_distance_limit']:.4f} "
                         f"hit_to_anchor={validation_debug.get('hit_distance')}",
-                        flush=True,
                     )
                 self._apply_controller_attachment_remap(
                     source, remap_candidate, controller_attachment_metadata
@@ -25741,14 +25830,13 @@ class InvPhyTrainerWarp:
         if state_cache.get(source) == state:
             return
 
-        print(
+        self._log_live_openxr_controller_info(
             "[live_openxr_controller] "
             + ("" if sample_id is None else f"sample={int(sample_id)} ")
             +
             f"{source} select available={int(state[0])} "
             f"pressed={int(state[1])} value={state[2]:.3f} source={state[3]}"
             ,
-            flush=True,
         )
         state_cache[source] = state
 
@@ -25772,14 +25860,13 @@ class InvPhyTrainerWarp:
         if state_cache.get(source) == state:
             return
 
-        print(
+        self._log_live_openxr_controller_info(
             "[live_openxr_controller] "
             + ("" if sample_id is None else f"sample={int(sample_id)} ")
             +
             f"{source} select_hold start_edge={int(state[0])} "
             f"hold_active={int(state[1])} release_ready={int(state[2])} "
             f"release_frames={state[3]} value={state[4]:.3f}",
-            flush=True,
         )
         state_cache[source] = state
 
@@ -25795,11 +25882,10 @@ class InvPhyTrainerWarp:
         if state_cache.get(source) == state:
             return
 
-        print(
+        self._log_live_openxr_controller_info(
             "[live_openxr_controller] "
             f"{source} anchor_cycle available={int(state[0])} "
             f"pressed={int(state[1])} source={state[2]}",
-            flush=True,
         )
         state_cache[source] = state
 
@@ -25815,11 +25901,10 @@ class InvPhyTrainerWarp:
         if state_cache.get(source) == state:
             return
 
-        print(
+        self._log_live_openxr_controller_info(
             "[live_openxr_controller] "
             f"{source} anchor_reset available={int(state[0])} "
             f"pressed={int(state[1])} source={state[2]}",
-            flush=True,
         )
         state_cache[source] = state
 
@@ -25835,11 +25920,10 @@ class InvPhyTrainerWarp:
         if state_cache.get(source) == state:
             return
 
-        print(
+        self._log_live_openxr_controller_info(
             "[live_openxr_controller] "
             f"{source} snap_assist available={int(state[0])} "
             f"pressed={int(state[1])} source={state[2]}",
-            flush=True,
         )
         state_cache[source] = state
 
@@ -25856,11 +25940,10 @@ class InvPhyTrainerWarp:
         if state_cache.get(source) == state:
             return
 
-        print(
+        self._log_live_openxr_controller_info(
             "[live_openxr_controller] "
             f"{source} exit available={int(state[0])} "
             f"pressed={int(state[1])} value={state[2]:.3f} source={state[3]}",
-            flush=True,
         )
         state_cache[source] = state
 
@@ -25878,20 +25961,18 @@ class InvPhyTrainerWarp:
             return
 
         if not state[0]:
-            print(
+            self._log_live_openxr_controller_info(
                 "[live_openxr_controller] "
                 f"{source} anchor_preview=0 "
                 f"mode={'cycled_locked' if state[1] else 'nearest'}",
-                flush=True,
             )
         else:
-            print(
+            self._log_live_openxr_controller_info(
                 "[live_openxr_controller] "
                 f"{source} mode={'cycled_locked' if state[1] else 'nearest'} "
                 "anchor_preview=1 "
                 f"selected={state[2]} "
                 f"rank={state[3]}/{state[4]}",
-                flush=True,
             )
         state_cache[source] = state
 
@@ -25900,7 +25981,9 @@ class InvPhyTrainerWarp:
         if state_cache.get(source) == state:
             return
 
-        print(f"[live_openxr_controller] {source} ray_hit={int(state)}", flush=True)
+        self._log_live_openxr_controller_info(
+            f"[live_openxr_controller] {source} ray_hit={int(state)}"
+        )
         state_cache[source] = state
 
     def _log_controller_attach_candidate_transition(self, source, overlay, state_cache):
@@ -25924,20 +26007,20 @@ class InvPhyTrainerWarp:
             return
 
         if state is None:
-            print(f"[live_openxr_controller] {source} attach_candidate=0", flush=True)
+            self._log_live_openxr_controller_info(
+                f"[live_openxr_controller] {source} attach_candidate=0"
+            )
         else:
             if state[1] is None or state[2] is None:
-                print(
+                self._log_live_openxr_controller_info(
                     "[live_openxr_controller] "
                     f"{source} attach_candidate=1 anchor={state[0]}",
-                    flush=True,
                 )
             else:
-                print(
+                self._log_live_openxr_controller_info(
                     "[live_openxr_controller] "
                     f"{source} attach_candidate=1 anchor={state[0]} "
                     f"nodes={state[1]} radius={state[2]:.3f}",
-                    flush=True,
                 )
         state_cache[source] = state
 
@@ -25969,7 +26052,9 @@ class InvPhyTrainerWarp:
             return
 
         if state is None:
-            print(f"[live_openxr_controller] {source} interaction=0", flush=True)
+            self._log_live_openxr_controller_info(
+                f"[live_openxr_controller] {source} interaction=0"
+            )
         else:
             multi_points_suffix = ""
             if state[5] is not None:
@@ -25980,7 +26065,7 @@ class InvPhyTrainerWarp:
                         f" multi_points_seed={state[5][0]} multi_points_patch={state[5][1]} "
                         f"multi_points_depth=[{state[5][2]:.3f},{state[5][3]:.3f}]"
                     )
-            print(
+            self._log_live_openxr_controller_info(
                 "[live_openxr_controller] "
                 f"{source} interaction=1 anchor={state[0]} "
                 f"ray_distance={state[1]:.3f} "
@@ -25988,19 +26073,17 @@ class InvPhyTrainerWarp:
                 f"nodes={state[3]} radius={state[4]:.3f}"
                 f"{multi_points_suffix}"
                 ,
-                flush=True,
             )
         state_cache[source] = state
 
     def _log_controller_interaction_end(self, source, interaction_state, reason):
         if interaction_state is None:
             return
-        print(
+        self._log_live_openxr_controller_info(
             "[live_openxr_controller] "
             f"{source} interaction_end=1 "
             f"anchor={interaction_state.get('anchor_name')} "
             f"reason={reason}",
-            flush=True,
         )
 
     def _controller_target_point_indices_for_state(
@@ -26164,7 +26247,7 @@ class InvPhyTrainerWarp:
             )
             if parity_failure:
                 log_prefix += "parity_failure=1 "
-            print(
+            self._log_live_openxr_controller_info(
                 log_prefix
                 + f"frame={frame_index} "
                 + ("" if sample_id is None else f"sample={int(sample_id)} ")
@@ -28361,8 +28444,16 @@ class InvPhyTrainerWarp:
             and active_scene_stereo_mode
             == self.IMMERSIVE_BALANCED_INTERNAL_STEREO_MODE
         )
+        static_scene_reuse_requested = immersive_static_scene_reuse_mode in {
+            "static",
+            "adaptive",
+        }
         framegen_requested = immersive_framegen_mode in {"static", "adaptive"}
         profile_enabled = bool(profile)
+        previous_verbose_console_diagnostics_enabled = (
+            self._should_log_immersive_verbose_console_diagnostics()
+        )
+        self._set_immersive_verbose_console_diagnostics_enabled(profile_enabled)
         diagnostic_collection_enabled = bool(profile_enabled)
         profile_freq = int(profile_freq)
         stable_compose_safety_enabled = bool(
@@ -29239,10 +29330,9 @@ class InvPhyTrainerWarp:
                     intrinsic,
                 )
             )
-            print(
+            self._log_live_openxr_controller_info(
                 "[live_openxr_controller] immersive controller handedness validation "
                 "pending until both controllers have valid grip poses",
-                flush=True,
             )
 
             (
@@ -29482,7 +29572,7 @@ class InvPhyTrainerWarp:
                 "[quest_display] immersive",
                 anchor_mapping_debug,
             )
-            print(
+            self._log_live_openxr_controller_info(
                 "[live_openxr_controller] immersive controller case profile: "
                 f"case={live_controller_case_profile['case_name']} "
                 "default_translation_scale="
@@ -29492,7 +29582,6 @@ class InvPhyTrainerWarp:
                 "effective_translation_scale="
                 f"{live_controller_case_profile['controller_translation_scale']:.2f} "
                 f"post_select_grab_mode={live_controller_case_profile['post_select_grab_mode']}",
-                flush=True,
             )
 
             two_point_runtime = self._build_two_point_live_controller_runtime(
@@ -29676,22 +29765,19 @@ class InvPhyTrainerWarp:
             live_controller_alignment = controller_runtime_state["alignment"]
             live_controller_alignment_mode = controller_runtime_state["alignment_mode"]
             if live_controller_alignment is None:
-                print(
+                self._log_live_openxr_controller_info(
                     "[live_openxr_controller] immersive controller alignment still pending "
                     "after scene spawn shift",
-                    flush=True,
                 )
             else:
-                print(
+                self._log_live_openxr_controller_info(
                     "[live_openxr_controller] immersive controller alignment ready "
                     f"after scene spawn shift mode={live_controller_alignment_mode}",
-                    flush=True,
                 )
             current_live_left_controller = controller_runtime_state["left_controller"]
             current_live_right_controller = controller_runtime_state["right_controller"]
-            print(
+            self._log_live_openxr_controller_info(
                 "[live_openxr_controller] immersive using shared 2D controller runtime",
-                flush=True,
             )
             last_left_eye_pose_world = initial_left_eye_pose_world
             last_right_eye_pose_world = initial_right_eye_pose_world
@@ -31648,10 +31734,9 @@ class InvPhyTrainerWarp:
                     live_controller_alignment = controller_runtime_state["alignment"]
                     live_controller_alignment_mode = controller_runtime_state["alignment_mode"]
                     if controller_runtime_state["alignment_acquired"]:
-                        print(
+                        self._log_live_openxr_controller_info(
                             "[live_openxr_controller] immersive controller alignment acquired "
                             f"after startup mode={live_controller_alignment_mode}",
-                            flush=True,
                         )
                     current_live_left_controller = controller_runtime_state["left_controller"]
                     current_live_right_controller = controller_runtime_state["right_controller"]
@@ -31661,11 +31746,10 @@ class InvPhyTrainerWarp:
                             self._controller_exit_button_label(source)
                             for source in controller_exit_sources
                         ]
-                        print(
+                        self._log_live_openxr_controller_info(
                             "[live_openxr_controller] immersive clean exit requested via "
                             + "/".join(pressed_buttons)
                             + "; shutting down cleanly",
-                            flush=True,
                         )
                         break
                     (
@@ -31696,11 +31780,10 @@ class InvPhyTrainerWarp:
                         reset_log_suffix = "; restoring the settled table pose"
                         if rope_game_state is not None:
                             reset_log_suffix = "; restarting the rope game course"
-                        print(
+                        self._log_live_openxr_controller_info(
                             "[live_openxr_controller] immersive reset requested via "
                             + "/".join(pressed_buttons)
                             + reset_log_suffix,
-                            flush=True,
                         )
                         reset_target = self._reset_live_controller_runtime(
                             controller_runtime_base_target,
@@ -34211,6 +34294,10 @@ class InvPhyTrainerWarp:
                     render_profile_frame["pre_compose_ready_ms"] = float(
                         pre_compose_ready_wall_s
                     )
+                    render_profile_frame["compositing_ms"] = float(compositing_wall_s)
+                    render_profile_frame["overlay_publish_ms"] = float(
+                        overlay_publish_wall_s
+                    )
                     render_profile_frame = self._render_profile_finalize_frame(
                         render_profile_frame
                     )
@@ -34355,6 +34442,9 @@ class InvPhyTrainerWarp:
                 raise RuntimeError(message) from exc
             raise
         finally:
+            self._set_immersive_verbose_console_diagnostics_enabled(
+                previous_verbose_console_diagnostics_enabled
+            )
             self._immersive_stable_present_policy_active = False
             self._immersive_active_render_preset_name_value = "balanced"
             if presentation_worker is not None:
@@ -34999,6 +35089,30 @@ class InvPhyTrainerWarp:
                     if render_stage_times.get("static_scene_render_ms", [])
                     else None
                 )
+                timing_summary_context = self._resolve_immersive_timing_summary_context(
+                    requested_timewarp_mode=timing_summary_requested_flags[
+                        "immersive_timewarp"
+                    ],
+                    requested_static_scene_overlap_mode=timing_summary_requested_flags[
+                        "immersive_static_scene_overlap"
+                    ],
+                    requested_framegen_mode=timing_summary_requested_flags[
+                        "immersive_framegen"
+                    ],
+                    requested_gaussian_render_mode=timing_summary_requested_flags[
+                        "immersive_gaussian_render"
+                    ],
+                    requested_present_pipeline_enabled=timing_summary_requested_flags[
+                        "immersive_present_pipeline"
+                    ],
+                    effective_static_scene_overlap_enabled=static_scene_overlap_enabled,
+                    effective_scene_depth_reproject_enabled=scene_depth_reproject_enabled,
+                    effective_framegen_mode=immersive_framegen_mode,
+                    effective_gaussian_render_mode=immersive_gaussian_render_mode,
+                    presentation_backend_enabled=presentation_backend_enabled,
+                    presentation_backend_kind=presentation_backend_kind,
+                    balanced_eye_parallel_enabled=balanced_eye_parallel_enabled,
+                )
 
                 high_level_lines = ["High-Level Results:"]
                 _append_fps_line(
@@ -35155,12 +35269,18 @@ class InvPhyTrainerWarp:
                         "Average Static Scene Overlay Refresh Ratio: "
                         f"{average_static_scene_overlay_refresh_ratio * 100.0:.1f}%"
                     )
-                if static_scene_branch_full_avg_ms is not None:
+                if (
+                    timing_summary_context.get("top_level_overlap_active", False)
+                    and static_scene_branch_full_avg_ms is not None
+                ):
                     diagnostics_lines.append(
                         "Static Scene Full Branch Time Ms: "
                         f"{static_scene_branch_full_avg_ms:.2f}"
                     )
-                if static_scene_residual_avg_ms is not None:
+                if (
+                    timing_summary_context.get("top_level_overlap_active", False)
+                    and static_scene_residual_avg_ms is not None
+                ):
                     diagnostics_lines.append(
                         "Static Scene Critical-Path Residual Ms: "
                         f"{static_scene_residual_avg_ms:.2f}"
@@ -35993,36 +36113,16 @@ class InvPhyTrainerWarp:
                         component_summary_rows,
                     )
                 )
+                timing_configuration_lines = (
+                    self._format_immersive_timing_configuration_lines(
+                        timing_summary_context
+                    )
+                )
                 render_stage_lines = []
                 if diagnostic_collection_enabled:
                     render_stage_rows = []
-                    for stage_key, stage_label in (
-                        (
-                            "static_scene_branch_full_ms",
-                            "Parallel branch A: Static scene render (full branch time)",
-                        ),
-                        (
-                            "branch_b_ready_ms",
-                            "Parallel branch B: Spring-mass simulation + LBS + Gaussian render",
-                        ),
-                        (
-                            "compose_join_full_ms",
-                            "Join at compose: earliest start after both branches finish",
-                        ),
-                        ("simulation_lbs_wall_ms", "Spring-mass simulation + LBS"),
-                        ("gaussian_render_wall_ms", "Gaussian render"),
-                        ("compositing_ms", "Compositing"),
-                        ("overlay_publish_ms", "Overlay + publish"),
-                        ("scene_present_worker_ms", "Presentation worker"),
-                        ("scene_present_queue_wait_ms", "Presentation queue wait"),
-                        ("scene_present_submit_ms", "Presentation submit"),
-                        ("scene_present_compose_left_ms", "Presentation compose left"),
-                        ("scene_present_compose_right_ms", "Presentation compose right"),
-                        ("scene_present_overlay_left_ms", "Presentation overlay left"),
-                        ("scene_present_overlay_right_ms", "Presentation overlay right"),
-                        ("scene_present_parallel_wait_ms", "Presentation parallel wait"),
-                        ("scene_present_preview_ms", "Preview upload"),
-                        ("scene_present_source_age_ms", "Presentation source age"),
+                    for stage_key, stage_label in self._immersive_timing_stage_specs(
+                        timing_summary_context
                     ):
                         stage_samples = render_stage_times.get(stage_key, [])
                         if stage_samples:
@@ -36035,9 +36135,13 @@ class InvPhyTrainerWarp:
                     render_stage_lines = self._format_immersive_render_stage_breakdown_lines(
                         average_frame_time,
                         render_stage_rows,
+                        title="Timing Flow:",
+                        stage_column_title="Stage",
+                        flow_line=timing_summary_context.get("flow_line"),
                     )
 
                 _append_section(high_level_lines)
+                _append_section(timing_configuration_lines)
                 _append_section(component_lines)
                 if diagnostic_collection_enabled:
                     _append_section(render_stage_lines)
@@ -36046,6 +36150,7 @@ class InvPhyTrainerWarp:
                         "immersive",
                         immersive_render_profile_series,
                         immersive_render_profile_summary_keys,
+                        summary_context=timing_summary_context,
                     )
                     for line in render_profile_lines:
                         print(line)

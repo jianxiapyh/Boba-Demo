@@ -6187,6 +6187,10 @@ class InvPhyTrainerWarp:
     )
     IMMERSIVE_STATIC_SCENE_MODE_BALANCED_FOCUS = "balanced_focus"
     IMMERSIVE_STATIC_SCENE_MODE_BALANCED_SUPPORT_FOCUS = "balanced_support_focus"
+    IMMERSIVE_STATIC_SCENE_REUSE_ADAPTIVE_MAX_AGE_FRAMES = 4
+    IMMERSIVE_STATIC_SCENE_REUSE_STATIC_MAX_AGE_FRAMES = 8
+    IMMERSIVE_STATIC_SCENE_REUSE_ADAPTIVE_TRANSLATION_GUARD_M = 0.015
+    IMMERSIVE_STATIC_SCENE_REUSE_ADAPTIVE_ROTATION_GUARD_DEG = 1.5
     IMMERSIVE_FRAMEGEN_ADAPTIVE_MAX_AGE_FRAMES = 4
     IMMERSIVE_FRAMEGEN_STATIC_MAX_AGE_FRAMES = 8
     IMMERSIVE_FRAMEGEN_ADAPTIVE_TRANSLATION_GUARD_M = 0.015
@@ -12030,10 +12034,12 @@ class InvPhyTrainerWarp:
         *,
         requested_timewarp_mode,
         requested_static_scene_overlap_mode,
+        requested_static_scene_reuse_mode,
         requested_framegen_mode,
         requested_gaussian_render_mode,
         requested_present_pipeline_enabled,
         effective_static_scene_overlap_enabled,
+        effective_static_scene_reuse_mode,
         effective_scene_depth_reproject_enabled,
         effective_framegen_mode,
         effective_gaussian_render_mode,
@@ -12046,6 +12052,9 @@ class InvPhyTrainerWarp:
             "immersive_static_scene_overlap": str(
                 requested_static_scene_overlap_mode
             ).strip().lower(),
+            "immersive_static_scene_reuse": str(
+                requested_static_scene_reuse_mode
+            ).strip().lower(),
             "immersive_framegen": str(requested_framegen_mode).strip().lower(),
             "immersive_gaussian_render": str(
                 requested_gaussian_render_mode
@@ -12054,9 +12063,16 @@ class InvPhyTrainerWarp:
                 "on" if bool(requested_present_pipeline_enabled) else "off"
             ),
         }
+        effective_static_scene_reuse_mode = str(
+            effective_static_scene_reuse_mode
+        ).strip().lower()
         effective_framegen_mode = str(effective_framegen_mode).strip().lower()
         effective_gaussian_render_mode = str(effective_gaussian_render_mode).strip().lower()
         top_level_overlap_active = bool(effective_static_scene_overlap_enabled)
+        static_scene_reuse_active = effective_static_scene_reuse_mode in {
+            "static",
+            "adaptive",
+        }
         scene_timewarp_active = bool(effective_scene_depth_reproject_enabled)
         framegen_active = effective_framegen_mode in {"static", "adaptive"}
         presentation_backend_label = (
@@ -12110,6 +12126,8 @@ class InvPhyTrainerWarp:
             "summary_shape": summary_shape,
             "flow_line": flow_line,
             "top_level_overlap_active": top_level_overlap_active,
+            "static_scene_reuse_active": static_scene_reuse_active,
+            "effective_static_scene_reuse_mode": effective_static_scene_reuse_mode,
             "scene_timewarp_active": scene_timewarp_active,
             "framegen_active": framegen_active,
             "effective_framegen_mode": effective_framegen_mode,
@@ -12133,6 +12151,7 @@ class InvPhyTrainerWarp:
             "Requested flags: "
             f"timewarp={requested_flags.get('immersive_timewarp', 'off')} "
             f"static_scene_overlap={requested_flags.get('immersive_static_scene_overlap', 'off')} "
+            f"static_scene_reuse={requested_flags.get('immersive_static_scene_reuse', 'off')} "
             f"framegen={requested_flags.get('immersive_framegen', 'off')} "
             f"gaussian_render={requested_flags.get('immersive_gaussian_render', 'serial')} "
             f"present_pipeline={requested_flags.get('immersive_present_pipeline', 'off')}"
@@ -12141,6 +12160,7 @@ class InvPhyTrainerWarp:
             "Derived execution: "
             f"shape={summary_context.get('summary_shape', 'direct')} "
             f"top_level_overlap={'on' if summary_context.get('top_level_overlap_active', False) else 'off'} "
+            f"static_scene_reuse={summary_context.get('effective_static_scene_reuse_mode', 'off')} "
             f"gaussian={summary_context.get('effective_gaussian_render_mode', 'serial')} "
             f"presentation_backend={summary_context.get('presentation_backend_label', 'direct_main_thread')} "
             f"timewarp={'on' if summary_context.get('scene_timewarp_active', False) else 'off'} "
@@ -14407,7 +14427,6 @@ class InvPhyTrainerWarp:
             f"final_left_ray_x={_fmt(controller_basis_state['final_left_ray_x'])} "
             f"final_right_ray_x={_fmt(controller_basis_state['final_right_ray_x'])} "
             f"controller_basis_lateral={basis_lateral}",
-            flush=True,
         )
 
     def _controller_basis_active_sources(self, controller_runtime_state):
@@ -15509,11 +15528,69 @@ class InvPhyTrainerWarp:
             return latest_sample
         if bool(bootstrap_state.get("complete", False)):
             return current_sample
-        return self._progress_immersive_startup_bootstrap_substages(
-            bootstrap_state,
-            force=force,
-            startup_context=startup_context,
+        if not force:
+            return self._progress_immersive_startup_bootstrap_substages(
+                bootstrap_state,
+                force=False,
+                startup_context=startup_context,
+            )
+
+        while not bool(bootstrap_state.get("complete", False)):
+            progress_before = self._startup_bootstrap_progress_signature(bootstrap_state)
+            current_sample = self._progress_immersive_startup_bootstrap_substages(
+                bootstrap_state,
+                force=True,
+                startup_context=startup_context,
+            )
+            if current_sample is not None:
+                bootstrap_output["initial_sample"] = current_sample
+            if bool(bootstrap_state.get("complete", False)):
+                break
+            progress_after = self._startup_bootstrap_progress_signature(bootstrap_state)
+            if progress_after == progress_before:
+                raise RuntimeError(
+                    "Immersive startup bootstrap stalled during forced completion. "
+                    + self._format_startup_bootstrap_state(bootstrap_state)
+                )
+
+        return bootstrap_output.get("initial_sample", current_sample)
+
+    def _startup_bootstrap_progress_signature(self, bootstrap_state):
+        if not isinstance(bootstrap_state, dict):
+            return (-1, -1, "missing", -1)
+        settle_state = bootstrap_state.get("settle_state")
+        if not isinstance(settle_state, dict):
+            settle_state = {}
+        return (
+            int(bootstrap_state.get("stage_index", -1)),
+            int(bootstrap_state.get("substage_index", -1)),
+            str(bootstrap_state.get("substage_name", "unknown")),
+            int(settle_state.get("step_idx", -1)),
         )
+
+    def _format_startup_bootstrap_state(self, bootstrap_state):
+        if not isinstance(bootstrap_state, dict):
+            return "bootstrap_state=missing"
+        settle_state = bootstrap_state.get("settle_state")
+        if not isinstance(settle_state, dict):
+            settle_state = {}
+        output = bootstrap_state.get("output")
+        if not isinstance(output, dict):
+            output = {}
+        parts = [
+            f"complete={int(bool(bootstrap_state.get('complete', False)))}",
+            f"stage_index={int(bootstrap_state.get('stage_index', -1))}",
+            f"substage_index={int(bootstrap_state.get('substage_index', -1))}",
+            f"substage={str(bootstrap_state.get('substage_name', 'unknown'))}",
+            "last_completed_substage="
+            + str(bootstrap_state.get("last_completed_substage", "none")),
+            f"settle_step_idx={int(settle_state.get('step_idx', -1))}",
+            f"settle_done={int(bool(settle_state.get('done', False)))}",
+            f"scene_rest_state_ready={int('scene_rest_state' in output)}",
+            f"x_ready={int('x' in output)}",
+            f"startup_render_debug_ready={int('startup_render_debug' in output)}",
+        ]
+        return " ".join(parts)
 
     def _progress_immersive_startup_bootstrap_substages(
         self,
@@ -18055,17 +18132,17 @@ class InvPhyTrainerWarp:
             "age_displayed_frames": 0,
         }
 
-    def _immersive_static_scene_framegen_max_age_frames(self, framegen_mode):
-        mode = str(framegen_mode).strip().lower()
+    def _immersive_static_scene_reuse_max_age_frames(self, reuse_mode):
+        mode = str(reuse_mode).strip().lower()
         if self._immersive_stable_present_policy_enabled():
             if mode == "adaptive":
                 return int(self.IMMERSIVE_STABLE_PRESENT_ADAPTIVE_MAX_AGE_FRAMES)
             if mode == "static":
                 return int(self.IMMERSIVE_STABLE_PRESENT_STATIC_MAX_AGE_FRAMES)
         if mode == "adaptive":
-            return int(self.IMMERSIVE_FRAMEGEN_ADAPTIVE_MAX_AGE_FRAMES)
+            return int(self.IMMERSIVE_STATIC_SCENE_REUSE_ADAPTIVE_MAX_AGE_FRAMES)
         if mode == "static":
-            return int(self.IMMERSIVE_FRAMEGEN_STATIC_MAX_AGE_FRAMES)
+            return int(self.IMMERSIVE_STATIC_SCENE_REUSE_STATIC_MAX_AGE_FRAMES)
         return 0
 
     def _immersive_stable_present_policy_enabled(self):
@@ -18082,15 +18159,24 @@ class InvPhyTrainerWarp:
             )
         ).strip().lower()
 
-    def _immersive_framegen_translation_guard_m(self):
+    def _immersive_static_scene_reuse_translation_guard_m(self):
         if self._immersive_stable_present_policy_enabled():
             return float(self.IMMERSIVE_STABLE_PRESENT_TRANSLATION_GUARD_M)
-        return float(self.IMMERSIVE_FRAMEGEN_ADAPTIVE_TRANSLATION_GUARD_M)
+        return float(self.IMMERSIVE_STATIC_SCENE_REUSE_ADAPTIVE_TRANSLATION_GUARD_M)
 
-    def _immersive_framegen_rotation_guard_deg(self):
+    def _immersive_static_scene_reuse_rotation_guard_deg(self):
         if self._immersive_stable_present_policy_enabled():
             return float(self.IMMERSIVE_STABLE_PRESENT_ROTATION_GUARD_DEG)
-        return float(self.IMMERSIVE_FRAMEGEN_ADAPTIVE_ROTATION_GUARD_DEG)
+        return float(self.IMMERSIVE_STATIC_SCENE_REUSE_ADAPTIVE_ROTATION_GUARD_DEG)
+
+    def _immersive_static_scene_framegen_max_age_frames(self, framegen_mode):
+        return self._immersive_static_scene_reuse_max_age_frames(framegen_mode)
+
+    def _immersive_framegen_translation_guard_m(self):
+        return self._immersive_static_scene_reuse_translation_guard_m()
+
+    def _immersive_framegen_rotation_guard_deg(self):
+        return self._immersive_static_scene_reuse_rotation_guard_deg()
 
     def _evaluate_immersive_scene_timewarp_admission(
         self,
@@ -18769,7 +18855,7 @@ class InvPhyTrainerWarp:
     def _evaluate_immersive_static_scene_layer_reuse(
         self,
         *,
-        framegen_mode,
+        reuse_mode,
         layer_cache,
         render_sample,
         head_pose_state,
@@ -18785,7 +18871,7 @@ class InvPhyTrainerWarp:
             "signature_changed": False,
             "max_age_hit": False,
         }
-        mode = str(framegen_mode).strip().lower()
+        mode = str(reuse_mode).strip().lower()
         if mode not in {"static", "adaptive"}:
             return decision
         decision["reason"] = "cache_miss"
@@ -18808,7 +18894,7 @@ class InvPhyTrainerWarp:
             return decision
         next_age_frames = int(layer_cache.get("age_displayed_frames", 0)) + 1
         decision["reuse_age_frames"] = float(next_age_frames)
-        max_age_frames = self._immersive_static_scene_framegen_max_age_frames(mode)
+        max_age_frames = self._immersive_static_scene_reuse_max_age_frames(mode)
         if next_age_frames > max_age_frames:
             decision["reason"] = "age_limit"
             decision["max_age_hit"] = True
@@ -18840,10 +18926,16 @@ class InvPhyTrainerWarp:
         ):
             decision["reason"] = "head_reset"
             return decision
-        if decision["translation_m"] > self._immersive_framegen_translation_guard_m():
+        if (
+            decision["translation_m"]
+            > self._immersive_static_scene_reuse_translation_guard_m()
+        ):
             decision["reason"] = "translation_guard"
             return decision
-        if decision["rotation_deg"] > self._immersive_framegen_rotation_guard_deg():
+        if (
+            decision["rotation_deg"]
+            > self._immersive_static_scene_reuse_rotation_guard_deg()
+        ):
             decision["reason"] = "rotation_guard"
             return decision
 
@@ -18958,7 +19050,7 @@ class InvPhyTrainerWarp:
     def _evaluate_immersive_balanced_layer_refresh_plan(
         self,
         *,
-        framegen_mode,
+        reuse_mode,
         layer_cache,
         render_plan,
         render_sample,
@@ -18988,7 +19080,7 @@ class InvPhyTrainerWarp:
             eye_cache = {} if layer_cache is None else layer_cache.get(eye_label, {})
             for layer_name in required_layers_by_eye.get(eye_label, []):
                 decision = self._evaluate_immersive_static_scene_layer_reuse(
-                    framegen_mode=framegen_mode,
+                    reuse_mode=reuse_mode,
                     layer_cache=None if eye_cache is None else eye_cache.get(layer_name),
                     render_sample=render_sample,
                     head_pose_state=head_pose_state,
@@ -19040,11 +19132,11 @@ class InvPhyTrainerWarp:
             "max_reuse_age_frames": float(max_reuse_age_frames),
         }
 
-    def _evaluate_immersive_static_scene_framegen_reuse(
+    def _evaluate_immersive_static_scene_reuse(
         self,
         *,
-        framegen_mode,
-        framegen_cache,
+        reuse_mode,
+        reuse_cache,
         render_sample,
         head_pose_state,
         left_eye_pose_world,
@@ -19060,11 +19152,11 @@ class InvPhyTrainerWarp:
             "signature_changed": False,
             "max_age_hit": False,
         }
-        mode = str(framegen_mode).strip().lower()
+        mode = str(reuse_mode).strip().lower()
         if mode not in {"static", "adaptive"}:
             return decision
         decision["reason"] = "cache_miss"
-        if framegen_cache is None:
+        if reuse_cache is None:
             return decision
         if render_plan_signature is None:
             decision["reason"] = "signature_unavailable"
@@ -19077,22 +19169,22 @@ class InvPhyTrainerWarp:
             or right_eye_pose_world is None
         ):
             return decision
-        cached_signature = framegen_cache.get("static_scene_signature")
+        cached_signature = reuse_cache.get("static_scene_signature")
         if cached_signature != render_plan_signature:
             decision["reason"] = "signature_change"
             decision["signature_changed"] = True
             return decision
-        next_age_frames = int(framegen_cache.get("age_displayed_frames", 0)) + 1
+        next_age_frames = int(reuse_cache.get("age_displayed_frames", 0)) + 1
         decision["reuse_age_frames"] = float(next_age_frames)
-        max_age_frames = self._immersive_static_scene_framegen_max_age_frames(mode)
+        max_age_frames = self._immersive_static_scene_reuse_max_age_frames(mode)
         if next_age_frames > max_age_frames:
             decision["reason"] = "age_limit"
             decision["max_age_hit"] = True
             return decision
 
         cached_center = self._immersive_eye_pair_center_world(
-            framegen_cache.get("source_left_eye_pose_world"),
-            framegen_cache.get("source_right_eye_pose_world"),
+            reuse_cache.get("source_left_eye_pose_world"),
+            reuse_cache.get("source_right_eye_pose_world"),
         )
         current_center = self._immersive_eye_pair_center_world(
             left_eye_pose_world,
@@ -19109,7 +19201,7 @@ class InvPhyTrainerWarp:
             ("source_right_eye_pose_world", right_eye_pose_world),
         ):
             rotation_delta_deg = self._immersive_pose_rotation_delta_deg(
-                framegen_cache.get(source_eye_key),
+                reuse_cache.get(source_eye_key),
                 current_eye_pose_world,
             )
             if rotation_delta_deg is not None:
@@ -19126,20 +19218,47 @@ class InvPhyTrainerWarp:
             head_pose_state.get("last_reset_frame_index", -1)
         )
         if current_reset_frame_index != int(
-            framegen_cache.get("head_pose_reset_frame_index", -1)
+            reuse_cache.get("head_pose_reset_frame_index", -1)
         ):
             decision["reason"] = "head_reset"
             return decision
-        if decision["translation_m"] > self._immersive_framegen_translation_guard_m():
+        if (
+            decision["translation_m"]
+            > self._immersive_static_scene_reuse_translation_guard_m()
+        ):
             decision["reason"] = "translation_guard"
             return decision
-        if decision["rotation_deg"] > self._immersive_framegen_rotation_guard_deg():
+        if (
+            decision["rotation_deg"]
+            > self._immersive_static_scene_reuse_rotation_guard_deg()
+        ):
             decision["reason"] = "rotation_guard"
             return decision
 
         decision["reuse"] = True
         decision["reason"] = "adaptive_guardrails_passed"
         return decision
+
+    def _evaluate_immersive_static_scene_framegen_reuse(
+        self,
+        *,
+        framegen_mode,
+        framegen_cache,
+        render_sample,
+        head_pose_state,
+        left_eye_pose_world,
+        right_eye_pose_world,
+        render_plan_signature=None,
+    ):
+        return self._evaluate_immersive_static_scene_reuse(
+            reuse_mode=framegen_mode,
+            reuse_cache=framegen_cache,
+            render_sample=render_sample,
+            head_pose_state=head_pose_state,
+            left_eye_pose_world=left_eye_pose_world,
+            right_eye_pose_world=right_eye_pose_world,
+            render_plan_signature=render_plan_signature,
+        )
 
     def _build_immersive_balanced_scene_render_plan(
         self,
@@ -24396,7 +24515,6 @@ class InvPhyTrainerWarp:
             f"projected_anchor={None if projected_anchor_distance is None else round(float(projected_anchor_distance), 4)} "
             f"target_delta={None if target_delta is None else round(float(target_delta), 4)} "
             f"reason={reason}",
-            flush=True,
         )
 
     def _log_controller_interaction_rejected(
@@ -24462,7 +24580,6 @@ class InvPhyTrainerWarp:
             f"projected_anchor={None if projected_anchor_distance is None else round(float(projected_anchor_distance), 4)} "
             f"target_delta={None if target_delta is None else round(float(target_delta), 4)} "
             f"reason={reason}",
-            flush=True,
         )
 
     def _validate_immersive_grab_start_frame(
@@ -26261,7 +26378,6 @@ class InvPhyTrainerWarp:
                 f"spring_active={int(spring_stats['spring_active'])} "
                 f"spring_mean={spring_stats['spring_mean']:.4f} "
                 f"spring_max={spring_stats['spring_max']:.4f}",
-                flush=True,
             )
 
         state_cache[source] = {
@@ -28158,6 +28274,7 @@ class InvPhyTrainerWarp:
         profile_freq=30,
         immersive_timewarp="off",
         immersive_static_scene_overlap="on",
+        immersive_static_scene_reuse="off",
         immersive_static_scene_mode="balanced_support_focus",
         immersive_support_entry_overlay=False,
         immersive_framegen="off",
@@ -28405,6 +28522,14 @@ class InvPhyTrainerWarp:
                 "immersive_static_scene_overlap must be one of "
                 "{'off', 'on'}"
             )
+        immersive_static_scene_reuse_mode = str(
+            immersive_static_scene_reuse
+        ).strip().lower()
+        if immersive_static_scene_reuse_mode not in {"off", "static", "adaptive"}:
+            raise ValueError(
+                "immersive_static_scene_reuse must be one of "
+                "{'off', 'static', 'adaptive'}"
+            )
         immersive_static_scene_mode = str(
             immersive_static_scene_mode
         ).strip().lower()
@@ -28479,20 +28604,19 @@ class InvPhyTrainerWarp:
             diagnostic_collection_enabled
             and stable_gaussian_source_validation_enabled
         )
-        if scene_depth_reproject_requested and not static_scene_overlap_requested:
-            raise ValueError(
-                "immersive_timewarp scene_depth_reproject requires "
-                "--immersive_static_scene_overlap on"
-            )
-        if framegen_requested and not static_scene_overlap_requested:
-            raise ValueError(
-                "immersive_framegen static|adaptive requires "
-                "--immersive_static_scene_overlap on"
-            )
         if framegen_requested and not scene_depth_reproject_requested:
             raise ValueError(
                 "immersive_framegen static|adaptive requires "
                 "--immersive_timewarp scene_depth_reproject"
+            )
+        if (
+            framegen_requested
+            and not static_scene_overlap_requested
+            and immersive_gaussian_render_mode != "serial"
+        ):
+            raise ValueError(
+                "immersive_framegen with --immersive_static_scene_overlap off "
+                "currently supports --immersive_gaussian_render serial only"
             )
         if immersive_gaussian_render_mode == "stereo_batched" and (
             immersive_static_scene_overlap_mode != "off"
@@ -28514,10 +28638,14 @@ class InvPhyTrainerWarp:
                 and not framegen_requested
                 and immersive_timewarp_mode == "off"
             )
-            if immersive_timewarp_mode != "off" and not overlap_framegen_stereo_parallel_allowed:
+            if (
+                immersive_timewarp_mode != "off"
+                and static_scene_overlap_requested
+                and not overlap_framegen_stereo_parallel_allowed
+            ):
                 raise ValueError(
                     "immersive_gaussian_render stereo_parallel requires "
-                    "--immersive_timewarp off, except for the supported "
+                    "--immersive_timewarp off on the overlap path, except for the supported "
                     "framegen overlap path"
                 )
             if immersive_static_scene_overlap_mode == "on" and (
@@ -28536,10 +28664,22 @@ class InvPhyTrainerWarp:
                     "(--immersive_framegen static|adaptive with "
                     "--immersive_timewarp scene_depth_reproject)"
                 )
-        if immersive_present_pipeline_enabled and not static_scene_overlap_requested:
+        if (
+            immersive_present_pipeline_enabled
+            and not static_scene_overlap_requested
+            and not framegen_requested
+        ):
             raise ValueError(
                 "immersive_present_pipeline requires --immersive_static_scene_overlap on"
             )
+        timing_summary_requested_flags = {
+            "immersive_timewarp": immersive_timewarp_mode,
+            "immersive_static_scene_overlap": immersive_static_scene_overlap_mode,
+            "immersive_static_scene_reuse": immersive_static_scene_reuse_mode,
+            "immersive_framegen": immersive_framegen_mode,
+            "immersive_gaussian_render": immersive_gaussian_render_mode,
+            "immersive_present_pipeline": bool(immersive_present_pipeline_enabled),
+        }
         presentation_backend_enabled = bool(
             immersive_present_pipeline_enabled or framegen_requested
         )
@@ -30439,6 +30579,11 @@ class InvPhyTrainerWarp:
                 startup_context=startup_bootstrap_context,
             )
             startup_bootstrap_output = startup_bootstrap_state["output"]
+            if not bool(startup_bootstrap_state.get("complete", False)):
+                raise RuntimeError(
+                    "Immersive startup bootstrap handoff incomplete after forced completion. "
+                    + self._format_startup_bootstrap_state(startup_bootstrap_state)
+                )
             scene_renderer = startup_bootstrap_output["scene_renderer"]
             scene_analysis_cache_debug = startup_bootstrap_output[
                 "scene_analysis_cache_debug"
@@ -31849,15 +31994,15 @@ class InvPhyTrainerWarp:
                         "render_eye_intrinsics_setup_wall",
                         time.perf_counter() - intrinsics_setup_start,
                     )
-                framegen_reuse_applied = False
-                framegen_forced_render = 0.0
-                framegen_reuse_age_frames = 0.0
-                framegen_reuse_translation_m = 0.0
-                framegen_reuse_rotation_deg = 0.0
-                framegen_reuse_reason = "off"
-                framegen_signature_changed = False
-                framegen_max_age_hit = False
-                direct_framegen_reuse_applied = False
+                static_scene_reuse_applied = False
+                static_scene_reuse_forced_render = 0.0
+                static_scene_reuse_age_frames = 0.0
+                static_scene_reuse_translation_m = 0.0
+                static_scene_reuse_rotation_deg = 0.0
+                static_scene_reuse_reason = "off"
+                static_scene_signature_changed = False
+                static_scene_reuse_max_age_hit = False
+                direct_static_scene_reuse_applied = False
                 base_refresh_required = False
                 overlay_refresh_required = False
                 base_refresh_reasons = []
@@ -31865,8 +32010,8 @@ class InvPhyTrainerWarp:
                 base_refresh_max_age_hit = False
                 overlay_refresh_max_age_hit = False
                 layer_refresh_plan = None
-                framegen_metrics_enabled_for_frame = (
-                    immersive_framegen_mode in {"static", "adaptive"}
+                static_scene_reuse_metrics_enabled_for_frame = bool(
+                    static_scene_reuse_requested
                 )
                 static_scene_request_submitted = False
                 static_scene_request_is_layered = False
@@ -31878,7 +32023,7 @@ class InvPhyTrainerWarp:
                 if last_left_eye_pose_world is None or last_right_eye_pose_world is None:
                     raise RuntimeError("Immersive eye poses became unavailable.")
                 if (
-                    static_scene_overlap_enabled
+                    (static_scene_overlap_enabled or static_scene_reuse_requested)
                     and active_scene_stereo_mode
                     == self.IMMERSIVE_BALANCED_INTERNAL_STEREO_MODE
                 ):
@@ -31891,8 +32036,9 @@ class InvPhyTrainerWarp:
                     if cached_bounds_min is None or cached_bounds_max is None:
                         if not static_scene_overlap_cache_miss_logged:
                             print(
-                                "[quest_display] immersive static-scene overlap skipped "
-                                "for one frame; cached object bounds are unavailable",
+                                "[quest_display] immersive static-scene reuse/overlap "
+                                "skipped for one frame; cached object bounds are "
+                                "unavailable",
                                 flush=True,
                             )
                             static_scene_overlap_cache_miss_logged = True
@@ -31926,11 +32072,11 @@ class InvPhyTrainerWarp:
                                 prebuilt_overlap_render_plan
                             )
                         )
-                if framegen_metrics_enabled_for_frame:
-                    framegen_decision = (
-                        self._evaluate_immersive_static_scene_framegen_reuse(
-                            framegen_mode=immersive_framegen_mode,
-                            framegen_cache=static_scene_reuse_cache,
+                if static_scene_reuse_metrics_enabled_for_frame:
+                    static_scene_reuse_decision = (
+                        self._evaluate_immersive_static_scene_reuse(
+                            reuse_mode=immersive_static_scene_reuse_mode,
+                            reuse_cache=static_scene_reuse_cache,
                             render_sample=render_sample,
                             head_pose_state=head_pose_state,
                             left_eye_pose_world=last_left_eye_pose_world,
@@ -31938,28 +32084,38 @@ class InvPhyTrainerWarp:
                             render_plan_signature=prebuilt_overlap_render_plan_signature,
                         )
                     )
-                    direct_framegen_reuse_applied = bool(framegen_decision["reuse"])
-                    framegen_reuse_applied = bool(direct_framegen_reuse_applied)
-                    framegen_forced_render = 0.0 if framegen_reuse_applied else 1.0
-                    framegen_reuse_age_frames = float(
-                        framegen_decision["reuse_age_frames"]
+                    direct_static_scene_reuse_applied = bool(
+                        static_scene_reuse_decision["reuse"]
                     )
-                    framegen_reuse_translation_m = float(
-                        framegen_decision["translation_m"]
+                    static_scene_reuse_applied = bool(
+                        direct_static_scene_reuse_applied
                     )
-                    framegen_reuse_rotation_deg = float(
-                        framegen_decision["rotation_deg"]
+                    static_scene_reuse_forced_render = (
+                        0.0 if static_scene_reuse_applied else 1.0
                     )
-                    framegen_reuse_reason = str(framegen_decision["reason"])
-                    framegen_signature_changed = bool(
-                        framegen_decision.get("signature_changed", False)
+                    static_scene_reuse_age_frames = float(
+                        static_scene_reuse_decision["reuse_age_frames"]
                     )
-                    framegen_max_age_hit = bool(
-                        framegen_decision.get("max_age_hit", False)
+                    static_scene_reuse_translation_m = float(
+                        static_scene_reuse_decision["translation_m"]
+                    )
+                    static_scene_reuse_rotation_deg = float(
+                        static_scene_reuse_decision["rotation_deg"]
+                    )
+                    static_scene_reuse_reason = str(
+                        static_scene_reuse_decision["reason"]
+                    )
+                    static_scene_signature_changed = bool(
+                        static_scene_reuse_decision.get(
+                            "signature_changed",
+                            False,
+                        )
+                    )
+                    static_scene_reuse_max_age_hit = bool(
+                        static_scene_reuse_decision.get("max_age_hit", False)
                     )
                     if (
-                        not direct_framegen_reuse_applied
-                        and static_scene_overlap_enabled
+                        not direct_static_scene_reuse_applied
                         and active_scene_stereo_mode
                         == self.IMMERSIVE_BALANCED_INTERNAL_STEREO_MODE
                         and prebuilt_overlap_render_plan is not None
@@ -31970,7 +32126,7 @@ class InvPhyTrainerWarp:
                             )
                         layer_refresh_plan = (
                             self._evaluate_immersive_balanced_layer_refresh_plan(
-                                framegen_mode=immersive_framegen_mode,
+                                reuse_mode=immersive_static_scene_reuse_mode,
                                 layer_cache=static_scene_layer_cache,
                                 render_plan=prebuilt_overlap_render_plan,
                                 render_sample=render_sample,
@@ -31999,61 +32155,71 @@ class InvPhyTrainerWarp:
                             static_scene_base_signature_change_count += 1
                         if bool(layer_refresh_plan["overlay_signature_changed"]):
                             static_scene_overlay_signature_change_count += 1
-                        framegen_signature_changed = bool(framegen_signature_changed) or bool(
+                        static_scene_signature_changed = bool(
+                            static_scene_signature_changed
+                        ) or bool(
                             layer_refresh_plan["base_signature_changed"]
                             or layer_refresh_plan["overlay_signature_changed"]
                         )
-                        framegen_max_age_hit = bool(framegen_max_age_hit) or bool(
+                        static_scene_reuse_max_age_hit = bool(
+                            static_scene_reuse_max_age_hit
+                        ) or bool(
                             base_refresh_max_age_hit or overlay_refresh_max_age_hit
                         )
                         if bool(layer_refresh_plan["all_required_layers_reusable"]):
-                            framegen_reuse_applied = True
-                            framegen_forced_render = 0.0
-                            framegen_reuse_age_frames = float(
+                            static_scene_reuse_applied = True
+                            static_scene_reuse_forced_render = 0.0
+                            static_scene_reuse_age_frames = float(
                                 layer_refresh_plan["max_reuse_age_frames"]
                             )
-                            framegen_reuse_reason = (
+                            static_scene_reuse_reason = (
                                 "static_cadence"
-                                if str(immersive_framegen_mode).strip().lower()
+                                if str(immersive_static_scene_reuse_mode)
+                                .strip()
+                                .lower()
                                 == "static"
                                 else "adaptive_guardrails_passed"
                             )
-                    if framegen_signature_changed:
+                    if static_scene_signature_changed:
                         static_scene_signature_change_count += 1
-                    if not framegen_reuse_applied:
+                    if not static_scene_reuse_applied:
                         static_scene_cache_invalidation_count += 1
                         if base_refresh_required and base_refresh_reasons:
-                            framegen_reuse_reason = str(base_refresh_reasons[0])
+                            static_scene_reuse_reason = str(base_refresh_reasons[0])
                         elif overlay_refresh_required and overlay_refresh_reasons:
-                            framegen_reuse_reason = str(overlay_refresh_reasons[0])
-                        static_scene_reuse_reason_counts[framegen_reuse_reason] = (
+                            static_scene_reuse_reason = str(
+                                overlay_refresh_reasons[0]
+                            )
+                        static_scene_reuse_reason_counts[
+                            static_scene_reuse_reason
+                        ] = (
                             static_scene_reuse_reason_counts.get(
-                                framegen_reuse_reason,
+                                static_scene_reuse_reason,
                                 0,
                             )
                             + 1
                         )
                 if render_profile_frame is not None:
                     render_profile_frame["static_scene_reuse_applied"] = float(
-                        framegen_reuse_applied
+                        static_scene_reuse_applied
                     )
                     render_profile_frame["static_scene_reuse_age_frames"] = float(
-                        framegen_reuse_age_frames
+                        static_scene_reuse_age_frames
                     )
                     render_profile_frame["static_scene_framegen_forced_render"] = float(
-                        framegen_forced_render
+                        static_scene_reuse_forced_render
                     )
                     render_profile_frame["static_scene_reuse_translation_m"] = float(
-                        framegen_reuse_translation_m
+                        static_scene_reuse_translation_m
                     )
                     render_profile_frame["static_scene_reuse_rotation_deg"] = float(
-                        framegen_reuse_rotation_deg
+                        static_scene_reuse_rotation_deg
                     )
                     self._record_immersive_static_scene_reuse_profile_metrics(
                         render_profile_frame,
-                        fresh_render=not framegen_reuse_applied,
-                        reason=framegen_reuse_reason,
-                        max_age_hit=framegen_max_age_hit,
+                        fresh_render=not static_scene_reuse_applied,
+                        reason=static_scene_reuse_reason,
+                        max_age_hit=static_scene_reuse_max_age_hit,
                         cache_invalidation_count=_steady_state_scalar_count(
                             "static_scene_cache_invalidation_count",
                             static_scene_cache_invalidation_count,
@@ -32086,7 +32252,7 @@ class InvPhyTrainerWarp:
                         ),
                     )
                 if (
-                    not framegen_reuse_applied
+                    not static_scene_reuse_applied
                     and static_scene_overlap_enabled
                     and static_scene_worker is not None
                     and active_scene_stereo_mode
@@ -32111,8 +32277,8 @@ class InvPhyTrainerWarp:
                             )
                             static_scene_request_submitted = True
                         except Exception as exc:
-                            if framegen_metrics_enabled_for_frame:
-                                framegen_reuse_reason = "worker_failure"
+                            if static_scene_reuse_metrics_enabled_for_frame:
+                                static_scene_reuse_reason = "worker_failure"
                                 static_scene_cache_invalidation_count += 1
                                 static_scene_reuse_reason_counts["worker_failure"] = (
                                     static_scene_reuse_reason_counts.get(
@@ -32126,7 +32292,7 @@ class InvPhyTrainerWarp:
                                         render_profile_frame,
                                         fresh_render=True,
                                         reason="worker_failure",
-                                        max_age_hit=framegen_max_age_hit,
+                                        max_age_hit=static_scene_reuse_max_age_hit,
                                         cache_invalidation_count=_steady_state_scalar_count(
                                             "static_scene_cache_invalidation_count",
                                             static_scene_cache_invalidation_count,
@@ -32604,7 +32770,7 @@ class InvPhyTrainerWarp:
                 right_gaussian_depth = None
                 scene_layers_ready = False
                 if (
-                    direct_framegen_reuse_applied
+                    direct_static_scene_reuse_applied
                     and static_scene_reuse_cache is not None
                 ):
                     static_scene_reuse_start = time.perf_counter()
@@ -32654,7 +32820,7 @@ class InvPhyTrainerWarp:
                         ).copy()
                     publish_sample_id = int(scene_source_sample_id)
                     static_scene_reuse_cache["age_displayed_frames"] = int(
-                        framegen_reuse_age_frames
+                        static_scene_reuse_age_frames
                     )
                     static_scene_assemble_wall_s = (
                         time.perf_counter() - static_scene_reuse_start
@@ -32662,7 +32828,7 @@ class InvPhyTrainerWarp:
                     static_scene_render_wall_s = static_scene_assemble_wall_s
                     scene_layers_ready = True
                 elif (
-                    framegen_reuse_applied
+                    static_scene_reuse_applied
                     and layer_refresh_plan is not None
                     and prebuilt_overlap_render_plan is not None
                     and static_scene_layer_cache is not None
@@ -32694,7 +32860,7 @@ class InvPhyTrainerWarp:
                         reproject_caches=shared_scene_reproject_caches,
                         render_profile_frame=render_profile_frame,
                     )
-                    if framegen_metrics_enabled_for_frame:
+                    if static_scene_reuse_metrics_enabled_for_frame:
                         static_scene_reuse_cache = (
                             self._make_immersive_static_scene_reuse_cache_entry(
                                 render_plan=balanced_scene_render_plan,
@@ -32820,7 +32986,7 @@ class InvPhyTrainerWarp:
                             reproject_caches=shared_scene_reproject_caches,
                             render_profile_frame=render_profile_frame,
                         )
-                        if framegen_metrics_enabled_for_frame:
+                        if static_scene_reuse_metrics_enabled_for_frame:
                             static_scene_reuse_cache = (
                                 self._make_immersive_static_scene_reuse_cache_entry(
                                     render_plan=balanced_scene_render_plan,
@@ -32845,8 +33011,8 @@ class InvPhyTrainerWarp:
                         )
                         scene_layers_ready = True
                     except Exception as exc:
-                        if framegen_metrics_enabled_for_frame:
-                            framegen_reuse_reason = "worker_failure"
+                        if static_scene_reuse_metrics_enabled_for_frame:
+                            static_scene_reuse_reason = "worker_failure"
                             static_scene_cache_invalidation_count += 1
                             static_scene_reuse_reason_counts["worker_failure"] = (
                                 static_scene_reuse_reason_counts.get(
@@ -32860,7 +33026,7 @@ class InvPhyTrainerWarp:
                                     render_profile_frame,
                                     fresh_render=True,
                                     reason="worker_failure",
-                                    max_age_hit=framegen_max_age_hit,
+                                    max_age_hit=static_scene_reuse_max_age_hit,
                                     cache_invalidation_count=_steady_state_scalar_count(
                                         "static_scene_cache_invalidation_count",
                                         static_scene_cache_invalidation_count,
@@ -32889,6 +33055,15 @@ class InvPhyTrainerWarp:
                         static_scene_reuse_cache = None
                         immersive_framegen_mode = "off"
                         balanced_scene_render_plan = None
+
+                if (
+                    not scene_layers_ready
+                    and balanced_scene_render_plan is None
+                    and prebuilt_overlap_render_plan is not None
+                    and active_scene_stereo_mode
+                    == self.IMMERSIVE_BALANCED_INTERNAL_STEREO_MODE
+                ):
+                    balanced_scene_render_plan = prebuilt_overlap_render_plan
 
                 if (
                     not scene_layers_ready
@@ -32927,7 +33102,49 @@ class InvPhyTrainerWarp:
                     ):
                         scene_render_outputs = None
                         parallel_metrics = None
-                        if balanced_eye_parallel_enabled and balanced_eye_workers:
+                        layer_refresh_completed = False
+                        if (
+                            layer_refresh_plan is not None
+                            and static_scene_layer_cache is not None
+                        ):
+                            static_scene_execute_start = time.perf_counter()
+                            layer_request = (
+                                _build_immersive_balanced_scene_layer_request(
+                                    balanced_scene_render_plan,
+                                    layer_refresh_plan["requested_layers_by_eye"],
+                                )
+                            )
+                            layer_outputs = (
+                                _execute_immersive_balanced_scene_render_layers(
+                                    scene_execute_renderer,
+                                    layer_request,
+                                )
+                            )
+                            static_scene_execute_wall_s = (
+                                time.perf_counter() - static_scene_execute_start
+                            )
+                            (
+                                static_scene_layer_cache,
+                                fresh_layers_by_eye,
+                            ) = self._update_immersive_static_scene_layer_cache(
+                                layer_cache=static_scene_layer_cache,
+                                render_plan=balanced_scene_render_plan,
+                                layer_outputs=layer_outputs,
+                                head_pose_state=head_pose_state,
+                            )
+                            scene_render_outputs = (
+                                _build_immersive_balanced_render_outputs_from_layer_cache(
+                                    balanced_scene_render_plan,
+                                    static_scene_layer_cache,
+                                    fresh_layers_by_eye=fresh_layers_by_eye,
+                                )
+                            )
+                            layer_refresh_completed = True
+                        if (
+                            scene_render_outputs is None
+                            and balanced_eye_parallel_enabled
+                            and balanced_eye_workers
+                        ):
                             static_scene_execute_start = time.perf_counter()
                             try:
                                 (
@@ -32971,8 +33188,9 @@ class InvPhyTrainerWarp:
                             for metric_key, metric_value in parallel_metrics.items():
                                 render_profile_frame[metric_key] = float(metric_value)
                         if (
-                            immersive_framegen_mode in {"static", "adaptive"}
+                            static_scene_reuse_requested
                             and static_scene_layer_cache is not None
+                            and not layer_refresh_completed
                         ):
                             (
                                 static_scene_layer_cache,
@@ -33011,7 +33229,7 @@ class InvPhyTrainerWarp:
                             float(static_scene_execute_wall_s)
                             + float(static_scene_assemble_wall_s)
                         )
-                        if immersive_framegen_mode in {"static", "adaptive"}:
+                        if static_scene_reuse_metrics_enabled_for_frame:
                             static_scene_reuse_cache = (
                                 self._make_immersive_static_scene_reuse_cache_entry(
                                     render_plan=balanced_scene_render_plan,
@@ -33373,7 +33591,7 @@ class InvPhyTrainerWarp:
                         queue_wait_ms=0.0,
                         source_ready_wall_time_s=source_ready_wall_time_s,
                         static_scene_reuse_age_frames=float(
-                            framegen_reuse_age_frames
+                            static_scene_reuse_age_frames
                         ),
                         stale_packet=False,
                         reproject_caches=shared_scene_reproject_caches,
@@ -33873,9 +34091,11 @@ class InvPhyTrainerWarp:
                         "stable_fast_path_enabled": bool(
                             stable_present_pipeline_fast_path_enabled
                         ),
-                        "static_scene_reuse_applied": bool(framegen_reuse_applied),
+                        "static_scene_reuse_applied": bool(
+                            static_scene_reuse_applied
+                        ),
                         "static_scene_reuse_age_frames": float(
-                            framegen_reuse_age_frames
+                            static_scene_reuse_age_frames
                         ),
                         "scene_depth_reproject_enabled": bool(
                             scene_depth_reproject_enabled
@@ -34340,9 +34560,9 @@ class InvPhyTrainerWarp:
                     self._render_profile_capture_cuda_memory(render_profile_frame)
                     self._record_immersive_static_scene_reuse_profile_metrics(
                         render_profile_frame,
-                        fresh_render=not framegen_reuse_applied,
-                        reason=framegen_reuse_reason,
-                        max_age_hit=framegen_max_age_hit,
+                        fresh_render=not static_scene_reuse_applied,
+                        reason=static_scene_reuse_reason,
+                        max_age_hit=static_scene_reuse_max_age_hit,
                         cache_invalidation_count=_steady_state_scalar_count(
                             "static_scene_cache_invalidation_count",
                             static_scene_cache_invalidation_count,
@@ -34352,15 +34572,19 @@ class InvPhyTrainerWarp:
                             static_scene_signature_change_count,
                         ),
                     )
-                if profile_enabled and frame_count > 1 and framegen_metrics_enabled_for_frame:
+                if (
+                    profile_enabled
+                    and frame_count > 1
+                    and static_scene_reuse_metrics_enabled_for_frame
+                ):
                     static_scene_reuse_applied_samples.append(
-                        float(framegen_reuse_applied)
+                        float(static_scene_reuse_applied)
                     )
                     static_scene_fresh_render_samples.append(
-                        0.0 if framegen_reuse_applied else 1.0
+                        0.0 if static_scene_reuse_applied else 1.0
                     )
                     static_scene_reuse_max_age_hit_samples.append(
-                        1.0 if framegen_max_age_hit else 0.0
+                        1.0 if static_scene_reuse_max_age_hit else 0.0
                     )
                     static_scene_base_refresh_samples.append(
                         1.0 if base_refresh_required else 0.0
@@ -35096,6 +35320,9 @@ class InvPhyTrainerWarp:
                     requested_static_scene_overlap_mode=timing_summary_requested_flags[
                         "immersive_static_scene_overlap"
                     ],
+                    requested_static_scene_reuse_mode=timing_summary_requested_flags[
+                        "immersive_static_scene_reuse"
+                    ],
                     requested_framegen_mode=timing_summary_requested_flags[
                         "immersive_framegen"
                     ],
@@ -35106,6 +35333,7 @@ class InvPhyTrainerWarp:
                         "immersive_present_pipeline"
                     ],
                     effective_static_scene_overlap_enabled=static_scene_overlap_enabled,
+                    effective_static_scene_reuse_mode=immersive_static_scene_reuse_mode,
                     effective_scene_depth_reproject_enabled=scene_depth_reproject_enabled,
                     effective_framegen_mode=immersive_framegen_mode,
                     effective_gaussian_render_mode=immersive_gaussian_render_mode,
@@ -36215,6 +36443,7 @@ class InvPhyTrainerWarp:
         profile_freq=30,
         immersive_timewarp="off",
         immersive_static_scene_overlap="on",
+        immersive_static_scene_reuse="off",
         immersive_static_scene_mode="balanced_support_focus",
         immersive_support_entry_overlay=False,
         immersive_framegen="off",
@@ -36238,6 +36467,7 @@ class InvPhyTrainerWarp:
             profile_freq=profile_freq,
             immersive_timewarp=immersive_timewarp,
             immersive_static_scene_overlap=immersive_static_scene_overlap,
+            immersive_static_scene_reuse=immersive_static_scene_reuse,
             immersive_static_scene_mode=immersive_static_scene_mode,
             immersive_support_entry_overlay=immersive_support_entry_overlay,
             immersive_framegen=immersive_framegen,

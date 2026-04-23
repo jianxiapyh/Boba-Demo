@@ -294,8 +294,7 @@ def build_parser() -> ArgumentParser:
             "late-warp mode for immersive Quest output: "
             "'off' keeps the current shipped path, "
             "'scene_depth_reproject' late-warps the fully composed scene via depth reprojection "
-            "(requires --immersive_static_scene_overlap on; required for "
-            "--immersive_framegen static|adaptive)"
+            "(required for --immersive_framegen static|adaptive)"
         ),
     )
     parser.add_argument(
@@ -306,7 +305,18 @@ def build_parser() -> ArgumentParser:
             "static scene overlap mode for immersive Quest output: "
             "'off' keeps the serial reference path, "
             "'on' overlaps balanced room/table rendering with simulation+LBS and "
-            "unlocks the overlap-only framegen, timewarp, and present-pipeline path"
+            "enables the parallel static-scene worker and same-frame overlap path"
+        ),
+    )
+    parser.add_argument(
+        "--immersive_static_scene_reuse",
+        choices=("off", "static", "adaptive"),
+        default="off",
+        help=(
+            "real-frame static-scene reuse mode for immersive Quest output: "
+            "'off' always renders a fresh static scene, "
+            "'static' reuses cached static-scene outputs up to a fixed age limit, "
+            "'adaptive' adds motion/head-reset guardrails before reuse"
         ),
     )
     parser.add_argument(
@@ -334,11 +344,9 @@ def build_parser() -> ArgumentParser:
         help=(
             "in-between display-frame generation mode for immersive Quest output: "
             "'off' sends only real source frames, "
-            "'static' keeps static-scene reuse enabled internally and may synthesize one extra "
-            "head-reprojected stereo frame after a real source frame, "
+            "'static' may synthesize one extra head-reprojected stereo frame after a real source frame, "
             "'adaptive' does the same with stricter motion/freshness guardrails "
-            "(static/adaptive require --immersive_static_scene_overlap on and "
-            "--immersive_timewarp scene_depth_reproject)"
+            "(static/adaptive require --immersive_timewarp scene_depth_reproject)"
         ),
     )
     parser.add_argument(
@@ -353,7 +361,8 @@ def build_parser() -> ArgumentParser:
             "on the narrow stable path with --immersive_present_pipeline, "
             "--immersive_framegen off, and --immersive_timewarp off, and on the "
             "framegen path with --immersive_framegen static|adaptive and "
-            "--immersive_timewarp scene_depth_reproject), "
+            "--immersive_timewarp scene_depth_reproject; non-overlap framegen v1 supports "
+            "--immersive_gaussian_render serial only), "
             "'stereo_batched' experimentally renders both eyes in one batched gsplat call "
             "(requires --immersive_static_scene_overlap off and --immersive_timewarp off; "
             "not supported for framegen v1)"
@@ -414,6 +423,11 @@ def main(argv: list[str] | None = None):
     print(
         "[quest_display] immersive_static_scene_overlap="
         f"{args.immersive_static_scene_overlap}",
+        flush=True,
+    )
+    print(
+        "[quest_display] immersive_static_scene_reuse="
+        f"{args.immersive_static_scene_reuse}",
         flush=True,
     )
     print(
@@ -543,6 +557,7 @@ def main(argv: list[str] | None = None):
             profile_freq=args.profile_freq,
             immersive_timewarp=args.immersive_timewarp,
             immersive_static_scene_overlap=args.immersive_static_scene_overlap,
+            immersive_static_scene_reuse=args.immersive_static_scene_reuse,
             immersive_static_scene_mode=args.immersive_static_scene_mode,
             immersive_support_entry_overlay=args.immersive_support_entry_overlay,
             immersive_framegen=args.immersive_framegen,

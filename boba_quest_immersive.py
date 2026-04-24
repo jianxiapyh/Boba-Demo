@@ -391,11 +391,11 @@ def build_parser() -> ArgumentParser:
     parser.add_argument(
         "--immersive_eye_resolution",
         type=int,
-        default=1536,
+        default=1408,
         help=(
             "square per-eye immersive output resolution. "
-            "1536 is the default native GL quality/performance preset; "
-            "use 1024 for speed or 2048 for quality experiments"
+            "1408 is the default native GL quality/performance preset; "
+            "use 1024 for speed or 1536/2048 for quality experiments"
         ),
     )
     parser.add_argument(
@@ -432,9 +432,10 @@ def build_parser() -> ArgumentParser:
     parser.add_argument(
         "--immersive_gaussian_render",
         choices=("serial", "stereo_parallel", "stereo_batched"),
-        default="stereo_parallel",
+        default=None,
         help=(
             "Gaussian render scheduling mode for immersive Quest output: "
+            "default is 'stereo_batched' for native_gl and 'serial' otherwise; "
             "'serial' renders left/right Gaussian eyes sequentially, "
             "'stereo_parallel' experimentally renders both eyes concurrently on separate CUDA streams "
             "(requires --immersive_timewarp off on the reference path; overlap=on is also supported "
@@ -501,6 +502,12 @@ def main(argv: list[str] | None = None):
         and args.immersive_static_scene_mode is None
     ):
         args.immersive_static_scene_mode = "balanced_support_focus"
+    if args.immersive_gaussian_render is None:
+        args.immersive_gaussian_render = (
+            "stereo_batched"
+            if immersive_static_scene_backend == "native_gl"
+            else "serial"
+        )
 
     global np, torch
     import numpy as np  # type: ignore[assignment]

@@ -17,6 +17,8 @@ from pyrender.renderer import Renderer
 _SUPPORT_CACHE: tuple[bool, str] | None = None
 _UNPACK_MODULE = None
 _UNPACK_FUNCTION = None
+_NATIVE_GL_UNPACK_U8_MODULE = None
+_NATIVE_GL_UNPACK_U8_FUNCTION = None
 _PREVIEW_COPY_MODULE = None
 _PREVIEW_COPY_FUNCTION = None
 
@@ -106,6 +108,69 @@ def _get_unpack_function():
     _UNPACK_FUNCTION = _UNPACK_MODULE.get_function("unpack_rgba_depth")
     _UNPACK_FUNCTION.prepare("PPPPiiffi")
     return _UNPACK_FUNCTION
+
+
+def _get_native_gl_uint8_unpack_function():
+    global _NATIVE_GL_UNPACK_U8_MODULE, _NATIVE_GL_UNPACK_U8_FUNCTION
+    if _NATIVE_GL_UNPACK_U8_FUNCTION is not None:
+        return _NATIVE_GL_UNPACK_U8_FUNCTION
+
+    _NATIVE_GL_UNPACK_U8_MODULE = SourceModule(
+        r"""
+        extern "C" __global__ void unpack_rgba_u8_depth(
+            const unsigned char* color_in,
+            const float* depth_in,
+            unsigned char* color_out,
+            float* depth_out,
+            int width,
+            int height,
+            float z_near,
+            float z_far,
+            int use_z_far
+        ) {
+            int pixel_index = blockIdx.x * blockDim.x + threadIdx.x;
+            int pixel_count = width * height;
+            if (pixel_index >= pixel_count) {
+                return;
+            }
+
+            int x = pixel_index % width;
+            int y = pixel_index / width;
+            int src_y = height - 1 - y;
+            int src_index = src_y * width + x;
+
+            const uchar4* src_rgba = reinterpret_cast<const uchar4*>(color_in);
+            uchar4* dst_rgba = reinterpret_cast<uchar4*>(color_out);
+            dst_rgba[pixel_index] = src_rgba[src_index];
+
+            float raw_depth = depth_in[src_index];
+            if (!isfinite(raw_depth) || raw_depth >= 1.0f) {
+                depth_out[pixel_index] = 0.0f;
+                return;
+            }
+
+            float ndc_depth = 2.0f * raw_depth - 1.0f;
+            float linear_depth = 0.0f;
+            if (use_z_far) {
+                linear_depth = (2.0f * z_near * z_far) /
+                    (z_far + z_near - ndc_depth * (z_far - z_near));
+            } else {
+                linear_depth = 2.0f * z_near / (1.0f - ndc_depth);
+            }
+            if (!isfinite(linear_depth) || linear_depth <= 1.0e-6f) {
+                depth_out[pixel_index] = 0.0f;
+                return;
+            }
+            depth_out[pixel_index] = linear_depth;
+        }
+        """,
+        no_extern_c=True,
+    )
+    _NATIVE_GL_UNPACK_U8_FUNCTION = _NATIVE_GL_UNPACK_U8_MODULE.get_function(
+        "unpack_rgba_u8_depth"
+    )
+    _NATIVE_GL_UNPACK_U8_FUNCTION.prepare("PPPPiiffi")
+    return _NATIVE_GL_UNPACK_U8_FUNCTION
 
 
 def _get_preview_copy_function():

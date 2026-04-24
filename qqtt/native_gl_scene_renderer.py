@@ -17,7 +17,7 @@ from PIL import Image
 
 from .pyrender_cuda_bridge import (
     _InteropBuffer,
-    _get_unpack_function,
+    _get_native_gl_uint8_unpack_function,
     graphics_map_flags,
 )
 
@@ -963,7 +963,7 @@ class NativeGlSceneRenderer:
         self._color_tensors = [
             torch.empty(
                 (height, width, 4),
-                dtype=torch.float32,
+                dtype=torch.uint8,
                 device=self.device,
             )
             for _ in range(self._output_ring_size)
@@ -997,7 +997,7 @@ class NativeGlSceneRenderer:
         pixel_count = int(self.width) * int(self.height)
         block_size = 256
         grid_size = max((pixel_count + block_size - 1) // block_size, 1)
-        unpack_function = _get_unpack_function()
+        unpack_function = _get_native_gl_uint8_unpack_function()
         unpack_function.prepared_call(
             (grid_size, 1, 1),
             (block_size, 1, 1),
@@ -1163,6 +1163,8 @@ class NativeGlSceneRenderer:
             "native_gl_anisotropy_reason": str(self.anisotropy_reason),
             "native_gl_msaa_samples": int(self.msaa_samples),
             "native_gl_depth_format": self.depth_format,
+            "native_gl_color_dtype": "uint8",
+            "native_gl_depth_dtype": "float32",
         }
         return color, depth
 
@@ -1222,6 +1224,8 @@ class NativeGlSceneRenderer:
             "native_gl_anisotropy_reason": str(self.anisotropy_reason),
             "msaa_samples": int(self.msaa_samples),
             "depth_format": self.depth_format,
+            "native_gl_color_dtype": "uint8",
+            "native_gl_depth_dtype": "float32",
         }
 
     def _delete_cuda_readback_targets(self) -> None:

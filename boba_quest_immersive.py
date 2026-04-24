@@ -379,6 +379,16 @@ def build_parser() -> ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--immersive_gaussian_source_validation",
+        choices=("off", "on"),
+        default="off",
+        help=(
+            "expensive Gaussian source corruption validator for rope-family "
+            "immersive runs. Keep off for normal native-GL gameplay; use on for "
+            "debugging source-coverage rollback behavior"
+        ),
+    )
+    parser.add_argument(
         "--immersive_eye_resolution",
         type=int,
         default=1536,
@@ -527,6 +537,11 @@ def main(argv: list[str] | None = None):
     print(
         "[quest_display] immersive_static_scene_backend="
         f"{args.immersive_static_scene_backend}",
+        flush=True,
+    )
+    print(
+        "[quest_display] immersive_gaussian_source_validation="
+        f"{args.immersive_gaussian_source_validation}",
         flush=True,
     )
     if immersive_static_scene_backend == "native_gl":
@@ -683,6 +698,9 @@ def main(argv: list[str] | None = None):
             immersive_native_gl_anisotropy=args.immersive_native_gl_anisotropy,
             immersive_native_gl_msaa_samples=args.immersive_native_gl_msaa_samples,
             immersive_native_gl_depth_format=args.immersive_native_gl_depth_format,
+            immersive_gaussian_source_validation=(
+                args.immersive_gaussian_source_validation
+            ),
             immersive_support_entry_overlay=args.immersive_support_entry_overlay,
             immersive_framegen=args.immersive_framegen,
             immersive_gaussian_render=args.immersive_gaussian_render,

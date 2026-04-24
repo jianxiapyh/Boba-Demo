@@ -177,6 +177,13 @@ def _normalize_immersive_native_gl_depth_format(depth_format):
     return normalized_format
 
 
+def _normalize_immersive_on_off(value, *, flag_name):
+    normalized_value = str(value).strip().lower()
+    if normalized_value not in {"off", "on"}:
+        raise ValueError(f"{flag_name} must be one of {{'off', 'on'}}")
+    return normalized_value
+
+
 def _expected_immersive_static_scene_readback_mode(*, balanced_render_backend):
     backend_mode = _normalize_immersive_static_scene_backend_mode(
         balanced_render_backend
@@ -6563,6 +6570,7 @@ class InvPhyTrainerWarp:
     IMMERSIVE_IDLE_FULLFRAME_FLASH_NEAR_BLACK_MAX_RGB = 12.0
     IMMERSIVE_IDLE_FULLFRAME_FLASH_MIN_NEAR_BLACK_RATIO = 0.85
     IMMERSIVE_IDLE_FULLFRAME_FLASH_MAX_LUMA_RATIO = 0.25
+    IMMERSIVE_IDLE_FULLFRAME_FLASH_SAMPLE_STRIDE = 8
     IMMERSIVE_STARTUP_KEEPALIVE_RGBA = [232, 232, 232, 255]
     IMMERSIVE_TUTORIAL_BACKGROUND_RGBA = [18, 20, 28, 255]
     IMMERSIVE_TUTORIAL_SAFE_WIDTH_FRACTION = 0.80
@@ -12329,6 +12337,7 @@ class InvPhyTrainerWarp:
         requested_native_gl_anisotropy,
         requested_native_gl_msaa_samples,
         requested_native_gl_depth_format,
+        requested_gaussian_source_validation_mode,
         requested_framegen_mode,
         requested_gaussian_render_mode,
         requested_present_pipeline_enabled,
@@ -12373,6 +12382,10 @@ class InvPhyTrainerWarp:
                 _normalize_immersive_native_gl_depth_format(
                     requested_native_gl_depth_format
                 )
+            ),
+            "immersive_gaussian_source_validation": _normalize_immersive_on_off(
+                requested_gaussian_source_validation_mode,
+                flag_name="immersive_gaussian_source_validation",
             ),
             "immersive_framegen": str(requested_framegen_mode).strip().lower(),
             "immersive_gaussian_render": str(
@@ -12489,6 +12502,7 @@ class InvPhyTrainerWarp:
             f"native_gl_anisotropy={requested_flags.get('immersive_native_gl_anisotropy', 8)} "
             f"native_gl_msaa_samples={requested_flags.get('immersive_native_gl_msaa_samples', 4)} "
             f"native_gl_depth_format={requested_flags.get('immersive_native_gl_depth_format', 'depth32f')} "
+            f"gaussian_source_validation={requested_flags.get('immersive_gaussian_source_validation', 'off')} "
             f"framegen={requested_flags.get('immersive_framegen', 'off')} "
             f"gaussian_render={requested_flags.get('immersive_gaussian_render', 'serial')} "
             f"present_pipeline={requested_flags.get('immersive_present_pipeline', 'off')}"
@@ -18160,10 +18174,18 @@ class InvPhyTrainerWarp:
         }
 
     @torch.no_grad()
-    def _compute_immersive_idle_fullframe_flash_eye_metrics(self, frame):
+    def _compute_immersive_idle_fullframe_flash_eye_metrics(
+        self,
+        frame,
+        *,
+        sample_stride=1,
+    ):
         if not torch.is_tensor(frame) or frame.ndim != 3 or int(frame.shape[-1]) < 3:
             return None
+        sample_stride = max(1, int(sample_stride))
         rgb = frame[..., :3].detach()
+        if sample_stride > 1:
+            rgb = rgb[::sample_stride, ::sample_stride, :]
         if rgb.dtype != torch.float32:
             rgb = rgb.to(dtype=torch.float32)
         max_rgb = rgb.max(dim=-1).values
@@ -18188,6 +18210,7 @@ class InvPhyTrainerWarp:
         return {
             "near_black_ratio": float(near_black_ratio),
             "mean_luma": float(mean_luma),
+            "sample_stride": int(sample_stride),
         }
 
     @torch.no_grad()
@@ -18199,8 +18222,9 @@ class InvPhyTrainerWarp:
         committed_safe_cover_left_frame,
         committed_safe_cover_right_frame,
         committed_safe_cover_frame_count,
+        committed_safe_cover_metrics_by_eye=None,
         interaction_context=None,
-        backend_kind,
+        backend_kind="",
     ):
         interaction_context = (
             {} if interaction_context is None else copy.deepcopy(interaction_context)
@@ -18228,6 +18252,8 @@ class InvPhyTrainerWarp:
             "metrics_by_eye": {},
             "rejected_eyes": [],
             "trigger_reasons": [],
+            "sample_stride": int(self.IMMERSIVE_IDLE_FULLFRAME_FLASH_SAMPLE_STRIDE),
+            "fullframe_confirmation": False,
         }
         if int(committed_safe_cover_frame_count) < int(
             self.IMMERSIVE_IDLE_FULLFRAME_FLASH_ARM_SAFE_COVER_FRAMES
@@ -18242,15 +18268,29 @@ class InvPhyTrainerWarp:
             "left": committed_safe_cover_left_frame,
             "right": committed_safe_cover_right_frame,
         }
+        cached_baseline_metrics_by_eye = (
+            {}
+            if committed_safe_cover_metrics_by_eye is None
+            else committed_safe_cover_metrics_by_eye
+        )
+        sample_stride = int(decision["sample_stride"])
         baseline_valid = True
         rejected_eyes = []
         for eye_label in ("left", "right"):
             current_metrics = self._compute_immersive_idle_fullframe_flash_eye_metrics(
-                current_frames[eye_label]
+                current_frames[eye_label],
+                sample_stride=sample_stride,
             )
-            baseline_metrics = self._compute_immersive_idle_fullframe_flash_eye_metrics(
-                baseline_frames[eye_label]
+            baseline_metrics = copy.deepcopy(
+                cached_baseline_metrics_by_eye.get(eye_label)
             )
+            if baseline_metrics is None:
+                baseline_metrics = (
+                    self._compute_immersive_idle_fullframe_flash_eye_metrics(
+                        baseline_frames[eye_label],
+                        sample_stride=sample_stride,
+                    )
+                )
             decision["metrics_by_eye"][eye_label] = {
                 "current": copy.deepcopy(current_metrics),
                 "baseline": copy.deepcopy(baseline_metrics),
@@ -18287,6 +18327,63 @@ class InvPhyTrainerWarp:
         if not baseline_valid:
             decision["reason"] = "baseline_invalid"
             return decision
+        if len(rejected_eyes) == 2 and sample_stride > 1:
+            fullframe_rejected_eyes = []
+            fullframe_metrics_by_eye = {}
+            fullframe_baseline_valid = True
+            for eye_label in ("left", "right"):
+                current_metrics = self._compute_immersive_idle_fullframe_flash_eye_metrics(
+                    current_frames[eye_label],
+                    sample_stride=1,
+                )
+                baseline_metrics = self._compute_immersive_idle_fullframe_flash_eye_metrics(
+                    baseline_frames[eye_label],
+                    sample_stride=1,
+                )
+                fullframe_metrics_by_eye[eye_label] = {
+                    "current": copy.deepcopy(current_metrics),
+                    "baseline": copy.deepcopy(baseline_metrics),
+                    "luma_ratio_to_baseline": None,
+                    "reject": False,
+                }
+                if current_metrics is None or baseline_metrics is None:
+                    fullframe_baseline_valid = False
+                    continue
+                baseline_near_black = bool(
+                    float(baseline_metrics.get("near_black_ratio", 1.0))
+                    >= float(self.IMMERSIVE_IDLE_FULLFRAME_FLASH_MIN_NEAR_BLACK_RATIO)
+                )
+                baseline_luma = max(
+                    float(baseline_metrics.get("mean_luma", 0.0)),
+                    1e-6,
+                )
+                luma_ratio = (
+                    float(current_metrics.get("mean_luma", 0.0)) / baseline_luma
+                )
+                eye_reject = bool(
+                    (not baseline_near_black)
+                    and float(current_metrics.get("near_black_ratio", 0.0))
+                    >= float(self.IMMERSIVE_IDLE_FULLFRAME_FLASH_MIN_NEAR_BLACK_RATIO)
+                    and luma_ratio
+                    < float(self.IMMERSIVE_IDLE_FULLFRAME_FLASH_MAX_LUMA_RATIO)
+                )
+                fullframe_metrics_by_eye[eye_label][
+                    "luma_ratio_to_baseline"
+                ] = float(luma_ratio)
+                fullframe_metrics_by_eye[eye_label]["reject"] = bool(eye_reject)
+                if baseline_near_black:
+                    fullframe_baseline_valid = False
+                if eye_reject:
+                    fullframe_rejected_eyes.append(str(eye_label))
+            decision["fullframe_confirmation"] = True
+            decision["sampled_metrics_by_eye"] = copy.deepcopy(
+                decision["metrics_by_eye"]
+            )
+            decision["metrics_by_eye"] = fullframe_metrics_by_eye
+            rejected_eyes = fullframe_rejected_eyes
+            if not fullframe_baseline_valid:
+                decision["reason"] = "baseline_invalid"
+                return decision
         decision["armed"] = True
         decision["rejected_eyes"] = list(rejected_eyes)
         if len(rejected_eyes) == 2:
@@ -26931,6 +27028,12 @@ class InvPhyTrainerWarp:
             return None
         return float(pixel_np[0]), float(pixel_np[1])
 
+    def _viewer_overlay_pixel_tuple(self, pixel):
+        xy = self._viewer_overlay_pixel_xy(pixel)
+        if xy is None:
+            return None
+        return (float(xy[0]), float(xy[1]))
+
     def _append_viewer_overlay_line_command(
         self,
         commands,
@@ -27038,11 +27141,20 @@ class InvPhyTrainerWarp:
             for group_entries in candidate_groups.values():
                 if not group_entries:
                     continue
-                candidate_pixels = [entry["attach_candidate_pixel"] for entry in group_entries]
-                if len(candidate_pixels) == 1:
-                    candidate_pixel = candidate_pixels[0]
+                candidate_xys = [
+                    self._viewer_overlay_pixel_xy(entry["attach_candidate_pixel"])
+                    for entry in group_entries
+                ]
+                candidate_xys = [xy for xy in candidate_xys if xy is not None]
+                if not candidate_xys:
+                    continue
+                if len(candidate_xys) == 1:
+                    candidate_pixel = candidate_xys[0]
                 else:
-                    candidate_pixel = torch.stack(candidate_pixels, dim=0).mean(dim=0)
+                    candidate_pixel = (
+                        sum(xy[0] for xy in candidate_xys) / len(candidate_xys),
+                        sum(xy[1] for xy in candidate_xys) / len(candidate_xys),
+                    )
                 left_entry = next(
                     (entry for entry in group_entries if entry.get("source") == "left"),
                     None,
@@ -27155,9 +27267,11 @@ class InvPhyTrainerWarp:
                             blend=0.96,
                         )
             if not active_contact_only and overlay["select_available"]:
-                indicator_pixel = origin_pixel + origin_pixel.new_tensor(
-                    [0.0, -10.0],
-                    dtype=torch.float32,
+                origin_xy = self._viewer_overlay_pixel_xy(origin_pixel)
+                indicator_pixel = (
+                    None
+                    if origin_xy is None
+                    else (origin_xy[0], origin_xy[1] - 10.0)
                 )
                 indicator_color = (
                     self.LIVE_CONTROLLER_SELECT_COLOR
@@ -27195,6 +27309,174 @@ class InvPhyTrainerWarp:
                     blend=0.98,
                 )
         return commands
+
+    @torch.no_grad()
+    def _build_live_controller_viewer_overlay_commands_from_world_batched(
+        self,
+        overlay_world_entries,
+        eye_render_states,
+        height,
+        width,
+    ):
+        eye_items = list(eye_render_states.items())
+        commands_by_eye = {eye_label: [] for eye_label, _ in eye_items}
+        overlay_world_entries = list(overlay_world_entries or [])
+        if not eye_items or not overlay_world_entries:
+            return commands_by_eye
+
+        world_points = []
+        point_refs = []
+        for overlay_idx, overlay_world in enumerate(overlay_world_entries):
+            for field_name in (
+                "origin_world",
+                "ray_end_world",
+                "hit_world",
+                "attach_candidate_world",
+                "active_overlay_world",
+                "active_overlay_fallback_world",
+            ):
+                world_point = overlay_world.get(field_name)
+                if world_point is None:
+                    continue
+                world_points.append(
+                    torch.as_tensor(
+                        world_point,
+                        dtype=torch.float32,
+                        device=cfg.device,
+                    ).reshape(1, 3)
+                )
+                point_refs.append((overlay_idx, field_name, None))
+            for preview_idx, preview_entry in enumerate(
+                overlay_world.get("anchor_preview_entries_world", [])
+            ):
+                world_point = preview_entry.get("world")
+                if world_point is None:
+                    continue
+                world_points.append(
+                    torch.as_tensor(
+                        world_point,
+                        dtype=torch.float32,
+                        device=cfg.device,
+                    ).reshape(1, 3)
+                )
+                point_refs.append(
+                    (overlay_idx, "anchor_preview_entries_world", preview_idx)
+                )
+        if not world_points:
+            return commands_by_eye
+
+        intrinsic_by_eye_t = torch.stack(
+            [state["intrinsic_t"] for _, state in eye_items],
+            dim=0,
+        )
+        w2c_by_eye_t = torch.stack(
+            [state["w2c_cv_t"] for _, state in eye_items],
+            dim=0,
+        )
+        pixels_by_eye, depth_valid_by_eye = self._project_points_to_pixels_multi_eye(
+            torch.cat(world_points, dim=0),
+            intrinsic_by_eye_t,
+            w2c_by_eye_t,
+        )
+        onscreen_by_eye = (
+            depth_valid_by_eye
+            & (pixels_by_eye[..., 0] >= 0.0)
+            & (pixels_by_eye[..., 0] < float(width))
+            & (pixels_by_eye[..., 1] >= 0.0)
+            & (pixels_by_eye[..., 1] < float(height))
+        )
+
+        projected_field_by_eye = [
+            [dict() for _ in overlay_world_entries] for _ in eye_items
+        ]
+        projected_preview_by_eye = [
+            [dict() for _ in overlay_world_entries] for _ in eye_items
+        ]
+        for point_idx, (overlay_idx, field_name, preview_idx) in enumerate(point_refs):
+            for eye_idx in range(len(eye_items)):
+                depth_valid = bool(depth_valid_by_eye[eye_idx, point_idx].item())
+                pixel = None
+                if depth_valid:
+                    if field_name in {"origin_world", "ray_end_world"}:
+                        pixel = pixels_by_eye[eye_idx, point_idx]
+                    elif bool(onscreen_by_eye[eye_idx, point_idx].item()):
+                        pixel = pixels_by_eye[eye_idx, point_idx]
+                if preview_idx is None:
+                    projected_field_by_eye[eye_idx][overlay_idx][field_name] = pixel
+                else:
+                    projected_preview_by_eye[eye_idx][overlay_idx][preview_idx] = pixel
+
+        for eye_idx, (eye_label, _) in enumerate(eye_items):
+            eye_entries = []
+            for overlay_idx, overlay_world in enumerate(overlay_world_entries):
+                projected_fields = projected_field_by_eye[eye_idx][overlay_idx]
+                overlay_geometry = (
+                    self._resolve_live_controller_projected_overlay_geometry(
+                        overlay_world,
+                        projected_fields,
+                        eye_label=eye_label,
+                        height=height,
+                        width=width,
+                    )
+                )
+                if overlay_geometry is None:
+                    continue
+                projected = {
+                    "source": overlay_world["source"],
+                    "origin_pixel": self._viewer_overlay_pixel_tuple(
+                        overlay_geometry["origin_pixel"]
+                    ),
+                    "end_pixel": self._viewer_overlay_pixel_tuple(
+                        overlay_geometry["end_pixel"]
+                    ),
+                    "hit_pixel": self._viewer_overlay_pixel_tuple(
+                        projected_fields.get("hit_world")
+                    ),
+                    "attach_candidate_pixel": self._viewer_overlay_pixel_tuple(
+                        projected_fields.get("attach_candidate_world")
+                    ),
+                    "attach_candidate_anchor_name": overlay_world.get(
+                        "attach_candidate_anchor_name"
+                    ),
+                    "attach_active_pixel": self._viewer_overlay_pixel_tuple(
+                        overlay_geometry["attach_active_pixel"]
+                    ),
+                    "attach_candidate": bool(
+                        overlay_world.get("attach_candidate", False)
+                    ),
+                    "attachment_active": bool(
+                        overlay_world.get("attachment_active", False)
+                    ),
+                    "active_contact_only": bool(
+                        overlay_geometry["active_contact_only"]
+                    ),
+                    "color": overlay_world["color"],
+                    "select_available": bool(overlay_world["select_available"]),
+                    "select_pressed": bool(overlay_world["select_pressed"]),
+                    "anchor_preview_entries": [],
+                }
+                preview_pixels = projected_preview_by_eye[eye_idx][overlay_idx]
+                for preview_idx, preview_entry in enumerate(
+                    overlay_world.get("anchor_preview_entries_world", [])
+                ):
+                    preview_pixel = self._viewer_overlay_pixel_tuple(
+                        preview_pixels.get(preview_idx)
+                    )
+                    if preview_pixel is None:
+                        continue
+                    projected["anchor_preview_entries"].append(
+                        {
+                            "pixel": preview_pixel,
+                            "selected": preview_entry["selected"],
+                            "active": preview_entry["active"],
+                            "occupied": bool(preview_entry.get("occupied", False)),
+                        }
+                    )
+                eye_entries.append(projected)
+            commands_by_eye[eye_label] = (
+                self._build_live_controller_viewer_overlay_commands(eye_entries)
+            )
+        return commands_by_eye
 
     def _build_rope_game_viewer_overlay_commands(
         self,
@@ -30078,6 +30360,7 @@ class InvPhyTrainerWarp:
         immersive_native_gl_anisotropy=8,
         immersive_native_gl_msaa_samples=4,
         immersive_native_gl_depth_format="depth32f",
+        immersive_gaussian_source_validation="off",
         immersive_support_entry_overlay=False,
         immersive_framegen="off",
         immersive_gaussian_render="stereo_parallel",
@@ -30354,6 +30637,10 @@ class InvPhyTrainerWarp:
         immersive_native_gl_depth_format = _normalize_immersive_native_gl_depth_format(
             immersive_native_gl_depth_format
         )
+        immersive_gaussian_source_validation_mode = _normalize_immersive_on_off(
+            immersive_gaussian_source_validation,
+            flag_name="immersive_gaussian_source_validation",
+        )
         if (
             immersive_static_scene_backend_mode == "native_gl"
             and immersive_static_scene_mode is not None
@@ -30439,7 +30726,8 @@ class InvPhyTrainerWarp:
         )
         stable_compose_safety_gate_enabled = bool(stable_compose_safety_enabled)
         stable_gaussian_source_validation_enabled = bool(
-            immersive_timewarp_mode == "off"
+            immersive_gaussian_source_validation_mode == "on"
+            and immersive_timewarp_mode == "off"
             and immersive_framegen_mode == "off"
             and self._is_rope_family_case()
         )
@@ -30565,6 +30853,9 @@ class InvPhyTrainerWarp:
             "immersive_native_gl_anisotropy": immersive_native_gl_anisotropy,
             "immersive_native_gl_msaa_samples": immersive_native_gl_msaa_samples,
             "immersive_native_gl_depth_format": immersive_native_gl_depth_format,
+            "immersive_gaussian_source_validation": (
+                immersive_gaussian_source_validation_mode
+            ),
             "immersive_framegen": immersive_framegen_mode,
             "immersive_gaussian_render": immersive_gaussian_render_mode,
             "immersive_present_pipeline": bool(immersive_present_pipeline_enabled),
@@ -30797,6 +31088,7 @@ class InvPhyTrainerWarp:
             "render_eye_intrinsics_setup_wall",
             "scene_compose_artifact_context_wall",
             "scene_gaussian_source_validation_wall",
+            "scene_gaussian_source_validation_active_ratio",
             "scene_publish_state_resolve_wall",
             "scene_stable_compose_analysis_wall",
             "scene_stable_compose_artifact_finalize_wall",
@@ -32691,6 +32983,7 @@ class InvPhyTrainerWarp:
             committed_safe_cover_left_frame = None
             committed_safe_cover_right_frame = None
             committed_safe_preview_frame = None
+            committed_safe_cover_metrics_by_eye = None
             committed_safe_cover_frame_count = 0
 
             def _update_balanced_scene_input_cache_from_points(object_points_t):
@@ -33003,6 +33296,7 @@ class InvPhyTrainerWarp:
                 nonlocal committed_safe_cover_left_frame
                 nonlocal committed_safe_cover_right_frame
                 nonlocal committed_safe_preview_frame
+                nonlocal committed_safe_cover_metrics_by_eye
                 nonlocal committed_safe_cover_frame_count
                 if snapshot is None:
                     return
@@ -33012,6 +33306,20 @@ class InvPhyTrainerWarp:
                 committed_safe_preview_frame = (
                     None if preview_frame is None else preview_frame.clone()
                 )
+                committed_safe_cover_metrics_by_eye = {
+                    "left": self._compute_immersive_idle_fullframe_flash_eye_metrics(
+                        committed_safe_cover_left_frame,
+                        sample_stride=(
+                            self.IMMERSIVE_IDLE_FULLFRAME_FLASH_SAMPLE_STRIDE
+                        ),
+                    ),
+                    "right": self._compute_immersive_idle_fullframe_flash_eye_metrics(
+                        committed_safe_cover_right_frame,
+                        sample_stride=(
+                            self.IMMERSIVE_IDLE_FULLFRAME_FLASH_SAMPLE_STRIDE
+                        ),
+                    ),
+                }
                 committed_safe_cover_frame_count = int(
                     committed_safe_cover_frame_count
                 ) + 1
@@ -33974,6 +34282,10 @@ class InvPhyTrainerWarp:
                     current_live_right_controller = None
 
                 render_profile_frame = self._render_profile_new_frame(profile_enabled)
+                if render_profile_frame is not None:
+                    render_profile_frame[
+                        "scene_gaussian_source_validation_active_ratio"
+                    ] = 1.0 if stable_gaussian_source_validation_enabled else 0.0
                 render_sample = last_immersive_sample
                 render_sample_received_monotonic_s = (
                     self._sample_received_monotonic_s(render_sample)
@@ -36044,36 +36356,6 @@ class InvPhyTrainerWarp:
                                 "scene_support_overlay_cache_wall",
                                 time.perf_counter() - support_overlay_cache_start,
                             )
-                    overlay_projection_start = (
-                        time.perf_counter() if render_profile_frame is not None else None
-                    )
-                    projected_overlay_entries = (
-                        self._project_live_controller_world_overlays_batched(
-                            list(controller_overlay_by_source.values()),
-                            {
-                                "left": left_overlay_eye_render_state,
-                                "right": right_overlay_eye_render_state,
-                            },
-                            eye_height,
-                            eye_width,
-                        )
-                    )
-                    left_eye_overlay_entries = projected_overlay_entries.get("left", [])
-                    right_eye_overlay_entries = projected_overlay_entries.get("right", [])
-                    if overlay_projection_start is not None:
-                        overlay_projection_elapsed_s = (
-                            time.perf_counter() - overlay_projection_start
-                        )
-                        self._render_profile_add_wall_time(
-                            render_profile_frame,
-                            "overlay_projection_wall",
-                            overlay_projection_elapsed_s,
-                        )
-                        self._render_profile_add_wall_time(
-                            render_profile_frame,
-                            "scene_overlay_projection_wall",
-                            overlay_projection_elapsed_s,
-                        )
                     viewer_overlay_sidecar_active = bool(
                         getattr(
                             immersive_bridge,
@@ -36082,21 +36364,31 @@ class InvPhyTrainerWarp:
                         )()
                     )
                     viewer_overlay_published = False
+                    overlay_world_entries = list(controller_overlay_by_source.values())
+                    left_eye_overlay_entries = []
+                    right_eye_overlay_entries = []
                     if viewer_overlay_sidecar_active:
                         viewer_overlay_command_build_start = (
                             time.perf_counter()
                             if render_profile_frame is not None
                             else None
                         )
-                        left_viewer_overlay_commands = (
-                            self._build_live_controller_viewer_overlay_commands(
-                                left_eye_overlay_entries
+                        viewer_overlay_commands_by_eye = (
+                            self._build_live_controller_viewer_overlay_commands_from_world_batched(
+                                overlay_world_entries,
+                                {
+                                    "left": left_overlay_eye_render_state,
+                                    "right": right_overlay_eye_render_state,
+                                },
+                                eye_height,
+                                eye_width,
                             )
                         )
+                        left_viewer_overlay_commands = (
+                            viewer_overlay_commands_by_eye.get("left", [])
+                        )
                         right_viewer_overlay_commands = (
-                            self._build_live_controller_viewer_overlay_commands(
-                                right_eye_overlay_entries
-                            )
+                            viewer_overlay_commands_by_eye.get("right", [])
                         )
                         if rope_game_overlay_state is not None:
                             left_viewer_overlay_commands.extend(
@@ -36148,6 +36440,45 @@ class InvPhyTrainerWarp:
                             render_profile_frame[
                                 "viewer_overlay_right_command_count"
                             ] = float(len(right_viewer_overlay_commands))
+                    if not viewer_overlay_published:
+                        overlay_projection_start = (
+                            time.perf_counter()
+                            if render_profile_frame is not None
+                            else None
+                        )
+                        projected_overlay_entries = (
+                            self._project_live_controller_world_overlays_batched(
+                                overlay_world_entries,
+                                {
+                                    "left": left_overlay_eye_render_state,
+                                    "right": right_overlay_eye_render_state,
+                                },
+                                eye_height,
+                                eye_width,
+                            )
+                        )
+                        left_eye_overlay_entries = projected_overlay_entries.get(
+                            "left",
+                            [],
+                        )
+                        right_eye_overlay_entries = projected_overlay_entries.get(
+                            "right",
+                            [],
+                        )
+                        if overlay_projection_start is not None:
+                            overlay_projection_elapsed_s = (
+                                time.perf_counter() - overlay_projection_start
+                            )
+                            self._render_profile_add_wall_time(
+                                render_profile_frame,
+                                "overlay_projection_wall",
+                                overlay_projection_elapsed_s,
+                            )
+                            self._render_profile_add_wall_time(
+                                render_profile_frame,
+                                "scene_overlay_projection_wall",
+                                overlay_projection_elapsed_s,
+                            )
                     rope_game_python_overlay_needed = bool(
                         rope_game_overlay_state is not None
                         and (
@@ -36780,6 +37111,9 @@ class InvPhyTrainerWarp:
                             committed_safe_cover_left_frame=committed_safe_cover_left_frame,
                             committed_safe_cover_right_frame=committed_safe_cover_right_frame,
                             committed_safe_cover_frame_count=committed_safe_cover_frame_count,
+                            committed_safe_cover_metrics_by_eye=(
+                                committed_safe_cover_metrics_by_eye
+                            ),
                             interaction_context=compose_artifact_interaction_context,
                             backend_kind="main_thread_direct",
                         )
@@ -37905,6 +38239,11 @@ class InvPhyTrainerWarp:
                     requested_native_gl_depth_format=timing_summary_requested_flags[
                         "immersive_native_gl_depth_format"
                     ],
+                    requested_gaussian_source_validation_mode=(
+                        timing_summary_requested_flags[
+                            "immersive_gaussian_source_validation"
+                        ]
+                    ),
                     requested_framegen_mode=timing_summary_requested_flags[
                         "immersive_framegen"
                     ],
@@ -39058,6 +39397,7 @@ class InvPhyTrainerWarp:
         immersive_native_gl_anisotropy=8,
         immersive_native_gl_msaa_samples=4,
         immersive_native_gl_depth_format="depth32f",
+        immersive_gaussian_source_validation="off",
         immersive_support_entry_overlay=False,
         immersive_framegen="off",
         immersive_gaussian_render="stereo_parallel",
@@ -39088,6 +39428,9 @@ class InvPhyTrainerWarp:
             immersive_native_gl_anisotropy=immersive_native_gl_anisotropy,
             immersive_native_gl_msaa_samples=immersive_native_gl_msaa_samples,
             immersive_native_gl_depth_format=immersive_native_gl_depth_format,
+            immersive_gaussian_source_validation=(
+                immersive_gaussian_source_validation
+            ),
             immersive_support_entry_overlay=immersive_support_entry_overlay,
             immersive_framegen=immersive_framegen,
             immersive_gaussian_render=immersive_gaussian_render,
@@ -42776,6 +43119,7 @@ class InvPhyTrainerWarp:
             "scene_render_parallel_join_overhead_ms",
             "scene_compose_artifact_context_wall",
             "scene_gaussian_source_validation_wall",
+            "scene_gaussian_source_validation_active_ratio",
             "scene_publish_state_resolve_wall",
             "scene_stable_compose_analysis_wall",
             "compose_left_roi_bounds_wall",

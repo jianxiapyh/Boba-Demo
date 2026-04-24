@@ -304,8 +304,9 @@ def build_parser() -> ArgumentParser:
         help=(
             "static scene overlap mode for immersive Quest output: "
             "'off' keeps the serial reference path, "
-            "'on' overlaps balanced room/table rendering with simulation+LBS and "
-            "enables the parallel static-scene worker and same-frame overlap path"
+            "'on' overlaps static room rendering with simulation+LBS. "
+            "For native_gl this uses the full_scene_per_eye worker path; "
+            "legacy pyrender/gpu use the balanced room/table worker path"
         ),
     )
     parser.add_argument(
@@ -445,8 +446,8 @@ def build_parser() -> ArgumentParser:
             "--immersive_timewarp scene_depth_reproject; non-overlap framegen v1 supports "
             "--immersive_gaussian_render serial only), "
             "'stereo_batched' experimentally renders both eyes in one batched gsplat call "
-            "(requires --immersive_static_scene_overlap off and --immersive_timewarp off; "
-            "not supported for framegen v1)"
+            "(requires --immersive_timewarp off; non-native backends also require "
+            "--immersive_static_scene_overlap off; not supported for framegen v1)"
         ),
     )
     parser.add_argument(

@@ -304,6 +304,75 @@ def _balanced_renderer_last_debug(renderer):
     return dict(debug)
 
 
+def _execute_immersive_native_gl_full_scene_request(
+    renderer,
+    request,
+    *,
+    tensor_validator=None,
+):
+    def _validate_tensor(value, label):
+        if tensor_validator is None:
+            return value
+        return tensor_validator(value, label=label)
+
+    scene_width = int(request["scene_width"])
+    scene_height = int(request["scene_height"])
+    result = {
+        "request_type": "native_gl_full_scene_per_eye",
+    }
+    for eye_label in ("left", "right"):
+        eye_pose_world = np.asarray(
+            request[f"{eye_label}_eye_pose_world"],
+            dtype=np.float32,
+        )
+        eye_intrinsic = np.asarray(
+            request[f"{eye_label}_scene_intrinsic"],
+            dtype=np.float32,
+        )
+        eye_color, eye_depth = renderer.render_eye(
+            eye_pose_world,
+            eye_intrinsic,
+            width=scene_width,
+            height=scene_height,
+        )
+        result[f"{eye_label}_scene_color"] = _validate_tensor(
+            eye_color,
+            f"{eye_label}.scene_color",
+        )
+        result[f"{eye_label}_scene_depth"] = _validate_tensor(
+            eye_depth,
+            f"{eye_label}.scene_depth",
+        )
+        result[f"{eye_label}_render_debug"] = _balanced_renderer_last_debug(renderer)
+    return result
+
+
+def _execute_immersive_static_scene_worker_request(
+    renderer,
+    request,
+    *,
+    tensor_validator=None,
+):
+    request_type = str(request.get("request_type", "")).strip().lower()
+    if request_type == "native_gl_full_scene_per_eye":
+        return _execute_immersive_native_gl_full_scene_request(
+            renderer,
+            request,
+            tensor_validator=tensor_validator,
+        )
+    if request_type == "balanced_layers":
+        return _execute_immersive_balanced_scene_render_layers(
+            renderer,
+            request,
+            tensor_validator=tensor_validator,
+        )
+    return _execute_immersive_balanced_scene_render_plan(
+        renderer,
+        request,
+        tensor_validator=tensor_validator,
+    )
+
+
 def _execute_immersive_balanced_scene_render_eye(
     renderer,
     eye_request,
@@ -1778,7 +1847,7 @@ class _ImmersiveStaticSceneRenderWorker:
                     **self._startup_warmup_kwargs
                 )
             if self._startup_validation_request is not None:
-                _ = _execute_immersive_balanced_scene_render_plan(
+                _ = _execute_immersive_static_scene_worker_request(
                     execute_renderer,
                     self._startup_validation_request,
                     tensor_validator=self._require_cuda_tensor,
@@ -1807,18 +1876,11 @@ class _ImmersiveStaticSceneRenderWorker:
                     continue
                 request = item["request"]
                 render_start = time.perf_counter()
-                if str(request.get("request_type", "")).strip().lower() == "balanced_layers":
-                    payload = _execute_immersive_balanced_scene_render_layers(
-                        execute_renderer,
-                        request,
-                        tensor_validator=self._require_cuda_tensor,
-                    )
-                else:
-                    payload = _execute_immersive_balanced_scene_render_plan(
-                        execute_renderer,
-                        request,
-                        tensor_validator=self._require_cuda_tensor,
-                    )
+                payload = _execute_immersive_static_scene_worker_request(
+                    execute_renderer,
+                    request,
+                    tensor_validator=self._require_cuda_tensor,
+                )
                 payload["worker_wall_ms"] = 1000.0 * (
                     time.perf_counter() - render_start
                 )
@@ -12477,6 +12539,8 @@ class InvPhyTrainerWarp:
         presentation_backend_enabled,
         presentation_backend_kind,
         balanced_eye_parallel_enabled,
+        native_gl_static_overlap_status="disabled",
+        native_gl_static_overlap_failure_reason="",
     ):
         requested_flags = {
             "immersive_timewarp": str(requested_timewarp_mode).strip().lower(),
@@ -12607,6 +12671,18 @@ class InvPhyTrainerWarp:
                 balanced_eye_parallel_enabled
             ),
             "eye_resolution": int(requested_eye_resolution),
+            "native_gl_static_overlap_status": str(
+                native_gl_static_overlap_status
+            ).strip(),
+            "native_gl_static_overlap_failure_reason": str(
+                native_gl_static_overlap_failure_reason or ""
+            ).strip(),
+            "static_scene_overlap_requested_ratio": 1.0
+            if requested_flags.get("immersive_static_scene_overlap") == "on"
+            else 0.0,
+            "static_scene_overlap_active_ratio": 1.0
+            if top_level_overlap_active
+            else 0.0,
         }
 
     def _format_immersive_timing_configuration_lines(self, summary_context):
@@ -12648,6 +12724,18 @@ class InvPhyTrainerWarp:
             f"internal_static_scene_eye_parallelism="
             f"{'on' if summary_context.get('internal_static_scene_eye_parallelism', False) else 'off'}"
         )
+        if summary_context.get("effective_static_scene_backend_mode") == "native_gl":
+            lines.append(
+                "Native GL static overlap: "
+                f"status={summary_context.get('native_gl_static_overlap_status', 'disabled')} "
+                f"requested_ratio={summary_context.get('static_scene_overlap_requested_ratio', 0.0):.3f} "
+                f"active_ratio={summary_context.get('static_scene_overlap_active_ratio', 0.0):.3f}"
+            )
+            failure_reason = str(
+                summary_context.get("native_gl_static_overlap_failure_reason", "")
+            ).strip()
+            if failure_reason:
+                lines.append(f"Native GL static overlap failure: {failure_reason}")
         return lines
 
     def _immersive_timing_stage_specs(self, summary_context):
@@ -12718,6 +12806,8 @@ class InvPhyTrainerWarp:
             "pre_compose_ready_ms",
             "overlap_wait_wall_ms",
             "static_scene_worker_wall_ms",
+            "static_scene_overlap_hidden_ms",
+            "static_scene_overlap_fallback_ratio",
         }:
             return True
         if (
@@ -13018,6 +13108,16 @@ class InvPhyTrainerWarp:
                 [
                     ("overlap_wait_wall_ms", "overlap_wait_wall_ms", []),
                     ("static_scene_worker_wall_ms", "static_scene_worker_wall_ms", []),
+                    (
+                        "static_scene_overlap_hidden_ms",
+                        "static_scene_overlap_hidden_ms",
+                        [],
+                    ),
+                    (
+                        "static_scene_overlap_fallback_ratio",
+                        "static_scene_overlap_fallback_ratio",
+                        [],
+                    ),
                 ]
             )
         return hierarchy
@@ -17497,6 +17597,75 @@ class InvPhyTrainerWarp:
                             f"{type(exc).__name__}: {exc}",
                             flush=True,
                         )
+                elif (
+                    bootstrap_output["active_scene_stereo_mode"] == "per_eye"
+                    and immersive_static_scene_backend_mode == "native_gl"
+                    and static_scene_overlap_requested
+                ):
+                    try:
+                        static_scene_worker = _ImmersiveStaticSceneRenderWorker(
+                            scene_assets_root=scene_assets_root,
+                            scene_width=scene_width,
+                            scene_height=scene_height,
+                            lighting_mode=immersive_render_options["lighting_mode"],
+                            balanced_render_backend=immersive_static_scene_backend_mode,
+                            static_scene_mode=immersive_static_scene_mode,
+                            layout=bootstrap_output["layout"],
+                            cuda_device_index=int(torch.cuda.current_device()),
+                            native_gl_texture_mode=immersive_native_gl_texture_mode,
+                            native_gl_anisotropy=immersive_native_gl_anisotropy,
+                            native_gl_msaa_samples=immersive_native_gl_msaa_samples,
+                            native_gl_depth_format=immersive_native_gl_depth_format,
+                        )
+                        native_gl_validation_request = (
+                            self._build_immersive_native_gl_full_scene_worker_request(
+                                bootstrap_output["last_left_eye_pose_world"],
+                                bootstrap_output["last_right_eye_pose_world"],
+                                bootstrap_output["initial_left_intrinsic"],
+                                bootstrap_output["initial_right_intrinsic"],
+                                eye_width,
+                                eye_height,
+                                scene_width,
+                                scene_height,
+                            )
+                        )
+                        worker_startup_debug = static_scene_worker.start(
+                            validation_request=native_gl_validation_request,
+                            warmup_kwargs=None,
+                        )
+                        static_scene_overlap_enabled = True
+                        bootstrap_output["native_gl_static_overlap_status"] = "active"
+                        bootstrap_output["native_gl_static_overlap_failure_reason"] = ""
+                        print(
+                            "[quest_display] immersive static-scene overlap: "
+                            "mode=native_gl_full_scene_worker",
+                            flush=True,
+                        )
+                        print(
+                            "[quest_display] static_scene_worker_readback_mode="
+                            f"{worker_startup_debug.get('readback_mode')}",
+                            flush=True,
+                        )
+                    except Exception as exc:
+                        if static_scene_worker is not None:
+                            try:
+                                static_scene_worker.stop()
+                            except Exception:
+                                pass
+                        static_scene_worker = None
+                        static_scene_overlap_enabled = False
+                        failure_reason = f"{type(exc).__name__}: {exc}"
+                        bootstrap_output["native_gl_static_overlap_status"] = (
+                            "startup_failed"
+                        )
+                        bootstrap_output[
+                            "native_gl_static_overlap_failure_reason"
+                        ] = failure_reason
+                        raise RuntimeError(
+                            "Native GL static-scene overlap startup failed; "
+                            "Stage 1 overlap is required for this run. "
+                            f"{failure_reason}"
+                        ) from exc
                 bootstrap_output["static_scene_worker"] = static_scene_worker
                 bootstrap_output["static_scene_overlap_enabled"] = (
                     static_scene_overlap_enabled
@@ -31244,11 +31413,29 @@ class InvPhyTrainerWarp:
         scene_depth_reproject_requested = (
             immersive_timewarp_mode == "scene_depth_reproject"
         )
+        requested_static_scene_reuse_mode_for_summary = immersive_static_scene_reuse_mode
+        native_gl_static_overlap_requested = bool(
+            immersive_static_scene_backend_mode == "native_gl"
+            and immersive_static_scene_overlap_mode == "on"
+        )
         static_scene_overlap_requested = (
             immersive_static_scene_overlap_mode == "on"
-            and active_scene_stereo_mode
-            == self.IMMERSIVE_BALANCED_INTERNAL_STEREO_MODE
+            and (
+                active_scene_stereo_mode
+                == self.IMMERSIVE_BALANCED_INTERNAL_STEREO_MODE
+                or native_gl_static_overlap_requested
+            )
         )
+        native_gl_static_overlap_status = "disabled"
+        native_gl_static_overlap_failure_reason = ""
+        if native_gl_static_overlap_requested and immersive_static_scene_reuse_mode != "off":
+            print(
+                "[quest_display] native_gl static-scene overlap forcing "
+                "--immersive_static_scene_reuse off for clean Stage 1 measurement "
+                f"(requested={immersive_static_scene_reuse_mode})",
+                flush=True,
+            )
+            immersive_static_scene_reuse_mode = "off"
         static_scene_reuse_requested = immersive_static_scene_reuse_mode in {
             "static",
             "adaptive",
@@ -31310,11 +31497,6 @@ class InvPhyTrainerWarp:
                     "--immersive_framegen off"
                 )
         if immersive_static_scene_backend_mode == "native_gl":
-            if immersive_static_scene_overlap_mode != "off":
-                raise ValueError(
-                    "immersive_static_scene_backend native_gl v1 requires "
-                    "--immersive_static_scene_overlap off"
-                )
             if immersive_timewarp_mode != "off":
                 raise ValueError(
                     "immersive_static_scene_backend native_gl v1 requires "
@@ -31324,6 +31506,11 @@ class InvPhyTrainerWarp:
                 raise ValueError(
                     "immersive_static_scene_backend native_gl v1 requires "
                     "--immersive_framegen off"
+                )
+            if immersive_present_pipeline_enabled:
+                raise ValueError(
+                    "immersive_static_scene_backend native_gl v1 requires "
+                    "--immersive_present_pipeline off"
                 )
             if immersive_gaussian_render_mode == "stereo_parallel":
                 raise ValueError(
@@ -31346,12 +31533,16 @@ class InvPhyTrainerWarp:
                 "currently supports --immersive_gaussian_render serial only"
             )
         if immersive_gaussian_render_mode == "stereo_batched" and (
-            immersive_static_scene_overlap_mode != "off"
+            (
+                immersive_static_scene_overlap_mode != "off"
+                and immersive_static_scene_backend_mode != "native_gl"
+            )
             or immersive_timewarp_mode != "off"
         ):
             raise ValueError(
                 "immersive_gaussian_render stereo_batched requires "
-                "--immersive_static_scene_overlap off and --immersive_timewarp off"
+                "--immersive_static_scene_overlap off and --immersive_timewarp off "
+                "except on the native_gl full_scene_per_eye overlap path"
             )
         if immersive_gaussian_render_mode == "stereo_parallel":
             overlap_framegen_stereo_parallel_allowed = bool(
@@ -31403,7 +31594,7 @@ class InvPhyTrainerWarp:
             "immersive_eye_resolution": int(immersive_eye_resolution),
             "immersive_timewarp": immersive_timewarp_mode,
             "immersive_static_scene_overlap": immersive_static_scene_overlap_mode,
-            "immersive_static_scene_reuse": immersive_static_scene_reuse_mode,
+            "immersive_static_scene_reuse": requested_static_scene_reuse_mode_for_summary,
             "immersive_static_scene_backend": immersive_static_scene_backend_mode,
             "immersive_native_gl_texture_mode": immersive_native_gl_texture_mode,
             "immersive_native_gl_anisotropy": immersive_native_gl_anisotropy,
@@ -31614,6 +31805,8 @@ class InvPhyTrainerWarp:
             "gaussian_render_wall_ms": [],
             "branch_b_ready_ms": [],
             "pre_compose_ready_ms": [],
+            "static_scene_overlap_hidden_ms": [],
+            "static_scene_overlap_fallback_ratio": [],
             "compositing_ms": [],
             "overlay_publish_ms": [],
             "scene_present_worker_ms": [],
@@ -31918,6 +32111,8 @@ class InvPhyTrainerWarp:
             "scene_timewarp_fallback_right_used",
             "scene_timewarp_gpu_ms",
             "static_scene_worker_wall_ms",
+            "static_scene_overlap_hidden_ms",
+            "static_scene_overlap_fallback_ratio",
             "simulation_lbs_wall_ms",
             "overlap_wait_wall_ms",
             "static_scene_render_ms",
@@ -33139,6 +33334,84 @@ class InvPhyTrainerWarp:
                     f"worker_paths={warmup_worker_label}",
                     flush=True,
                 )
+            if (
+                static_scene_overlap_requested
+                and active_scene_stereo_mode == "per_eye"
+                and immersive_static_scene_backend_mode == "native_gl"
+            ):
+                try:
+                    static_scene_worker = _ImmersiveStaticSceneRenderWorker(
+                        scene_assets_root=scene_assets_root,
+                        scene_width=scene_width,
+                        scene_height=scene_height,
+                        lighting_mode=immersive_render_options["lighting_mode"],
+                        balanced_render_backend=immersive_static_scene_backend_mode,
+                        static_scene_mode=immersive_static_scene_mode,
+                        layout=layout,
+                        cuda_device_index=int(torch.cuda.current_device()),
+                        native_gl_texture_mode=immersive_native_gl_texture_mode,
+                        native_gl_anisotropy=immersive_native_gl_anisotropy,
+                        native_gl_msaa_samples=immersive_native_gl_msaa_samples,
+                        native_gl_depth_format=immersive_native_gl_depth_format,
+                    )
+                    native_gl_validation_request = (
+                        self._build_immersive_native_gl_full_scene_worker_request(
+                            last_left_eye_pose_world,
+                            last_right_eye_pose_world,
+                            initial_left_intrinsic,
+                            initial_right_intrinsic,
+                            eye_width,
+                            eye_height,
+                            scene_width,
+                            scene_height,
+                        )
+                    )
+                    worker_startup_debug = static_scene_worker.start(
+                        validation_request=native_gl_validation_request,
+                        warmup_kwargs=None,
+                    )
+                    static_scene_overlap_enabled = True
+                    native_gl_static_overlap_status = "active"
+                    native_gl_static_overlap_failure_reason = ""
+                    print(
+                        "[quest_display] immersive static-scene overlap: "
+                        "mode=native_gl_full_scene_worker",
+                        flush=True,
+                    )
+                    print(
+                        "[quest_display] static_scene_worker_readback_mode="
+                        f"{worker_startup_debug.get('readback_mode')}",
+                        flush=True,
+                    )
+                except Exception as exc:
+                    if static_scene_worker is not None:
+                        try:
+                            static_scene_worker.stop()
+                        except Exception:
+                            pass
+                    static_scene_worker = None
+                    static_scene_overlap_enabled = False
+                    native_gl_static_overlap_status = "startup_failed"
+                    native_gl_static_overlap_failure_reason = (
+                        f"{type(exc).__name__}: {exc}"
+                    )
+                    raise RuntimeError(
+                        "Native GL static-scene overlap startup failed; "
+                        "Stage 1 overlap is required for this run. "
+                        f"{native_gl_static_overlap_failure_reason}"
+                    ) from exc
+            if native_gl_static_overlap_requested and not static_scene_overlap_enabled:
+                native_gl_static_overlap_status = "startup_failed"
+                if not native_gl_static_overlap_failure_reason:
+                    native_gl_static_overlap_failure_reason = (
+                        "native_gl overlap was requested but startup did not "
+                        "enable the static-scene worker"
+                    )
+                raise RuntimeError(
+                    "Native GL static-scene overlap startup failed; "
+                    "Stage 1 overlap is required for this run. "
+                    f"{native_gl_static_overlap_failure_reason}"
+                )
             print(
                 "[quest_display] immersive gaussian render: "
                 f"mode={immersive_gaussian_render_mode}",
@@ -33547,6 +33820,32 @@ class InvPhyTrainerWarp:
             static_scene_overlap_enabled = startup_bootstrap_output[
                 "static_scene_overlap_enabled"
             ]
+            if native_gl_static_overlap_requested:
+                native_gl_static_overlap_status = str(
+                    startup_bootstrap_output.get(
+                        "native_gl_static_overlap_status",
+                        "active" if static_scene_overlap_enabled else "startup_failed",
+                    )
+                )
+                native_gl_static_overlap_failure_reason = str(
+                    startup_bootstrap_output.get(
+                        "native_gl_static_overlap_failure_reason",
+                        "",
+                    )
+                    or ""
+                )
+                if not static_scene_overlap_enabled:
+                    if not native_gl_static_overlap_failure_reason:
+                        native_gl_static_overlap_failure_reason = (
+                            "native_gl overlap was requested but startup did not "
+                            "enable the static-scene worker"
+                        )
+                    native_gl_static_overlap_status = "startup_failed"
+                    raise RuntimeError(
+                        "Native GL static-scene overlap startup failed; "
+                        "Stage 1 overlap is required for this run. "
+                        f"{native_gl_static_overlap_failure_reason}"
+                    )
             scene_depth_reproject_enabled = startup_bootstrap_output[
                 "scene_depth_reproject_enabled"
             ]
@@ -34963,6 +35262,8 @@ class InvPhyTrainerWarp:
                 )
                 static_scene_request_submitted = False
                 static_scene_request_is_layered = False
+                static_scene_request_is_native_gl_full_scene = False
+                static_scene_overlap_fallback_ratio = 0.0
                 balanced_scene_render_plan = None
                 prebuilt_overlap_render_plan = None
                 prebuilt_overlap_render_plan_signature = None
@@ -35199,6 +35500,48 @@ class InvPhyTrainerWarp:
                             static_scene_overlay_signature_change_count,
                         ),
                     )
+                if (
+                    not static_scene_reuse_applied
+                    and static_scene_overlap_enabled
+                    and static_scene_worker is not None
+                    and active_scene_stereo_mode == "per_eye"
+                    and immersive_static_scene_backend_mode == "native_gl"
+                ):
+                    try:
+                        native_gl_scene_request = (
+                            self._build_immersive_native_gl_full_scene_worker_request(
+                                last_left_eye_pose_world,
+                                last_right_eye_pose_world,
+                                left_intrinsic,
+                                right_intrinsic,
+                                eye_width,
+                                eye_height,
+                                scene_width,
+                                scene_height,
+                            )
+                        )
+                        static_scene_worker.submit(native_gl_scene_request)
+                        static_scene_request_submitted = True
+                        static_scene_request_is_native_gl_full_scene = True
+                    except Exception as exc:
+                        if static_scene_worker is not None:
+                            try:
+                                static_scene_worker.stop()
+                            except Exception:
+                                pass
+                        static_scene_worker = None
+                        static_scene_overlap_enabled = False
+                        static_scene_overlap_fallback_ratio = 1.0
+                        native_gl_static_overlap_status = "render_failed"
+                        native_gl_static_overlap_failure_reason = (
+                            f"{type(exc).__name__}: {exc}"
+                        )
+                        raise RuntimeError(
+                            "Native GL static-scene overlap render submit failed; "
+                            "Stage 1 overlap is required for this run. "
+                            f"{native_gl_static_overlap_failure_reason}"
+                        ) from exc
+
                 if (
                     not static_scene_reuse_applied
                     and static_scene_overlap_enabled
@@ -35902,81 +36245,174 @@ class InvPhyTrainerWarp:
                             render_profile_frame["overlap_wait_wall_ms"] = (
                                 overlap_wait_wall_s
                             )
-                        static_scene_assemble_start = time.perf_counter()
-                        if static_scene_request_is_layered:
-                            (
-                                static_scene_layer_cache,
-                                fresh_layers_by_eye,
-                            ) = self._update_immersive_static_scene_layer_cache(
-                                layer_cache=static_scene_layer_cache,
-                                render_plan=balanced_scene_render_plan,
-                                layer_outputs=static_scene_result,
-                                head_pose_state=head_pose_state,
-                            )
-                            scene_render_outputs = (
-                                _build_immersive_balanced_render_outputs_from_layer_cache(
-                                    balanced_scene_render_plan,
-                                    static_scene_layer_cache,
-                                    fresh_layers_by_eye=fresh_layers_by_eye,
+                            render_profile_frame["static_scene_overlap_hidden_ms"] = (
+                                max(
+                                    0.0,
+                                    float(static_scene_worker_wall_s)
+                                    - float(overlap_wait_wall_s),
                                 )
                             )
+                            render_profile_frame["static_scene_overlap_fallback_ratio"] = 0.0
+                        static_scene_assemble_start = time.perf_counter()
+                        if static_scene_request_is_native_gl_full_scene:
+                            required_native_scene_keys = (
+                                "left_scene_color",
+                                "left_scene_depth",
+                                "right_scene_color",
+                                "right_scene_depth",
+                            )
+                            missing_native_scene_keys = [
+                                key
+                                for key in required_native_scene_keys
+                                if key not in static_scene_result
+                            ]
+                            if missing_native_scene_keys:
+                                raise RuntimeError(
+                                    "native_gl_full_scene_per_eye result missing "
+                                    + ", ".join(missing_native_scene_keys)
+                                )
+                            left_scene_color = static_scene_result["left_scene_color"]
+                            left_scene_depth = static_scene_result["left_scene_depth"]
+                            right_scene_color = static_scene_result["right_scene_color"]
+                            right_scene_depth = static_scene_result["right_scene_depth"]
+                            if render_profile_frame is not None:
+                                self._record_immersive_balanced_render_backend_debug(
+                                    render_profile_frame,
+                                    eye_label="left",
+                                    role_key="base",
+                                    render_debug=static_scene_result.get(
+                                        "left_render_debug"
+                                    ),
+                                )
+                                self._record_immersive_balanced_render_backend_debug(
+                                    render_profile_frame,
+                                    eye_label="right",
+                                    role_key="base",
+                                    render_debug=static_scene_result.get(
+                                        "right_render_debug"
+                                    ),
+                                )
+                            if static_scene_reuse_metrics_enabled_for_frame:
+                                static_scene_reuse_cache = (
+                                    self._make_immersive_static_scene_reuse_cache_entry(
+                                        render_plan=None,
+                                        render_sample=render_sample,
+                                        head_pose_state=head_pose_state,
+                                        left_eye_pose_world=last_left_eye_pose_world,
+                                        right_eye_pose_world=last_right_eye_pose_world,
+                                        left_intrinsic=left_intrinsic,
+                                        right_intrinsic=right_intrinsic,
+                                        left_scene_color=left_scene_color,
+                                        left_scene_depth=left_scene_depth,
+                                        right_scene_color=right_scene_color,
+                                        right_scene_depth=right_scene_depth,
+                                    )
+                                )
+                            static_scene_assemble_wall_s = (
+                                time.perf_counter() - static_scene_assemble_start
+                            )
+                            static_scene_render_wall_s = (
+                                float(static_scene_execute_wall_s)
+                                + float(static_scene_assemble_wall_s)
+                            )
+                            scene_layers_ready = True
                         else:
-                            scene_render_outputs = static_scene_result
-                            if static_scene_layer_cache is not None:
+                            if static_scene_request_is_layered:
                                 (
                                     static_scene_layer_cache,
-                                    _,
+                                    fresh_layers_by_eye,
                                 ) = self._update_immersive_static_scene_layer_cache(
                                     layer_cache=static_scene_layer_cache,
                                     render_plan=balanced_scene_render_plan,
-                                    layer_outputs=(
-                                        _extract_immersive_balanced_layer_outputs_from_render_outputs(
-                                            balanced_scene_render_plan,
-                                            static_scene_result,
-                                        )
-                                    ),
+                                    layer_outputs=static_scene_result,
                                     head_pose_state=head_pose_state,
                                 )
-                        (
-                            left_scene_color,
-                            left_scene_depth,
-                            right_scene_color,
-                            right_scene_depth,
-                        ) = self._assemble_immersive_balanced_scene_from_render_outputs(
-                            scene_renderer,
-                            balanced_scene_render_plan,
-                            scene_render_outputs,
-                            eye_width,
-                            eye_height,
-                            shared_scene_compose_cache=shared_scene_compose_cache,
-                            reproject_caches=shared_scene_reproject_caches,
-                            render_profile_frame=render_profile_frame,
-                        )
-                        if static_scene_reuse_metrics_enabled_for_frame:
-                            static_scene_reuse_cache = (
-                                self._make_immersive_static_scene_reuse_cache_entry(
-                                    render_plan=balanced_scene_render_plan,
-                                    render_sample=render_sample,
-                                    head_pose_state=head_pose_state,
-                                    left_eye_pose_world=last_left_eye_pose_world,
-                                    right_eye_pose_world=last_right_eye_pose_world,
-                                    left_intrinsic=left_intrinsic,
-                                    right_intrinsic=right_intrinsic,
-                                    left_scene_color=left_scene_color,
-                                    left_scene_depth=left_scene_depth,
-                                    right_scene_color=right_scene_color,
-                                    right_scene_depth=right_scene_depth,
+                                scene_render_outputs = (
+                                    _build_immersive_balanced_render_outputs_from_layer_cache(
+                                        balanced_scene_render_plan,
+                                        static_scene_layer_cache,
+                                        fresh_layers_by_eye=fresh_layers_by_eye,
+                                    )
                                 )
+                            else:
+                                scene_render_outputs = static_scene_result
+                                if static_scene_layer_cache is not None:
+                                    (
+                                        static_scene_layer_cache,
+                                        _,
+                                    ) = self._update_immersive_static_scene_layer_cache(
+                                        layer_cache=static_scene_layer_cache,
+                                        render_plan=balanced_scene_render_plan,
+                                        layer_outputs=(
+                                            _extract_immersive_balanced_layer_outputs_from_render_outputs(
+                                                balanced_scene_render_plan,
+                                                static_scene_result,
+                                            )
+                                        ),
+                                        head_pose_state=head_pose_state,
+                                    )
+                            (
+                                left_scene_color,
+                                left_scene_depth,
+                                right_scene_color,
+                                right_scene_depth,
+                            ) = self._assemble_immersive_balanced_scene_from_render_outputs(
+                                scene_renderer,
+                                balanced_scene_render_plan,
+                                scene_render_outputs,
+                                eye_width,
+                                eye_height,
+                                shared_scene_compose_cache=shared_scene_compose_cache,
+                                reproject_caches=shared_scene_reproject_caches,
+                                render_profile_frame=render_profile_frame,
                             )
-                        static_scene_assemble_wall_s = (
-                            time.perf_counter() - static_scene_assemble_start
-                        )
-                        static_scene_render_wall_s = (
-                            float(static_scene_execute_wall_s)
-                            + float(static_scene_assemble_wall_s)
-                        )
-                        scene_layers_ready = True
+                            if static_scene_reuse_metrics_enabled_for_frame:
+                                static_scene_reuse_cache = (
+                                    self._make_immersive_static_scene_reuse_cache_entry(
+                                        render_plan=balanced_scene_render_plan,
+                                        render_sample=render_sample,
+                                        head_pose_state=head_pose_state,
+                                        left_eye_pose_world=last_left_eye_pose_world,
+                                        right_eye_pose_world=last_right_eye_pose_world,
+                                        left_intrinsic=left_intrinsic,
+                                        right_intrinsic=right_intrinsic,
+                                        left_scene_color=left_scene_color,
+                                        left_scene_depth=left_scene_depth,
+                                        right_scene_color=right_scene_color,
+                                        right_scene_depth=right_scene_depth,
+                                    )
+                                )
+                            static_scene_assemble_wall_s = (
+                                time.perf_counter() - static_scene_assemble_start
+                            )
+                            static_scene_render_wall_s = (
+                                float(static_scene_execute_wall_s)
+                                + float(static_scene_assemble_wall_s)
+                            )
+                            scene_layers_ready = True
                     except Exception as exc:
+                        if static_scene_request_is_native_gl_full_scene:
+                            if static_scene_worker is not None:
+                                try:
+                                    static_scene_worker.stop()
+                                except Exception:
+                                    pass
+                            static_scene_worker = None
+                            static_scene_overlap_enabled = False
+                            static_scene_overlap_fallback_ratio = 1.0
+                            native_gl_static_overlap_status = "render_failed"
+                            native_gl_static_overlap_failure_reason = (
+                                f"{type(exc).__name__}: {exc}"
+                            )
+                            if render_profile_frame is not None:
+                                render_profile_frame[
+                                    "static_scene_overlap_fallback_ratio"
+                                ] = 1.0
+                            raise RuntimeError(
+                                "Native GL static-scene overlap render failed; "
+                                "Stage 1 overlap is required for this run. "
+                                f"{native_gl_static_overlap_failure_reason}"
+                            ) from exc
                         if static_scene_reuse_metrics_enabled_for_frame:
                             static_scene_reuse_reason = "worker_failure"
                             static_scene_cache_invalidation_count += 1
@@ -36017,6 +36453,11 @@ class InvPhyTrainerWarp:
                                 pass
                         static_scene_worker = None
                         static_scene_overlap_enabled = False
+                        static_scene_overlap_fallback_ratio = 1.0
+                        if render_profile_frame is not None:
+                            render_profile_frame[
+                                "static_scene_overlap_fallback_ratio"
+                            ] = 1.0
                         scene_depth_reproject_enabled = False
                         static_scene_reuse_cache = None
                         immersive_framegen_mode = "off"
@@ -38059,6 +38500,27 @@ class InvPhyTrainerWarp:
                         "pre_compose_ready_ms",
                         float(pre_compose_ready_wall_s),
                     )
+                    if (
+                        static_scene_overlap_requested
+                        and not static_scene_request_submitted
+                        and not static_scene_reuse_applied
+                    ):
+                        static_scene_overlap_fallback_ratio = 1.0
+                    if static_scene_overlap_requested:
+                        _record_render_stage_time(
+                            "static_scene_overlap_hidden_ms",
+                            max(
+                                0.0,
+                                float(static_scene_worker_wall_s)
+                                - float(overlap_wait_wall_s),
+                            )
+                            if static_scene_request_submitted
+                            else 0.0,
+                        )
+                        _record_render_stage_time(
+                            "static_scene_overlap_fallback_ratio",
+                            float(static_scene_overlap_fallback_ratio),
+                        )
                     if not presentation_backend_enabled:
                         _record_render_stage_time(
                             "compositing_ms",
@@ -38132,6 +38594,18 @@ class InvPhyTrainerWarp:
                     )
                     render_profile_frame["pre_compose_ready_ms"] = float(
                         pre_compose_ready_wall_s
+                    )
+                    render_profile_frame["static_scene_overlap_hidden_ms"] = (
+                        max(
+                            0.0,
+                            float(static_scene_worker_wall_s)
+                            - float(overlap_wait_wall_s),
+                        )
+                        if static_scene_request_submitted
+                        else 0.0
+                    )
+                    render_profile_frame["static_scene_overlap_fallback_ratio"] = float(
+                        static_scene_overlap_fallback_ratio
                     )
                     render_profile_frame["compositing_ms"] = float(compositing_wall_s)
                     render_profile_frame["overlay_publish_ms"] = float(
@@ -38999,6 +39473,10 @@ class InvPhyTrainerWarp:
                     presentation_backend_enabled=presentation_backend_enabled,
                     presentation_backend_kind=presentation_backend_kind,
                     balanced_eye_parallel_enabled=balanced_eye_parallel_enabled,
+                    native_gl_static_overlap_status=native_gl_static_overlap_status,
+                    native_gl_static_overlap_failure_reason=(
+                        native_gl_static_overlap_failure_reason
+                    ),
                 )
 
                 high_level_lines = ["High-Level Results:"]
@@ -44016,6 +44494,8 @@ class InvPhyTrainerWarp:
             "scene_timewarp_fallback_right_used",
             "scene_timewarp_gpu_ms",
             "static_scene_worker_wall_ms",
+            "static_scene_overlap_hidden_ms",
+            "static_scene_overlap_fallback_ratio",
             "simulation_lbs_wall_ms",
             "overlap_wait_wall_ms",
             "static_scene_render_ms",
@@ -44329,6 +44809,54 @@ class InvPhyTrainerWarp:
             reproject_caches=reproject_caches,
             render_profile_frame=render_profile_frame,
         )
+
+    @torch.no_grad()
+    def _build_immersive_native_gl_full_scene_worker_request(
+        self,
+        left_eye_pose_world,
+        right_eye_pose_world,
+        left_intrinsic,
+        right_intrinsic,
+        eye_width,
+        eye_height,
+        scene_width,
+        scene_height,
+    ):
+        left_scene_intrinsic = self._scale_intrinsic_for_resolution(
+            left_intrinsic,
+            eye_width,
+            eye_height,
+            scene_width,
+            scene_height,
+        )
+        right_scene_intrinsic = self._scale_intrinsic_for_resolution(
+            right_intrinsic,
+            eye_width,
+            eye_height,
+            scene_width,
+            scene_height,
+        )
+        return {
+            "request_type": "native_gl_full_scene_per_eye",
+            "scene_width": int(scene_width),
+            "scene_height": int(scene_height),
+            "left_eye_pose_world": np.asarray(
+                left_eye_pose_world,
+                dtype=np.float32,
+            ).copy(),
+            "right_eye_pose_world": np.asarray(
+                right_eye_pose_world,
+                dtype=np.float32,
+            ).copy(),
+            "left_scene_intrinsic": np.asarray(
+                left_scene_intrinsic,
+                dtype=np.float32,
+            ).copy(),
+            "right_scene_intrinsic": np.asarray(
+                right_scene_intrinsic,
+                dtype=np.float32,
+            ).copy(),
+        }
 
     @torch.no_grad()
     def _render_immersive_scene_frames_for_mode(

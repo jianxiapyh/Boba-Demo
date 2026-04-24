@@ -67,6 +67,9 @@ from qqtt.immersive_scene import (
     ensure_simple_lab_assets,
     make_simple_lab_layout,
 )
+from qqtt.immersive_gaussian_fusion_triton import (
+    fuse_gaussian_scene_depth_aware,
+)
 from qqtt.pyrender_cuda_bridge import PreviewTextureCudaUploader
 
 TINY_BITMAP_FONT = {
@@ -12133,9 +12136,58 @@ class InvPhyTrainerWarp:
         frame_profile[f"scene_depth_suppressed_{eye_label}_ratio"] = float(
             1.0 if compose_metrics.get("scene_depth_suppressed", False) else 0.0
         )
+        if compose_metrics.get("native_gl_gaussian_fusion", False):
+            fusion_fallback_ratio = float(
+                compose_metrics.get("fusion_fallback_ratio", 0.0)
+            )
+            fusion_visible_ratio = float(compose_metrics.get("fusion_visible_ratio", 0.0))
+            fusion_occluded_ratio = float(
+                compose_metrics.get("fusion_occluded_ratio", 0.0)
+            )
+            fusion_depth_invalid_ratio = float(
+                compose_metrics.get("fusion_depth_invalid_ratio", 0.0)
+            )
+            frame_profile[f"scene_gaussian_fusion_{eye_label}_fallback_ratio"] = (
+                fusion_fallback_ratio
+            )
+            frame_profile[f"scene_gaussian_fusion_{eye_label}_visible_ratio"] = (
+                fusion_visible_ratio
+            )
+            frame_profile[f"scene_gaussian_fusion_{eye_label}_occluded_ratio"] = (
+                fusion_occluded_ratio
+            )
+            frame_profile[
+                f"scene_gaussian_fusion_{eye_label}_depth_invalid_ratio"
+            ] = fusion_depth_invalid_ratio
+            frame_profile["scene_gaussian_fusion_fallback_ratio"] = max(
+                float(frame_profile.get("scene_gaussian_fusion_fallback_ratio", 0.0)),
+                fusion_fallback_ratio,
+            )
+            frame_profile["scene_gaussian_fusion_visible_ratio"] = max(
+                float(frame_profile.get("scene_gaussian_fusion_visible_ratio", 0.0)),
+                fusion_visible_ratio,
+            )
+            frame_profile["scene_gaussian_fusion_occluded_ratio"] = max(
+                float(frame_profile.get("scene_gaussian_fusion_occluded_ratio", 0.0)),
+                fusion_occluded_ratio,
+            )
+            frame_profile["scene_gaussian_fusion_depth_invalid_ratio"] = max(
+                float(
+                    frame_profile.get(
+                        "scene_gaussian_fusion_depth_invalid_ratio",
+                        0.0,
+                    )
+                ),
+                fusion_depth_invalid_ratio,
+            )
         frame_profile["compose_fallback_active_ratio"] = max(
             float(frame_profile.get("compose_fallback_active_ratio", 0.0)),
-            float(1.0 if compose_metrics.get("compose_mode") != "depth_aware" else 0.0),
+            float(
+                0.0
+                if compose_metrics.get("compose_mode")
+                in {"depth_aware", "depth_aware_fused"}
+                else 1.0
+            ),
         )
 
     def _render_profile_begin_cuda_span(self, frame_profile, key):
@@ -12685,6 +12737,8 @@ class InvPhyTrainerWarp:
                 ("compose_right_metrics_wall", "compose_right_metrics_wall", []),
                 ("compose_left_safety_analysis_wall", "compose_left_safety_analysis_wall", []),
                 ("compose_right_safety_analysis_wall", "compose_right_safety_analysis_wall", []),
+                ("scene_gaussian_fusion_left_cuda", "scene_gaussian_fusion_left_cuda", []),
+                ("scene_gaussian_fusion_right_cuda", "scene_gaussian_fusion_right_cuda", []),
                 ("compose_left_cuda", "compose_left_cuda", []),
                 ("compose_right_cuda", "compose_right_cuda", []),
                 (
@@ -12715,6 +12769,12 @@ class InvPhyTrainerWarp:
                     "scene_support_overlay_cache_wall",
                     [],
                 ),
+                ("viewer_overlay_command_build_wall", "viewer_overlay_command_build_wall", []),
+                (
+                    "viewer_overlay_sidecar_publish_wall",
+                    "viewer_overlay_sidecar_publish_wall",
+                    [],
+                ),
                 ("overlay_draw_left_wall", "overlay_draw_left_wall", []),
                 ("overlay_draw_right_wall", "overlay_draw_right_wall", []),
                 ("publish_total_wall", "publish_total_wall", []),
@@ -12737,7 +12797,9 @@ class InvPhyTrainerWarp:
                 ("publish_fallback_copy_wall", "publish_fallback_copy_wall", []),
             ],
             "scene_present_worker_ms": [
+                ("scene_present_packet_build_wall", "scene_present_packet_build_wall", []),
                 ("scene_present_submit_ms", "scene_present_submit_ms", []),
+                ("scene_present_safe_snapshot_wall", "scene_present_safe_snapshot_wall", []),
                 ("scene_present_queue_wait_ms", "scene_present_queue_wait_ms", []),
                 ("scene_present_compose_ms", "scene_present_compose_ms", []),
                 ("scene_present_compose_left_ms", "scene_present_compose_left_ms", []),
@@ -13187,6 +13249,8 @@ class InvPhyTrainerWarp:
             f"B{frame_profile.get('gaussian_render_stereo_batched_cuda', 0.0) * 1000.0:.2f}ms "
             f"compose=L{frame_profile.get('compose_left_cuda', 0.0) * 1000.0:.2f}/"
             f"R{frame_profile.get('compose_right_cuda', 0.0) * 1000.0:.2f}ms "
+            f"fusion=L{frame_profile.get('scene_gaussian_fusion_left_cuda', 0.0) * 1000.0:.2f}/"
+            f"R{frame_profile.get('scene_gaussian_fusion_right_cuda', 0.0) * 1000.0:.2f}ms "
             f"gaussian_roi=L{frame_profile.get('gaussian_compose_roi_left_ratio', 0.0) * 100.0:.1f}/"
             f"R{frame_profile.get('gaussian_compose_roi_right_ratio', 0.0) * 100.0:.1f}% "
             f"diag=rawL{frame_profile.get('gaussian_raw_left_ratio', 0.0) * 100.0:.2f}->"
@@ -28138,6 +28202,202 @@ class InvPhyTrainerWarp:
         )
 
     @torch.no_grad()
+    def _try_fuse_immersive_gaussian_scene_eye(
+        self,
+        scene_color,
+        scene_depth,
+        gaussian_rgba,
+        gaussian_depth,
+        eye_height,
+        eye_width,
+        compose_mode,
+        *,
+        eye_label,
+        render_profile_frame=None,
+        collect_metrics=True,
+    ):
+        if str(compose_mode).strip().lower() != "depth_aware":
+            return None
+        if gaussian_depth is None:
+            return None
+        target_device = torch.device(cfg.device)
+        try:
+            scene_color_t, scene_depth_t = self._prepare_immersive_scene_frame_for_compose(
+                scene_color,
+                scene_depth,
+                int(eye_height),
+                int(eye_width),
+            )
+            gaussian_rgba_t = gaussian_rgba.detach()
+            if (
+                gaussian_rgba_t.device != target_device
+                or gaussian_rgba_t.dtype != torch.float32
+            ):
+                gaussian_rgba_t = gaussian_rgba_t.to(
+                    device=target_device,
+                    dtype=torch.float32,
+                )
+            if gaussian_rgba_t.ndim != 3 or int(gaussian_rgba_t.shape[0]) < 4:
+                return None
+            if tuple(gaussian_rgba_t.shape[-2:]) != (
+                int(eye_height),
+                int(eye_width),
+            ):
+                return None
+            gaussian_depth_t = gaussian_depth
+            if not torch.is_tensor(gaussian_depth_t):
+                gaussian_depth_t = torch.as_tensor(
+                    gaussian_depth_t,
+                    device=target_device,
+                    dtype=torch.float32,
+                )
+            else:
+                gaussian_depth_t = gaussian_depth_t.to(
+                    device=target_device,
+                    dtype=torch.float32,
+                )
+            gaussian_depth_t = self._normalize_gaussian_depth(gaussian_depth_t)
+            if tuple(gaussian_depth_t.shape[-2:]) != (
+                int(eye_height),
+                int(eye_width),
+            ):
+                return None
+        except Exception:
+            return None
+
+        fusion_span = self._render_profile_begin_cuda_span(
+            render_profile_frame,
+            f"scene_gaussian_fusion_{eye_label}_cuda",
+        )
+        try:
+            fusion_result = fuse_gaussian_scene_depth_aware(
+                scene_color_t,
+                scene_depth_t,
+                gaussian_rgba_t,
+                gaussian_depth_t,
+                alpha_eps=float(self.IMMERSIVE_COMPOSE_ALPHA_EPS),
+                depth_eps=float(self.IMMERSIVE_STARTUP_DEPTH_EPS),
+                occlusion_eps=5e-3,
+                collect_metrics=bool(collect_metrics),
+            )
+        except Exception:
+            self._render_profile_end_cuda_span(render_profile_frame, fusion_span)
+            return None
+        self._render_profile_end_cuda_span(render_profile_frame, fusion_span)
+        if fusion_result is None:
+            return None
+
+        fused_color, fused_depth, fusion_metrics = fusion_result
+        total_pixel_count = int(max(int(eye_height) * int(eye_width), 1))
+        raw_ratio = float(fusion_metrics.get("fusion_raw_ratio", 0.0))
+        visible_ratio = float(fusion_metrics.get("fusion_visible_ratio", 0.0))
+        retention_ratio = float(
+            fusion_metrics.get(
+                "fusion_retention_ratio",
+                visible_ratio / max(raw_ratio, 1e-6) if raw_ratio > 0.0 else 1.0,
+            )
+        )
+        depth_invalid_ratio = float(
+            fusion_metrics.get("fusion_depth_invalid_ratio", 0.0)
+        )
+        compose_metrics = {
+            "compose_mode": "depth_aware_fused",
+            "native_gl_gaussian_fusion": True,
+            "fusion_fallback_ratio": 0.0,
+            "fusion_raw_ratio": raw_ratio,
+            "fusion_visible_ratio": visible_ratio,
+            "fusion_occluded_ratio": float(
+                fusion_metrics.get("fusion_occluded_ratio", 0.0)
+            ),
+            "fusion_depth_invalid_ratio": depth_invalid_ratio,
+            "raw_gaussian_coverage_ratio": raw_ratio,
+            "visible_gaussian_coverage_ratio": visible_ratio,
+            "visible_retention_ratio": retention_ratio,
+            "scene_depth_finite_ratio": 1.0,
+            "scene_depth_positive_ratio": max(0.0, 1.0 - depth_invalid_ratio),
+            "scene_depth_valid_min": 0.0,
+            "scene_depth_valid_max": 0.0,
+            "scene_depth_invalid": False,
+            "scene_depth_suppressed": False,
+            "compose_roi_ratio": 0.0,
+            "compose_roi_bounds_wall": 0.0,
+            "compose_base_copy_wall": 0.0,
+            "compose_object_blend_wall": 0.0,
+            "compose_metrics_wall": 0.0,
+            "raw_mask_pixel_count": int(
+                fusion_metrics.get(
+                    "fusion_raw_pixel_count",
+                    raw_ratio * float(total_pixel_count),
+                )
+            ),
+            "raw_mask_bbox_area_pixels": 0,
+            "total_pixel_count": int(total_pixel_count),
+            "raw_mask_bbox_xyxy": None,
+            "raw_mask_bbox_area_ratio": 0.0,
+            "raw_mask_row_span_ratio": 0.0,
+            "raw_mask_column_span_ratio": 0.0,
+            "gaussian_depth_positive_ratio": 1.0 if raw_ratio > 0.0 else 0.0,
+            "composed_luma_mean": 0.0,
+            "composed_luma_variance": 0.0,
+        }
+        return fused_color, fused_depth, compose_metrics
+
+    @torch.no_grad()
+    def _try_fuse_immersive_gaussian_scene_stereo(
+        self,
+        left_scene_color,
+        left_scene_depth,
+        right_scene_color,
+        right_scene_depth,
+        left_gaussian_rgba,
+        left_gaussian_depth,
+        right_gaussian_rgba,
+        right_gaussian_depth,
+        eye_height,
+        eye_width,
+        compose_mode,
+        *,
+        render_profile_frame=None,
+        collect_metrics=True,
+    ):
+        left_result = self._try_fuse_immersive_gaussian_scene_eye(
+            left_scene_color,
+            left_scene_depth,
+            left_gaussian_rgba,
+            left_gaussian_depth,
+            eye_height,
+            eye_width,
+            compose_mode,
+            eye_label="left",
+            render_profile_frame=render_profile_frame,
+            collect_metrics=collect_metrics,
+        )
+        if left_result is None:
+            return None
+        right_result = self._try_fuse_immersive_gaussian_scene_eye(
+            right_scene_color,
+            right_scene_depth,
+            right_gaussian_rgba,
+            right_gaussian_depth,
+            eye_height,
+            eye_width,
+            compose_mode,
+            eye_label="right",
+            render_profile_frame=render_profile_frame,
+            collect_metrics=collect_metrics,
+        )
+        if right_result is None:
+            return None
+        return (
+            left_result[0],
+            left_result[1],
+            left_result[2],
+            right_result[0],
+            right_result[1],
+            right_result[2],
+        )
+
+    @torch.no_grad()
     def _render_immersive_eye_frame(
         self,
         eye_pose_world,
@@ -30528,6 +30788,10 @@ class InvPhyTrainerWarp:
         immersive_render_profile_keys = [
             "rendering",
             "scene_render_residual_wall",
+            "scene_render_residual_explained_wall",
+            "scene_render_residual_unexplained_wall",
+            "scene_render_pose_metadata_wall",
+            "scene_render_eye_state_setup_wall",
             "static_scene_execute_wall_ms",
             "static_scene_assemble_wall_ms",
             "render_eye_intrinsics_setup_wall",
@@ -30535,6 +30799,7 @@ class InvPhyTrainerWarp:
             "scene_gaussian_source_validation_wall",
             "scene_publish_state_resolve_wall",
             "scene_stable_compose_analysis_wall",
+            "scene_stable_compose_artifact_finalize_wall",
             "compose_left_roi_bounds_wall",
             "compose_right_roi_bounds_wall",
             "compose_left_base_copy_wall",
@@ -30555,6 +30820,8 @@ class InvPhyTrainerWarp:
             "scene_render_parallel_wait_ms",
             "scene_render_parallel_join_overhead_ms",
             "scene_present_submit_ms",
+            "scene_present_packet_build_wall",
+            "scene_present_safe_snapshot_wall",
             "scene_present_queue_wait_ms",
             "scene_present_worker_ms",
             "scene_present_compose_ms",
@@ -30661,10 +30928,22 @@ class InvPhyTrainerWarp:
             "gaussian_visible_left_ratio",
             "gaussian_retention_left_ratio",
             "gaussian_compose_roi_left_ratio",
+            "scene_gaussian_fusion_fallback_ratio",
+            "scene_gaussian_fusion_visible_ratio",
+            "scene_gaussian_fusion_occluded_ratio",
+            "scene_gaussian_fusion_depth_invalid_ratio",
+            "scene_gaussian_fusion_left_fallback_ratio",
+            "scene_gaussian_fusion_left_visible_ratio",
+            "scene_gaussian_fusion_left_occluded_ratio",
+            "scene_gaussian_fusion_left_depth_invalid_ratio",
             "gaussian_raw_right_ratio",
             "gaussian_visible_right_ratio",
             "gaussian_retention_right_ratio",
             "gaussian_compose_roi_right_ratio",
+            "scene_gaussian_fusion_right_fallback_ratio",
+            "scene_gaussian_fusion_right_visible_ratio",
+            "scene_gaussian_fusion_right_occluded_ratio",
+            "scene_gaussian_fusion_right_depth_invalid_ratio",
             "scene_depth_finite_left_ratio",
             "scene_depth_positive_left_ratio",
             "scene_depth_invalid_left_ratio",
@@ -30713,14 +30992,25 @@ class InvPhyTrainerWarp:
             "scene_compose_table_right_cuda",
             "scene_compose_focus_left_cuda",
             "scene_compose_focus_right_cuda",
+            "scene_gaussian_fusion_left_cuda",
+            "scene_gaussian_fusion_right_cuda",
             "compose_left_cuda",
             "compose_right_cuda",
             "overlay_projection_wall",
             "scene_overlay_projection_wall",
             "scene_support_overlay_cache_wall",
+            "viewer_overlay_command_build_wall",
+            "viewer_overlay_sidecar_publish_wall",
+            "viewer_overlay_left_command_count",
+            "viewer_overlay_right_command_count",
+            "viewer_overlay_sidecar_active_ratio",
             "overlay_draw_left_wall",
             "overlay_draw_right_wall",
             "grab_validation_wall",
+            "scene_direct_publish_dtype_convert_wall",
+            "scene_direct_publish_flash_guard_wall",
+            "scene_direct_publish_safe_anchor_wall",
+            "scene_direct_publish_safe_cover_wall",
             "publish_total_wall",
             "publish_process_check_wall",
             "publish_pending_drain_nonblock_wall",
@@ -34400,6 +34690,9 @@ class InvPhyTrainerWarp:
                     )
 
                 render_stage_start = time.perf_counter()
+                render_pose_metadata_start = (
+                    time.perf_counter() if render_profile_frame is not None else None
+                )
                 render_sample_id = (
                     -1 if render_sample is None else int(render_sample.sample)
                 )
@@ -34427,6 +34720,12 @@ class InvPhyTrainerWarp:
                     dtype=np.float32,
                 ).copy()
                 publish_sample_id = int(scene_source_sample_id)
+                if render_pose_metadata_start is not None:
+                    self._render_profile_add_wall_time(
+                        render_profile_frame,
+                        "scene_render_pose_metadata_wall",
+                        time.perf_counter() - render_pose_metadata_start,
+                    )
                 scene_pose_sample = None
                 scene_timewarp_applied = 0.0
                 scene_timewarp_fallback_left_used = 0.0
@@ -34470,10 +34769,18 @@ class InvPhyTrainerWarp:
                     eye_label="right",
                 )
                 if eye_state_setup_start is not None:
+                    eye_state_setup_elapsed_s = (
+                        time.perf_counter() - eye_state_setup_start
+                    )
                     self._render_profile_add_wall_time(
                         render_profile_frame,
                         "render_eye_intrinsics_setup_wall",
-                        time.perf_counter() - eye_state_setup_start,
+                        eye_state_setup_elapsed_s,
+                    )
+                    self._render_profile_add_wall_time(
+                        render_profile_frame,
+                        "scene_render_eye_state_setup_wall",
+                        eye_state_setup_elapsed_s,
                     )
                 left_overlay_eye_render_state = left_eye_render_state
                 right_overlay_eye_render_state = right_eye_render_state
@@ -35215,30 +35522,81 @@ class InvPhyTrainerWarp:
                     left_compose_artifact_pre_stabilization = None
                     right_compose_artifact_pre_stabilization = None
                     stable_compose_analysis_start = None
-                    (
-                        left_eye_frame,
-                        left_eye_frame_depth,
-                        left_compose_metrics,
-                        right_eye_frame,
-                        right_eye_frame_depth,
-                        right_compose_metrics,
-                    ) = self._compose_immersive_stereo_eye_frames(
-                        left_scene_color,
-                        left_scene_depth,
-                        right_scene_color,
-                        right_scene_depth,
-                        left_gaussian_rgba,
-                        left_gaussian_depth,
-                        right_gaussian_rgba,
-                        right_gaussian_depth,
-                        eye_height,
-                        eye_width,
-                        immersive_compose_mode,
-                        gaussian_compose_roi_padding,
-                        render_profile_frame=render_profile_frame,
-                        output_dtype=eye_frame_output_dtype,
-                        collect_compose_metrics=stable_compose_safety_enabled,
+                    native_gl_gaussian_fusion_active = False
+                    native_gl_gaussian_fusion_attempted = bool(
+                        immersive_static_scene_backend_mode == "native_gl"
+                        and str(immersive_compose_mode).strip().lower()
+                        == "depth_aware"
+                        and eye_frame_output_dtype is torch.uint8
                     )
+                    fused_compose_result = (
+                        self._try_fuse_immersive_gaussian_scene_stereo(
+                            left_scene_color,
+                            left_scene_depth,
+                            right_scene_color,
+                            right_scene_depth,
+                            left_gaussian_rgba,
+                            left_gaussian_depth,
+                            right_gaussian_rgba,
+                            right_gaussian_depth,
+                            eye_height,
+                            eye_width,
+                            immersive_compose_mode,
+                            render_profile_frame=render_profile_frame,
+                            collect_metrics=stable_compose_safety_enabled
+                            or render_profile_frame is not None,
+                        )
+                        if native_gl_gaussian_fusion_attempted
+                        else None
+                    )
+                    if fused_compose_result is not None:
+                        (
+                            left_eye_frame,
+                            left_eye_frame_depth,
+                            left_compose_metrics,
+                            right_eye_frame,
+                            right_eye_frame_depth,
+                            right_compose_metrics,
+                        ) = fused_compose_result
+                        native_gl_gaussian_fusion_active = True
+                    else:
+                        if (
+                            render_profile_frame is not None
+                            and native_gl_gaussian_fusion_attempted
+                        ):
+                            render_profile_frame[
+                                "scene_gaussian_fusion_left_fallback_ratio"
+                            ] = 1.0
+                            render_profile_frame[
+                                "scene_gaussian_fusion_right_fallback_ratio"
+                            ] = 1.0
+                            render_profile_frame[
+                                "scene_gaussian_fusion_fallback_ratio"
+                            ] = 1.0
+                        (
+                            left_eye_frame,
+                            left_eye_frame_depth,
+                            left_compose_metrics,
+                            right_eye_frame,
+                            right_eye_frame_depth,
+                            right_compose_metrics,
+                        ) = self._compose_immersive_stereo_eye_frames(
+                            left_scene_color,
+                            left_scene_depth,
+                            right_scene_color,
+                            right_scene_depth,
+                            left_gaussian_rgba,
+                            left_gaussian_depth,
+                            right_gaussian_rgba,
+                            right_gaussian_depth,
+                            eye_height,
+                            eye_width,
+                            immersive_compose_mode,
+                            gaussian_compose_roi_padding,
+                            render_profile_frame=render_profile_frame,
+                            output_dtype=eye_frame_output_dtype,
+                            collect_compose_metrics=stable_compose_safety_enabled,
+                        )
                     def _compose_metrics_suspicious_for_full_analysis(metrics):
                         if not metrics:
                             return False
@@ -35272,7 +35630,10 @@ class InvPhyTrainerWarp:
                     stable_compose_full_analysis_active = bool(
                         stable_compose_safety_enabled
                         and (
-                            stable_expensive_validation_active
+                            (
+                                stable_expensive_validation_active
+                                and not native_gl_gaussian_fusion_active
+                            )
                             or _compose_metrics_suspicious_for_full_analysis(
                                 left_compose_metrics
                             )
@@ -35722,7 +36083,7 @@ class InvPhyTrainerWarp:
                     )
                     viewer_overlay_published = False
                     if viewer_overlay_sidecar_active:
-                        viewer_overlay_start = (
+                        viewer_overlay_command_build_start = (
                             time.perf_counter()
                             if render_profile_frame is not None
                             else None
@@ -35750,6 +36111,18 @@ class InvPhyTrainerWarp:
                                     right_overlay_eye_render_state,
                                 )
                             )
+                        if viewer_overlay_command_build_start is not None:
+                            self._render_profile_add_wall_time(
+                                render_profile_frame,
+                                "viewer_overlay_command_build_wall",
+                                time.perf_counter()
+                                - viewer_overlay_command_build_start,
+                            )
+                        viewer_overlay_publish_start = (
+                            time.perf_counter()
+                            if render_profile_frame is not None
+                            else None
+                        )
                         try:
                             viewer_overlay_published = bool(
                                 immersive_bridge.publish_overlay_commands(
@@ -35759,6 +36132,12 @@ class InvPhyTrainerWarp:
                             )
                         except Exception:
                             viewer_overlay_published = False
+                        if viewer_overlay_publish_start is not None:
+                            self._render_profile_add_wall_time(
+                                render_profile_frame,
+                                "viewer_overlay_sidecar_publish_wall",
+                                time.perf_counter() - viewer_overlay_publish_start,
+                            )
                         if render_profile_frame is not None:
                             render_profile_frame[
                                 "viewer_overlay_sidecar_active_ratio"
@@ -35769,12 +36148,6 @@ class InvPhyTrainerWarp:
                             render_profile_frame[
                                 "viewer_overlay_right_command_count"
                             ] = float(len(right_viewer_overlay_commands))
-                            if viewer_overlay_start is not None:
-                                self._render_profile_add_wall_time(
-                                    render_profile_frame,
-                                    "viewer_overlay_sidecar_publish_wall",
-                                    time.perf_counter() - viewer_overlay_start,
-                                )
                     rope_game_python_overlay_needed = bool(
                         rope_game_overlay_state is not None
                         and (
@@ -35851,10 +36224,27 @@ class InvPhyTrainerWarp:
                             )
                     overlay_draw_wall_s = time.perf_counter() - overlay_stage_start
 
+                    dtype_convert_start = (
+                        time.perf_counter() if render_profile_frame is not None else None
+                    )
                     if left_eye_frame.dtype != torch.uint8:
                         left_eye_frame = left_eye_frame.clamp(0.0, 255.0).to(torch.uint8)
                     if right_eye_frame.dtype != torch.uint8:
                         right_eye_frame = right_eye_frame.clamp(0.0, 255.0).to(torch.uint8)
+                    if dtype_convert_start is not None:
+                        self._render_profile_add_wall_time(
+                            render_profile_frame,
+                            "scene_direct_publish_dtype_convert_wall",
+                            time.perf_counter() - dtype_convert_start,
+                        )
+                    stable_artifact_finalize_start = (
+                        time.perf_counter()
+                        if (
+                            render_profile_frame is not None
+                            and stable_compose_safety_enabled
+                        )
+                        else None
+                    )
                     if stable_compose_safety_enabled:
                         self._finalize_immersive_runtime_compose_artifact(
                             left_compose_artifact_token,
@@ -35879,6 +36269,12 @@ class InvPhyTrainerWarp:
                             compose_mode=immersive_compose_mode,
                             pre_stabilization_composed_pre_overlay=right_compose_artifact_pre_stabilization,
                             extra_metadata=right_compose_artifact_extra_metadata,
+                        )
+                    if stable_artifact_finalize_start is not None:
+                        self._render_profile_add_wall_time(
+                            render_profile_frame,
+                            "scene_stable_compose_artifact_finalize_wall",
+                            time.perf_counter() - stable_artifact_finalize_start,
                         )
 
                 validation_sources = []
@@ -36112,6 +36508,9 @@ class InvPhyTrainerWarp:
                                 "scene_overlay_projection_wall",
                                 overlay_projection_elapsed_s,
                             )
+                    present_packet_build_start = (
+                        time.perf_counter() if render_profile_frame is not None else None
+                    )
                     producer_ready_event = None
                     if torch.cuda.is_available():
                         producer_ready_event = torch.cuda.Event()
@@ -36265,13 +36664,34 @@ class InvPhyTrainerWarp:
                             )
                         ),
                     }
+                    if present_packet_build_start is not None:
+                        self._render_profile_add_wall_time(
+                            render_profile_frame,
+                            "scene_present_packet_build_wall",
+                            time.perf_counter() - present_packet_build_start,
+                        )
                     present_submit_start = time.perf_counter()
+                    present_safe_snapshot_start = (
+                        time.perf_counter()
+                        if (
+                            render_profile_frame is not None
+                            and stable_compose_safety_gate_enabled
+                            and presentation_backend_kind == "legacy_single_worker"
+                        )
+                        else None
+                    )
                     if (
                         stable_compose_safety_gate_enabled
                         and presentation_backend_kind == "legacy_single_worker"
                     ):
                         presentation_pending_safe_snapshots[int(frame_count)] = (
                             _capture_stable_present_safe_snapshot()
+                        )
+                    if present_safe_snapshot_start is not None:
+                        self._render_profile_add_wall_time(
+                            render_profile_frame,
+                            "scene_present_safe_snapshot_wall",
+                            time.perf_counter() - present_safe_snapshot_start,
                         )
                     dropped_packet = presentation_worker.submit(present_packet)
                     scene_present_submit_wall_s = (
@@ -36302,10 +36722,19 @@ class InvPhyTrainerWarp:
                         )
                     _update_preview_from_latest_completion(render_profile_frame)
                 else:
+                    dtype_convert_start = (
+                        time.perf_counter() if render_profile_frame is not None else None
+                    )
                     if left_eye_frame.dtype != torch.uint8:
                         left_eye_frame = left_eye_frame.clamp(0.0, 255.0).to(torch.uint8)
                     if right_eye_frame.dtype != torch.uint8:
                         right_eye_frame = right_eye_frame.clamp(0.0, 255.0).to(torch.uint8)
+                    if dtype_convert_start is not None:
+                        self._render_profile_add_wall_time(
+                            render_profile_frame,
+                            "scene_direct_publish_dtype_convert_wall",
+                            time.perf_counter() - dtype_convert_start,
+                        )
 
                     if scene_depth_reproject_enabled:
                         publish_measurement_s = time.monotonic()
@@ -36341,6 +36770,9 @@ class InvPhyTrainerWarp:
                                 "scene_pose_staleness_savings_ms"
                             ] = scene_pose_staleness_savings_ms / 1000.0
 
+                    flash_guard_start = (
+                        time.perf_counter() if render_profile_frame is not None else None
+                    )
                     idle_fullframe_flash_decision = (
                         self._evaluate_immersive_idle_fullframe_flash_guard(
                             left_eye_frame=left_eye_frame,
@@ -36352,6 +36784,12 @@ class InvPhyTrainerWarp:
                             backend_kind="main_thread_direct",
                         )
                     )
+                    if flash_guard_start is not None:
+                        self._render_profile_add_wall_time(
+                            render_profile_frame,
+                            "scene_direct_publish_flash_guard_wall",
+                            time.perf_counter() - flash_guard_start,
+                        )
                     if bool(idle_fullframe_flash_decision.get("reject_publish", False)):
                         reject_source = str(
                             idle_fullframe_flash_decision.get(
@@ -36455,10 +36893,35 @@ class InvPhyTrainerWarp:
                                 f"startup_gap_ms={startup_gap_ms:.1f}",
                                 flush=True,
                             )
+                    safe_anchor_start = (
+                        time.perf_counter()
+                        if (
+                            render_profile_frame is not None
+                            and stable_compose_safety_gate_enabled
+                        )
+                        else None
+                    )
                     if stable_compose_safety_gate_enabled:
                         _promote_committed_safe_anchor(
                             _capture_stable_present_safe_snapshot()
                         )
+                    if safe_anchor_start is not None:
+                        self._render_profile_add_wall_time(
+                            render_profile_frame,
+                            "scene_direct_publish_safe_anchor_wall",
+                            time.perf_counter() - safe_anchor_start,
+                        )
+                    safe_cover_start = (
+                        time.perf_counter()
+                        if (
+                            render_profile_frame is not None
+                            and (
+                                stable_compose_safety_gate_enabled
+                                or stable_gaussian_source_validation_enabled
+                            )
+                        )
+                        else None
+                    )
                     if (
                         stable_compose_safety_gate_enabled
                         or stable_gaussian_source_validation_enabled
@@ -36469,6 +36932,12 @@ class InvPhyTrainerWarp:
                                 right_eye_frame,
                                 preview_frame=left_eye_frame,
                             )
+                        )
+                    if safe_cover_start is not None:
+                        self._render_profile_add_wall_time(
+                            render_profile_frame,
+                            "scene_direct_publish_safe_cover_wall",
+                            time.perf_counter() - safe_cover_start,
                         )
                     _present_preview_frame_direct(
                         left_eye_frame,
@@ -36539,10 +37008,41 @@ class InvPhyTrainerWarp:
                         + float(overlay_publish_wall_s)
                         + float(scene_present_submit_wall_s)
                     )
-                    render_profile_frame["rendering"] = float(render_time)
-                    render_profile_frame["scene_render_residual_wall"] = max(
+                    render_residual_wall_s = max(
                         0.0,
                         float(render_time) - profiled_render_wall_s,
+                    )
+                    residual_explained_keys = (
+                        "scene_render_pose_metadata_wall",
+                        "scene_render_eye_state_setup_wall",
+                        "scene_compose_artifact_context_wall",
+                        "scene_gaussian_source_validation_wall",
+                        "scene_stable_compose_artifact_finalize_wall",
+                        "grab_validation_wall",
+                        "scene_direct_publish_dtype_convert_wall",
+                        "scene_direct_publish_flash_guard_wall",
+                        "scene_direct_publish_safe_anchor_wall",
+                        "scene_direct_publish_safe_cover_wall",
+                        "scene_present_packet_build_wall",
+                        "scene_present_safe_snapshot_wall",
+                        "scene_present_preview_ms",
+                        "preview_window_wall",
+                        "glfw_poll_wall",
+                    )
+                    residual_explained_wall_s = sum(
+                        float(render_profile_frame.get(key, 0.0))
+                        for key in residual_explained_keys
+                    )
+                    render_profile_frame["rendering"] = float(render_time)
+                    render_profile_frame["scene_render_residual_wall"] = (
+                        render_residual_wall_s
+                    )
+                    render_profile_frame["scene_render_residual_explained_wall"] = (
+                        residual_explained_wall_s
+                    )
+                    render_profile_frame["scene_render_residual_unexplained_wall"] = max(
+                        0.0,
+                        render_residual_wall_s - residual_explained_wall_s,
                     )
                     render_profile_frame["static_scene_execute_wall_ms"] = float(
                         static_scene_execute_wall_s
@@ -42261,6 +42761,10 @@ class InvPhyTrainerWarp:
             "scene_render_left_wall",
             "scene_render_right_wall",
             "scene_render_residual_wall",
+            "scene_render_residual_explained_wall",
+            "scene_render_residual_unexplained_wall",
+            "scene_render_pose_metadata_wall",
+            "scene_render_eye_state_setup_wall",
             "scene_render_eye_left_total_ms",
             "scene_render_eye_right_total_ms",
             "scene_render_eye_left_dispatch_ms",
@@ -42285,6 +42789,8 @@ class InvPhyTrainerWarp:
             "compose_left_safety_analysis_wall",
             "compose_right_safety_analysis_wall",
             "scene_present_submit_ms",
+            "scene_present_packet_build_wall",
+            "scene_present_safe_snapshot_wall",
             "scene_present_queue_wait_ms",
             "scene_present_worker_ms",
             "scene_present_compose_ms",
@@ -42391,6 +42897,16 @@ class InvPhyTrainerWarp:
             "scene_compose_side_right_cuda",
             "scene_overlay_projection_wall",
             "scene_support_overlay_cache_wall",
+            "scene_stable_compose_artifact_finalize_wall",
+            "viewer_overlay_command_build_wall",
+            "viewer_overlay_sidecar_publish_wall",
+            "viewer_overlay_left_command_count",
+            "viewer_overlay_right_command_count",
+            "viewer_overlay_sidecar_active_ratio",
+            "scene_direct_publish_dtype_convert_wall",
+            "scene_direct_publish_flash_guard_wall",
+            "scene_direct_publish_safe_anchor_wall",
+            "scene_direct_publish_safe_cover_wall",
             "scene_reproject_background_left_cuda",
             "scene_reproject_background_right_cuda",
             "scene_reproject_background_hole_fill_left_cuda",

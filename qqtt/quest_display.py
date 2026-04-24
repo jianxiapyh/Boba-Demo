@@ -2911,6 +2911,7 @@ class OpenXRImmersiveBridge(OpenXRFramePanelMirror):
         left_frame_rgba: torch.Tensor,
         right_frame_rgba: torch.Tensor,
         presentation_mode=None,
+        producer_ready_event=None,
     ) -> tuple[bool, dict[str, float]]:
         timing = {
             "process_check_wall": 0.0,
@@ -3026,6 +3027,7 @@ class OpenXRImmersiveBridge(OpenXRFramePanelMirror):
             submit_wall_s=submit_wall_s,
             expected_publish_sample_bytes=expected_publish_sample_bytes,
             presentation_mode=normalized_presentation_mode,
+            producer_ready_event=producer_ready_event,
         )
         timing["total_wall"] = time.perf_counter() - publish_start
         self._last_published_frame_id = frame_id
@@ -3041,6 +3043,7 @@ class OpenXRImmersiveBridge(OpenXRFramePanelMirror):
         submit_wall_s: Optional[float] = None,
         expected_publish_sample_bytes: Optional[bytes] = None,
         presentation_mode: Optional[int] = None,
+        producer_ready_event=None,
     ) -> float:
         if submit_wall_s is None:
             submit_wall_s = time.perf_counter()
@@ -3066,9 +3069,10 @@ class OpenXRImmersiveBridge(OpenXRFramePanelMirror):
             )
             stage_buffer = self._cpu_stage_buffers[stage_index]
             stage_array = self._cpu_stage_arrays[stage_index]
-            producer_ready_event = torch.cuda.Event()
+            if producer_ready_event is None:
+                producer_ready_event = torch.cuda.Event()
+                producer_ready_event.record(torch.cuda.current_stream())
             enqueue_start = time.perf_counter()
-            producer_ready_event.record(torch.cuda.current_stream())
             copy_start_event = None
             copy_end_event = None
             if not self._direct_commit_enabled:

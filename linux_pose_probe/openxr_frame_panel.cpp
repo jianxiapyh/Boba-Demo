@@ -52,6 +52,9 @@ constexpr float kSelectPressedThreshold = 0.75f;
 constexpr float kExitPressedThreshold = 0.85f;
 constexpr uint32_t kPresentationModeStereoFullscreen = 0u;
 constexpr uint32_t kPresentationModeMonoPanel = 1u;
+constexpr const char* kExpectedOverlayMagic = "BOBAOVL1";
+constexpr uint32_t kOverlayHeaderVersion = 1u;
+constexpr uint32_t kOverlayCommandStrideFloats = 14u;
 volatile std::sig_atomic_t g_stop_requested = 0;
 
 struct SharedFrameHeader {
@@ -77,6 +80,30 @@ struct SharedFrameFile {
     size_t mapped_size = 0;
     const SharedFrameHeader* header = nullptr;
     const uint8_t* payload = nullptr;
+};
+
+#pragma pack(push, 1)
+struct SharedOverlayHeader {
+    char magic[8];
+    uint32_t version;
+    uint32_t command_stride_floats;
+    uint32_t max_commands_per_eye;
+    uint64_t latest_overlay_id;
+    uint32_t left_count;
+    uint32_t right_count;
+    uint32_t reserved0;
+    uint8_t padding[24];
+};
+#pragma pack(pop)
+
+static_assert(sizeof(SharedOverlayHeader) == 64, "SharedOverlayHeader size mismatch");
+
+struct SharedOverlayFile {
+    int fd = -1;
+    void* mapped = MAP_FAILED;
+    size_t mapped_size = 0;
+    const SharedOverlayHeader* header = nullptr;
+    const float* payload = nullptr;
 };
 
 struct SwapchainView {
@@ -162,15 +189,20 @@ void HandleSignal(int) {
     g_stop_requested = 1;
 }
 
-bool ParseArgs(int argc, char** argv, std::string* frame_path) {
+bool ParseArgs(int argc, char** argv, std::string* frame_path, std::string* overlay_path) {
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
         if (arg == "--frame-path" && i + 1 < argc) {
             *frame_path = argv[++i];
             continue;
         }
+        if (arg == "--overlay-path" && i + 1 < argc) {
+            *overlay_path = argv[++i];
+            continue;
+        }
         std::cerr << "Usage: " << kBinaryUsageName
-                  << " --frame-path /tmp/boba_quest_frame.bin\n";
+                  << " --frame-path /tmp/boba_quest_frame.bin"
+                  << " [--overlay-path /tmp/boba_quest_overlay.bin]\n";
         return false;
     }
 
@@ -682,6 +714,110 @@ void CloseSharedFrameFile(SharedFrameFile* file) {
     file->payload = nullptr;
 }
 
+bool OpenSharedOverlayFile(const std::string& overlay_path, SharedOverlayFile* file) {
+    if (overlay_path.empty()) {
+        return false;
+    }
+    file->fd = open(overlay_path.c_str(), O_RDONLY);
+    if (file->fd < 0) {
+        perror("open(overlay_path)");
+        return false;
+    }
+
+    struct stat st {};
+    if (fstat(file->fd, &st) != 0) {
+        perror("fstat(overlay_path)");
+        close(file->fd);
+        file->fd = -1;
+        return false;
+    }
+
+    file->mapped_size = static_cast<size_t>(st.st_size);
+    file->mapped = mmap(nullptr, file->mapped_size, PROT_READ, MAP_SHARED, file->fd, 0);
+    if (file->mapped == MAP_FAILED) {
+        perror("mmap(overlay_path)");
+        close(file->fd);
+        file->fd = -1;
+        return false;
+    }
+
+    file->header = static_cast<const SharedOverlayHeader*>(file->mapped);
+    if (std::memcmp(file->header->magic, kExpectedOverlayMagic, 8) != 0) {
+        std::cerr << "Shared overlay header magic mismatch.\n";
+        munmap(file->mapped, file->mapped_size);
+        close(file->fd);
+        file->mapped = MAP_FAILED;
+        file->fd = -1;
+        return false;
+    }
+    if (file->header->version != kOverlayHeaderVersion ||
+        file->header->command_stride_floats != kOverlayCommandStrideFloats) {
+        std::cerr << "Shared overlay header version/stride mismatch: version="
+                  << file->header->version << " stride="
+                  << file->header->command_stride_floats << "\n";
+        munmap(file->mapped, file->mapped_size);
+        close(file->fd);
+        file->mapped = MAP_FAILED;
+        file->fd = -1;
+        return false;
+    }
+    const size_t expected_size =
+        sizeof(SharedOverlayHeader) +
+        2u * static_cast<size_t>(file->header->max_commands_per_eye) *
+            static_cast<size_t>(file->header->command_stride_floats) * sizeof(float);
+    if (file->mapped_size < expected_size) {
+        std::cerr << "Shared overlay file is smaller than expected.\n";
+        munmap(file->mapped, file->mapped_size);
+        close(file->fd);
+        file->mapped = MAP_FAILED;
+        file->fd = -1;
+        return false;
+    }
+    file->payload = reinterpret_cast<const float*>(
+        static_cast<const uint8_t*>(file->mapped) + sizeof(SharedOverlayHeader));
+    std::cerr << "Opened shared overlay file " << overlay_path
+              << " max_commands_per_eye=" << file->header->max_commands_per_eye
+              << "\n";
+    return true;
+}
+
+void CloseSharedOverlayFile(SharedOverlayFile* file) {
+    if (file->mapped != MAP_FAILED) {
+        munmap(file->mapped, file->mapped_size);
+        file->mapped = MAP_FAILED;
+    }
+    if (file->fd >= 0) {
+        close(file->fd);
+        file->fd = -1;
+    }
+    file->mapped_size = 0;
+    file->header = nullptr;
+    file->payload = nullptr;
+}
+
+bool UpdateOverlayCommandsIfNeeded(const SharedOverlayFile& file,
+                                   uint64_t* latest_overlay_id,
+                                   std::vector<float>* left_commands,
+                                   std::vector<float>* right_commands) {
+    if (file.header == nullptr || file.payload == nullptr) {
+        return false;
+    }
+    const SharedOverlayHeader header = *file.header;
+    if (header.latest_overlay_id == *latest_overlay_id) {
+        return false;
+    }
+    const uint32_t max_commands = header.max_commands_per_eye;
+    const uint32_t stride = header.command_stride_floats;
+    const uint32_t left_count = std::min(header.left_count, max_commands);
+    const uint32_t right_count = std::min(header.right_count, max_commands);
+    const float* left_base = file.payload;
+    const float* right_base = file.payload + static_cast<size_t>(max_commands) * stride;
+    left_commands->assign(left_base, left_base + static_cast<size_t>(left_count) * stride);
+    right_commands->assign(right_base, right_base + static_cast<size_t>(right_count) * stride);
+    *latest_overlay_id = header.latest_overlay_id;
+    return true;
+}
+
 bool UpdateDisplayFrameIfNeeded(const SharedFrameFile& file, uint64_t* latest_frame_id,
                                 std::vector<uint8_t>* display_rgba) {
     const SharedFrameHeader header = *file.header;
@@ -1084,6 +1220,174 @@ GLuint CreatePanelProgram() {
     return program;
 }
 
+GLuint CreateOverlayProgram() {
+    const char* vertex_source = R"GLSL(
+        #version 330 core
+        layout(location = 0) in vec2 aPos;
+        layout(location = 1) in vec4 aColor;
+        uniform vec2 uSourceSize;
+        out vec4 vColor;
+        void main() {
+            vec2 ndc = vec2(
+                (aPos.x / max(uSourceSize.x, 1.0)) * 2.0 - 1.0,
+                1.0 - (aPos.y / max(uSourceSize.y, 1.0)) * 2.0
+            );
+            gl_Position = vec4(ndc, 0.0, 1.0);
+            vColor = aColor;
+        }
+    )GLSL";
+
+    const char* fragment_source = R"GLSL(
+        #version 330 core
+        in vec4 vColor;
+        out vec4 frag;
+        void main() {
+            frag = vColor;
+        }
+    )GLSL";
+
+    const GLuint vertex_shader = CompileShader(GL_VERTEX_SHADER, vertex_source);
+    const GLuint fragment_shader = CompileShader(GL_FRAGMENT_SHADER, fragment_source);
+    if (vertex_shader == 0 || fragment_shader == 0) {
+        glDeleteShader(vertex_shader);
+        glDeleteShader(fragment_shader);
+        return 0;
+    }
+    const GLuint program = glCreateProgram();
+    glAttachShader(program, vertex_shader);
+    glAttachShader(program, fragment_shader);
+    glLinkProgram(program);
+    glDeleteShader(vertex_shader);
+    glDeleteShader(fragment_shader);
+
+    GLint status = GL_FALSE;
+    glGetProgramiv(program, GL_LINK_STATUS, &status);
+    if (status != GL_TRUE) {
+        GLint log_length = 0;
+        glGetProgramiv(program, GL_INFO_LOG_LENGTH, &log_length);
+        std::vector<GLchar> log(std::max(1, log_length), '\0');
+        glGetProgramInfoLog(program, log_length, nullptr, log.data());
+        std::cerr << "Overlay program link failed: " << log.data() << "\n";
+        glDeleteProgram(program);
+        return 0;
+    }
+    return program;
+}
+
+void AppendOverlayVertex(std::vector<float>* vertices,
+                         float x,
+                         float y,
+                         float r,
+                         float g,
+                         float b,
+                         float a) {
+    vertices->push_back(x);
+    vertices->push_back(y);
+    vertices->push_back(std::clamp(r / 255.0f, 0.0f, 1.0f));
+    vertices->push_back(std::clamp(g / 255.0f, 0.0f, 1.0f));
+    vertices->push_back(std::clamp(b / 255.0f, 0.0f, 1.0f));
+    vertices->push_back(std::clamp(a, 0.0f, 1.0f));
+}
+
+void AppendOverlayTriangle(std::vector<float>* vertices,
+                           float x0, float y0,
+                           float x1, float y1,
+                           float x2, float y2,
+                           float r, float g, float b, float a) {
+    AppendOverlayVertex(vertices, x0, y0, r, g, b, a);
+    AppendOverlayVertex(vertices, x1, y1, r, g, b, a);
+    AppendOverlayVertex(vertices, x2, y2, r, g, b, a);
+}
+
+void AppendOverlayLine(std::vector<float>* vertices, const float* cmd) {
+    const float sx = cmd[1];
+    const float sy = cmd[2];
+    const float ex = cmd[3];
+    const float ey = cmd[4];
+    const float radius = std::max(0.5f, cmd[5]);
+    const float alpha = cmd[6];
+    const float r = cmd[7];
+    const float g = cmd[8];
+    const float b = cmd[9];
+    const float dx = ex - sx;
+    const float dy = ey - sy;
+    const float length = std::sqrt(dx * dx + dy * dy);
+    if (length <= 1.0e-4f) {
+        return;
+    }
+    const float nx = -dy / length * radius;
+    const float ny = dx / length * radius;
+    AppendOverlayTriangle(vertices, sx + nx, sy + ny, ex + nx, ey + ny,
+                          ex - nx, ey - ny, r, g, b, alpha);
+    AppendOverlayTriangle(vertices, sx + nx, sy + ny, ex - nx, ey - ny,
+                          sx - nx, sy - ny, r, g, b, alpha);
+}
+
+void AppendOverlayMarker(std::vector<float>* vertices, const float* cmd) {
+    const float cx = cmd[1];
+    const float cy = cmd[2];
+    const float radius = std::max(1.0f, cmd[5]);
+    const float alpha = cmd[6];
+    const float r = cmd[7];
+    const float g = cmd[8];
+    const float b = cmd[9];
+    constexpr int kSegments = 16;
+    constexpr float kPi = 3.14159265358979323846f;
+    for (int i = 0; i < kSegments; ++i) {
+        const float a0 = (2.0f * kPi * i) / kSegments;
+        const float a1 = (2.0f * kPi * (i + 1)) / kSegments;
+        AppendOverlayTriangle(vertices,
+                              cx, cy,
+                              cx + std::cos(a0) * radius, cy + std::sin(a0) * radius,
+                              cx + std::cos(a1) * radius, cy + std::sin(a1) * radius,
+                              r, g, b, alpha);
+    }
+}
+
+void DrawOverlayCommands(const std::vector<float>& commands,
+                         GLuint overlay_program,
+                         GLuint overlay_vao,
+                         GLuint overlay_vbo,
+                         GLint overlay_source_size_location,
+                         uint32_t source_width,
+                         uint32_t source_height) {
+    if (commands.empty() || overlay_program == 0 || overlay_vao == 0 || overlay_vbo == 0) {
+        return;
+    }
+    std::vector<float> vertices;
+    vertices.reserve(commands.size() * 18u);
+    const size_t command_count = commands.size() / kOverlayCommandStrideFloats;
+    for (size_t command_index = 0; command_index < command_count; ++command_index) {
+        const float* cmd = commands.data() + command_index * kOverlayCommandStrideFloats;
+        const int command_type = static_cast<int>(std::round(cmd[0]));
+        if (command_type == 0) {
+            AppendOverlayLine(&vertices, cmd);
+        } else if (command_type == 1) {
+            AppendOverlayMarker(&vertices, cmd);
+        }
+    }
+    if (vertices.empty()) {
+        return;
+    }
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glUseProgram(overlay_program);
+    glUniform2f(overlay_source_size_location,
+                static_cast<float>(source_width),
+                static_cast<float>(source_height));
+    glBindVertexArray(overlay_vao);
+    glBindBuffer(GL_ARRAY_BUFFER, overlay_vbo);
+    glBufferData(GL_ARRAY_BUFFER,
+                 static_cast<GLsizeiptr>(vertices.size() * sizeof(float)),
+                 vertices.data(),
+                 GL_STREAM_DRAW);
+    glDrawArrays(GL_TRIANGLES, 0, static_cast<GLsizei>(vertices.size() / 6u));
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glBindVertexArray(0);
+    glUseProgram(0);
+    glDisable(GL_BLEND);
+}
+
 bool CreateViewSwapchains(XrInstance instance, XrSession session, int64_t swapchain_format,
                           const std::vector<XrViewConfigurationView>& config_views,
                           std::vector<SwapchainView>* swapchain_views) {
@@ -1167,7 +1471,8 @@ int main(int argc, char** argv) {
     std::cerr << std::fixed << std::setprecision(6) << std::unitbuf;
 
     std::string frame_path;
-    if (!ParseArgs(argc, argv, &frame_path)) {
+    std::string overlay_path;
+    if (!ParseArgs(argc, argv, &frame_path, &overlay_path)) {
         return 2;
     }
 
@@ -1175,15 +1480,19 @@ int main(int argc, char** argv) {
     if (!OpenSharedFrameFile(frame_path, &shared_frame)) {
         return 3;
     }
+    SharedOverlayFile shared_overlay;
+    const bool overlay_enabled = OpenSharedOverlayFile(overlay_path, &shared_overlay);
     if (shared_frame.header->channels != 4) {
         std::cerr << "Expected RGBA frame data, got channels="
                   << shared_frame.header->channels << "\n";
+        CloseSharedOverlayFile(&shared_overlay);
         CloseSharedFrameFile(&shared_frame);
         return 4;
     }
 
     if (!glfwInit()) {
         std::cerr << "glfwInit failed.\n";
+        CloseSharedOverlayFile(&shared_overlay);
         CloseSharedFrameFile(&shared_frame);
         return 5;
     }
@@ -1584,6 +1893,30 @@ int main(int argc, char** argv) {
     glGenFramebuffers(1, &framebuffer);
     const GLint source_location = glGetUniformLocation(program, "uSource");
     const GLint mvp_location = glGetUniformLocation(program, "uMvp");
+    GLuint overlay_program = 0;
+    GLuint overlay_vao = 0;
+    GLuint overlay_vbo = 0;
+    GLint overlay_source_size_location = -1;
+    if (overlay_enabled) {
+        overlay_program = CreateOverlayProgram();
+        if (overlay_program != 0) {
+            overlay_source_size_location = glGetUniformLocation(overlay_program, "uSourceSize");
+            glGenVertexArrays(1, &overlay_vao);
+            glGenBuffers(1, &overlay_vbo);
+            glBindVertexArray(overlay_vao);
+            glBindBuffer(GL_ARRAY_BUFFER, overlay_vbo);
+            glEnableVertexAttribArray(0);
+            glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE,
+                                  static_cast<GLsizei>(6 * sizeof(float)),
+                                  reinterpret_cast<void*>(0));
+            glEnableVertexAttribArray(1);
+            glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE,
+                                  static_cast<GLsizei>(6 * sizeof(float)),
+                                  reinterpret_cast<void*>(2 * sizeof(float)));
+            glBindBuffer(GL_ARRAY_BUFFER, 0);
+            glBindVertexArray(0);
+        }
+    }
 
     XrReferenceSpaceCreateInfo local_space_info =
         MakeXrStruct<XrReferenceSpaceCreateInfo>(XR_TYPE_REFERENCE_SPACE_CREATE_INFO);
@@ -1593,6 +1926,15 @@ int main(int argc, char** argv) {
     if (!CheckXr(instance, xrCreateReferenceSpace(session, &local_space_info, &local_space),
                  "xrCreateReferenceSpace(LOCAL)")) {
         glDeleteFramebuffers(1, &framebuffer);
+        if (overlay_vbo != 0) {
+            glDeleteBuffers(1, &overlay_vbo);
+        }
+        if (overlay_vao != 0) {
+            glDeleteVertexArrays(1, &overlay_vao);
+        }
+        if (overlay_program != 0) {
+            glDeleteProgram(overlay_program);
+        }
         glDeleteVertexArrays(1, &vao);
         glDeleteProgram(program);
         glDeleteTextures(source_texture_count, source_textures);
@@ -1626,6 +1968,10 @@ int main(int argc, char** argv) {
     uint64_t coalesced_source_frame_count = 0;
     uint64_t rendered_frame_count = 0;
     uint64_t logged_rendered_frame_count = 0;
+    uint64_t texture_upload_count = 0;
+    uint64_t logged_texture_upload_count = 0;
+    double texture_upload_ms_sum = 0.0;
+    double logged_texture_upload_ms_sum = 0.0;
     uint64_t controller_sample_count = 0;
     auto first_source_update_time = std::chrono::steady_clock::time_point{};
     auto last_source_update_log_time = std::chrono::steady_clock::time_point{};
@@ -1640,6 +1986,9 @@ int main(int argc, char** argv) {
 #ifdef BOBA_IMMERSIVE_BRIDGE
     std::vector<uint8_t> display_rgba_left(eye_frame_bytes, 0);
     std::vector<uint8_t> display_rgba_right(eye_frame_bytes, 0);
+    std::vector<float> overlay_commands_left;
+    std::vector<float> overlay_commands_right;
+    uint64_t latest_overlay_id = 0;
     uint32_t current_presentation_mode = kPresentationModeStereoFullscreen;
     uint32_t logged_presentation_mode = current_presentation_mode;
     uint32_t previous_presentation_mode = current_presentation_mode;
@@ -1828,24 +2177,45 @@ int main(int argc, char** argv) {
             if (rendered_frame_count == 1 || render_since_last_log_s >= 1.0) {
                 const uint64_t rendered_since_last_log =
                     rendered_frame_count - logged_rendered_frame_count;
+                const uint64_t texture_uploads_since_last_log =
+                    texture_upload_count - logged_texture_upload_count;
+                const double texture_upload_ms_since_last_log =
+                    texture_upload_ms_sum - logged_texture_upload_ms_sum;
                 const double render_recent_fps =
                     (render_since_last_log_s > 0.0)
                         ? (static_cast<double>(rendered_since_last_log) / render_since_last_log_s)
+                        : 0.0;
+                const double texture_upload_recent_fps =
+                    (render_since_last_log_s > 0.0)
+                        ? (static_cast<double>(texture_uploads_since_last_log) /
+                           render_since_last_log_s)
+                        : 0.0;
+                const double texture_upload_avg_ms =
+                    (texture_uploads_since_last_log > 0)
+                        ? (texture_upload_ms_since_last_log /
+                           static_cast<double>(texture_uploads_since_last_log))
                         : 0.0;
                 std::cerr << std::fixed << std::setprecision(2)
                           << "Immersive bridge viewer_render_stats "
                           << "rendered_count=" << rendered_frame_count << " "
                           << "elapsed_s=" << render_elapsed_s << " "
-                          << "recent_fps=" << render_recent_fps << "\n";
+                          << "recent_fps=" << render_recent_fps << " "
+                          << "texture_upload_count=" << texture_upload_count << " "
+                          << "texture_upload_recent_fps=" << texture_upload_recent_fps << " "
+                          << "texture_upload_avg_ms=" << texture_upload_avg_ms << "\n";
                 last_render_log_time = now;
                 logged_rendered_frame_count = rendered_frame_count;
+                logged_texture_upload_count = texture_upload_count;
+                logged_texture_upload_ms_sum = texture_upload_ms_sum;
             }
 #ifdef BOBA_IMMERSIVE_BRIDGE
             uint64_t source_frame_delta = 0;
             previous_presentation_mode = current_presentation_mode;
-            if (UpdateStereoFramesIfNeeded(shared_frame, &latest_frame_id, &source_frame_delta,
+            const bool stereo_source_updated =
+                UpdateStereoFramesIfNeeded(shared_frame, &latest_frame_id, &source_frame_delta,
                                            &current_presentation_mode,
-                                           &display_rgba_left, &display_rgba_right)) {
+                                           &display_rgba_left, &display_rgba_right);
+            if (stereo_source_updated) {
                 ++applied_source_update_count;
                 source_frame_delta_count += source_frame_delta;
                 if (source_frame_delta > 0) {
@@ -1903,33 +2273,48 @@ int main(int argc, char** argv) {
                     logged_applied_source_update_count = applied_source_update_count;
                     logged_source_frame_delta_count = source_frame_delta_count;
                 }
-            }
 
-            glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-            glBindTexture(GL_TEXTURE_2D, source_textures[0]);
-            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, shared_frame.header->width,
-                            shared_frame.header->height, GL_RGBA, GL_UNSIGNED_BYTE,
-                            display_rgba_left.data());
-            glBindTexture(GL_TEXTURE_2D, 0);
-            glBindTexture(GL_TEXTURE_2D, source_textures[1]);
-            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, shared_frame.header->width,
-                            shared_frame.header->height, GL_RGBA, GL_UNSIGNED_BYTE,
-                            display_rgba_right.data());
-            glBindTexture(GL_TEXTURE_2D, 0);
+                const auto upload_start = std::chrono::steady_clock::now();
+                glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+                glBindTexture(GL_TEXTURE_2D, source_textures[0]);
+                glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, shared_frame.header->width,
+                                shared_frame.header->height, GL_RGBA, GL_UNSIGNED_BYTE,
+                                display_rgba_left.data());
+                glBindTexture(GL_TEXTURE_2D, source_textures[1]);
+                glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, shared_frame.header->width,
+                                shared_frame.header->height, GL_RGBA, GL_UNSIGNED_BYTE,
+                                display_rgba_right.data());
+                glBindTexture(GL_TEXTURE_2D, 0);
+                const auto upload_end = std::chrono::steady_clock::now();
+                texture_upload_ms_sum +=
+                    std::chrono::duration<double, std::milli>(upload_end - upload_start).count();
+                ++texture_upload_count;
+            }
+            if (overlay_enabled) {
+                UpdateOverlayCommandsIfNeeded(shared_overlay,
+                                              &latest_overlay_id,
+                                              &overlay_commands_left,
+                                              &overlay_commands_right);
+            }
 #else
             if (UpdateDisplayFrameIfNeeded(shared_frame, &latest_frame_id, &display_rgba)) {
                 if (latest_frame_id == 1 || latest_frame_id >= logged_source_frame_id + 120) {
                     std::cerr << "Panel received source frame " << latest_frame_id << "\n";
                     logged_source_frame_id = latest_frame_id;
                 }
-            }
 
-            glBindTexture(GL_TEXTURE_2D, source_textures[0]);
-            glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, shared_frame.header->width,
-                            shared_frame.header->height, GL_RGBA, GL_UNSIGNED_BYTE,
-                            display_rgba.data());
-            glBindTexture(GL_TEXTURE_2D, 0);
+                const auto upload_start = std::chrono::steady_clock::now();
+                glBindTexture(GL_TEXTURE_2D, source_textures[0]);
+                glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+                glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, shared_frame.header->width,
+                                shared_frame.header->height, GL_RGBA, GL_UNSIGNED_BYTE,
+                                display_rgba.data());
+                glBindTexture(GL_TEXTURE_2D, 0);
+                const auto upload_end = std::chrono::steady_clock::now();
+                texture_upload_ms_sum +=
+                    std::chrono::duration<double, std::milli>(upload_end - upload_start).count();
+                ++texture_upload_count;
+            }
 #endif
 
             const bool render_as_world_locked_panel =
@@ -2027,11 +2412,23 @@ int main(int argc, char** argv) {
                     glUniform1i(source_location, 0);
                     glUniformMatrix4fv(mvp_location, 1, GL_FALSE, mvp_matrix.m);
                     glDrawArrays(GL_TRIANGLES, 0, 6);
+                    if (!render_as_world_locked_panel && overlay_program != 0) {
+#ifdef BOBA_IMMERSIVE_BRIDGE
+                        const std::vector<float>& overlay_commands =
+                            (view_index == 0) ? overlay_commands_left : overlay_commands_right;
+                        DrawOverlayCommands(overlay_commands,
+                                            overlay_program,
+                                            overlay_vao,
+                                            overlay_vbo,
+                                            overlay_source_size_location,
+                                            shared_frame.header->width,
+                                            shared_frame.header->height);
+#endif
+                    }
                     glBindTexture(GL_TEXTURE_2D, 0);
                     glBindVertexArray(0);
                     glUseProgram(0);
                     glBindFramebuffer(GL_FRAMEBUFFER, 0);
-                    glFinish();
                 }
 
                 XrSwapchainImageReleaseInfo release_info =
@@ -2077,6 +2474,15 @@ int main(int argc, char** argv) {
     xrDestroySpace(grip_right_space);
     xrDestroySpace(grip_left_space);
     glDeleteFramebuffers(1, &framebuffer);
+    if (overlay_vbo != 0) {
+        glDeleteBuffers(1, &overlay_vbo);
+    }
+    if (overlay_vao != 0) {
+        glDeleteVertexArrays(1, &overlay_vao);
+    }
+    if (overlay_program != 0) {
+        glDeleteProgram(overlay_program);
+    }
     glDeleteVertexArrays(1, &vao);
     glDeleteProgram(program);
     glDeleteTextures(source_texture_count, source_textures);
@@ -2086,6 +2492,7 @@ int main(int argc, char** argv) {
     xrDestroyInstance(instance);
     glfwDestroyWindow(window);
     glfwTerminate();
+    CloseSharedOverlayFile(&shared_overlay);
     CloseSharedFrameFile(&shared_frame);
     return 0;
 }

@@ -72,6 +72,13 @@ DEFAULT_INTRINSIC = np.array(
 )
 DEPTH_EPS = 1.0e-4
 DEFAULT_IPD_M = 0.064
+STARTUP_PIXEL_MARGIN = 8.0
+SUPPORT_ROI_PADDING = 40
+SUPPORT_ROI_SNAP = 8
+SUPPORT_ROI_MIN_SIZE = 64
+SUPPORT_ROI_FULLFRAME_THRESHOLD = 0.70
+FOCUS_SUBSET_SELECTION_PADDING = 24
+SUPPORT_ROI_RENDER_SCALE = 1.25
 
 
 def rotation_x(degrees: float) -> np.ndarray:
@@ -251,55 +258,13 @@ def render_experimental_balanced_scene_full_eye(
     width: int,
     height: int,
 ) -> tuple[np.ndarray, np.ndarray]:
-    background_color, background_depth = color_and_depth_to_numpy(
-        *renderer.render_background_eye(
+    return color_and_depth_to_numpy(
+        *renderer.render_eye(
             pose_world,
             intrinsic,
             width=width,
             height=height,
         )
-    )
-    left_wall_color, left_wall_depth = color_and_depth_to_numpy(
-        *renderer.render_balanced_left_wall_eye(
-            pose_world,
-            intrinsic,
-            width=width,
-            height=height,
-        )
-    )
-    background_color, background_depth = depth_compose(
-        background_color,
-        background_depth,
-        left_wall_color,
-        left_wall_depth,
-    )
-    right_wall_color, right_wall_depth = color_and_depth_to_numpy(
-        *renderer.render_balanced_right_wall_eye(
-            pose_world,
-            intrinsic,
-            width=width,
-            height=height,
-        )
-    )
-    background_color, background_depth = depth_compose(
-        background_color,
-        background_depth,
-        right_wall_color,
-        right_wall_depth,
-    )
-    table_color, table_depth = color_and_depth_to_numpy(
-        *renderer.render_table_eye(
-            pose_world,
-            intrinsic,
-            width=width,
-            height=height,
-        )
-    )
-    return depth_compose(
-        background_color,
-        background_depth,
-        table_color,
-        table_depth,
     )
 
 
@@ -477,13 +442,7 @@ def make_layer_renderers(width: int, height: int):
             width=width,
             height=height,
         ),
-        "left_wall": lambda renderer, pose, intrinsic: renderer.render_balanced_left_wall_eye(
-            pose,
-            intrinsic,
-            width=width,
-            height=height,
-        ),
-        "right_wall": lambda renderer, pose, intrinsic: renderer.render_balanced_right_wall_eye(
+        "full": lambda renderer, pose, intrinsic: renderer.render_eye(
             pose,
             intrinsic,
             width=width,
@@ -496,6 +455,332 @@ def make_layer_renderers(width: int, height: int):
             height=height,
         ),
     }
+
+
+def camera_pose_world_to_cv_w2c(camera_pose_world: np.ndarray) -> np.ndarray:
+    camera_pose_world = np.asarray(camera_pose_world, dtype=np.float32)
+    cv_from_gl = np.diag([1.0, -1.0, -1.0]).astype(np.float32)
+    pose_world_cv = np.eye(4, dtype=np.float32)
+    pose_world_cv[:3, :3] = camera_pose_world[:3, :3] @ cv_from_gl
+    pose_world_cv[:3, 3] = camera_pose_world[:3, 3]
+    return np.linalg.inv(pose_world_cv).astype(np.float32)
+
+
+def object_bounds_corners(bounds_min, bounds_max) -> np.ndarray:
+    bounds_min = np.asarray(bounds_min, dtype=np.float32)
+    bounds_max = np.asarray(bounds_max, dtype=np.float32)
+    return np.array(
+        [
+            [bounds_min[0], bounds_min[1], bounds_min[2]],
+            [bounds_min[0], bounds_min[1], bounds_max[2]],
+            [bounds_min[0], bounds_max[1], bounds_min[2]],
+            [bounds_min[0], bounds_max[1], bounds_max[2]],
+            [bounds_max[0], bounds_min[1], bounds_min[2]],
+            [bounds_max[0], bounds_min[1], bounds_max[2]],
+            [bounds_max[0], bounds_max[1], bounds_min[2]],
+            [bounds_max[0], bounds_max[1], bounds_max[2]],
+        ],
+        dtype=np.float32,
+    )
+
+
+def project_world_point_into_eye(
+    world_point,
+    intrinsic: np.ndarray,
+    w2c: np.ndarray,
+    width: int,
+    height: int,
+) -> dict[str, object]:
+    if world_point is None:
+        return {"depth": None, "pixel": None, "in_bounds": False}
+    world_point = np.asarray(world_point, dtype=np.float32)
+    intrinsic = np.asarray(intrinsic, dtype=np.float32)
+    w2c = np.asarray(w2c, dtype=np.float32)
+    world_point_h = np.concatenate([world_point, np.array([1.0], dtype=np.float32)])
+    camera_point = w2c @ world_point_h
+    depth = float(camera_point[2])
+    pixel = None
+    in_bounds = False
+    if abs(depth) > 1.0e-6:
+        pixel_h = intrinsic @ camera_point[:3]
+        pixel = pixel_h[:2] / max(pixel_h[2], 1.0e-6)
+        in_bounds = bool(
+            depth > DEPTH_EPS
+            and pixel[0] >= -STARTUP_PIXEL_MARGIN
+            and pixel[0] <= float(width) + STARTUP_PIXEL_MARGIN
+            and pixel[1] >= -STARTUP_PIXEL_MARGIN
+            and pixel[1] <= float(height) + STARTUP_PIXEL_MARGIN
+        )
+    return {"depth": depth, "pixel": pixel, "in_bounds": in_bounds}
+
+
+def compute_projected_roi_bounds(
+    bounds_min,
+    bounds_max,
+    intrinsic: np.ndarray,
+    w2c: np.ndarray,
+    width: int,
+    height: int,
+    *,
+    padding: int = 0,
+    snap: int = 1,
+    min_size: int = 1,
+) -> tuple[int, int, int, int] | None:
+    if bounds_min is None or bounds_max is None:
+        return None
+    projected_pixels = []
+    for point in object_bounds_corners(bounds_min, bounds_max):
+        projection = project_world_point_into_eye(
+            point,
+            intrinsic,
+            w2c,
+            width,
+            height,
+        )
+        pixel = projection["pixel"]
+        depth = projection["depth"]
+        if pixel is None or depth is None or float(depth) <= DEPTH_EPS:
+            continue
+        projected_pixels.append(
+            np.array(
+                [
+                    np.clip(pixel[0], 0.0, float(width - 1)),
+                    np.clip(pixel[1], 0.0, float(height - 1)),
+                ],
+                dtype=np.float32,
+            )
+        )
+    if not projected_pixels:
+        return None
+    pixels_np = np.stack(projected_pixels, axis=0)
+    x0 = int(np.floor(np.min(pixels_np[:, 0]))) - int(padding)
+    x1 = int(np.ceil(np.max(pixels_np[:, 0]))) + int(padding) + 1
+    y0 = int(np.floor(np.min(pixels_np[:, 1]))) - int(padding)
+    y1 = int(np.ceil(np.max(pixels_np[:, 1]))) + int(padding) + 1
+    if int(snap) > 1:
+        x0 = int(np.floor(float(x0) / float(snap))) * int(snap)
+        x1 = int(np.ceil(float(x1) / float(snap))) * int(snap)
+        y0 = int(np.floor(float(y0) / float(snap))) * int(snap)
+        y1 = int(np.ceil(float(y1) / float(snap))) * int(snap)
+    x0 = max(0, x0)
+    x1 = min(int(width), x1)
+    y0 = max(0, y0)
+    y1 = min(int(height), y1)
+
+    def _expand_axis(lo: int, hi: int, limit: int) -> tuple[int, int]:
+        size = int(hi) - int(lo)
+        if size >= int(min_size):
+            return int(lo), int(hi)
+        if int(limit) <= int(min_size):
+            return 0, int(limit)
+        extra = int(min_size) - size
+        lo -= extra // 2
+        hi += extra - (extra // 2)
+        if lo < 0:
+            hi = min(int(limit), hi - lo)
+            lo = 0
+        if hi > int(limit):
+            lo = max(0, lo - (hi - int(limit)))
+            hi = int(limit)
+        if (hi - lo) < int(min_size):
+            if lo <= 0:
+                lo = 0
+                hi = min(int(limit), int(min_size))
+            else:
+                hi = int(limit)
+                lo = max(0, hi - int(min_size))
+        return int(lo), int(hi)
+
+    x0, x1 = _expand_axis(x0, x1, width)
+    y0, y1 = _expand_axis(y0, y1, height)
+    if x1 <= x0 or y1 <= y0:
+        return None
+    return (x0, y0, x1, y1)
+
+
+def roi_area_ratio(
+    roi_bounds: tuple[int, int, int, int] | None,
+    width: int,
+    height: int,
+) -> float:
+    if roi_bounds is None:
+        return 0.0
+    x0, y0, x1, y1 = [int(v) for v in roi_bounds]
+    if x1 <= x0 or y1 <= y0:
+        return 0.0
+    return float(((x1 - x0) * (y1 - y0)) / max(float(int(width) * int(height)), 1.0))
+
+
+def resolve_support_render_roi(
+    support_bounds_min,
+    support_bounds_max,
+    intrinsic: np.ndarray,
+    w2c: np.ndarray,
+    width: int,
+    height: int,
+) -> tuple[tuple[int, int, int, int] | None, float, bool]:
+    roi_bounds = compute_projected_roi_bounds(
+        support_bounds_min,
+        support_bounds_max,
+        intrinsic,
+        w2c,
+        width,
+        height,
+        padding=SUPPORT_ROI_PADDING,
+        snap=SUPPORT_ROI_SNAP,
+        min_size=SUPPORT_ROI_MIN_SIZE,
+    )
+    if roi_bounds is None:
+        return None, 1.0, True
+    ratio = roi_area_ratio(roi_bounds, width, height)
+    if ratio > SUPPORT_ROI_FULLFRAME_THRESHOLD:
+        return None, 1.0, True
+    return roi_bounds, ratio, False
+
+
+def roi_bounds_overlap(
+    roi_a: tuple[int, int, int, int] | None,
+    roi_b: tuple[int, int, int, int] | None,
+) -> bool:
+    if roi_a is None or roi_b is None:
+        return False
+    ax0, ay0, ax1, ay1 = [int(v) for v in roi_a]
+    bx0, by0, bx1, by1 = [int(v) for v in roi_b]
+    return not (ax1 <= bx0 or bx1 <= ax0 or ay1 <= by0 or by1 <= ay0)
+
+
+def select_focus_subset_entry_ids(
+    renderer: SimpleLabSceneRenderer,
+    focus_roi_bounds: tuple[int, int, int, int],
+    intrinsic: np.ndarray,
+    w2c: np.ndarray,
+    width: int,
+    height: int,
+) -> tuple[list[int], float, int, bool]:
+    catalog_entries = renderer.focus_render_catalog_world_entries_ref()
+    catalog_entries_by_id = renderer.focus_render_catalog_world_by_id_ref()
+    bvh_nodes = renderer.focus_render_bvh_world_nodes()
+    total_faces = int(renderer.focus_render_catalog_total_faces())
+    if not catalog_entries or not bvh_nodes or total_faces <= 0:
+        return [], 1.0, 0, True
+
+    selected_entry_ids: set[int] = {
+        int(v) for v in renderer.focus_render_active_table_entry_ids()
+    }
+    traversal_stack = [0]
+    while traversal_stack:
+        node_index = traversal_stack.pop()
+        if node_index < 0 or node_index >= len(bvh_nodes):
+            continue
+        node = bvh_nodes[node_index]
+        projected_bounds = compute_projected_roi_bounds(
+            node["bounds_min"],
+            node["bounds_max"],
+            intrinsic,
+            w2c,
+            width,
+            height,
+            padding=FOCUS_SUBSET_SELECTION_PADDING,
+            snap=1,
+            min_size=1,
+        )
+        if not roi_bounds_overlap(projected_bounds, focus_roi_bounds):
+            continue
+        if bool(node.get("is_leaf", False)):
+            for entry_id in node.get("leaf_entry_ids", []):
+                selected_entry_ids.add(int(entry_id))
+            continue
+        right_child = int(node.get("right_child", -1))
+        left_child = int(node.get("left_child", -1))
+        if right_child >= 0:
+            traversal_stack.append(right_child)
+        if left_child >= 0:
+            traversal_stack.append(left_child)
+
+    ordered_selected_entry_ids = sorted(int(v) for v in selected_entry_ids)
+    selected_face_count = 0
+    for entry_id in ordered_selected_entry_ids:
+        entry = catalog_entries_by_id.get(int(entry_id))
+        if entry is None:
+            return [], 1.0, 0, True
+        selected_face_count += int(entry["face_count"])
+    face_ratio = float(selected_face_count) / max(float(total_faces), 1.0)
+    return (
+        ordered_selected_entry_ids,
+        face_ratio,
+        len(ordered_selected_entry_ids),
+        False,
+    )
+
+
+def make_support_focus_subset_cases(
+    renderer: SimpleLabSceneRenderer,
+    intrinsic: np.ndarray,
+    width: int,
+    height: int,
+    *,
+    max_cases: int = 4,
+) -> list[dict[str, object]]:
+    support_entries = [
+        entry
+        for entry in renderer.support_surface_entries_ref()
+        if str(entry.get("kind", "support")).strip().lower() == "support"
+    ]
+    support_entries.sort(
+        key=lambda entry: (
+            -float(entry.get("support_area", 0.0)),
+            int(entry.get("support_id", 0)),
+        )
+    )
+    cases: list[dict[str, object]] = []
+    seen_selection_keys: set[tuple[int, ...]] = set()
+    for pose_name, pose_world in default_pose_sequence():
+        w2c = camera_pose_world_to_cv_w2c(pose_world)
+        for support_entry in support_entries:
+            roi_bounds, roi_ratio, fullframe_fallback = resolve_support_render_roi(
+                support_entry.get("render_bounds_min", support_entry["bounds_min"]),
+                support_entry.get("render_bounds_max", support_entry["bounds_max"]),
+                intrinsic,
+                w2c,
+                width,
+                height,
+            )
+            if roi_bounds is None or fullframe_fallback:
+                continue
+            (
+                selected_entry_ids,
+                face_ratio,
+                entry_count,
+                selection_failed,
+            ) = select_focus_subset_entry_ids(
+                renderer,
+                roi_bounds,
+                intrinsic,
+                w2c,
+                width,
+                height,
+            )
+            selection_key = tuple(int(v) for v in selected_entry_ids)
+            if selection_failed or not selection_key or selection_key in seen_selection_keys:
+                continue
+            seen_selection_keys.add(selection_key)
+            cases.append(
+                {
+                    "name": f"{pose_name}_support_{int(support_entry['support_id'])}",
+                    "pose_world": np.asarray(pose_world, dtype=np.float32).copy(),
+                    "support_id": int(support_entry["support_id"]),
+                    "roi_bounds": tuple(int(v) for v in roi_bounds),
+                    "roi_ratio": float(roi_ratio),
+                    "selected_entry_ids": list(selection_key),
+                    "face_ratio": float(face_ratio),
+                    "entry_count": int(entry_count),
+                    "render_scale": float(SUPPORT_ROI_RENDER_SCALE),
+                }
+            )
+            break
+        if len(cases) >= int(max_cases):
+            break
+    return cases
 
 
 def run_compare(args: argparse.Namespace) -> dict[str, object]:
@@ -516,19 +801,19 @@ def run_compare(args: argparse.Namespace) -> dict[str, object]:
         scene_assets_root,
         args.width,
         args.height,
-        lighting_mode="simple",
+        lighting_mode=immersive_scene.ILLIXR_BAKED_LIGHTING_MODE,
         balanced_render_backend="pyrender",
     )
-    experimental_renderer = SimpleLabSceneRenderer(
+    gpu_renderer = SimpleLabSceneRenderer(
         scene_assets_root,
         args.width,
         args.height,
-        lighting_mode="simple",
+        lighting_mode=immersive_scene.ILLIXR_BAKED_LIGHTING_MODE,
         balanced_render_backend="gpu",
     )
     balanced_compare_trainer = make_balanced_compare_trainer()
     pyrender_renderer.set_layout(layout)
-    experimental_renderer.set_layout(layout)
+    gpu_renderer.set_layout(layout)
 
     layer_renderers = make_layer_renderers(args.width, args.height)
     summary: dict[str, object] = {
@@ -541,9 +826,75 @@ def run_compare(args: argparse.Namespace) -> dict[str, object]:
         if _TRAINER_WARP_IMPORT_ERROR is None
         else repr(_TRAINER_WARP_IMPORT_ERROR),
         "poses": {},
+        "focus_subsets": {},
     }
 
     try:
+        focus_subset_cases = make_support_focus_subset_cases(
+            pyrender_renderer,
+            intrinsic,
+            args.width,
+            args.height,
+        )
+        for case in focus_subset_cases:
+            case_name = str(case["name"])
+            case_dir = output_dir / "focus_subsets" / case_name
+            case_dir.mkdir(parents=True, exist_ok=True)
+            pyrender_result, pyrender_ms = time_render(
+                lambda c=case: pyrender_renderer.render_focus_subset_eye_roi(
+                    c["pose_world"],
+                    intrinsic,
+                    c["selected_entry_ids"],
+                    c["roi_bounds"],
+                    render_scale=float(c["render_scale"]),
+                ),
+                args.repeats,
+            )
+            gpu_result, gpu_ms = time_render(
+                lambda c=case: gpu_renderer.render_focus_subset_eye_roi(
+                    c["pose_world"],
+                    intrinsic,
+                    c["selected_entry_ids"],
+                    c["roi_bounds"],
+                    render_scale=float(c["render_scale"]),
+                ),
+                args.repeats,
+            )
+            pyrender_color, pyrender_depth = color_and_depth_to_numpy(*pyrender_result)
+            gpu_color, gpu_depth = color_and_depth_to_numpy(*gpu_result)
+            metrics = compare_pair(
+                pyrender_color,
+                pyrender_depth,
+                gpu_color,
+                gpu_depth,
+            )
+            metrics["pyrender_ms"] = float(pyrender_ms)
+            metrics["gpu_ms"] = float(gpu_ms)
+            metrics["speedup"] = (
+                float(pyrender_ms / gpu_ms) if gpu_ms > 1.0e-6 else 0.0
+            )
+            metrics["support_id"] = int(case["support_id"])
+            metrics["roi_ratio"] = float(case["roi_ratio"])
+            metrics["face_ratio"] = float(case["face_ratio"])
+            metrics["entry_count"] = int(case["entry_count"])
+            metrics["render_scale"] = float(case["render_scale"])
+            summary["focus_subsets"][case_name] = metrics
+
+            save_rgb(case_dir / "pyrender.png", pyrender_color)
+            save_rgb(case_dir / "gpu.png", gpu_color)
+            save_rgb_diff(
+                case_dir / "rgb_diff.png",
+                np.abs(
+                    pyrender_color[..., :3].astype(np.float32)
+                    - gpu_color[..., :3].astype(np.float32)
+                ),
+            )
+            save_depth_diff(
+                case_dir / "depth_diff.png",
+                pyrender_depth,
+                gpu_depth,
+            )
+
         for pose_name, pose_world in default_pose_sequence():
             pose_dir = output_dir / pose_name
             pose_dir.mkdir(parents=True, exist_ok=True)
@@ -560,7 +911,7 @@ def run_compare(args: argparse.Namespace) -> dict[str, object]:
                 )
                 gpu_result, gpu_ms = time_render(
                     lambda rf=render_fn, pw=pose_world: rf(
-                        experimental_renderer,
+                        gpu_renderer,
                         pw,
                         intrinsic,
                     ),
@@ -676,14 +1027,14 @@ def run_compare(args: argparse.Namespace) -> dict[str, object]:
             _, experimental_ms = time_render(
                 lambda: (
                     render_experimental_balanced_scene_full_eye(
-                        experimental_renderer,
+                        gpu_renderer,
                         left_pose,
                         intrinsic,
                         args.width,
                         args.height,
                     ),
                     render_experimental_balanced_scene_full_eye(
-                        experimental_renderer,
+                        gpu_renderer,
                         right_pose,
                         intrinsic,
                         args.width,
@@ -719,7 +1070,7 @@ def run_compare(args: argparse.Namespace) -> dict[str, object]:
                 )
                 experimental_scene, experimental_depth = (
                     render_experimental_balanced_scene_full_eye(
-                        experimental_renderer,
+                        gpu_renderer,
                         eye_pose,
                         intrinsic,
                         args.width,
@@ -805,7 +1156,7 @@ def run_compare(args: argparse.Namespace) -> dict[str, object]:
             summary["poses"][pose_name] = pose_metrics
     finally:
         pyrender_renderer.delete()
-        experimental_renderer.delete()
+        gpu_renderer.delete()
 
     summary_path = output_dir / "summary.json"
     with open(summary_path, "w", encoding="utf-8") as handle:
@@ -815,8 +1166,8 @@ def run_compare(args: argparse.Namespace) -> dict[str, object]:
 
 def print_summary(summary: dict[str, object]) -> None:
     print(
-        "Comparing the shipped pyrender balanced path, the repaired balanced per-eye background path, "
-        "and the experimental GPU wall/table path against a full per-eye reference."
+        "Comparing the shipped pyrender balanced path and the opt-in hybrid GPU balanced backend "
+        "against a full per-eye reference."
     )
     if not summary.get("balanced_runtime_compare_available", False):
         print(
@@ -826,6 +1177,21 @@ def print_summary(summary: dict[str, object]) -> None:
         if summary.get("balanced_runtime_compare_error"):
             print(f"Reason: {summary['balanced_runtime_compare_error']}")
     poses = summary.get("poses", {})
+    focus_subsets = summary.get("focus_subsets", {})
+    if focus_subsets:
+        print("\n[focus_subsets]")
+        for case_name, metrics in focus_subsets.items():
+            print(
+                f"  {case_name}: "
+                f"rgb_mae={metrics['rgb_mae_affected']:.3f} "
+                f"depth_mae={metrics['depth_mae_affected']:.5f} "
+                f"entries={metrics['entry_count']} "
+                f"roi_ratio={metrics['roi_ratio']:.3f} "
+                f"face_ratio={metrics['face_ratio']:.3f} "
+                f"pyrender_ms={metrics['pyrender_ms']:.3f} "
+                f"gpu_ms={metrics['gpu_ms']:.3f} "
+                f"speedup={metrics['speedup']:.2f}x"
+            )
     for pose_name, pose_metrics in poses.items():
         print(f"\n[{pose_name}]")
         for layer_name, metrics in pose_metrics.get("layers", {}).items():
@@ -865,8 +1231,8 @@ def print_summary(summary: dict[str, object]) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Compare the broken balanced center-background path, the repaired balanced per-eye background path, "
-            "and an experimental GPU wall/table path against a full per-eye reference, "
+            "Compare the shipped pyrender balanced path and the opt-in hybrid GPU balanced backend "
+            "against a full per-eye reference, "
             "save background/side-wall/table/final diff images, and report timing/error metrics."
         )
     )

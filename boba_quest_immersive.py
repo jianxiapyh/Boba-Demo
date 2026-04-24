@@ -320,11 +320,81 @@ def build_parser() -> ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--immersive_static_scene_backend",
+        choices=("pyrender", "gpu", "native_gl"),
+        default="pyrender",
+        help=(
+            "backend for balanced static-scene rendering: "
+            "'pyrender' keeps the shipped OpenGL/PyRender path, "
+            "'gpu' enables the GPU-first hybrid balanced backend, using "
+            "CUDA-native layers where they are parity-proven and faster while "
+            "falling back to pyrender internally when needed "
+            "(v1 supports balanced_support_focus only, with --immersive_timewarp off "
+            "and --immersive_framegen off), "
+            "'native_gl' renders the full room with the native OpenGL path and "
+            "CUDA readback (v1 requires true-stereo serial mode with overlap/timewarp/framegen off)"
+        ),
+    )
+    parser.add_argument(
+        "--immersive_native_gl_texture_mode",
+        choices=("stable", "stable_mipmap", "legacy"),
+        default="stable_mipmap",
+        help=(
+            "native GL texture sampling mode: "
+            "'stable' uses clamp-to-edge, non-mipmapped linear sampling; "
+            "'stable_mipmap' uses clamp-to-edge with mipmapped linear sampling "
+            "and optional anisotropic filtering; "
+            "'legacy' keeps repeat wrapping with mipmapped linear sampling"
+        ),
+    )
+    parser.add_argument(
+        "--immersive_native_gl_anisotropy",
+        type=int,
+        choices=(1, 2, 4, 8, 16),
+        default=8,
+        help=(
+            "requested native GL anisotropic texture filtering level for "
+            "--immersive_native_gl_texture_mode stable_mipmap. "
+            "Ignored by stable and legacy modes"
+        ),
+    )
+    parser.add_argument(
+        "--immersive_native_gl_msaa_samples",
+        type=int,
+        choices=(1, 2, 4),
+        default=4,
+        help=(
+            "native GL MSAA sample count for the static scene FBO. "
+            "Use 1 to disable MSAA, or 2/4 for quality-first edge stability"
+        ),
+    )
+    parser.add_argument(
+        "--immersive_native_gl_depth_format",
+        choices=("depth24", "depth32f"),
+        default="depth32f",
+        help=(
+            "native GL depth renderbuffer format. "
+            "'depth32f' improves depth precision near occlusion boundaries; "
+            "'depth24' keeps the legacy format"
+        ),
+    )
+    parser.add_argument(
+        "--immersive_eye_resolution",
+        type=int,
+        default=1536,
+        help=(
+            "square per-eye immersive output resolution. "
+            "1536 is the default native GL quality/performance preset; "
+            "use 1024 for speed or 2048 for quality experiments"
+        ),
+    )
+    parser.add_argument(
         "--immersive_static_scene_mode",
         choices=("balanced_focus", "balanced_support_focus"),
-        default="balanced_support_focus",
+        default=None,
         help=(
-            "static-scene mode for immersive Quest output: "
+            "legacy pyrender/gpu static-scene mode for immersive Quest output. "
+            "Omit this flag for native_gl, which always uses full_scene_per_eye. "
             "'balanced_focus' uses the fast table-special ROI path, "
             "'balanced_support_focus' keeps the fast balanced path but lets one sharp ROI follow the active support surface"
         ),
@@ -400,6 +470,28 @@ def main(argv: list[str] | None = None):
         str(args.immersive_present_pipeline).strip().lower() == "on"
     )
 
+    if args.n_dup != 0:
+        raise ValueError("The shipped Quest immersive launcher supports only --n_dup 0.")
+    if int(args.immersive_eye_resolution) <= 0:
+        raise ValueError("--immersive_eye_resolution must be a positive integer.")
+    immersive_static_scene_backend = str(
+        args.immersive_static_scene_backend
+    ).strip().lower()
+    if (
+        immersive_static_scene_backend == "native_gl"
+        and args.immersive_static_scene_mode is not None
+    ):
+        raise ValueError(
+            "--immersive_static_scene_mode is not used with "
+            "--immersive_static_scene_backend native_gl; remove it. "
+            "Native GL always uses static_scene_path=full_scene_per_eye."
+        )
+    if (
+        immersive_static_scene_backend != "native_gl"
+        and args.immersive_static_scene_mode is None
+    ):
+        args.immersive_static_scene_mode = "balanced_support_focus"
+
     global np, torch
     import numpy as np  # type: ignore[assignment]
     import torch  # type: ignore[assignment]
@@ -411,14 +503,16 @@ def main(argv: list[str] | None = None):
     except AttributeError:
         pass
 
-    if args.n_dup != 0:
-        raise ValueError("The shipped Quest immersive launcher supports only --n_dup 0.")
-
     print("[quest_display] input_source=live_openxr_controller", flush=True)
     print("[quest_display] controller_mode=multi_points", flush=True)
     print("[quest_display] mode=immersive", flush=True)
     print("[quest_display] scene_preset=ILLIXR_lab", flush=True)
     print("[quest_display] immersive_render_preset=balanced", flush=True)
+    print(
+        "[quest_display] immersive_eye_resolution="
+        f"{int(args.immersive_eye_resolution)}",
+        flush=True,
+    )
     print(f"[quest_display] immersive_timewarp={args.immersive_timewarp}", flush=True)
     print(
         "[quest_display] immersive_static_scene_overlap="
@@ -430,6 +524,30 @@ def main(argv: list[str] | None = None):
         f"{args.immersive_static_scene_reuse}",
         flush=True,
     )
+    print(
+        "[quest_display] immersive_static_scene_backend="
+        f"{args.immersive_static_scene_backend}",
+        flush=True,
+    )
+    if immersive_static_scene_backend == "native_gl":
+        print(
+            "[quest_display] immersive_static_scene_path=full_scene_per_eye",
+            flush=True,
+        )
+        print(
+            "[quest_display] immersive_native_gl_options="
+            f"texture_mode={args.immersive_native_gl_texture_mode} "
+            f"anisotropy={int(args.immersive_native_gl_anisotropy)} "
+            f"msaa_samples={int(args.immersive_native_gl_msaa_samples)} "
+            f"depth_format={args.immersive_native_gl_depth_format}",
+            flush=True,
+        )
+    else:
+        print(
+            "[quest_display] immersive_static_scene_mode="
+            f"{args.immersive_static_scene_mode}",
+            flush=True,
+        )
     print(
         f"[quest_display] immersive_framegen={args.immersive_framegen}",
         flush=True,
@@ -558,7 +676,13 @@ def main(argv: list[str] | None = None):
             immersive_timewarp=args.immersive_timewarp,
             immersive_static_scene_overlap=args.immersive_static_scene_overlap,
             immersive_static_scene_reuse=args.immersive_static_scene_reuse,
+            immersive_static_scene_backend=args.immersive_static_scene_backend,
+            immersive_eye_resolution=args.immersive_eye_resolution,
             immersive_static_scene_mode=args.immersive_static_scene_mode,
+            immersive_native_gl_texture_mode=args.immersive_native_gl_texture_mode,
+            immersive_native_gl_anisotropy=args.immersive_native_gl_anisotropy,
+            immersive_native_gl_msaa_samples=args.immersive_native_gl_msaa_samples,
+            immersive_native_gl_depth_format=args.immersive_native_gl_depth_format,
             immersive_support_entry_overlay=args.immersive_support_entry_overlay,
             immersive_framegen=args.immersive_framegen,
             immersive_gaussian_render=args.immersive_gaussian_render,

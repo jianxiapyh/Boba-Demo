@@ -255,9 +255,19 @@ class OpenXRFramePanelMirror:
             if not enabled:
                 self._bridge_transition_trace.clear()
 
+    def _after_create_shared_frame_file(self) -> None:
+        return
+
+    def _extra_viewer_args(self) -> list[str]:
+        return []
+
+    def _cleanup_additional_shared_files(self) -> None:
+        return
+
     def start(self) -> None:
         rebuilt_binary = self._ensure_binary()
         self._create_shared_frame_file()
+        self._after_create_shared_frame_file()
         self._initialize_direct_commit_path()
 
         env = os.environ.copy()
@@ -273,8 +283,14 @@ class OpenXRFramePanelMirror:
             _prepend_env_path(env, "LD_LIBRARY_PATH", jsoncpp_compat_dir)
 
         assert self.shared_frame_path is not None
+        viewer_args = [
+            str(self.binary_path),
+            "--frame-path",
+            str(self.shared_frame_path),
+        ]
+        viewer_args.extend(self._extra_viewer_args())
         self.process = subprocess.Popen(
-            [str(self.binary_path), "--frame-path", str(self.shared_frame_path)],
+            viewer_args,
             cwd=self.repo_root,
             env=env,
             stdout=subprocess.PIPE,
@@ -361,6 +377,7 @@ class OpenXRFramePanelMirror:
                 if self.shared_frame_path.exists():
                     self.shared_frame_path.unlink()
             self.shared_frame_path = None
+        self._cleanup_additional_shared_files()
 
     def publish_frame(self, frame_rgba: torch.Tensor) -> tuple[bool, dict[str, float]]:
         timing = {
@@ -740,6 +757,41 @@ class OpenXRFramePanelMirror:
             return 0
         return int(stream_handle)
 
+    def _load_cuda_runtime_api(self):
+        cudart_factory = getattr(torch.cuda, "cudart", None)
+        if callable(cudart_factory):
+            try:
+                cudart_api = cudart_factory()
+                if all(
+                    hasattr(cudart_api, name)
+                    for name in (
+                        "cudaHostRegister",
+                        "cudaHostUnregister",
+                        "cudaMemcpyAsync",
+                    )
+                ):
+                    return cudart_api
+            except Exception:
+                pass
+        last_error = None
+        for library_name in (
+            "libcudart.so",
+            "libcudart.so.12",
+            "libcudart.so.11.0",
+        ):
+            try:
+                cudart_api = ctypes.CDLL(library_name)
+                for name in (
+                    "cudaHostRegister",
+                    "cudaHostUnregister",
+                    "cudaMemcpyAsync",
+                ):
+                    getattr(cudart_api, name)
+                return cudart_api
+            except Exception as exc:
+                last_error = exc
+        raise RuntimeError(f"CUDA runtime API unavailable: {last_error}")
+
     def _cudart_host_register(self, ptr: int, size_bytes: int) -> None:
         if self._direct_commit_cudart is None:
             raise RuntimeError("CUDA runtime API unavailable for host registration")
@@ -839,12 +891,8 @@ class OpenXRFramePanelMirror:
         ):
             self._direct_commit_warning = "CUDA direct commit prerequisites unavailable"
             return
-        cudart_factory = getattr(torch.cuda, "cudart", None)
-        if not callable(cudart_factory):
-            self._direct_commit_warning = "torch.cuda.cudart() is unavailable"
-            return
         try:
-            self._direct_commit_cudart = cudart_factory()
+            self._direct_commit_cudart = self._load_cuda_runtime_api()
         except Exception as exc:
             self._direct_commit_warning = f"failed to load cudart: {exc}"
             self._direct_commit_cudart = None
@@ -1107,6 +1155,9 @@ class OpenXRFramePanelMirror:
             self._viewer_rendered_frame_count = 0
             self._viewer_render_elapsed_s = 0.0
             self._viewer_recent_render_fps = 0.0
+            self._viewer_texture_upload_count = 0
+            self._viewer_texture_upload_recent_fps = 0.0
+            self._viewer_texture_upload_avg_ms = 0.0
 
     def _reset_bridge_commit_stats(self) -> None:
         with self._stage_condition:
@@ -1160,6 +1211,7 @@ class OpenXRFramePanelMirror:
             self._steady_state_viewer_source_frame_delta_count = 0
             self._steady_state_viewer_coalesced_source_frame_count = 0
             self._steady_state_viewer_render_baseline_count = 0
+            self._steady_state_viewer_texture_upload_baseline_count = 0
             self._steady_state_viewer_epoch_baseline_applied_update_count = 0
             self._steady_state_viewer_epoch_baseline_source_frame_delta_count = 0
             self._steady_state_viewer_epoch_baseline_coalesced_source_frame_count = 0
@@ -1285,6 +1337,9 @@ class OpenXRFramePanelMirror:
             self._steady_state_viewer_accounting_inconsistency_count = 0
             self._steady_state_viewer_render_baseline_count = int(
                 self._viewer_rendered_frame_count
+            )
+            self._steady_state_viewer_texture_upload_baseline_count = int(
+                self._viewer_texture_upload_count
             )
 
     def _record_bridge_submit_locked(
@@ -1896,7 +1951,10 @@ class OpenXRFramePanelMirror:
                 "viewer rendered frames: "
                 f"count={viewer_render_stats.get('count', 0)} "
                 f"elapsed_s={viewer_render_stats.get('elapsed_s', 0.0):.2f} "
-                f"recent_fps={viewer_render_stats.get('recent_fps', 0.0):.2f}"
+                f"recent_fps={viewer_render_stats.get('recent_fps', 0.0):.2f} "
+                f"texture_upload_count={viewer_render_stats.get('texture_upload_count', 0)} "
+                f"texture_upload_recent_fps={viewer_render_stats.get('texture_upload_recent_fps', 0.0):.2f} "
+                f"texture_upload_avg_ms={viewer_render_stats.get('texture_upload_avg_ms', 0.0):.2f}"
             )
         if self._stdout_tail:
             parts.append("stdout:\n" + "".join(self._stdout_tail).strip())
@@ -2170,6 +2228,24 @@ class OpenXRFramePanelMirror:
                 self._viewer_recent_render_fps = float(
                     parsed.get("recent_fps", self._viewer_recent_render_fps)
                 )
+                self._viewer_texture_upload_count = int(
+                    parsed.get(
+                        "texture_upload_count",
+                        self._viewer_texture_upload_count,
+                    )
+                )
+                self._viewer_texture_upload_recent_fps = float(
+                    parsed.get(
+                        "texture_upload_recent_fps",
+                        self._viewer_texture_upload_recent_fps,
+                    )
+                )
+                self._viewer_texture_upload_avg_ms = float(
+                    parsed.get(
+                        "texture_upload_avg_ms",
+                        self._viewer_texture_upload_avg_ms,
+                    )
+                )
         except Exception as exc:
             self._parse_errors.append(f"{exc}: {str(line).strip()}")
 
@@ -2333,19 +2409,32 @@ class OpenXRFramePanelMirror:
                     int(self._viewer_rendered_frame_count)
                     - int(self._steady_state_viewer_render_baseline_count),
                 )
+                texture_upload_count = max(
+                    0,
+                    int(self._viewer_texture_upload_count)
+                    - int(self._steady_state_viewer_texture_upload_baseline_count),
+                )
                 recent_fps = float(count) / elapsed_s if elapsed_s > 0.0 and count > 0 else 0.0
             else:
                 elapsed_s = float(self._viewer_render_elapsed_s)
                 count = int(self._viewer_rendered_frame_count)
+                texture_upload_count = int(self._viewer_texture_upload_count)
                 recent_fps = float(self._viewer_recent_render_fps)
         average_fps = 0.0
         if elapsed_s > 0.0 and count > 0:
             average_fps = float(count) / elapsed_s
+        texture_upload_average_fps = 0.0
+        if elapsed_s > 0.0 and texture_upload_count > 0:
+            texture_upload_average_fps = float(texture_upload_count) / elapsed_s
         return {
             "count": count,
             "elapsed_s": elapsed_s,
             "recent_fps": recent_fps,
             "average_fps": average_fps,
+            "texture_upload_count": texture_upload_count,
+            "texture_upload_recent_fps": float(self._viewer_texture_upload_recent_fps),
+            "texture_upload_average_fps": texture_upload_average_fps,
+            "texture_upload_avg_ms": float(self._viewer_texture_upload_avg_ms),
         }
 
     def bridge_commit_stats(
@@ -2664,10 +2753,20 @@ class OpenXRImmersiveBridge(OpenXRFramePanelMirror):
     SLOT_COUNT = 4
     STAGING_BUFFER_COUNT = 4
     FRESHNESS_FIRST_COMMIT = True
+    OVERLAY_HEADER_MAGIC = b"BOBAOVL1"
+    OVERLAY_HEADER_VERSION = 1
+    OVERLAY_COMMAND_STRIDE_FLOATS = 14
+    OVERLAY_MAX_COMMANDS_PER_EYE = 256
+    OVERLAY_HEADER_STRUCT = struct.Struct("<8sIIIQIII24x")
 
     def __init__(self, repo_root: Path, width: int, height: int):
         super().__init__(repo_root=repo_root, width=width, height=height)
         self.frame_bytes = self.width * self.height * self.channels * self.EYE_COUNT
+        self.shared_overlay_path: Optional[Path] = None
+        self._overlay_file = None
+        self._overlay_mmap: Optional[mmap.mmap] = None
+        self._overlay_command_array: Optional[np.ndarray] = None
+        self._overlay_frame_counter = 0
         pin_memory = torch.cuda.is_available()
         self._cpu_stage_buffers = [
             torch.empty(
@@ -2685,6 +2784,127 @@ class OpenXRImmersiveBridge(OpenXRFramePanelMirror):
             self.repo_root / "linux_pose_probe" / "build_boba_immersive_bridge.sh"
         )
         self.source_path = self.repo_root / "linux_pose_probe" / "openxr_frame_panel.cpp"
+
+    def _after_create_shared_frame_file(self) -> None:
+        self._create_shared_overlay_file()
+
+    def _extra_viewer_args(self) -> list[str]:
+        if self.shared_overlay_path is None:
+            return []
+        return ["--overlay-path", str(self.shared_overlay_path)]
+
+    def _cleanup_additional_shared_files(self) -> None:
+        if self._overlay_mmap is not None:
+            self._overlay_mmap.close()
+            self._overlay_mmap = None
+        if self._overlay_file is not None:
+            self._overlay_file.close()
+            self._overlay_file = None
+        if self.shared_overlay_path is not None:
+            try:
+                self.shared_overlay_path.unlink(missing_ok=True)
+            except TypeError:
+                if self.shared_overlay_path.exists():
+                    self.shared_overlay_path.unlink()
+            self.shared_overlay_path = None
+        self._overlay_command_array = None
+        self._overlay_frame_counter = 0
+
+    def _create_shared_overlay_file(self) -> None:
+        command_bytes = (
+            self.EYE_COUNT
+            * self.OVERLAY_MAX_COMMANDS_PER_EYE
+            * self.OVERLAY_COMMAND_STRIDE_FLOATS
+            * np.dtype(np.float32).itemsize
+        )
+        total_bytes = self.OVERLAY_HEADER_STRUCT.size + command_bytes
+        fd, path = tempfile.mkstemp(
+            prefix="boba_quest_overlay_",
+            suffix=".bin",
+            dir="/tmp",
+        )
+        self.shared_overlay_path = Path(path)
+        self._overlay_file = os.fdopen(fd, "r+b", buffering=0)
+        self._overlay_file.truncate(total_bytes)
+        self._overlay_mmap = mmap.mmap(self._overlay_file.fileno(), total_bytes)
+        self._overlay_command_array = np.ndarray(
+            (
+                self.EYE_COUNT,
+                self.OVERLAY_MAX_COMMANDS_PER_EYE,
+                self.OVERLAY_COMMAND_STRIDE_FLOATS,
+            ),
+            dtype=np.float32,
+            buffer=self._overlay_mmap,
+            offset=self.OVERLAY_HEADER_STRUCT.size,
+        )
+        self._overlay_command_array.fill(0.0)
+        self._write_overlay_header(latest_overlay_id=0, left_count=0, right_count=0)
+
+    def _write_overlay_header(
+        self,
+        *,
+        latest_overlay_id: int,
+        left_count: int,
+        right_count: int,
+    ) -> None:
+        if self._overlay_mmap is None:
+            return
+        self.OVERLAY_HEADER_STRUCT.pack_into(
+            self._overlay_mmap,
+            0,
+            self.OVERLAY_HEADER_MAGIC,
+            self.OVERLAY_HEADER_VERSION,
+            self.OVERLAY_COMMAND_STRIDE_FLOATS,
+            self.OVERLAY_MAX_COMMANDS_PER_EYE,
+            int(latest_overlay_id),
+            int(left_count),
+            int(right_count),
+            0,
+        )
+
+    def viewer_overlay_enabled(self) -> bool:
+        return self._overlay_mmap is not None and self._overlay_command_array is not None
+
+    def publish_overlay_commands(
+        self,
+        left_commands,
+        right_commands,
+    ) -> bool:
+        if self._overlay_mmap is None or self._overlay_command_array is None:
+            return False
+
+        def _normalize(commands):
+            normalized = []
+            for command in commands or []:
+                values = np.asarray(command, dtype=np.float32).reshape(-1)
+                if int(values.size) != int(self.OVERLAY_COMMAND_STRIDE_FLOATS):
+                    continue
+                normalized.append(values)
+                if len(normalized) >= int(self.OVERLAY_MAX_COMMANDS_PER_EYE):
+                    break
+            if not normalized:
+                return np.zeros(
+                    (0, self.OVERLAY_COMMAND_STRIDE_FLOATS),
+                    dtype=np.float32,
+                )
+            return np.stack(normalized, axis=0).astype(np.float32, copy=False)
+
+        left_array = _normalize(left_commands)
+        right_array = _normalize(right_commands)
+        left_count = int(left_array.shape[0])
+        right_count = int(right_array.shape[0])
+        self._overlay_command_array.fill(0.0)
+        if left_count:
+            self._overlay_command_array[0, :left_count, :] = left_array
+        if right_count:
+            self._overlay_command_array[1, :right_count, :] = right_array
+        self._overlay_frame_counter += 1
+        self._write_overlay_header(
+            latest_overlay_id=int(self._overlay_frame_counter),
+            left_count=left_count,
+            right_count=right_count,
+        )
+        return True
 
     def publish_stereo_frames(
         self,

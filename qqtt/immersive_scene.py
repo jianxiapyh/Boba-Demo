@@ -4,6 +4,7 @@ import gzip
 import hashlib
 import json
 import pickle
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -17,13 +18,15 @@ from .pyrender_cuda_bridge import (
     PyrenderCudaInteropOffscreenRenderer,
     probe_pyrender_cuda_bridge_support,
 )
+from .native_gl_scene_renderer import NativeGlSceneRenderer
+from .simple_lab_gpu_renderer import SimpleLabGpuRenderer
 
 
 MANIFEST_RELATIVE_PATH = Path("assets/scenes/ILLIXR_lab/manifest.json")
 ILLIXR_SCENE_NAME = "ILLIXR_lab"
 ILLIXR_BAKED_LIGHTING_MODE = "baked_texture_ambient"
-SCENE_ANALYSIS_CACHE_SCHEMA = 3
-DEFAULT_SCENE_ANALYSIS_CACHE_FILENAME = "scene_analysis_cache_v3.pkl.gz"
+SCENE_ANALYSIS_CACHE_SCHEMA = 4
+DEFAULT_SCENE_ANALYSIS_CACHE_FILENAME = "scene_analysis_cache_v4.pkl.gz"
 
 TARGET_TABLE_SIZE_X = 0.95
 TARGET_TABLE_SIZE_Y = 0.68
@@ -760,6 +763,10 @@ class SimpleLabSceneRenderer:
         lighting_mode: str = "full",
         balanced_render_backend: str = "pyrender",
         scene_analysis_cache_mode: str = "auto",
+        native_gl_texture_mode: str = "stable_mipmap",
+        native_gl_anisotropy: int = 8,
+        native_gl_msaa_samples: int = 4,
+        native_gl_depth_format: str = "depth32f",
     ):
         import pyrender
 
@@ -768,7 +775,19 @@ class SimpleLabSceneRenderer:
         self.height = int(height)
         self.requested_lighting_mode = str(lighting_mode)
         self.lighting_mode = self._resolve_lighting_mode(lighting_mode)
-        self.balanced_render_backend = "pyrender"
+        requested_backend = str(balanced_render_backend).strip().lower()
+        if requested_backend not in {"auto", "pyrender", "gpu", "native_gl"}:
+            raise ValueError(
+                "balanced_render_backend must be one of "
+                "{'auto', 'pyrender', 'gpu', 'native_gl'}"
+            )
+        self.balanced_render_backend = (
+            "pyrender" if requested_backend == "auto" else requested_backend
+        )
+        self.native_gl_texture_mode = str(native_gl_texture_mode).strip().lower()
+        self.native_gl_anisotropy = int(native_gl_anisotropy)
+        self.native_gl_msaa_samples = int(native_gl_msaa_samples)
+        self.native_gl_depth_format = str(native_gl_depth_format).strip().lower()
         self._pyrender = pyrender
         self.scene_root = ensure_illixr_lab_assets(scene_assets_root)
         self.manifest = load_illixr_lab_manifest(scene_assets_root)
@@ -845,6 +864,66 @@ class SimpleLabSceneRenderer:
             if self._pyrender_cuda_interop_supported
             else "cpu_fallback"
         )
+        self._gpu_balanced_renderer: SimpleLabGpuRenderer | None = None
+        self._native_gl_renderer: NativeGlSceneRenderer | None = None
+        if self.balanced_render_backend == "gpu":
+            self._gpu_balanced_renderer = SimpleLabGpuRenderer(
+                lighting_mode=self.lighting_mode,
+                device=torch.device(
+                    "cuda" if torch.cuda.is_available() else "cpu"
+                ),
+            )
+            if not self._gpu_balanced_renderer.table_available:
+                raise RuntimeError(
+                    "balanced_render_backend=gpu requires CUDA plus PyTorch3D mesh rasterization support."
+            )
+            self._pyrender_readback_mode = "gpu_native"
+            self._pyrender_readback_reason = "balanced_render_backend=gpu"
+        elif self.balanced_render_backend == "native_gl":
+            interop_supported, interop_reason = probe_pyrender_cuda_bridge_support()
+            if not interop_supported:
+                raise RuntimeError(
+                    "balanced_render_backend=native_gl requires CUDA/OpenGL interop: "
+                    f"{interop_reason}"
+                )
+            self._native_gl_renderer = NativeGlSceneRenderer(
+                scene_assets_root=scene_assets_root,
+                width=self.width,
+                height=self.height,
+                render_background=False,
+                znear=0.02,
+                zfar=100.0,
+                texture_mode=self.native_gl_texture_mode,
+                anisotropy=self.native_gl_anisotropy,
+                msaa_samples=self.native_gl_msaa_samples,
+                depth_format=self.native_gl_depth_format,
+                device=torch.device(
+                    "cuda" if torch.cuda.is_available() else "cpu"
+                ),
+            )
+            self._pyrender_readback_mode = str(
+                self._native_gl_renderer.pyrender_readback_mode()
+            )
+            self._pyrender_readback_reason = (
+                self._native_gl_renderer.pyrender_readback_reason()
+            )
+        self._gpu_supported_layer_names = frozenset(
+            {
+                "balanced_far_front_back_walls",
+                "balanced_left_wall",
+                "balanced_right_wall",
+                "balanced_near_floor",
+            }
+        )
+        # The shipped GPU backend keeps full-scene/background/table layers on the
+        # hybrid pyrender path, but support-focus subsets now use the dedicated
+        # GPU subset renderer with per-request pyrender fallback.
+        self._gpu_focus_subset_enabled = bool(
+            self.balanced_render_backend == "gpu"
+            and self._gpu_balanced_renderer is not None
+        )
+        self._gpu_focus_subset_policy_by_key: dict[tuple[int, ...], str] = {}
+        self._last_balanced_render_debug: dict[str, Any] | None = None
 
         for layer_name in self._eager_layer_names:
             self._layer_entries[layer_name] = self._make_layer_entry(layer_name)
@@ -870,6 +949,8 @@ class SimpleLabSceneRenderer:
         self._focus_render_catalog: list[dict[str, Any]] = []
         self._focus_render_catalog_total_faces = 0
         self._focus_render_bvh: list[dict[str, Any]] = []
+        self._focus_render_entry_geometry_cache_asset: dict[int, dict[str, Any]] = {}
+        self._focus_render_entry_geometry_cache_world: dict[int, dict[str, Any]] = {}
         self._focus_render_catalog_world: list[dict[str, Any]] = []
         self._focus_render_catalog_world_by_id: dict[int, dict[str, Any]] = {}
         self._focus_render_bvh_world: list[dict[str, Any]] = []
@@ -895,10 +976,13 @@ class SimpleLabSceneRenderer:
             )
         self._full_scene_mesh_world: trimesh.Trimesh | None = None
         self._background_mesh_world: trimesh.Trimesh | None = None
+        self._furniture_mesh_world: trimesh.Trimesh | None = None
         self._table_mesh_world: trimesh.Trimesh | None = None
         self._floor_mesh_world: trimesh.Trimesh | None = None
         self._left_wall_mesh_world: trimesh.Trimesh | None = None
         self._right_wall_mesh_world: trimesh.Trimesh | None = None
+        self._front_wall_mesh_world: trimesh.Trimesh | None = None
+        self._back_wall_mesh_world: trimesh.Trimesh | None = None
         self._front_back_mesh_world: trimesh.Trimesh | None = None
 
     def _resolve_scene_analysis_cache_path(self) -> Path:
@@ -1036,6 +1120,14 @@ class SimpleLabSceneRenderer:
             self._wall_asset_mesh,
             self._wall_face_masks["right"],
         )
+        self._front_wall_asset_mesh = self._slice_mesh_by_face_mask(
+            self._wall_asset_mesh,
+            self._wall_face_masks["front"],
+        )
+        self._back_wall_asset_mesh = self._slice_mesh_by_face_mask(
+            self._wall_asset_mesh,
+            self._wall_face_masks["back"],
+        )
         self._front_back_asset_mesh = self._slice_mesh_by_face_mask(
             self._wall_asset_mesh,
             self._wall_face_masks["front"] | self._wall_face_masks["back"],
@@ -1045,6 +1137,7 @@ class SimpleLabSceneRenderer:
             self._table_component_ids,
         )
         self._build_focus_render_catalog()
+        self._build_focus_render_entry_geometry_cache()
 
     def _export_scene_analysis_payload(self) -> dict[str, Any]:
         return {
@@ -1079,6 +1172,46 @@ class SimpleLabSceneRenderer:
                 self._focus_render_catalog_total_faces
             ),
             "focus_render_bvh": self._focus_render_bvh,
+            "focus_render_entry_geometry_cache": [
+                {
+                    "entry_id": int(entry_id),
+                    "source_mesh": str(cache_entry["source_mesh"]),
+                    "face_count": int(cache_entry["face_count"]),
+                    "vertices": np.asarray(
+                        cache_entry["vertices"],
+                        dtype=np.float32,
+                    ).copy(),
+                    "faces": np.asarray(
+                        cache_entry["faces"],
+                        dtype=np.int64,
+                    ).copy(),
+                    "visual_kind": str(cache_entry.get("visual_kind", "none")),
+                    "uv": (
+                        None
+                        if cache_entry.get("uv") is None
+                        else np.asarray(cache_entry["uv"], dtype=np.float32).copy()
+                    ),
+                    "vertex_colors": (
+                        None
+                        if cache_entry.get("vertex_colors") is None
+                        else np.asarray(
+                            cache_entry["vertex_colors"],
+                            dtype=np.uint8,
+                        ).copy()
+                    ),
+                    "face_colors": (
+                        None
+                        if cache_entry.get("face_colors") is None
+                        else np.asarray(
+                            cache_entry["face_colors"],
+                            dtype=np.uint8,
+                        ).copy()
+                    ),
+                }
+                for entry_id, cache_entry in sorted(
+                    self._focus_render_entry_geometry_cache_asset.items()
+                )
+            ],
         }
 
     def _apply_scene_analysis_payload(self, payload: dict[str, Any]) -> None:
@@ -1181,6 +1314,14 @@ class SimpleLabSceneRenderer:
             self._wall_asset_mesh,
             self._wall_face_masks["right"],
         )
+        self._front_wall_asset_mesh = self._slice_mesh_by_face_mask(
+            self._wall_asset_mesh,
+            self._wall_face_masks["front"],
+        )
+        self._back_wall_asset_mesh = self._slice_mesh_by_face_mask(
+            self._wall_asset_mesh,
+            self._wall_face_masks["back"],
+        )
         self._front_back_asset_mesh = self._slice_mesh_by_face_mask(
             self._wall_asset_mesh,
             self._wall_face_masks["front"] | self._wall_face_masks["back"],
@@ -1200,6 +1341,10 @@ class SimpleLabSceneRenderer:
             self._focus_render_bvh = _build_focus_render_bvh(
                 self._focus_render_catalog
             )
+        if not self._load_focus_render_entry_geometry_cache_payload(
+            payload.get("focus_render_entry_geometry_cache")
+        ):
+            self._build_focus_render_entry_geometry_cache()
 
     def _load_scene_analysis_cache(self) -> bool:
         cache_path = self._scene_analysis_cache_path
@@ -1334,12 +1479,17 @@ class SimpleLabSceneRenderer:
         self._layer_entries[layer_name] = entry
         if self.layout is not None:
             self._rebuild_scene_nodes()
-            if layer_name in self._eager_layer_names:
+            if (
+                self.balanced_render_backend not in {"gpu", "native_gl"}
+                and layer_name in self._eager_layer_names
+            ):
                 self._get_layer_renderer(layer_name, self.width, self.height)
         return entry
 
     def _initialize_eager_layer_renderers(self) -> None:
         if self.layout is None:
+            return
+        if self.balanced_render_backend in {"gpu", "native_gl"}:
             return
         for layer_name in self._eager_layer_names:
             self._get_layer_renderer(layer_name, self.width, self.height)
@@ -1355,6 +1505,11 @@ class SimpleLabSceneRenderer:
             if renderer is not None:
                 renderer.delete()
                 self._focus_scene_entry["renderer"] = None
+        if self._gpu_balanced_renderer is not None:
+            self._gpu_balanced_renderer.delete()
+        if self._native_gl_renderer is not None:
+            self._native_gl_renderer.delete()
+            self._native_gl_renderer = None
 
     def pyrender_readback_mode(self) -> str:
         return str(self._pyrender_readback_mode)
@@ -1365,13 +1520,41 @@ class SimpleLabSceneRenderer:
         return str(self._pyrender_readback_reason)
 
     def uses_gpu_balanced_table_renderer(self) -> bool:
-        return False
+        return bool(
+            self.balanced_render_backend == "gpu"
+            and "table" in self._gpu_supported_layer_names
+        )
 
     def uses_gpu_balanced_plane_renderer(self) -> bool:
-        return False
+        return bool(
+            self.balanced_render_backend == "gpu"
+            and any(
+                layer_name in self._gpu_supported_layer_names
+                for layer_name in (
+                    "balanced_far_front_back_walls",
+                    "balanced_left_wall",
+                    "balanced_right_wall",
+                    "balanced_near_floor",
+                )
+            )
+        )
 
     def uses_gpu_balanced_side_wall_renderer(self) -> bool:
-        return False
+        return bool(
+            self.balanced_render_backend == "gpu"
+            and any(
+                layer_name in self._gpu_supported_layer_names
+                for layer_name in (
+                    "balanced_left_wall",
+                    "balanced_right_wall",
+                )
+            )
+        )
+
+    def last_balanced_render_debug(self) -> dict[str, Any] | None:
+        if self._last_balanced_render_debug is None:
+            return None
+        return dict(self._last_balanced_render_debug)
 
     def table_alignment_debug(self) -> dict[str, Any] | None:
         if self._table_alignment_debug is None:
@@ -1433,6 +1616,8 @@ class SimpleLabSceneRenderer:
     def set_layout(self, layout: SimpleLabLayout) -> None:
         self.layout = layout
         self._rebuild_scene_nodes()
+        if self._native_gl_renderer is not None:
+            self._native_gl_renderer.set_layout(layout)
         self._initialize_eager_layer_renderers()
 
     @staticmethod
@@ -1479,6 +1664,7 @@ class SimpleLabSceneRenderer:
         scene_height: int,
         table_roi_bounds_by_eye: dict[str, tuple[int, int, int, int] | None] | None = None,
         focus_roi_bounds_by_eye: dict[str, tuple[int, int, int, int] | None] | None = None,
+        focus_selected_entry_ids_by_eye: dict[str, list[int] | tuple[int, ...]] | None = None,
         table_roi_render_scale: float = 1.0,
         focus_roi_render_scale: float = 1.0,
     ) -> list[str]:
@@ -1489,6 +1675,7 @@ class SimpleLabSceneRenderer:
         default_roi = self._default_warmup_roi_bounds(eye_width, eye_height)
         table_roi_bounds_by_eye = dict(table_roi_bounds_by_eye or {})
         focus_roi_bounds_by_eye = dict(focus_roi_bounds_by_eye or {})
+        focus_selected_entry_ids_by_eye = dict(focus_selected_entry_ids_by_eye or {})
 
         eye_specs = {
             "left": {
@@ -1517,6 +1704,10 @@ class SimpleLabSceneRenderer:
                 table_roi_bounds = default_roi
             if focus_roi_bounds is None:
                 focus_roi_bounds = default_roi
+            focus_selected_entry_ids = tuple(
+                int(v)
+                for v in (focus_selected_entry_ids_by_eye.get(eye_label) or [])
+            )
             background_roi_bounds = (
                 focus_roi_bounds
                 if focus_roi_bounds is not None
@@ -1551,6 +1742,15 @@ class SimpleLabSceneRenderer:
                 height=int(eye_height),
             )
             touched_paths.add("full_full")
+            if focus_selected_entry_ids:
+                self.render_focus_subset_eye(
+                    pose_world,
+                    eye_intrinsic,
+                    focus_selected_entry_ids,
+                    width=int(eye_width),
+                    height=int(eye_height),
+                )
+                touched_paths.add("focus_subset_full")
             self.render_table_eye(
                 pose_world,
                 base_intrinsic,
@@ -1574,6 +1774,15 @@ class SimpleLabSceneRenderer:
                 )
                 touched_paths.add("background_roi")
             if focus_roi_bounds is not None:
+                if focus_selected_entry_ids:
+                    self.render_focus_subset_eye_roi(
+                        pose_world,
+                        eye_intrinsic,
+                        focus_selected_entry_ids,
+                        tuple(int(v) for v in focus_roi_bounds),
+                        render_scale=float(focus_roi_render_scale),
+                    )
+                    touched_paths.add("focus_subset_roi")
                 self.render_eye_roi(
                     pose_world,
                     eye_intrinsic,
@@ -1825,8 +2034,233 @@ class SimpleLabSceneRenderer:
         return self._render_layer_eye_roi(layer_name, camera_pose_world, full_intrinsic, roi_bounds)
 
     def _should_use_gpu_balanced_layer(self, layer_name: str) -> bool:
-        _ = layer_name
-        return False
+        return bool(
+            self.balanced_render_backend == "gpu"
+            and str(layer_name).strip().lower() in self._gpu_supported_layer_names
+        )
+
+    def _should_use_gpu_balanced_focus_subset(
+        self,
+        selected_entry_ids: list[int] | tuple[int, ...],
+    ) -> bool:
+        return bool(
+            self.balanced_render_backend == "gpu"
+            and self._gpu_focus_subset_enabled
+            and bool(selected_entry_ids)
+        )
+
+    @staticmethod
+    def _balanced_render_pair_metrics(
+        reference_color: np.ndarray | torch.Tensor,
+        reference_depth: np.ndarray | torch.Tensor,
+        candidate_color: np.ndarray | torch.Tensor,
+        candidate_depth: np.ndarray | torch.Tensor,
+    ) -> dict[str, float]:
+        def _to_numpy(value):
+            if torch.is_tensor(value):
+                return value.detach().cpu().numpy()
+            return np.asarray(value)
+
+        depth_eps = 1.0e-4
+        reference_color_f = np.asarray(_to_numpy(reference_color), dtype=np.float32)
+        candidate_color_f = np.asarray(_to_numpy(candidate_color), dtype=np.float32)
+        reference_depth_f = np.asarray(_to_numpy(reference_depth), dtype=np.float32)
+        candidate_depth_f = np.asarray(_to_numpy(candidate_depth), dtype=np.float32)
+        affected_mask = (reference_depth_f > depth_eps) | (candidate_depth_f > depth_eps)
+        rgb_diff = np.abs(reference_color_f[..., :3] - candidate_color_f[..., :3])
+        depth_diff = np.abs(reference_depth_f - candidate_depth_f)
+        if np.any(affected_mask):
+            rgb_mae_affected = float(rgb_diff[affected_mask].mean())
+            depth_mae_affected = float(depth_diff[affected_mask].mean())
+        else:
+            rgb_mae_affected = 0.0
+            depth_mae_affected = 0.0
+        return {
+            "rgb_mae_affected": float(rgb_mae_affected),
+            "depth_mae_affected": float(depth_mae_affected),
+        }
+
+    def _gpu_renderer(self) -> SimpleLabGpuRenderer:
+        if self._gpu_balanced_renderer is None:
+            raise RuntimeError("GPU balanced renderer is not available.")
+        return self._gpu_balanced_renderer
+
+    def _gpu_clear_rgba(
+        self,
+        rgba: np.ndarray,
+    ) -> torch.Tensor:
+        return torch.as_tensor(
+            np.asarray(rgba, dtype=np.float32),
+            dtype=torch.float32,
+            device=self._gpu_renderer().device,
+        )
+
+    def _render_gpu_balanced_background(
+        self,
+        camera_pose_world: np.ndarray,
+        intrinsic: np.ndarray,
+        width: int,
+        height: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return self._gpu_renderer().render_mesh_layer(
+            "background",
+            camera_pose_world,
+            intrinsic,
+            int(width),
+            int(height),
+            clear_rgba=self._gpu_clear_rgba(self._scene_clear_color),
+        )
+
+    def _render_gpu_balanced_full(
+        self,
+        camera_pose_world: np.ndarray,
+        intrinsic: np.ndarray,
+        width: int,
+        height: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return self._gpu_renderer().render_mesh_layer(
+            "full",
+            camera_pose_world,
+            intrinsic,
+            int(width),
+            int(height),
+            clear_rgba=self._gpu_clear_rgba(self._scene_clear_color),
+        )
+
+    def _balanced_output_device(self) -> torch.device:
+        if self._gpu_balanced_renderer is not None:
+            return torch.device(self._gpu_balanced_renderer.device)
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    def _set_last_balanced_render_debug(
+        self,
+        *,
+        request_kind: str,
+        effective_backend: str,
+        upload_wall_s: float = 0.0,
+        width: int,
+        height: int,
+        extra_fields: dict[str, Any] | None = None,
+    ) -> None:
+        debug = {
+            "request_kind": str(request_kind),
+            "effective_backend": str(effective_backend),
+            "fallback_upload_wall_s": float(upload_wall_s),
+            "width": int(width),
+            "height": int(height),
+        }
+        if extra_fields:
+            debug.update(dict(extra_fields))
+        self._last_balanced_render_debug = debug
+
+    def _convert_balanced_output_to_cuda(
+        self,
+        color: np.ndarray | torch.Tensor,
+        depth: np.ndarray | torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, float]:
+        target_device = self._balanced_output_device()
+        upload_wall_s = 0.0
+        needs_transfer = (
+            not torch.is_tensor(color)
+            or color.device != target_device
+            or color.dtype != torch.float32
+            or not color.is_contiguous()
+            or not torch.is_tensor(depth)
+            or depth.device != target_device
+            or depth.dtype != torch.float32
+            or not depth.is_contiguous()
+        )
+        upload_start = time.perf_counter() if needs_transfer else None
+        if torch.is_tensor(color):
+            color_t = color
+            if color_t.device != target_device or color_t.dtype != torch.float32:
+                color_t = color_t.to(device=target_device, dtype=torch.float32)
+            elif not color_t.is_contiguous():
+                color_t = color_t.contiguous()
+        else:
+            color_t = torch.as_tensor(
+                np.asarray(color, dtype=np.float32),
+                dtype=torch.float32,
+                device=target_device,
+            ).contiguous()
+        if torch.is_tensor(depth):
+            depth_t = depth
+            if depth_t.device != target_device or depth_t.dtype != torch.float32:
+                depth_t = depth_t.to(device=target_device, dtype=torch.float32)
+            elif not depth_t.is_contiguous():
+                depth_t = depth_t.contiguous()
+        else:
+            depth_t = torch.as_tensor(
+                np.asarray(depth, dtype=np.float32),
+                dtype=torch.float32,
+                device=target_device,
+            ).contiguous()
+        if upload_start is not None:
+            upload_wall_s = time.perf_counter() - upload_start
+        return color_t, depth_t, float(upload_wall_s)
+
+    def _render_layer_eye_pyrender(
+        self,
+        layer_name: str,
+        camera_pose_world: np.ndarray,
+        intrinsic: np.ndarray,
+        width: int,
+        height: int,
+    ) -> tuple[np.ndarray, np.ndarray] | tuple[torch.Tensor, torch.Tensor]:
+        entry = self._ensure_layer_entry(layer_name)
+        camera = entry["camera"]
+        camera.fx = float(intrinsic[0, 0])
+        camera.fy = float(intrinsic[1, 1])
+        camera.cx = float(intrinsic[0, 2])
+        camera.cy = float(intrinsic[1, 2])
+        entry["scene"].set_pose(
+            entry["camera_node"],
+            pose=np.asarray(camera_pose_world, dtype=np.float32),
+        )
+        renderer = self._get_layer_renderer(layer_name, width, height)
+        color, depth = renderer.render(
+            entry["scene"],
+            flags=self._pyrender.RenderFlags.RGBA,
+        )
+        self._update_pyrender_readback_state(renderer)
+        color = self._postprocess_render_color(color)
+        if torch.is_tensor(depth):
+            return color, depth.to(dtype=torch.float32)
+        return color, depth.astype(np.float32)
+
+    def _render_focus_scene_eye_pyrender(
+        self,
+        camera_pose_world: np.ndarray,
+        intrinsic: np.ndarray,
+        selected_entry_ids: list[int] | tuple[int, ...],
+        width: int,
+        height: int,
+    ) -> tuple[
+        np.ndarray | torch.Tensor,
+        np.ndarray | torch.Tensor,
+        dict[str, Any],
+    ]:
+        entry = self._ensure_focus_scene_entry()
+        selection_debug = self._set_focus_scene_selection(selected_entry_ids)
+        camera = entry["camera"]
+        camera.fx = float(intrinsic[0, 0])
+        camera.fy = float(intrinsic[1, 1])
+        camera.cx = float(intrinsic[0, 2])
+        camera.cy = float(intrinsic[1, 2])
+        entry["scene"].set_pose(
+            entry["camera_node"],
+            pose=np.asarray(camera_pose_world, dtype=np.float32),
+        )
+        renderer = self._get_focus_scene_renderer(width, height)
+        color, depth = renderer.render(
+            entry["scene"],
+            flags=self._pyrender.RenderFlags.RGBA,
+        )
+        self._update_pyrender_readback_state(renderer)
+        color = self._postprocess_render_color(color)
+        if torch.is_tensor(depth):
+            return color, depth.to(dtype=torch.float32), dict(selection_debug)
+        return color, depth.astype(np.float32), dict(selection_debug)
 
     def _resolve_roi_render_params(
         self,
@@ -2368,6 +2802,202 @@ class SimpleLabSceneRenderer:
         )
         self._focus_render_bvh = _build_focus_render_bvh(catalog_entries)
 
+    def _build_focus_render_entry_geometry_cache(self) -> None:
+        geometry_cache: dict[int, dict[str, Any]] = {}
+        for asset_entry in self._focus_render_catalog:
+            entry_id = int(asset_entry["entry_id"])
+            source_mesh = str(asset_entry["source_mesh"])
+            mesh = self._slice_mesh_by_face_indices(
+                self._focus_render_source_mesh(source_mesh),
+                np.asarray(asset_entry["face_indices"], dtype=np.int64),
+            )
+            geometry_cache[entry_id] = self._focus_render_geometry_payload_from_mesh(
+                entry_id,
+                source_mesh,
+                mesh,
+            )
+        self._focus_render_entry_geometry_cache_asset = geometry_cache
+
+    def _focus_render_geometry_payload_from_mesh(
+        self,
+        entry_id: int,
+        source_mesh: str,
+        mesh: trimesh.Trimesh,
+    ) -> dict[str, Any]:
+        visual_kind = str(getattr(mesh.visual, "kind", "none"))
+        uv = getattr(mesh.visual, "uv", None)
+        vertex_colors = getattr(mesh.visual, "vertex_colors", None)
+        face_colors = getattr(mesh.visual, "face_colors", None)
+        return {
+            "entry_id": int(entry_id),
+            "source_mesh": str(source_mesh),
+            "face_count": int(mesh.faces.shape[0]),
+            "vertices": np.asarray(mesh.vertices, dtype=np.float32).copy(),
+            "faces": np.asarray(mesh.faces, dtype=np.int64).copy(),
+            "visual_kind": visual_kind,
+            "uv": (
+                None
+                if uv is None
+                else np.asarray(uv, dtype=np.float32).copy()
+            ),
+            "vertex_colors": (
+                None
+                if vertex_colors is None
+                else np.asarray(vertex_colors, dtype=np.uint8).copy()
+            ),
+            "face_colors": (
+                None
+                if face_colors is None
+                else np.asarray(face_colors, dtype=np.uint8).copy()
+            ),
+        }
+
+    def _load_focus_render_entry_geometry_cache_payload(
+        self,
+        payload: Any,
+    ) -> bool:
+        if not isinstance(payload, list):
+            return False
+        expected_entries = {
+            int(entry["entry_id"]): entry for entry in self._focus_render_catalog
+        }
+        geometry_cache: dict[int, dict[str, Any]] = {}
+        for raw_entry in payload:
+            if not isinstance(raw_entry, dict):
+                return False
+            try:
+                entry_id = int(raw_entry["entry_id"])
+                source_mesh = str(raw_entry["source_mesh"])
+                face_count = int(raw_entry["face_count"])
+            except Exception:
+                return False
+            asset_entry = expected_entries.get(entry_id)
+            if asset_entry is None:
+                return False
+            if source_mesh != str(asset_entry["source_mesh"]):
+                return False
+            if face_count != int(asset_entry["face_count"]):
+                return False
+            vertices = np.asarray(
+                raw_entry.get("vertices"),
+                dtype=np.float32,
+            )
+            faces = np.asarray(
+                raw_entry.get("faces"),
+                dtype=np.int64,
+            )
+            if vertices.ndim != 2 or vertices.shape[1] != 3:
+                return False
+            if faces.ndim != 2 or faces.shape[1] != 3:
+                return False
+            if int(faces.shape[0]) != face_count:
+                return False
+            geometry_cache[entry_id] = {
+                "entry_id": entry_id,
+                "source_mesh": source_mesh,
+                "face_count": face_count,
+                "vertices": vertices.copy(),
+                "faces": faces.copy(),
+                "visual_kind": str(raw_entry.get("visual_kind", "none")),
+                "uv": (
+                    None
+                    if raw_entry.get("uv") is None
+                    else np.asarray(raw_entry.get("uv"), dtype=np.float32).copy()
+                ),
+                "vertex_colors": (
+                    None
+                    if raw_entry.get("vertex_colors") is None
+                    else np.asarray(
+                        raw_entry.get("vertex_colors"),
+                        dtype=np.uint8,
+                    ).copy()
+                ),
+                "face_colors": (
+                    None
+                    if raw_entry.get("face_colors") is None
+                    else np.asarray(
+                        raw_entry.get("face_colors"),
+                        dtype=np.uint8,
+                    ).copy()
+                ),
+            }
+        if len(geometry_cache) != len(expected_entries):
+            return False
+        self._focus_render_entry_geometry_cache_asset = geometry_cache
+        return True
+
+    def _focus_render_entry_geometry_asset(
+        self,
+        entry_id: int,
+    ) -> dict[str, Any] | None:
+        entry_id = int(entry_id)
+        cached = self._focus_render_entry_geometry_cache_asset.get(entry_id)
+        if cached is not None:
+            return cached
+        asset_entry = next(
+            (
+                entry
+                for entry in self._focus_render_catalog
+                if int(entry["entry_id"]) == entry_id
+            ),
+            None,
+        )
+        if asset_entry is None:
+            return None
+        source_mesh = str(asset_entry["source_mesh"])
+        mesh = self._slice_mesh_by_face_indices(
+            self._focus_render_source_mesh(source_mesh),
+            np.asarray(asset_entry["face_indices"], dtype=np.int64),
+        )
+        cached = self._focus_render_geometry_payload_from_mesh(
+            entry_id,
+            source_mesh,
+            mesh,
+        )
+        self._focus_render_entry_geometry_cache_asset[entry_id] = cached
+        return cached
+
+    def _focus_render_entry_geometry_world(
+        self,
+        entry_id: int,
+        world_transform: np.ndarray,
+    ) -> dict[str, Any] | None:
+        asset_geometry = self._focus_render_entry_geometry_asset(entry_id)
+        if asset_geometry is None:
+            return None
+        return {
+            "entry_id": int(asset_geometry["entry_id"]),
+            "source_mesh": str(asset_geometry["source_mesh"]),
+            "face_count": int(asset_geometry["face_count"]),
+            "vertices": _transform_points(
+                np.asarray(asset_geometry["vertices"], dtype=np.float32),
+                np.asarray(world_transform, dtype=np.float32),
+            ),
+            "faces": np.asarray(asset_geometry["faces"], dtype=np.int64).copy(),
+            "visual_kind": str(asset_geometry.get("visual_kind", "none")),
+            "uv": (
+                None
+                if asset_geometry.get("uv") is None
+                else np.asarray(asset_geometry["uv"], dtype=np.float32).copy()
+            ),
+            "vertex_colors": (
+                None
+                if asset_geometry.get("vertex_colors") is None
+                else np.asarray(
+                    asset_geometry["vertex_colors"],
+                    dtype=np.uint8,
+                ).copy()
+            ),
+            "face_colors": (
+                None
+                if asset_geometry.get("face_colors") is None
+                else np.asarray(
+                    asset_geometry["face_colors"],
+                    dtype=np.uint8,
+                ).copy()
+            ),
+        }
+
     def _table_target_size_xy(self) -> np.ndarray:
         target_xy = np.asarray(self._target_table_size_xy, dtype=np.float32)
         if target_xy.shape[0] != 2:
@@ -2416,6 +3046,9 @@ class SimpleLabSceneRenderer:
         self._background_mesh_world = self._background_asset_mesh.copy()
         self._background_mesh_world.apply_transform(world_transform)
 
+        self._furniture_mesh_world = self._furniture_asset_mesh.copy()
+        self._furniture_mesh_world.apply_transform(world_transform)
+
         self._table_mesh_world = self._table_asset_mesh.copy()
         self._table_mesh_world.apply_transform(world_transform)
 
@@ -2426,6 +3059,10 @@ class SimpleLabSceneRenderer:
         self._left_wall_mesh_world.apply_transform(world_transform)
         self._right_wall_mesh_world = self._right_wall_asset_mesh.copy()
         self._right_wall_mesh_world.apply_transform(world_transform)
+        self._front_wall_mesh_world = self._front_wall_asset_mesh.copy()
+        self._front_wall_mesh_world.apply_transform(world_transform)
+        self._back_wall_mesh_world = self._back_wall_asset_mesh.copy()
+        self._back_wall_mesh_world.apply_transform(world_transform)
         self._front_back_mesh_world = self._front_back_asset_mesh.copy()
         self._front_back_mesh_world.apply_transform(world_transform)
 
@@ -2890,17 +3527,19 @@ class SimpleLabSceneRenderer:
     def _build_focus_render_catalog_world(self, world_transform: np.ndarray) -> None:
         catalog_world: list[dict[str, Any]] = []
         catalog_world_by_id: dict[int, dict[str, Any]] = {}
+        geometry_world_by_id: dict[int, dict[str, Any]] = {}
         bvh_world: list[dict[str, Any]] = []
         active_table_entry_ids: set[int] = set()
         self._focus_render_world_transform = np.asarray(world_transform, dtype=np.float32).copy()
         for asset_entry in self._focus_render_catalog:
+            entry_id = int(asset_entry["entry_id"])
             bounds_min, bounds_max = _transform_bounds(
                 np.asarray(asset_entry["bounds_min"], dtype=np.float32),
                 np.asarray(asset_entry["bounds_max"], dtype=np.float32),
                 self._focus_render_world_transform,
             )
             world_entry = {
-                "entry_id": int(asset_entry["entry_id"]),
+                "entry_id": entry_id,
                 "parent_component_id": asset_entry["parent_component_id"],
                 "source_mesh": str(asset_entry["source_mesh"]),
                 "role": str(asset_entry["role"]),
@@ -2911,12 +3550,17 @@ class SimpleLabSceneRenderer:
                 "face_indices": np.asarray(asset_entry["face_indices"], dtype=np.int64).copy(),
                 "bounds_min": bounds_min.copy(),
                 "bounds_max": bounds_max.copy(),
-                "pyrender_mesh": None,
             }
             catalog_world.append(world_entry)
-            catalog_world_by_id[int(world_entry["entry_id"])] = world_entry
+            catalog_world_by_id[entry_id] = world_entry
+            geometry_world = self._focus_render_entry_geometry_world(
+                entry_id,
+                self._focus_render_world_transform,
+            )
+            if geometry_world is not None:
+                geometry_world_by_id[entry_id] = geometry_world
             if bool(world_entry["always_include"]):
-                active_table_entry_ids.add(int(world_entry["entry_id"]))
+                active_table_entry_ids.add(entry_id)
         for asset_node in self._focus_render_bvh:
             bounds_min, bounds_max = _transform_bounds(
                 np.asarray(asset_node["bounds_min"], dtype=np.float32),
@@ -2939,9 +3583,11 @@ class SimpleLabSceneRenderer:
             )
         self._focus_render_catalog_world = catalog_world
         self._focus_render_catalog_world_by_id = catalog_world_by_id
+        self._focus_render_entry_geometry_cache_world = geometry_world_by_id
         self._focus_render_bvh_world = bvh_world
         self._focus_render_active_table_entry_ids = active_table_entry_ids
-        self._clear_focus_scene_entry_nodes()
+        self._gpu_focus_subset_policy_by_key = {}
+        self._clear_focus_scene_selection_cache()
 
     def _make_focus_scene_entry(self) -> dict[str, Any]:
         scene = self._pyrender.Scene(
@@ -2963,8 +3609,9 @@ class SimpleLabSceneRenderer:
             "camera": camera,
             "camera_node": camera_node,
             "renderer": None,
-            "entry_nodes": {},
-            "active_entry_ids": set(),
+            "selection_mesh_cache": {},
+            "active_selection_key": None,
+            "active_selection_node": None,
         }
 
     def _ensure_focus_scene_entry(self) -> dict[str, Any]:
@@ -2972,14 +3619,196 @@ class SimpleLabSceneRenderer:
             self._focus_scene_entry = self._make_focus_scene_entry()
         return self._focus_scene_entry
 
-    def _clear_focus_scene_entry_nodes(self) -> None:
+    def _clear_focus_scene_selection_cache(self) -> None:
         if self._focus_scene_entry is None:
             return
         scene = self._focus_scene_entry["scene"]
-        for node in self._focus_scene_entry["entry_nodes"].values():
-            scene.remove_node(node)
-        self._focus_scene_entry["entry_nodes"] = {}
-        self._focus_scene_entry["active_entry_ids"] = set()
+        active_node = self._focus_scene_entry.get("active_selection_node")
+        if active_node is not None:
+            scene.remove_node(active_node)
+        self._focus_scene_entry["active_selection_node"] = None
+        self._focus_scene_entry["active_selection_key"] = None
+        self._focus_scene_entry["selection_mesh_cache"] = {}
+
+    def _normalize_focus_scene_selection_key(
+        self,
+        selected_entry_ids: list[int] | tuple[int, ...],
+    ) -> tuple[int, ...]:
+        normalized = {
+            int(v)
+            for v in (selected_entry_ids or [])
+            if int(v) in self._focus_render_catalog_world_by_id
+        }
+        normalized.update(int(v) for v in self._focus_render_active_table_entry_ids)
+        return tuple(sorted(normalized))
+
+    def _build_focus_scene_selection_mesh_cache_entry(
+        self,
+        selection_key: tuple[int, ...],
+    ) -> dict[str, Any] | None:
+        if not selection_key:
+            return None
+        build_start = time.perf_counter()
+        geometry_entries_by_source: dict[str, list[dict[str, Any]]] = {}
+        for entry_id in selection_key:
+            geometry_entry = self._focus_render_entry_geometry_asset(int(entry_id))
+            if geometry_entry is None:
+                continue
+            source_mesh = str(geometry_entry["source_mesh"])
+            geometry_entries_by_source.setdefault(source_mesh, []).append(
+                geometry_entry
+            )
+        if not geometry_entries_by_source:
+            return None
+        asset_meshes = [
+            mesh
+            for source_mesh, source_entries in sorted(
+                geometry_entries_by_source.items()
+            )
+            for mesh in [self._compose_focus_selection_group_mesh(source_mesh, source_entries)]
+            if mesh is not None
+        ]
+        if not asset_meshes:
+            return None
+        if len(asset_meshes) == 1:
+            combined_mesh = self._pyrender.Mesh.from_trimesh(
+                asset_meshes[0],
+                smooth=False,
+            )
+        else:
+            combined_mesh = self._pyrender.Mesh.from_trimesh(
+                asset_meshes,
+                smooth=False,
+            )
+        return {
+            "mesh": combined_mesh,
+            "selection_entry_count": int(len(selection_key)),
+            "build_wall_s": float(time.perf_counter() - build_start),
+        }
+
+    def _compose_focus_selection_group_mesh(
+        self,
+        source_mesh: str,
+        geometry_entries: list[dict[str, Any]],
+    ) -> trimesh.Trimesh | None:
+        if not geometry_entries:
+            return None
+        vertices_parts: list[np.ndarray] = []
+        faces_parts: list[np.ndarray] = []
+        uv_parts: list[np.ndarray] = []
+        vertex_color_parts: list[np.ndarray] = []
+        face_color_parts: list[np.ndarray] = []
+        vertex_offset = 0
+        visual_kind = str(geometry_entries[0].get("visual_kind", "none"))
+        for geometry_entry in geometry_entries:
+            vertices = np.asarray(
+                geometry_entry.get("vertices"),
+                dtype=np.float32,
+            )
+            faces = np.asarray(
+                geometry_entry.get("faces"),
+                dtype=np.int64,
+            )
+            if (
+                vertices.ndim != 2
+                or vertices.shape[1] != 3
+                or faces.ndim != 2
+                or faces.shape[1] != 3
+                or vertices.shape[0] <= 0
+                or faces.shape[0] <= 0
+            ):
+                continue
+            vertices_parts.append(vertices.copy())
+            faces_parts.append(faces.copy() + int(vertex_offset))
+            vertex_offset += int(vertices.shape[0])
+            uv = geometry_entry.get("uv")
+            if uv is not None:
+                uv_parts.append(np.asarray(uv, dtype=np.float32).copy())
+            vertex_colors = geometry_entry.get("vertex_colors")
+            if vertex_colors is not None:
+                vertex_color_parts.append(
+                    np.asarray(vertex_colors, dtype=np.uint8).copy()
+                )
+            face_colors = geometry_entry.get("face_colors")
+            if face_colors is not None:
+                face_color_parts.append(
+                    np.asarray(face_colors, dtype=np.uint8).copy()
+                )
+        if not vertices_parts or not faces_parts:
+            return None
+        mesh = trimesh.Trimesh(
+            vertices=np.concatenate(vertices_parts, axis=0),
+            faces=np.concatenate(faces_parts, axis=0),
+            process=False,
+        )
+        source_visual = getattr(
+            self._focus_render_source_mesh(source_mesh),
+            "visual",
+            None,
+        )
+        if visual_kind == "texture" and uv_parts:
+            material = None if source_visual is None else getattr(source_visual, "material", None)
+            mesh.visual = trimesh.visual.TextureVisuals(
+                uv=np.concatenate(uv_parts, axis=0),
+                material=material,
+            )
+        elif visual_kind == "vertex" and vertex_color_parts:
+            mesh.visual = trimesh.visual.ColorVisuals(
+                mesh=mesh,
+                vertex_colors=np.concatenate(vertex_color_parts, axis=0),
+            )
+        elif visual_kind == "face" and face_color_parts:
+            mesh.visual = trimesh.visual.ColorVisuals(
+                mesh=mesh,
+                face_colors=np.concatenate(face_color_parts, axis=0),
+            )
+        return mesh
+
+    def _set_focus_scene_selection(
+        self,
+        selected_entry_ids: list[int] | tuple[int, ...],
+    ) -> dict[str, Any]:
+        entry = self._ensure_focus_scene_entry()
+        selection_key = self._normalize_focus_scene_selection_key(selected_entry_ids)
+        cached_selection = entry["selection_mesh_cache"].get(selection_key)
+        cache_hit = cached_selection is not None
+        cache_build_wall_s = 0.0
+        if selection_key and cached_selection is None:
+            cached_selection = self._build_focus_scene_selection_mesh_cache_entry(
+                selection_key
+            )
+            if cached_selection is not None:
+                entry["selection_mesh_cache"][selection_key] = cached_selection
+                cache_build_wall_s = float(cached_selection.get("build_wall_s", 0.0))
+        if selection_key == entry.get("active_selection_key"):
+            return {
+                "focus_selection_cache_hit_ratio": 1.0 if cache_hit else 0.0,
+                "focus_selection_cache_miss_ratio": 0.0 if cache_hit else 1.0,
+                "focus_selection_cache_build_wall_s": float(cache_build_wall_s),
+                "focus_selection_entry_count": float(len(selection_key)),
+            }
+        scene = entry["scene"]
+        active_node = entry.get("active_selection_node")
+        if active_node is not None:
+            scene.remove_node(active_node)
+        entry["active_selection_node"] = None
+        if selection_key and cached_selection is not None:
+            node_pose = (
+                np.asarray(self._focus_render_world_transform, dtype=np.float32)
+                if self._focus_render_world_transform is not None
+                else np.eye(4, dtype=np.float32)
+            )
+            entry["active_selection_node"] = scene.add(
+                cached_selection["mesh"],
+                pose=node_pose,
+            )
+        entry["active_selection_key"] = selection_key
+        return {
+            "focus_selection_cache_hit_ratio": 1.0 if cache_hit else 0.0,
+            "focus_selection_cache_miss_ratio": 0.0 if cache_hit else 1.0,
+            "focus_selection_cache_build_wall_s": float(cache_build_wall_s),
+            "focus_selection_entry_count": float(len(selection_key)),
+        }
 
     def _get_focus_scene_renderer(self, width: int, height: int):
         entry = self._ensure_focus_scene_entry()
@@ -3005,38 +3834,6 @@ class SimpleLabSceneRenderer:
         self._update_pyrender_readback_state(renderer)
         return renderer
 
-    def _set_focus_scene_selection(self, selected_entry_ids: list[int] | tuple[int, ...]) -> None:
-        entry = self._ensure_focus_scene_entry()
-        desired_entry_ids = {int(v) for v in selected_entry_ids}
-        current_entry_ids = set(entry["active_entry_ids"])
-        if desired_entry_ids == current_entry_ids:
-            return
-        scene = entry["scene"]
-        for entry_id in sorted(current_entry_ids - desired_entry_ids):
-            node = entry["entry_nodes"].pop(int(entry_id), None)
-            if node is not None:
-                scene.remove_node(node)
-        for entry_id in sorted(desired_entry_ids - current_entry_ids):
-            focus_entry = self._focus_render_catalog_world_by_id.get(int(entry_id))
-            if focus_entry is None:
-                continue
-            if focus_entry.get("pyrender_mesh") is None:
-                if self._focus_render_world_transform is None:
-                    raise RuntimeError("Focus render world transform is unavailable.")
-                source_mesh = self._focus_render_source_mesh(focus_entry["source_mesh"])
-                entry_mesh_world = self._slice_mesh_by_face_indices(
-                    source_mesh,
-                    np.asarray(focus_entry["face_indices"], dtype=np.int64),
-                )
-                entry_mesh_world.apply_transform(self._focus_render_world_transform)
-                focus_entry["pyrender_mesh"] = self._pyrender.Mesh.from_trimesh(
-                    entry_mesh_world.copy(),
-                    smooth=False,
-                )
-            node = scene.add(focus_entry["pyrender_mesh"])
-            entry["entry_nodes"][int(entry_id)] = node
-        entry["active_entry_ids"] = desired_entry_ids
-
     def _render_focus_scene_eye(
         self,
         camera_pose_world: np.ndarray,
@@ -3051,26 +3848,161 @@ class SimpleLabSceneRenderer:
             width = self.width
         if height is None:
             height = self.height
-        entry = self._ensure_focus_scene_entry()
-        self._set_focus_scene_selection(selected_entry_ids)
-        camera = entry["camera"]
-        camera.fx = float(intrinsic[0, 0])
-        camera.fy = float(intrinsic[1, 1])
-        camera.cx = float(intrinsic[0, 2])
-        camera.cy = float(intrinsic[1, 2])
-        entry["scene"].set_pose(
-            entry["camera_node"],
-            pose=np.asarray(camera_pose_world, dtype=np.float32),
+        if self.balanced_render_backend == "gpu":
+            normalized_selected_entry_ids = self._normalize_focus_scene_selection_key(
+                selected_entry_ids
+            )
+            selection_key = tuple(int(v) for v in normalized_selected_entry_ids)
+            focus_policy = self._gpu_focus_subset_policy_by_key.get(selection_key)
+            if (
+                self._should_use_gpu_balanced_focus_subset(normalized_selected_entry_ids)
+                and focus_policy != "pyrender"
+            ):
+                try:
+                    gpu_renderer = self._gpu_renderer()
+                    color, depth = gpu_renderer.render_focus_subset(
+                        normalized_selected_entry_ids,
+                        camera_pose_world,
+                        intrinsic,
+                        int(width),
+                        int(height),
+                        clear_rgba=self._gpu_clear_rgba(self._table_clear_color),
+                    )
+                    color = self._postprocess_render_color(color)
+                    depth = depth.to(dtype=torch.float32)
+                    gpu_focus_debug = gpu_renderer.last_focus_subset_debug() or {}
+                    if focus_policy != "gpu":
+                        reference_color, reference_depth, selection_debug = (
+                            self._render_focus_scene_eye_pyrender(
+                                camera_pose_world,
+                                intrinsic,
+                                normalized_selected_entry_ids,
+                                int(width),
+                                int(height),
+                            )
+                        )
+                        compare_metrics = self._balanced_render_pair_metrics(
+                            reference_color,
+                            reference_depth,
+                            color,
+                            depth,
+                        )
+                        gpu_focus_debug.update(
+                            {
+                                "gpu_focus_subset_validation_rgb_mae": float(
+                                    compare_metrics["rgb_mae_affected"]
+                                ),
+                                "gpu_focus_subset_validation_depth_mae": float(
+                                    compare_metrics["depth_mae_affected"]
+                                ),
+                            }
+                        )
+                        if (
+                            float(compare_metrics["rgb_mae_affected"]) > 5.0
+                            or float(compare_metrics["depth_mae_affected"]) > 0.05
+                        ):
+                            self._gpu_focus_subset_policy_by_key[selection_key] = (
+                                "pyrender"
+                            )
+                            gpu_focus_debug[
+                                "gpu_focus_subset_policy_forced_pyrender_ratio"
+                            ] = 1.0
+                            color_t, depth_t, upload_wall_s = (
+                                self._convert_balanced_output_to_cuda(
+                                    reference_color,
+                                    reference_depth,
+                                )
+                            )
+                            self._set_last_balanced_render_debug(
+                                request_kind="focus_subset",
+                                effective_backend="pyrender",
+                                upload_wall_s=upload_wall_s,
+                                width=int(width),
+                                height=int(height),
+                                extra_fields={
+                                    **dict(selection_debug),
+                                    **gpu_focus_debug,
+                                },
+                            )
+                            return color_t, depth_t
+                        self._gpu_focus_subset_policy_by_key[selection_key] = "gpu"
+                        gpu_focus_debug["gpu_focus_subset_policy_gpu_ratio"] = 1.0
+                    else:
+                        gpu_focus_debug[
+                            "gpu_focus_subset_policy_cached_gpu_ratio"
+                        ] = 1.0
+                    self._set_last_balanced_render_debug(
+                        request_kind="focus_subset",
+                        effective_backend="gpu",
+                        upload_wall_s=0.0,
+                        width=int(width),
+                        height=int(height),
+                        extra_fields={
+                            **gpu_focus_debug,
+                            "focus_selection_entry_count": float(
+                                len(normalized_selected_entry_ids)
+                            ),
+                        },
+                    )
+                    return color, depth
+                except Exception as exc:
+                    gpu_fallback_debug = {
+                        "gpu_focus_subset_fallback_ratio": 1.0,
+                        "gpu_focus_subset_fallback_reason": (
+                            f"{type(exc).__name__}: {exc}"
+                        ),
+                    }
+            else:
+                gpu_fallback_debug = (
+                    None
+                    if focus_policy != "pyrender"
+                    else {
+                        "gpu_focus_subset_policy_cached_pyrender_ratio": 1.0,
+                    }
+                )
+            color, depth, selection_debug = self._render_focus_scene_eye_pyrender(
+                camera_pose_world,
+                intrinsic,
+                normalized_selected_entry_ids,
+                int(width),
+                int(height),
+            )
+            color_t, depth_t, upload_wall_s = self._convert_balanced_output_to_cuda(
+                color,
+                depth,
+            )
+            self._set_last_balanced_render_debug(
+                request_kind="focus_subset",
+                effective_backend="pyrender",
+                upload_wall_s=upload_wall_s,
+                width=int(width),
+                height=int(height),
+                extra_fields=(
+                    dict(selection_debug)
+                    if gpu_fallback_debug is None
+                    else {
+                        **dict(selection_debug),
+                        **gpu_fallback_debug,
+                    }
+                ),
+            )
+            return color_t, depth_t
+        color, depth, selection_debug = self._render_focus_scene_eye_pyrender(
+            camera_pose_world,
+            intrinsic,
+            selected_entry_ids,
+            int(width),
+            int(height),
         )
-        renderer = self._get_focus_scene_renderer(width, height)
-        color, depth = renderer.render(
-            entry["scene"],
-            flags=self._pyrender.RenderFlags.RGBA,
+        self._set_last_balanced_render_debug(
+            request_kind="focus_subset",
+            effective_backend="pyrender",
+            upload_wall_s=0.0,
+            width=int(width),
+            height=int(height),
+            extra_fields=selection_debug,
         )
-        self._update_pyrender_readback_state(renderer)
-        if torch.is_tensor(depth):
-            return color, depth.to(dtype=torch.float32)
-        return color, depth.astype(np.float32)
+        return color, depth
 
     def _render_focus_scene_eye_roi(
         self,
@@ -3133,11 +4065,16 @@ class SimpleLabSceneRenderer:
             return
         self._prepare_positioned_scene()
         assert self._background_mesh_world is not None
+        assert self._furniture_mesh_world is not None
         assert self._table_mesh_world is not None
         assert self._floor_mesh_world is not None
         assert self._left_wall_mesh_world is not None
         assert self._right_wall_mesh_world is not None
+        assert self._front_wall_mesh_world is not None
+        assert self._back_wall_mesh_world is not None
         assert self._front_back_mesh_world is not None
+        if self.balanced_render_backend == "native_gl":
+            return
 
         mesh_by_role = {
             "all": self._background_mesh_world,
@@ -3174,6 +4111,30 @@ class SimpleLabSceneRenderer:
                         self._pyrender.Mesh.from_trimesh(mesh.copy(), smooth=False)
                     )
                     entry["background_nodes"].append(node)
+        if self._gpu_balanced_renderer is not None:
+            self._gpu_balanced_renderer.update_scene_geometry(
+                background_mesh=self._background_mesh_world,
+                full_scene_mesh=self._full_scene_mesh_world,
+                positioned_table_mesh=self._table_mesh_world,
+                floor_mesh=self._floor_mesh_world,
+                wall_meshes={
+                    "left": self._left_wall_mesh_world,
+                    "right": self._right_wall_mesh_world,
+                    "front": self._front_wall_mesh_world,
+                    "back": self._back_wall_mesh_world,
+                },
+                focus_catalog_world_by_id=self._focus_render_catalog_world_by_id,
+                focus_entry_geometry_world_by_id=(
+                    self._focus_render_entry_geometry_cache_world
+                ),
+                focus_source_meshes_world={
+                    "floor": self._floor_mesh_world,
+                    "left_wall": self._left_wall_mesh_world,
+                    "right_wall": self._right_wall_mesh_world,
+                    "front_back_walls": self._front_back_mesh_world,
+                    "furniture": self._furniture_mesh_world,
+                },
+            )
 
     def _get_layer_renderer(self, layer_name: str, width: int, height: int):
         entry = self._ensure_layer_entry(layer_name)
@@ -3200,6 +4161,8 @@ class SimpleLabSceneRenderer:
         return renderer
 
     def _update_pyrender_readback_state(self, renderer) -> None:
+        if self.balanced_render_backend in {"gpu", "native_gl"}:
+            return
         mode = getattr(renderer, "readback_mode", None)
         if mode is not None:
             self._pyrender_readback_mode = str(mode)
@@ -3237,26 +4200,91 @@ class SimpleLabSceneRenderer:
             width = self.width
         if height is None:
             height = self.height
-        entry = self._ensure_layer_entry(layer_name)
-        camera = entry["camera"]
-        camera.fx = float(intrinsic[0, 0])
-        camera.fy = float(intrinsic[1, 1])
-        camera.cx = float(intrinsic[0, 2])
-        camera.cy = float(intrinsic[1, 2])
-        entry["scene"].set_pose(
-            entry["camera_node"],
-            pose=np.asarray(camera_pose_world, dtype=np.float32),
-        )
-        renderer = self._get_layer_renderer(layer_name, width, height)
-        color, depth = renderer.render(
-            entry["scene"],
-            flags=self._pyrender.RenderFlags.RGBA,
-        )
-        self._update_pyrender_readback_state(renderer)
-        color = self._postprocess_render_color(color)
-        if torch.is_tensor(depth):
+        if self.balanced_render_backend == "native_gl":
+            normalized_layer_name = str(layer_name).strip().lower()
+            if normalized_layer_name != "full":
+                raise RuntimeError(
+                    "balanced_render_backend=native_gl v1 supports only full-scene "
+                    f"renders, got layer={normalized_layer_name!r}."
+                )
+            if self._native_gl_renderer is None:
+                raise RuntimeError("Native GL renderer is not available.")
+            color, depth = self._native_gl_renderer.render_eye(
+                camera_pose_world,
+                intrinsic,
+                width=int(width),
+                height=int(height),
+            )
+            native_debug = self._native_gl_renderer.last_render_debug() or {}
+            self._set_last_balanced_render_debug(
+                request_kind=normalized_layer_name,
+                effective_backend="native_gl",
+                upload_wall_s=0.0,
+                width=int(width),
+                height=int(height),
+                extra_fields=native_debug,
+            )
             return color, depth.to(dtype=torch.float32)
-        return color, depth.astype(np.float32)
+        if self.balanced_render_backend == "gpu":
+            normalized_layer_name = str(layer_name).strip().lower()
+            if self._should_use_gpu_balanced_layer(normalized_layer_name):
+                gpu_renderer = self._gpu_renderer()
+                clear_rgba = (
+                    self._gpu_clear_rgba(self._table_clear_color)
+                    if normalized_layer_name == "table"
+                    else self._gpu_clear_rgba(self._scene_clear_color)
+                )
+                color, depth = gpu_renderer.render_mesh_layer(
+                    normalized_layer_name,
+                    camera_pose_world,
+                    intrinsic,
+                    int(width),
+                    int(height),
+                    clear_rgba=clear_rgba,
+                )
+                color = self._postprocess_render_color(color)
+                self._set_last_balanced_render_debug(
+                    request_kind=normalized_layer_name,
+                    effective_backend="gpu",
+                    upload_wall_s=0.0,
+                    width=int(width),
+                    height=int(height),
+                )
+                return color, depth.to(dtype=torch.float32)
+            color, depth = self._render_layer_eye_pyrender(
+                layer_name,
+                camera_pose_world,
+                intrinsic,
+                int(width),
+                int(height),
+            )
+            color_t, depth_t, upload_wall_s = self._convert_balanced_output_to_cuda(
+                color,
+                depth,
+            )
+            self._set_last_balanced_render_debug(
+                request_kind=normalized_layer_name,
+                effective_backend="pyrender",
+                upload_wall_s=upload_wall_s,
+                width=int(width),
+                height=int(height),
+            )
+            return color_t, depth_t
+        color, depth = self._render_layer_eye_pyrender(
+            layer_name,
+            camera_pose_world,
+            intrinsic,
+            int(width),
+            int(height),
+        )
+        self._set_last_balanced_render_debug(
+            request_kind=str(layer_name).strip().lower(),
+            effective_backend="pyrender",
+            upload_wall_s=0.0,
+            width=int(width),
+            height=int(height),
+        )
+        return color, depth
 
     def _render_layer_eye_roi(
         self,

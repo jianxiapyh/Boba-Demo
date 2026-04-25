@@ -537,6 +537,7 @@ class OpenXRFramePanelMirror:
         presentation_mode: Optional[int] = None,
         frame_slot_metadata=None,
         overlay_slot_commands=None,
+        overlay_modal_payload=None,
     ) -> dict[str, float]:
         copy_start = time.perf_counter()
         slot_view = self._slot_views[slot]
@@ -556,6 +557,13 @@ class OpenXRFramePanelMirror:
                 slot=slot,
                 frame_id=frame_id,
                 overlay_slot_commands=overlay_slot_commands,
+            )
+        modal_writer = getattr(self, "_write_frame_slot_modal", None)
+        if modal_writer is not None:
+            modal_writer(
+                slot=slot,
+                frame_id=frame_id,
+                overlay_modal_payload=overlay_modal_payload,
             )
         self._write_frame_slot_metadata(
             slot=slot,
@@ -593,6 +601,7 @@ class OpenXRFramePanelMirror:
             presentation_mode=pending.get("presentation_mode"),
             frame_slot_metadata=pending.get("frame_slot_metadata"),
             overlay_slot_commands=pending.get("overlay_slot_commands"),
+            overlay_modal_payload=pending.get("overlay_modal_payload"),
         )
         submit_to_commit_start_ms = float(
             pending.get("submit_to_commit_start_ms", 0.0)
@@ -1112,6 +1121,13 @@ class OpenXRFramePanelMirror:
                 frame_id=int(pending["frame_id"]),
                 overlay_slot_commands=pending.get("overlay_slot_commands"),
             )
+        modal_writer = getattr(self, "_write_frame_slot_modal", None)
+        if modal_writer is not None:
+            modal_writer(
+                slot=slot,
+                frame_id=int(pending["frame_id"]),
+                overlay_modal_payload=pending.get("overlay_modal_payload"),
+            )
         self._write_frame_slot_metadata(
             slot=slot,
             frame_id=int(pending["frame_id"]),
@@ -1306,6 +1322,11 @@ class OpenXRFramePanelMirror:
             self._viewer_overlay_latched_match_count = 0
             self._viewer_overlay_latched_mismatch_count = 0
             self._viewer_overlay_latched_empty_count = 0
+            self._viewer_modal_latched_match_count = 0
+            self._viewer_modal_latched_mismatch_count = 0
+            self._viewer_modal_latched_empty_count = 0
+            self._viewer_modal_layer_present_count = 0
+            self._viewer_modal_layer_mode = "disabled"
 
     def _reset_bridge_commit_stats(self) -> None:
         with self._stage_condition:
@@ -1377,6 +1398,10 @@ class OpenXRFramePanelMirror:
             self._steady_state_viewer_overlay_latched_match_baseline_count = 0
             self._steady_state_viewer_overlay_latched_mismatch_baseline_count = 0
             self._steady_state_viewer_overlay_latched_empty_baseline_count = 0
+            self._steady_state_viewer_modal_latched_match_baseline_count = 0
+            self._steady_state_viewer_modal_latched_mismatch_baseline_count = 0
+            self._steady_state_viewer_modal_latched_empty_baseline_count = 0
+            self._steady_state_viewer_modal_layer_present_baseline_count = 0
             self._steady_state_viewer_epoch_baseline_applied_update_count = 0
             self._steady_state_viewer_epoch_baseline_source_frame_delta_count = 0
             self._steady_state_viewer_epoch_baseline_coalesced_source_frame_count = 0
@@ -1556,6 +1581,18 @@ class OpenXRFramePanelMirror:
             )
             self._steady_state_viewer_overlay_latched_empty_baseline_count = int(
                 self._viewer_overlay_latched_empty_count
+            )
+            self._steady_state_viewer_modal_latched_match_baseline_count = int(
+                self._viewer_modal_latched_match_count
+            )
+            self._steady_state_viewer_modal_latched_mismatch_baseline_count = int(
+                self._viewer_modal_latched_mismatch_count
+            )
+            self._steady_state_viewer_modal_latched_empty_baseline_count = int(
+                self._viewer_modal_latched_empty_count
+            )
+            self._steady_state_viewer_modal_layer_present_baseline_count = int(
+                self._viewer_modal_layer_present_count
             )
 
     def _record_bridge_submit_locked(
@@ -2203,7 +2240,12 @@ class OpenXRFramePanelMirror:
                 f"viewer_source_pose_metadata_fallback_count={viewer_render_stats.get('viewer_source_pose_metadata_fallback_count', 0)} "
                 f"viewer_overlay_latched_match_count={viewer_render_stats.get('viewer_overlay_latched_match_count', 0)} "
                 f"viewer_overlay_latched_mismatch_count={viewer_render_stats.get('viewer_overlay_latched_mismatch_count', 0)} "
-                f"viewer_overlay_latched_empty_count={viewer_render_stats.get('viewer_overlay_latched_empty_count', 0)}"
+                f"viewer_overlay_latched_empty_count={viewer_render_stats.get('viewer_overlay_latched_empty_count', 0)} "
+                f"viewer_modal_latched_match_count={viewer_render_stats.get('viewer_modal_latched_match_count', 0)} "
+                f"viewer_modal_latched_mismatch_count={viewer_render_stats.get('viewer_modal_latched_mismatch_count', 0)} "
+                f"viewer_modal_latched_empty_count={viewer_render_stats.get('viewer_modal_latched_empty_count', 0)} "
+                f"viewer_modal_layer_present_count={viewer_render_stats.get('viewer_modal_layer_present_count', 0)} "
+                f"viewer_modal_layer_mode={viewer_render_stats.get('viewer_modal_layer_mode', 'disabled')}"
             )
         if self._stdout_tail:
             parts.append("stdout:\n" + "".join(self._stdout_tail).strip())
@@ -2581,6 +2623,36 @@ class OpenXRFramePanelMirror:
                     parsed.get(
                         "viewer_overlay_latched_empty_count",
                         self._viewer_overlay_latched_empty_count,
+                    )
+                )
+                self._viewer_modal_latched_match_count = int(
+                    parsed.get(
+                        "viewer_modal_latched_match_count",
+                        self._viewer_modal_latched_match_count,
+                    )
+                )
+                self._viewer_modal_latched_mismatch_count = int(
+                    parsed.get(
+                        "viewer_modal_latched_mismatch_count",
+                        self._viewer_modal_latched_mismatch_count,
+                    )
+                )
+                self._viewer_modal_latched_empty_count = int(
+                    parsed.get(
+                        "viewer_modal_latched_empty_count",
+                        self._viewer_modal_latched_empty_count,
+                    )
+                )
+                self._viewer_modal_layer_present_count = int(
+                    parsed.get(
+                        "viewer_modal_layer_present_count",
+                        self._viewer_modal_layer_present_count,
+                    )
+                )
+                self._viewer_modal_layer_mode = str(
+                    parsed.get(
+                        "viewer_modal_layer_mode",
+                        self._viewer_modal_layer_mode,
                     )
                 )
                 self._viewer_texture_upload_mmap_copy_avg_ms = float(
@@ -2966,6 +3038,34 @@ class OpenXRFramePanelMirror:
                         self._steady_state_viewer_overlay_latched_empty_baseline_count
                     ),
                 )
+                modal_latched_match_count = max(
+                    0,
+                    int(self._viewer_modal_latched_match_count)
+                    - int(
+                        self._steady_state_viewer_modal_latched_match_baseline_count
+                    ),
+                )
+                modal_latched_mismatch_count = max(
+                    0,
+                    int(self._viewer_modal_latched_mismatch_count)
+                    - int(
+                        self._steady_state_viewer_modal_latched_mismatch_baseline_count
+                    ),
+                )
+                modal_latched_empty_count = max(
+                    0,
+                    int(self._viewer_modal_latched_empty_count)
+                    - int(
+                        self._steady_state_viewer_modal_latched_empty_baseline_count
+                    ),
+                )
+                modal_layer_present_count = max(
+                    0,
+                    int(self._viewer_modal_layer_present_count)
+                    - int(
+                        self._steady_state_viewer_modal_layer_present_baseline_count
+                    ),
+                )
                 recent_fps = float(count) / elapsed_s if elapsed_s > 0.0 and count > 0 else 0.0
             else:
                 elapsed_s = float(self._viewer_render_elapsed_s)
@@ -3015,6 +3115,18 @@ class OpenXRFramePanelMirror:
                 )
                 overlay_latched_empty_count = int(
                     self._viewer_overlay_latched_empty_count
+                )
+                modal_latched_match_count = int(
+                    self._viewer_modal_latched_match_count
+                )
+                modal_latched_mismatch_count = int(
+                    self._viewer_modal_latched_mismatch_count
+                )
+                modal_latched_empty_count = int(
+                    self._viewer_modal_latched_empty_count
+                )
+                modal_layer_present_count = int(
+                    self._viewer_modal_layer_present_count
                 )
                 recent_fps = float(self._viewer_recent_render_fps)
         average_fps = 0.0
@@ -3078,6 +3190,11 @@ class OpenXRFramePanelMirror:
             "viewer_overlay_latched_match_count": overlay_latched_match_count,
             "viewer_overlay_latched_mismatch_count": overlay_latched_mismatch_count,
             "viewer_overlay_latched_empty_count": overlay_latched_empty_count,
+            "viewer_modal_latched_match_count": modal_latched_match_count,
+            "viewer_modal_latched_mismatch_count": modal_latched_mismatch_count,
+            "viewer_modal_latched_empty_count": modal_latched_empty_count,
+            "viewer_modal_layer_present_count": modal_layer_present_count,
+            "viewer_modal_layer_mode": str(self._viewer_modal_layer_mode),
         }
 
     def bridge_commit_stats(
@@ -3414,6 +3531,15 @@ class OpenXRImmersiveBridge(OpenXRFramePanelMirror):
     OVERLAY_MAX_COMMANDS_PER_EYE = 256
     OVERLAY_HEADER_STRUCT = struct.Struct("<8sIIIQIII24x")
     OVERLAY_SLOT_METADATA_STRUCT = struct.Struct("<QIIII8x")
+    MODAL_HEADER_MAGIC = b"BOBAMOD1"
+    MODAL_HEADER_VERSION = 1
+    MODAL_MAX_TEXTURE_WIDTH = 1024
+    MODAL_MAX_TEXTURE_HEIGHT = 512
+    MODAL_VALID_FLAG_VISIBLE = 1 << 0
+    MODAL_VALID_FLAG_LEFT = 1 << 1
+    MODAL_VALID_FLAG_RIGHT = 1 << 2
+    MODAL_HEADER_STRUCT = struct.Struct("<8sIIIIQII24x")
+    MODAL_SLOT_METADATA_STRUCT = struct.Struct("<QIIII16f2f32x")
 
     def __init__(self, repo_root: Path, width: int, height: int):
         super().__init__(repo_root=repo_root, width=width, height=height)
@@ -3429,6 +3555,16 @@ class OpenXRImmersiveBridge(OpenXRFramePanelMirror):
         self._overlay_command_array: Optional[np.ndarray] = None
         self._overlay_frame_counter = 0
         self._pending_overlay_commands_by_eye = None
+        self.shared_overlay_modal_path: Optional[Path] = None
+        self._overlay_modal_file = None
+        self._overlay_modal_mmap: Optional[mmap.mmap] = None
+        self._overlay_modal_slot_metadata_offset = self.MODAL_HEADER_STRUCT.size
+        self._overlay_modal_payload_offset = (
+            self.MODAL_HEADER_STRUCT.size
+            + self.SLOT_COUNT * self.MODAL_SLOT_METADATA_STRUCT.size
+        )
+        self._overlay_modal_array: Optional[np.ndarray] = None
+        self._overlay_modal_frame_counter = 0
         pin_memory = torch.cuda.is_available()
         self._cpu_stage_buffers = [
             torch.empty(
@@ -3449,11 +3585,16 @@ class OpenXRImmersiveBridge(OpenXRFramePanelMirror):
 
     def _after_create_shared_frame_file(self) -> None:
         self._create_shared_overlay_file()
+        self._create_shared_overlay_modal_file()
 
     def _extra_viewer_args(self) -> list[str]:
+        args = []
         if self.shared_overlay_path is None:
-            return []
-        return ["--overlay-path", str(self.shared_overlay_path)]
+            return args
+        args.extend(["--overlay-path", str(self.shared_overlay_path)])
+        if self.shared_overlay_modal_path is not None:
+            args.extend(["--overlay-modal-path", str(self.shared_overlay_modal_path)])
+        return args
 
     def _cleanup_additional_shared_files(self) -> None:
         if self._overlay_mmap is not None:
@@ -3472,6 +3613,21 @@ class OpenXRImmersiveBridge(OpenXRFramePanelMirror):
         self._overlay_command_array = None
         self._overlay_frame_counter = 0
         self._pending_overlay_commands_by_eye = None
+        if self._overlay_modal_mmap is not None:
+            self._overlay_modal_mmap.close()
+            self._overlay_modal_mmap = None
+        if self._overlay_modal_file is not None:
+            self._overlay_modal_file.close()
+            self._overlay_modal_file = None
+        if self.shared_overlay_modal_path is not None:
+            try:
+                self.shared_overlay_modal_path.unlink(missing_ok=True)
+            except TypeError:
+                if self.shared_overlay_modal_path.exists():
+                    self.shared_overlay_modal_path.unlink()
+            self.shared_overlay_modal_path = None
+        self._overlay_modal_array = None
+        self._overlay_modal_frame_counter = 0
 
     @property
     def _pose_metadata_bytes(self) -> int:
@@ -3629,6 +3785,143 @@ class OpenXRImmersiveBridge(OpenXRFramePanelMirror):
     def viewer_overlay_enabled(self) -> bool:
         return self._overlay_mmap is not None and self._overlay_command_array is not None
 
+    def _create_shared_overlay_modal_file(self) -> None:
+        texture_bytes = (
+            self.SLOT_COUNT
+            * self.MODAL_MAX_TEXTURE_HEIGHT
+            * self.MODAL_MAX_TEXTURE_WIDTH
+            * self.channels
+            * np.dtype(np.uint8).itemsize
+        )
+        metadata_bytes = self.SLOT_COUNT * self.MODAL_SLOT_METADATA_STRUCT.size
+        total_bytes = self.MODAL_HEADER_STRUCT.size + metadata_bytes + texture_bytes
+        fd, path = tempfile.mkstemp(
+            prefix="boba_quest_overlay_modal_",
+            suffix=".bin",
+            dir="/tmp",
+        )
+        self.shared_overlay_modal_path = Path(path)
+        self._overlay_modal_file = os.fdopen(fd, "r+b", buffering=0)
+        self._overlay_modal_file.truncate(total_bytes)
+        self._overlay_modal_mmap = mmap.mmap(
+            self._overlay_modal_file.fileno(),
+            total_bytes,
+        )
+        self._overlay_modal_mmap[
+            self._overlay_modal_slot_metadata_offset : self._overlay_modal_payload_offset
+        ] = b"\x00" * metadata_bytes
+        self._overlay_modal_array = np.ndarray(
+            (
+                self.SLOT_COUNT,
+                self.MODAL_MAX_TEXTURE_HEIGHT,
+                self.MODAL_MAX_TEXTURE_WIDTH,
+                self.channels,
+            ),
+            dtype=np.uint8,
+            buffer=self._overlay_modal_mmap,
+            offset=self._overlay_modal_payload_offset,
+        )
+        self._overlay_modal_array.fill(0)
+        self._write_overlay_modal_header(latest_modal_id=0)
+
+    def _write_overlay_modal_header(self, *, latest_modal_id: int) -> None:
+        if self._overlay_modal_mmap is None:
+            return
+        self.MODAL_HEADER_STRUCT.pack_into(
+            self._overlay_modal_mmap,
+            0,
+            self.MODAL_HEADER_MAGIC,
+            self.MODAL_HEADER_VERSION,
+            self.MODAL_MAX_TEXTURE_WIDTH,
+            self.MODAL_MAX_TEXTURE_HEIGHT,
+            int(self.SLOT_COUNT),
+            int(latest_modal_id),
+            0,
+            0,
+        )
+
+    def viewer_overlay_modal_enabled(self) -> bool:
+        return (
+            self._overlay_modal_mmap is not None
+            and self._overlay_modal_array is not None
+        )
+
+    @staticmethod
+    def _normalize_modal_quad(quad) -> Optional[np.ndarray]:
+        try:
+            quad_array = np.asarray(quad, dtype=np.float32).reshape(4, 2)
+        except (TypeError, ValueError):
+            return None
+        if not np.all(np.isfinite(quad_array)):
+            return None
+        return quad_array.astype(np.float32, copy=True)
+
+    def _resize_modal_texture_to_fit(self, texture: np.ndarray) -> np.ndarray:
+        height, width = texture.shape[:2]
+        if (
+            width <= int(self.MODAL_MAX_TEXTURE_WIDTH)
+            and height <= int(self.MODAL_MAX_TEXTURE_HEIGHT)
+        ):
+            return texture
+        scale = min(
+            float(self.MODAL_MAX_TEXTURE_WIDTH) / max(float(width), 1.0),
+            float(self.MODAL_MAX_TEXTURE_HEIGHT) / max(float(height), 1.0),
+        )
+        new_width = max(1, int(np.floor(float(width) * scale)))
+        new_height = max(1, int(np.floor(float(height) * scale)))
+        texture_t = torch.from_numpy(np.ascontiguousarray(texture)).to(
+            dtype=torch.float32
+        )
+        texture_t = texture_t.permute(2, 0, 1).unsqueeze(0)
+        resized = torch.nn.functional.interpolate(
+            texture_t,
+            size=(new_height, new_width),
+            mode="bilinear",
+            align_corners=False,
+        )
+        resized = resized.squeeze(0).permute(1, 2, 0).clamp(0.0, 255.0)
+        return resized.to(dtype=torch.uint8).cpu().numpy()
+
+    def _normalize_overlay_bitmap_quad(self, overlay_bitmap_quad=None):
+        if overlay_bitmap_quad is None:
+            return None
+        if not self.viewer_overlay_modal_enabled():
+            return None
+        texture_rgba = overlay_bitmap_quad.get("texture_rgba")
+        if texture_rgba is None:
+            return None
+        texture = np.asarray(texture_rgba, dtype=np.uint8)
+        if texture.ndim != 3 or texture.shape[2] != int(self.channels):
+            return None
+        if texture.shape[0] <= 0 or texture.shape[1] <= 0:
+            return None
+        left_quad = self._normalize_modal_quad(
+            overlay_bitmap_quad.get("left_quad_pixels")
+        )
+        right_quad = self._normalize_modal_quad(
+            overlay_bitmap_quad.get("right_quad_pixels")
+        )
+        valid_flags = int(self.MODAL_VALID_FLAG_VISIBLE)
+        if left_quad is not None:
+            valid_flags |= int(self.MODAL_VALID_FLAG_LEFT)
+        if right_quad is not None:
+            valid_flags |= int(self.MODAL_VALID_FLAG_RIGHT)
+        texture = self._resize_modal_texture_to_fit(np.ascontiguousarray(texture))
+        width_m = float(overlay_bitmap_quad.get("width_m", 0.0) or 0.0)
+        height_m = float(overlay_bitmap_quad.get("height_m", 0.0) or 0.0)
+        if not np.isfinite(width_m) or width_m <= 0.0:
+            width_m = 0.0
+        if not np.isfinite(height_m) or height_m <= 0.0:
+            height_m = 0.0
+        return {
+            "texture_rgba": texture,
+            "left_quad_pixels": left_quad,
+            "right_quad_pixels": right_quad,
+            "valid_flags": valid_flags,
+            "width_m": width_m,
+            "height_m": height_m,
+        }
+
     def _normalize_overlay_commands(self, commands) -> np.ndarray:
         normalized = []
         for command in commands or []:
@@ -3715,6 +4008,97 @@ class OpenXRImmersiveBridge(OpenXRFramePanelMirror):
             right_count=right_count,
         )
 
+    def _write_frame_slot_modal(
+        self,
+        *,
+        slot: int,
+        frame_id: int,
+        overlay_modal_payload=None,
+    ) -> None:
+        if self._overlay_modal_mmap is None or self._overlay_modal_array is None:
+            return
+        slot = int(slot)
+        if slot < 0 or slot >= int(self.SLOT_COUNT):
+            return
+        metadata_offset = (
+            self._overlay_modal_slot_metadata_offset
+            + slot * self.MODAL_SLOT_METADATA_STRUCT.size
+        )
+        zero_quads = [0.0] * 16
+        self.MODAL_SLOT_METADATA_STRUCT.pack_into(
+            self._overlay_modal_mmap,
+            metadata_offset,
+            0,
+            0,
+            0,
+            0,
+            0,
+            *zero_quads,
+            0.0,
+            0.0,
+        )
+        if overlay_modal_payload is None:
+            self.MODAL_SLOT_METADATA_STRUCT.pack_into(
+                self._overlay_modal_mmap,
+                metadata_offset,
+                int(frame_id),
+                0,
+                0,
+                0,
+                0,
+                *zero_quads,
+                0.0,
+                0.0,
+            )
+            self._overlay_modal_frame_counter += 1
+            self._write_overlay_modal_header(
+                latest_modal_id=int(self._overlay_modal_frame_counter)
+            )
+            return
+
+        texture = np.asarray(
+            overlay_modal_payload["texture_rgba"],
+            dtype=np.uint8,
+        )
+        height = int(texture.shape[0])
+        width = int(texture.shape[1])
+        if (
+            height <= 0
+            or width <= 0
+            or height > int(self.MODAL_MAX_TEXTURE_HEIGHT)
+            or width > int(self.MODAL_MAX_TEXTURE_WIDTH)
+        ):
+            return
+        self._overlay_modal_array[slot, :height, :width, :] = texture
+        left_quad = overlay_modal_payload.get("left_quad_pixels")
+        right_quad = overlay_modal_payload.get("right_quad_pixels")
+        if left_quad is None:
+            left_quad = np.zeros((4, 2), dtype=np.float32)
+        if right_quad is None:
+            right_quad = np.zeros((4, 2), dtype=np.float32)
+        quad_values = np.concatenate(
+            [
+                np.asarray(left_quad, dtype=np.float32).reshape(-1),
+                np.asarray(right_quad, dtype=np.float32).reshape(-1),
+            ]
+        )
+        self.MODAL_SLOT_METADATA_STRUCT.pack_into(
+            self._overlay_modal_mmap,
+            metadata_offset,
+            int(frame_id),
+            int(overlay_modal_payload.get("valid_flags", 0)),
+            int(width),
+            int(height),
+            0,
+            *[float(v) for v in quad_values],
+            float(overlay_modal_payload.get("width_m", 0.0) or 0.0),
+            float(overlay_modal_payload.get("height_m", 0.0) or 0.0),
+        )
+        self._overlay_modal_frame_counter += 1
+        self._write_overlay_modal_header(
+            latest_modal_id=int(self._overlay_modal_frame_counter)
+        )
+
     def publish_overlay_commands(
         self,
         left_commands,
@@ -3734,6 +4118,7 @@ class OpenXRImmersiveBridge(OpenXRFramePanelMirror):
         left_eye_sample: Optional[EyePoseSample] = None,
         right_eye_sample: Optional[EyePoseSample] = None,
         overlay_commands_by_eye=None,
+        overlay_bitmap_quad=None,
     ) -> tuple[bool, dict[str, float]]:
         timing = {
             "process_check_wall": 0.0,
@@ -3776,6 +4161,9 @@ class OpenXRImmersiveBridge(OpenXRFramePanelMirror):
         )
         overlay_slot_commands = self._normalize_overlay_commands_by_eye(
             overlay_commands_by_eye
+        )
+        overlay_modal_payload = self._normalize_overlay_bitmap_quad(
+            overlay_bitmap_quad
         )
         process_check_start = time.perf_counter()
         if self.process is not None and self.process.poll() is not None:
@@ -3822,6 +4210,7 @@ class OpenXRImmersiveBridge(OpenXRFramePanelMirror):
                 presentation_mode=normalized_presentation_mode,
                 frame_slot_metadata=frame_slot_metadata,
                 overlay_slot_commands=overlay_slot_commands,
+                overlay_modal_payload=overlay_modal_payload,
             )
             timing["fallback_copy_wall"] = time.perf_counter() - fallback_start
             timing["cpu_mmap_copy_wall"] += commit_stats["cpu_mmap_copy_wall"]
@@ -3861,6 +4250,7 @@ class OpenXRImmersiveBridge(OpenXRFramePanelMirror):
             producer_ready_event=producer_ready_event,
             frame_slot_metadata=frame_slot_metadata,
             overlay_slot_commands=overlay_slot_commands,
+            overlay_modal_payload=overlay_modal_payload,
         )
         timing["total_wall"] = time.perf_counter() - publish_start
         self._last_published_frame_id = frame_id
@@ -3879,6 +4269,7 @@ class OpenXRImmersiveBridge(OpenXRFramePanelMirror):
         producer_ready_event=None,
         frame_slot_metadata=None,
         overlay_slot_commands=None,
+        overlay_modal_payload=None,
     ) -> float:
         if submit_wall_s is None:
             submit_wall_s = time.perf_counter()
@@ -3931,6 +4322,7 @@ class OpenXRImmersiveBridge(OpenXRFramePanelMirror):
                     ),
                     "frame_slot_metadata": frame_slot_metadata,
                     "overlay_slot_commands": overlay_slot_commands,
+                    "overlay_modal_payload": overlay_modal_payload,
                 }
                 if self._direct_commit_enabled:
                     pending.update(

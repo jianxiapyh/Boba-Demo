@@ -28865,6 +28865,77 @@ class InvPhyTrainerWarp:
             )
         return commands
 
+    def _project_rope_game_finish_modal_quad_pixels(
+        self,
+        finish_modal_world_corners,
+        eye_render_state,
+    ):
+        if finish_modal_world_corners is None or eye_render_state is None:
+            return None
+        intrinsic_t = eye_render_state.get("intrinsic_t")
+        w2c_cv_t = eye_render_state.get("w2c_cv_t")
+        if intrinsic_t is None or w2c_cv_t is None:
+            return None
+        device = intrinsic_t.device if torch.is_tensor(intrinsic_t) else None
+        quad_pixels, depth_valid = self._project_points_to_pixels(
+            torch.as_tensor(
+                finish_modal_world_corners,
+                dtype=torch.float32,
+                device=device,
+            ),
+            intrinsic_t,
+            w2c_cv_t,
+        )
+        if not bool(depth_valid.all().item()):
+            return None
+        quad_np = quad_pixels.detach().cpu().numpy().astype(np.float32, copy=False)
+        if quad_np.shape != (4, 2) or not np.all(np.isfinite(quad_np)):
+            return None
+        return quad_np.copy()
+
+    def _build_rope_game_finish_modal_viewer_overlay_bitmap_quad(
+        self,
+        rope_game_overlay_state,
+        left_eye_render_state,
+        right_eye_render_state,
+    ):
+        if rope_game_overlay_state is None:
+            return None
+        state_name = str(rope_game_overlay_state.get("state", "")).strip().lower()
+        if state_name != "course_finished":
+            return None
+        finish_modal_lines = rope_game_overlay_state.get("finish_modal_lines") or []
+        finish_modal_world_corners = rope_game_overlay_state.get(
+            "finish_modal_world_corners"
+        )
+        if not finish_modal_lines or finish_modal_world_corners is None:
+            return None
+        texture_entry = self._build_rope_game_finish_modal_texture_rgba(
+            finish_modal_lines
+        )
+        if texture_entry is None:
+            return None
+        left_quad = self._project_rope_game_finish_modal_quad_pixels(
+            finish_modal_world_corners,
+            left_eye_render_state,
+        )
+        right_quad = self._project_rope_game_finish_modal_quad_pixels(
+            finish_modal_world_corners,
+            right_eye_render_state,
+        )
+        card_width_m = float(self.ROPE_GAME_FINISH_MODAL_WORLD_WIDTH_M)
+        card_height_m = min(
+            card_width_m * float(texture_entry.get("aspect_ratio", 1.0)),
+            float(self.ROPE_GAME_FINISH_MODAL_WORLD_MAX_HEIGHT_M),
+        )
+        return {
+            "texture_rgba": texture_entry.get("texture_rgba"),
+            "left_quad_pixels": left_quad,
+            "right_quad_pixels": right_quad,
+            "width_m": card_width_m,
+            "height_m": card_height_m,
+        }
+
     def _draw_live_controller_overlay(self, frame, controller_overlays):
         if self._try_draw_live_controller_overlay_batched(frame, controller_overlays):
             return
@@ -38594,8 +38665,16 @@ class InvPhyTrainerWarp:
                             lambda: False,
                         )()
                     )
+                    viewer_modal_sidecar_active = bool(
+                        getattr(
+                            immersive_bridge,
+                            "viewer_overlay_modal_enabled",
+                            lambda: False,
+                        )()
+                    )
                     viewer_overlay_published = False
                     viewer_overlay_commands_for_publish = None
+                    viewer_modal_payload_for_publish = None
                     overlay_world_entries = list(controller_overlay_by_source.values())
                     left_eye_overlay_entries = []
                     right_eye_overlay_entries = []
@@ -38661,6 +38740,44 @@ class InvPhyTrainerWarp:
                             render_profile_frame[
                                 "viewer_overlay_right_command_count"
                             ] = float(len(right_viewer_overlay_commands))
+                    rope_game_course_finished = bool(
+                        rope_game_overlay_state is not None
+                        and str(
+                            rope_game_overlay_state.get("state", "")
+                        ).strip().lower()
+                        == "course_finished"
+                    )
+                    if (
+                        viewer_modal_sidecar_active
+                        and rope_game_course_finished
+                        and rope_game_overlay_state is not None
+                    ):
+                        modal_payload_build_start = (
+                            time.perf_counter()
+                            if render_profile_frame is not None
+                            else None
+                        )
+                        viewer_modal_payload_for_publish = (
+                            self._build_rope_game_finish_modal_viewer_overlay_bitmap_quad(
+                                rope_game_overlay_state,
+                                left_overlay_eye_render_state,
+                                right_overlay_eye_render_state,
+                            )
+                        )
+                        if modal_payload_build_start is not None:
+                            self._render_profile_add_wall_time(
+                                render_profile_frame,
+                                "viewer_modal_payload_build_wall",
+                                time.perf_counter() - modal_payload_build_start,
+                            )
+                        if render_profile_frame is not None:
+                            render_profile_frame[
+                                "viewer_modal_sidecar_active_ratio"
+                            ] = (
+                                1.0
+                                if viewer_modal_payload_for_publish is not None
+                                else 0.0
+                            )
                     if not viewer_overlay_published:
                         overlay_projection_start = (
                             time.perf_counter()
@@ -38703,11 +38820,11 @@ class InvPhyTrainerWarp:
                     rope_game_python_overlay_needed = bool(
                         rope_game_overlay_state is not None
                         and (
-                            not viewer_overlay_published
-                            or str(
-                                rope_game_overlay_state.get("state", "")
-                            ).strip().lower()
-                            == "course_finished"
+                            (not viewer_overlay_published and not rope_game_course_finished)
+                            or (
+                                rope_game_course_finished
+                                and viewer_modal_payload_for_publish is None
+                            )
                         )
                     )
                     if (
@@ -39387,6 +39504,7 @@ class InvPhyTrainerWarp:
                         left_eye_frame,
                         right_eye_frame,
                         overlay_commands_by_eye=viewer_overlay_commands_for_publish,
+                        overlay_bitmap_quad=viewer_modal_payload_for_publish,
                         left_eye_sample=(
                             render_sample.left_eye
                             if render_sample is not None
@@ -40236,6 +40354,11 @@ class InvPhyTrainerWarp:
                 viewer_overlay_latched_match_count = None
                 viewer_overlay_latched_mismatch_count = None
                 viewer_overlay_latched_empty_count = None
+                viewer_modal_latched_match_count = None
+                viewer_modal_latched_mismatch_count = None
+                viewer_modal_latched_empty_count = None
+                viewer_modal_layer_present_count = None
+                viewer_modal_layer_mode = None
                 viewer_texture_upload_mmap_copy_avg_ms = None
                 viewer_texture_upload_gl_avg_ms = None
                 viewer_texture_upload_gl_left_avg_ms = None
@@ -40475,6 +40598,36 @@ class InvPhyTrainerWarp:
                         viewer_render_stats.get(
                             "viewer_overlay_latched_empty_count",
                             0,
+                        )
+                    )
+                    viewer_modal_latched_match_count = int(
+                        viewer_render_stats.get(
+                            "viewer_modal_latched_match_count",
+                            0,
+                        )
+                    )
+                    viewer_modal_latched_mismatch_count = int(
+                        viewer_render_stats.get(
+                            "viewer_modal_latched_mismatch_count",
+                            0,
+                        )
+                    )
+                    viewer_modal_latched_empty_count = int(
+                        viewer_render_stats.get(
+                            "viewer_modal_latched_empty_count",
+                            0,
+                        )
+                    )
+                    viewer_modal_layer_present_count = int(
+                        viewer_render_stats.get(
+                            "viewer_modal_layer_present_count",
+                            0,
+                        )
+                    )
+                    viewer_modal_layer_mode = str(
+                        viewer_render_stats.get(
+                            "viewer_modal_layer_mode",
+                            "disabled",
                         )
                     )
                     viewer_texture_upload_mmap_copy_avg_ms = float(
@@ -40797,6 +40950,31 @@ class InvPhyTrainerWarp:
                     viewer_upload_lines.append(
                         "viewer_overlay_latched_empty_count: "
                         f"{int(viewer_overlay_latched_empty_count)}"
+                    )
+                if viewer_modal_latched_match_count is not None:
+                    viewer_upload_lines.append(
+                        "viewer_modal_latched_match_count: "
+                        f"{int(viewer_modal_latched_match_count)}"
+                    )
+                if viewer_modal_latched_mismatch_count is not None:
+                    viewer_upload_lines.append(
+                        "viewer_modal_latched_mismatch_count: "
+                        f"{int(viewer_modal_latched_mismatch_count)}"
+                    )
+                if viewer_modal_latched_empty_count is not None:
+                    viewer_upload_lines.append(
+                        "viewer_modal_latched_empty_count: "
+                        f"{int(viewer_modal_latched_empty_count)}"
+                    )
+                if viewer_modal_layer_present_count is not None:
+                    viewer_upload_lines.append(
+                        "viewer_modal_layer_present_count: "
+                        f"{int(viewer_modal_layer_present_count)}"
+                    )
+                if viewer_modal_layer_mode is not None:
+                    viewer_upload_lines.append(
+                        "viewer_modal_layer_mode: "
+                        f"{str(viewer_modal_layer_mode)}"
                     )
                 if viewer_texture_upload_count is not None:
                     viewer_upload_lines.append(

@@ -52,6 +52,7 @@ constexpr const char* kApplicationName = "Boba Immersive Demo";
 constexpr float kPanelDistanceMeters = 1.1f;
 constexpr float kPanelWidthMeters = 1.2f;
 constexpr float kPanelYOffsetMeters = 0.0f;
+constexpr float kModalHeadLockedDistanceMeters = 1.35f;
 constexpr float kNearZ = 0.02f;
 constexpr float kFarZ = 100.0f;
 constexpr float kSelectPressedThreshold = 0.75f;
@@ -62,6 +63,11 @@ constexpr uint32_t kPresentationModeHeadLockedPanel = 2u;
 constexpr const char* kExpectedOverlayMagic = "BOBAOVL1";
 constexpr uint32_t kOverlayHeaderVersion = 2u;
 constexpr uint32_t kOverlayCommandStrideFloats = 14u;
+constexpr const char* kExpectedModalMagic = "BOBAMOD1";
+constexpr uint32_t kModalHeaderVersion = 1u;
+constexpr uint32_t kModalValidFlagVisible = 1u << 0u;
+constexpr uint32_t kModalValidFlagLeft = 1u << 1u;
+constexpr uint32_t kModalValidFlagRight = 1u << 2u;
 volatile std::sig_atomic_t g_stop_requested = 0;
 
 struct SharedFrameHeader {
@@ -245,6 +251,66 @@ struct SharedOverlayFile {
     const float* payload = nullptr;
 };
 
+#pragma pack(push, 1)
+struct SharedModalHeader {
+    char magic[8];
+    uint32_t version;
+    uint32_t max_width;
+    uint32_t max_height;
+    uint32_t slot_count;
+    uint64_t latest_modal_id;
+    uint32_t reserved0;
+    uint32_t reserved1;
+    uint8_t padding[24];
+};
+#pragma pack(pop)
+
+static_assert(sizeof(SharedModalHeader) == 64, "SharedModalHeader size mismatch");
+
+#pragma pack(push, 1)
+struct SharedModalSlotMetadata {
+    uint64_t frame_id;
+    uint32_t valid_flags;
+    uint32_t width;
+    uint32_t height;
+    uint32_t reserved0;
+    float left_quad[8];
+    float right_quad[8];
+    float width_m;
+    float height_m;
+    uint8_t padding[32];
+};
+#pragma pack(pop)
+
+static_assert(
+    sizeof(SharedModalSlotMetadata) == 128,
+    "SharedModalSlotMetadata size mismatch");
+
+struct SharedModalFile {
+    int fd = -1;
+    void* mapped = MAP_FAILED;
+    size_t mapped_size = 0;
+    const SharedModalHeader* header = nullptr;
+    const SharedModalSlotMetadata* slot_metadata = nullptr;
+    uint32_t slot_count = 0;
+    const uint8_t* payload = nullptr;
+};
+
+struct ModalOverlayData {
+    bool visible = false;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    float width_m = 0.0f;
+    float height_m = 0.0f;
+    bool eye_valid[2] = {false, false};
+    float quads[2][8] = {};
+};
+
+struct ModalReadPayload {
+    ModalOverlayData data;
+    std::vector<uint8_t> rgba;
+};
+
 struct SwapchainView {
     XrSwapchain handle = XR_NULL_HANDLE;
     uint32_t width = 0;
@@ -336,7 +402,11 @@ void HandleSignal(int) {
     g_stop_requested = 1;
 }
 
-bool ParseArgs(int argc, char** argv, std::string* frame_path, std::string* overlay_path) {
+bool ParseArgs(int argc,
+               char** argv,
+               std::string* frame_path,
+               std::string* overlay_path,
+               std::string* overlay_modal_path) {
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
         if (arg == "--frame-path" && i + 1 < argc) {
@@ -347,9 +417,14 @@ bool ParseArgs(int argc, char** argv, std::string* frame_path, std::string* over
             *overlay_path = argv[++i];
             continue;
         }
+        if (arg == "--overlay-modal-path" && i + 1 < argc) {
+            *overlay_modal_path = argv[++i];
+            continue;
+        }
         std::cerr << "Usage: " << kBinaryUsageName
                   << " --frame-path /tmp/boba_quest_frame.bin"
-                  << " [--overlay-path /tmp/boba_quest_overlay.bin]\n";
+                  << " [--overlay-path /tmp/boba_quest_overlay.bin]"
+                  << " [--overlay-modal-path /tmp/boba_quest_overlay_modal.bin]\n";
         return false;
     }
 
@@ -461,10 +536,12 @@ constexpr uint64_t kDefaultImmersiveViewerUploadBusyBackoffUs = 100;
 struct ImmersiveUploadSlot {
     GLuint textures[2] = {0, 0};
     GLuint pbos[2] = {0, 0};
+    GLuint modal_texture = 0;
     GLsync fence = nullptr;
     bool has_frame = false;
     uint64_t frame_id = 0;
     std::vector<float> overlay_commands[2];
+    ModalOverlayData modal_overlay;
 #ifdef BOBA_IMMERSIVE_BRIDGE
     ImmersiveFramePoseMetadata pose_metadata;
 #endif
@@ -478,6 +555,29 @@ void ConfigureSourceTexture(GLuint texture, uint32_t width, uint32_t height) {
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0,
                  GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+}
+
+void UploadModalTexture(GLuint texture, const ModalReadPayload& modal_payload) {
+    if (
+        texture == 0 ||
+        !modal_payload.data.visible ||
+        modal_payload.data.width == 0 ||
+        modal_payload.data.height == 0 ||
+        modal_payload.rgba.empty()
+    ) {
+        return;
+    }
+    glBindTexture(GL_TEXTURE_2D, texture);
+    glTexImage2D(GL_TEXTURE_2D,
+                 0,
+                 GL_RGBA8,
+                 modal_payload.data.width,
+                 modal_payload.data.height,
+                 0,
+                 GL_RGBA,
+                 GL_UNSIGNED_BYTE,
+                 modal_payload.rgba.data());
+    glBindTexture(GL_TEXTURE_2D, 0);
 }
 
 void DestroyImmersiveUploadSlots(std::vector<ImmersiveUploadSlot>* slots) {
@@ -495,7 +595,12 @@ void DestroyImmersiveUploadSlots(std::vector<ImmersiveUploadSlot>* slots) {
         glDeleteTextures(2, slot.textures);
         slot.textures[0] = 0;
         slot.textures[1] = 0;
+        if (slot.modal_texture != 0) {
+            glDeleteTextures(1, &slot.modal_texture);
+            slot.modal_texture = 0;
+        }
         slot.has_frame = false;
+        slot.modal_overlay = ModalOverlayData{};
     }
     slots->clear();
 }
@@ -503,6 +608,8 @@ void DestroyImmersiveUploadSlots(std::vector<ImmersiveUploadSlot>* slots) {
 bool InitializeImmersivePboUploadSlots(uint32_t width,
                                        uint32_t height,
                                        size_t eye_frame_bytes,
+                                       uint32_t modal_max_width,
+                                       uint32_t modal_max_height,
                                        uint64_t requested_slot_count,
                                        std::vector<ImmersiveUploadSlot>* slots,
                                        std::string* error_message) {
@@ -514,6 +621,7 @@ bool InitializeImmersivePboUploadSlots(uint32_t width,
     for (auto& slot : *slots) {
         glGenTextures(2, slot.textures);
         glGenBuffers(2, slot.pbos);
+        glGenTextures(1, &slot.modal_texture);
         for (int eye = 0; eye < 2; ++eye) {
             if (slot.textures[eye] == 0 || slot.pbos[eye] == 0) {
                 if (error_message != nullptr) {
@@ -529,6 +637,16 @@ bool InitializeImmersivePboUploadSlots(uint32_t width,
                          nullptr,
                          GL_STREAM_DRAW);
         }
+        if (slot.modal_texture == 0) {
+            if (error_message != nullptr) {
+                *error_message = "failed to allocate modal texture";
+            }
+            DestroyImmersiveUploadSlots(slots);
+            return false;
+        }
+        ConfigureSourceTexture(slot.modal_texture,
+                               std::max<uint32_t>(modal_max_width, 1u),
+                               std::max<uint32_t>(modal_max_height, 1u));
     }
     glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
     glBindTexture(GL_TEXTURE_2D, 0);
@@ -1286,6 +1404,103 @@ void CloseSharedOverlayFile(SharedOverlayFile* file) {
     file->payload = nullptr;
 }
 
+bool OpenSharedModalFile(const std::string& modal_path, SharedModalFile* file) {
+    if (modal_path.empty()) {
+        return false;
+    }
+    file->fd = open(modal_path.c_str(), O_RDONLY);
+    if (file->fd < 0) {
+        perror("open(overlay_modal_path)");
+        return false;
+    }
+
+    struct stat st {};
+    if (fstat(file->fd, &st) != 0) {
+        perror("fstat(overlay_modal_path)");
+        close(file->fd);
+        file->fd = -1;
+        return false;
+    }
+
+    file->mapped_size = static_cast<size_t>(st.st_size);
+    file->mapped = mmap(nullptr, file->mapped_size, PROT_READ, MAP_SHARED, file->fd, 0);
+    if (file->mapped == MAP_FAILED) {
+        perror("mmap(overlay_modal_path)");
+        close(file->fd);
+        file->fd = -1;
+        return false;
+    }
+
+    file->header = static_cast<const SharedModalHeader*>(file->mapped);
+    if (std::memcmp(file->header->magic, kExpectedModalMagic, 8) != 0) {
+        std::cerr << "Shared modal header magic mismatch.\n";
+        munmap(file->mapped, file->mapped_size);
+        close(file->fd);
+        file->mapped = MAP_FAILED;
+        file->fd = -1;
+        return false;
+    }
+    if (file->header->version != kModalHeaderVersion ||
+        file->header->max_width == 0 ||
+        file->header->max_height == 0 ||
+        file->header->slot_count == 0) {
+        std::cerr << "Shared modal header version/size mismatch: version="
+                  << file->header->version << " max_width="
+                  << file->header->max_width << " max_height="
+                  << file->header->max_height << " slot_count="
+                  << file->header->slot_count << "\n";
+        munmap(file->mapped, file->mapped_size);
+        close(file->fd);
+        file->mapped = MAP_FAILED;
+        file->fd = -1;
+        return false;
+    }
+    file->slot_count = file->header->slot_count;
+    const size_t metadata_bytes =
+        static_cast<size_t>(file->slot_count) * sizeof(SharedModalSlotMetadata);
+    const size_t payload_bytes =
+        static_cast<size_t>(file->slot_count) *
+        static_cast<size_t>(file->header->max_width) *
+        static_cast<size_t>(file->header->max_height) * 4u;
+    const size_t expected_size =
+        sizeof(SharedModalHeader) + metadata_bytes + payload_bytes;
+    if (file->mapped_size < expected_size) {
+        std::cerr << "Shared modal file is smaller than expected.\n";
+        munmap(file->mapped, file->mapped_size);
+        close(file->fd);
+        file->mapped = MAP_FAILED;
+        file->fd = -1;
+        return false;
+    }
+    file->slot_metadata = reinterpret_cast<const SharedModalSlotMetadata*>(
+        static_cast<const uint8_t*>(file->mapped) + sizeof(SharedModalHeader));
+    file->payload =
+        static_cast<const uint8_t*>(file->mapped) + sizeof(SharedModalHeader) +
+        metadata_bytes;
+    std::cerr << "Opened shared modal overlay file " << modal_path
+              << " max_width=" << file->header->max_width
+              << " max_height=" << file->header->max_height
+              << " slot_count=" << file->slot_count
+              << "\n";
+    return true;
+}
+
+void CloseSharedModalFile(SharedModalFile* file) {
+    if (file->mapped != MAP_FAILED) {
+        munmap(file->mapped, file->mapped_size);
+        file->mapped = MAP_FAILED;
+    }
+    if (file->fd >= 0) {
+        close(file->fd);
+        file->fd = -1;
+    }
+    file->mapped_size = 0;
+    file->header = nullptr;
+    file->slot_metadata = nullptr;
+    file->slot_count = 0;
+    file->payload = nullptr;
+}
+
 enum class OverlayLatchReadStatus {
     Unavailable,
     Match,
@@ -1345,6 +1560,75 @@ OverlayLatchReadStatus ReadOverlayCommandsForFrameSlot(
     return (left_count == 0 && right_count == 0)
         ? OverlayLatchReadStatus::Empty
         : OverlayLatchReadStatus::Match;
+}
+
+OverlayLatchReadStatus ReadModalForFrameSlot(
+    const SharedModalFile& file,
+    uint64_t frame_id,
+    uint64_t frame_slot,
+    ModalReadPayload* payload) {
+    if (payload != nullptr) {
+        payload->data = ModalOverlayData{};
+        payload->rgba.clear();
+    }
+    if (
+        file.header == nullptr ||
+        file.slot_metadata == nullptr ||
+        file.payload == nullptr
+    ) {
+        return OverlayLatchReadStatus::Unavailable;
+    }
+    if (frame_slot >= file.slot_count) {
+        return OverlayLatchReadStatus::Mismatch;
+    }
+    const SharedModalHeader header = *file.header;
+    const SharedModalSlotMetadata metadata =
+        file.slot_metadata[static_cast<size_t>(frame_slot)];
+    if (metadata.frame_id != frame_id) {
+        return OverlayLatchReadStatus::Mismatch;
+    }
+    if (
+        (metadata.valid_flags & kModalValidFlagVisible) == 0 ||
+        metadata.width == 0 ||
+        metadata.height == 0
+    ) {
+        return OverlayLatchReadStatus::Empty;
+    }
+    const uint32_t width = std::min(metadata.width, header.max_width);
+    const uint32_t height = std::min(metadata.height, header.max_height);
+    if (payload != nullptr) {
+        payload->data.visible = true;
+        payload->data.width = width;
+        payload->data.height = height;
+        payload->data.width_m =
+            (std::isfinite(metadata.width_m) && metadata.width_m > 0.0f)
+                ? metadata.width_m
+                : 0.0f;
+        payload->data.height_m =
+            (std::isfinite(metadata.height_m) && metadata.height_m > 0.0f)
+                ? metadata.height_m
+                : 0.0f;
+        payload->data.eye_valid[0] =
+            (metadata.valid_flags & kModalValidFlagLeft) != 0;
+        payload->data.eye_valid[1] =
+            (metadata.valid_flags & kModalValidFlagRight) != 0;
+        std::memcpy(payload->data.quads[0], metadata.left_quad, sizeof(metadata.left_quad));
+        std::memcpy(payload->data.quads[1], metadata.right_quad, sizeof(metadata.right_quad));
+        payload->rgba.resize(static_cast<size_t>(width) * height * 4u);
+        const size_t slot_stride =
+            static_cast<size_t>(header.max_width) *
+            static_cast<size_t>(header.max_height) * 4u;
+        const uint8_t* slot_base =
+            file.payload + static_cast<size_t>(frame_slot) * slot_stride;
+        for (uint32_t row = 0; row < height; ++row) {
+            const uint8_t* row_src =
+                slot_base + static_cast<size_t>(row) * header.max_width * 4u;
+            uint8_t* row_dst =
+                payload->rgba.data() + static_cast<size_t>(row) * width * 4u;
+            std::memcpy(row_dst, row_src, static_cast<size_t>(width) * 4u);
+        }
+    }
+    return OverlayLatchReadStatus::Match;
 }
 
 bool UpdateDisplayFrameIfNeeded(const SharedFrameFile& file, uint64_t* latest_frame_id,
@@ -1683,6 +1967,50 @@ Mat4 PoseMatrix(const XrPosef& pose) {
     return matrix;
 }
 
+XrVector3f RotateVectorByQuaternion(const XrQuaternionf& q, const XrVector3f& v) {
+    const float tx = 2.0f * (q.y * v.z - q.z * v.y);
+    const float ty = 2.0f * (q.z * v.x - q.x * v.z);
+    const float tz = 2.0f * (q.x * v.y - q.y * v.x);
+    return {
+        v.x + q.w * tx + (q.y * tz - q.z * ty),
+        v.y + q.w * ty + (q.z * tx - q.x * tz),
+        v.z + q.w * tz + (q.x * ty - q.y * tx),
+    };
+}
+
+XrPosef MakeHeadLockedModalPose(const std::vector<XrView>& views,
+                                uint32_t view_count_output) {
+    XrPosef pose{};
+    pose.orientation.w = 1.0f;
+    if (views.empty() || view_count_output == 0) {
+        pose.position.z = -kModalHeadLockedDistanceMeters;
+        return pose;
+    }
+    const uint32_t count =
+        std::min<uint32_t>(view_count_output, static_cast<uint32_t>(views.size()));
+    pose.orientation = views[0].pose.orientation;
+    XrVector3f center{0.0f, 0.0f, 0.0f};
+    for (uint32_t index = 0; index < count; ++index) {
+        center.x += views[index].pose.position.x;
+        center.y += views[index].pose.position.y;
+        center.z += views[index].pose.position.z;
+    }
+    const float inv_count = 1.0f / static_cast<float>(count);
+    center.x *= inv_count;
+    center.y *= inv_count;
+    center.z *= inv_count;
+
+    const XrVector3f forward_offset =
+        RotateVectorByQuaternion(pose.orientation,
+                                 {0.0f, 0.0f, -kModalHeadLockedDistanceMeters});
+    pose.position = {
+        center.x + forward_offset.x,
+        center.y + forward_offset.y,
+        center.z + forward_offset.z,
+    };
+    return pose;
+}
+
 Mat4 InverseRigidTransform(const Mat4& matrix) {
     Mat4 inverse = IdentityMatrix();
     inverse.m[0] = matrix.m[0];
@@ -1952,6 +2280,163 @@ void DrawOverlayCommands(const std::vector<float>& commands,
     glDisable(GL_BLEND);
 }
 
+GLuint CreateModalProgram() {
+    const char* vertex_source = R"GLSL(
+        #version 330 core
+        layout(location = 0) in vec2 aPos;
+        layout(location = 1) in vec2 aUv;
+        uniform vec2 uSourceSize;
+        out vec2 vUv;
+        void main() {
+            vec2 ndc = vec2(
+                (aPos.x / max(uSourceSize.x, 1.0)) * 2.0 - 1.0,
+                1.0 - (aPos.y / max(uSourceSize.y, 1.0)) * 2.0
+            );
+            gl_Position = vec4(ndc, 0.0, 1.0);
+            vUv = aUv;
+        }
+    )GLSL";
+
+    const char* fragment_source = R"GLSL(
+        #version 330 core
+        in vec2 vUv;
+        out vec4 frag;
+        uniform sampler2D uModal;
+        void main() {
+            frag = texture(uModal, vUv);
+        }
+    )GLSL";
+
+    const GLuint vertex_shader = CompileShader(GL_VERTEX_SHADER, vertex_source);
+    const GLuint fragment_shader = CompileShader(GL_FRAGMENT_SHADER, fragment_source);
+    if (vertex_shader == 0 || fragment_shader == 0) {
+        glDeleteShader(vertex_shader);
+        glDeleteShader(fragment_shader);
+        return 0;
+    }
+    const GLuint program = glCreateProgram();
+    glAttachShader(program, vertex_shader);
+    glAttachShader(program, fragment_shader);
+    glLinkProgram(program);
+    glDeleteShader(vertex_shader);
+    glDeleteShader(fragment_shader);
+
+    GLint status = GL_FALSE;
+    glGetProgramiv(program, GL_LINK_STATUS, &status);
+    if (status != GL_TRUE) {
+        GLint log_length = 0;
+        glGetProgramiv(program, GL_INFO_LOG_LENGTH, &log_length);
+        std::vector<GLchar> log(std::max(1, log_length), '\0');
+        glGetProgramInfoLog(program, log_length, nullptr, log.data());
+        std::cerr << "Modal program link failed: " << log.data() << "\n";
+        glDeleteProgram(program);
+        return 0;
+    }
+    return program;
+}
+
+void DrawModalOverlay(const ModalOverlayData& modal,
+                      GLuint modal_texture,
+                      GLuint modal_program,
+                      GLuint modal_vao,
+                      GLuint modal_vbo,
+                      GLint modal_source_size_location,
+                      GLint modal_texture_location,
+                      uint32_t eye_index,
+                      uint32_t source_width,
+                      uint32_t source_height) {
+    if (
+        !modal.visible ||
+        modal_texture == 0 ||
+        modal_program == 0 ||
+        modal_vao == 0 ||
+        modal_vbo == 0 ||
+        eye_index > 1u ||
+        !modal.eye_valid[eye_index] ||
+        modal.width == 0 ||
+        modal.height == 0
+    ) {
+        return;
+    }
+    const float* q = modal.quads[eye_index];
+    const float vertices[] = {
+        q[0], q[1], 0.0f, 0.0f,
+        q[2], q[3], 1.0f, 0.0f,
+        q[4], q[5], 1.0f, 1.0f,
+        q[0], q[1], 0.0f, 0.0f,
+        q[4], q[5], 1.0f, 1.0f,
+        q[6], q[7], 0.0f, 1.0f,
+    };
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glUseProgram(modal_program);
+    glUniform2f(modal_source_size_location,
+                static_cast<float>(source_width),
+                static_cast<float>(source_height));
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, modal_texture);
+    glUniform1i(modal_texture_location, 0);
+    glBindVertexArray(modal_vao);
+    glBindBuffer(GL_ARRAY_BUFFER, modal_vbo);
+    glBufferData(GL_ARRAY_BUFFER,
+                 static_cast<GLsizeiptr>(sizeof(vertices)),
+                 vertices,
+                 GL_STREAM_DRAW);
+    glDrawArrays(GL_TRIANGLES, 0, 6);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glBindVertexArray(0);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    glUseProgram(0);
+    glDisable(GL_BLEND);
+}
+
+void DrawModalTextureRect(GLuint modal_texture,
+                          GLuint modal_program,
+                          GLuint modal_vao,
+                          GLuint modal_vbo,
+                          GLint modal_source_size_location,
+                          GLint modal_texture_location,
+                          uint32_t width,
+                          uint32_t height) {
+    if (
+        modal_texture == 0 ||
+        modal_program == 0 ||
+        modal_vao == 0 ||
+        modal_vbo == 0 ||
+        width == 0 ||
+        height == 0
+    ) {
+        return;
+    }
+    const float w = static_cast<float>(width);
+    const float h = static_cast<float>(height);
+    const float vertices[] = {
+        0.0f, 0.0f, 0.0f, 0.0f,
+        w,    0.0f, 1.0f, 0.0f,
+        w,    h,    1.0f, 1.0f,
+        0.0f, 0.0f, 0.0f, 0.0f,
+        w,    h,    1.0f, 1.0f,
+        0.0f, h,    0.0f, 1.0f,
+    };
+    glDisable(GL_BLEND);
+    glUseProgram(modal_program);
+    glUniform2f(modal_source_size_location, w, h);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, modal_texture);
+    glUniform1i(modal_texture_location, 0);
+    glBindVertexArray(modal_vao);
+    glBindBuffer(GL_ARRAY_BUFFER, modal_vbo);
+    glBufferData(GL_ARRAY_BUFFER,
+                 static_cast<GLsizeiptr>(sizeof(vertices)),
+                 vertices,
+                 GL_STREAM_DRAW);
+    glDrawArrays(GL_TRIANGLES, 0, 6);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glBindVertexArray(0);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    glUseProgram(0);
+}
+
 bool CreateViewSwapchains(XrInstance instance, XrSession session, int64_t swapchain_format,
                           const std::vector<XrViewConfigurationView>& config_views,
                           std::vector<SwapchainView>* swapchain_views) {
@@ -2026,6 +2511,195 @@ void DestroyViewSwapchains(std::vector<SwapchainView>* swapchain_views) {
     }
 }
 
+void DestroySwapchainView(SwapchainView* swapchain_view) {
+    if (swapchain_view == nullptr) {
+        return;
+    }
+    if (swapchain_view->handle != XR_NULL_HANDLE) {
+        xrDestroySwapchain(swapchain_view->handle);
+        swapchain_view->handle = XR_NULL_HANDLE;
+    }
+    swapchain_view->images.clear();
+    swapchain_view->width = 0;
+    swapchain_view->height = 0;
+}
+
+bool CreateSingleSwapchainView(XrInstance instance,
+                               XrSession session,
+                               int64_t swapchain_format,
+                               uint32_t width,
+                               uint32_t height,
+                               const char* label,
+                               SwapchainView* swapchain_view) {
+    if (swapchain_view == nullptr || width == 0 || height == 0) {
+        return false;
+    }
+    DestroySwapchainView(swapchain_view);
+    swapchain_view->width = width;
+    swapchain_view->height = height;
+
+    XrSwapchainCreateInfo swapchain_info =
+        MakeXrStruct<XrSwapchainCreateInfo>(XR_TYPE_SWAPCHAIN_CREATE_INFO);
+    swapchain_info.createFlags = 0;
+    swapchain_info.usageFlags =
+        XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
+    swapchain_info.format = swapchain_format;
+    swapchain_info.sampleCount = 1;
+    swapchain_info.width = width;
+    swapchain_info.height = height;
+    swapchain_info.faceCount = 1;
+    swapchain_info.arraySize = 1;
+    swapchain_info.mipCount = 1;
+
+    if (!CheckXr(instance,
+                 xrCreateSwapchain(session, &swapchain_info, &swapchain_view->handle),
+                 label)) {
+        DestroySwapchainView(swapchain_view);
+        return false;
+    }
+
+    uint32_t image_count = 0;
+    if (!CheckXr(instance,
+                 xrEnumerateSwapchainImages(swapchain_view->handle, 0, &image_count, nullptr),
+                 "xrEnumerateSwapchainImages(modal count)")) {
+        DestroySwapchainView(swapchain_view);
+        return false;
+    }
+
+    swapchain_view->images.resize(image_count);
+    for (auto& image : swapchain_view->images) {
+        image = MakeXrStruct<XrSwapchainImageOpenGLKHR>(
+            XR_TYPE_SWAPCHAIN_IMAGE_OPENGL_KHR);
+    }
+    if (!CheckXr(instance,
+                 xrEnumerateSwapchainImages(
+                     swapchain_view->handle, image_count, &image_count,
+                     reinterpret_cast<XrSwapchainImageBaseHeader*>(
+                         swapchain_view->images.data())),
+                 "xrEnumerateSwapchainImages(modal list)")) {
+        DestroySwapchainView(swapchain_view);
+        return false;
+    }
+
+    for (const auto& image : swapchain_view->images) {
+        glBindTexture(GL_TEXTURE_2D, image.image);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    }
+    glBindTexture(GL_TEXTURE_2D, 0);
+    return true;
+}
+
+bool RenderModalTextureToQuadSwapchain(XrInstance instance,
+                                       const ModalOverlayData& modal,
+                                       GLuint modal_texture,
+                                       SwapchainView* modal_swapchain,
+                                       GLuint framebuffer,
+                                       GLuint modal_program,
+                                       GLuint modal_vao,
+                                       GLuint modal_vbo,
+                                       GLint modal_source_size_location,
+                                       GLint modal_texture_location) {
+    if (
+        modal_swapchain == nullptr ||
+        modal_swapchain->handle == XR_NULL_HANDLE ||
+        modal_swapchain->images.empty() ||
+        !modal.visible ||
+        modal_texture == 0 ||
+        modal.width == 0 ||
+        modal.height == 0
+    ) {
+        return false;
+    }
+    const uint32_t draw_width = std::min(modal.width, modal_swapchain->width);
+    const uint32_t draw_height = std::min(modal.height, modal_swapchain->height);
+    if (draw_width == 0 || draw_height == 0) {
+        return false;
+    }
+
+    XrSwapchainImageAcquireInfo acquire_info =
+        MakeXrStruct<XrSwapchainImageAcquireInfo>(
+            XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO);
+    uint32_t image_index = 0;
+    if (!CheckXr(instance,
+                 xrAcquireSwapchainImage(modal_swapchain->handle,
+                                         &acquire_info,
+                                         &image_index),
+                 "xrAcquireSwapchainImage(modal)")) {
+        return false;
+    }
+
+    bool render_ok = true;
+    XrSwapchainImageWaitInfo wait_info =
+        MakeXrStruct<XrSwapchainImageWaitInfo>(
+            XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO);
+    wait_info.timeout = XR_INFINITE_DURATION;
+    if (!CheckXr(instance,
+                 xrWaitSwapchainImage(modal_swapchain->handle, &wait_info),
+                 "xrWaitSwapchainImage(modal)")) {
+        render_ok = false;
+    } else {
+        glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
+        glFramebufferTexture2D(GL_FRAMEBUFFER,
+                               GL_COLOR_ATTACHMENT0,
+                               GL_TEXTURE_2D,
+                               modal_swapchain->images[image_index].image,
+                               0);
+        if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+            std::cerr << "Framebuffer incomplete for modal quad layer.\n";
+            render_ok = false;
+        } else {
+            glViewport(0, 0,
+                       static_cast<GLsizei>(modal_swapchain->width),
+                       static_cast<GLsizei>(modal_swapchain->height));
+            glDisable(GL_DEPTH_TEST);
+            glDisable(GL_CULL_FACE);
+            glDisable(GL_BLEND);
+            glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+            glClear(GL_COLOR_BUFFER_BIT);
+
+            glViewport(0, 0,
+                       static_cast<GLsizei>(draw_width),
+                       static_cast<GLsizei>(draw_height));
+            DrawModalTextureRect(modal_texture,
+                                 modal_program,
+                                 modal_vao,
+                                 modal_vbo,
+                                 modal_source_size_location,
+                                 modal_texture_location,
+                                 draw_width,
+                                 draw_height);
+            if (modal_swapchain->height > draw_height) {
+                glViewport(0,
+                           static_cast<GLint>(modal_swapchain->height - draw_height),
+                           static_cast<GLsizei>(draw_width),
+                           static_cast<GLsizei>(draw_height));
+                DrawModalTextureRect(modal_texture,
+                                     modal_program,
+                                     modal_vao,
+                                     modal_vbo,
+                                     modal_source_size_location,
+                                     modal_texture_location,
+                                     draw_width,
+                                     draw_height);
+            }
+            glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        }
+    }
+
+    XrSwapchainImageReleaseInfo release_info =
+        MakeXrStruct<XrSwapchainImageReleaseInfo>(
+            XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO);
+    if (!CheckXr(instance,
+                 xrReleaseSwapchainImage(modal_swapchain->handle, &release_info),
+                 "xrReleaseSwapchainImage(modal)")) {
+        return false;
+    }
+    return render_ok;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -2036,7 +2710,8 @@ int main(int argc, char** argv) {
 
     std::string frame_path;
     std::string overlay_path;
-    if (!ParseArgs(argc, argv, &frame_path, &overlay_path)) {
+    std::string overlay_modal_path;
+    if (!ParseArgs(argc, argv, &frame_path, &overlay_path, &overlay_modal_path)) {
         return 2;
     }
 
@@ -2046,9 +2721,12 @@ int main(int argc, char** argv) {
     }
     SharedOverlayFile shared_overlay;
     const bool overlay_enabled = OpenSharedOverlayFile(overlay_path, &shared_overlay);
+    SharedModalFile shared_modal;
+    const bool modal_enabled = OpenSharedModalFile(overlay_modal_path, &shared_modal);
     if (shared_frame.header->channels != 4) {
         std::cerr << "Expected RGBA frame data, got channels="
                   << shared_frame.header->channels << "\n";
+        CloseSharedModalFile(&shared_modal);
         CloseSharedOverlayFile(&shared_overlay);
         CloseSharedFrameFile(&shared_frame);
         return 4;
@@ -2464,11 +3142,50 @@ int main(int argc, char** argv) {
     }
     glBindTexture(GL_TEXTURE_2D, 0);
 #ifdef BOBA_IMMERSIVE_BRIDGE
+    const uint32_t modal_max_width =
+        modal_enabled ? shared_modal.header->max_width : 1u;
+    const uint32_t modal_max_height =
+        modal_enabled ? shared_modal.header->max_height : 1u;
+    GLuint active_modal_texture = 0;
+    ModalOverlayData active_modal_overlay;
+    SwapchainView modal_quad_swapchain;
+    bool modal_quad_layer_available = false;
+    std::string viewer_modal_layer_mode = "disabled";
+    uint64_t viewer_modal_layer_present_count = 0;
+    if (modal_enabled) {
+        glGenTextures(1, &active_modal_texture);
+        if (active_modal_texture != 0) {
+            ConfigureSourceTexture(active_modal_texture,
+                                   std::max<uint32_t>(modal_max_width, 1u),
+                                   std::max<uint32_t>(modal_max_height, 1u));
+        }
+        modal_quad_layer_available =
+            CreateSingleSwapchainView(instance,
+                                      session,
+                                      color_format,
+                                      std::max<uint32_t>(modal_max_width, 1u),
+                                      std::max<uint32_t>(modal_max_height, 1u),
+                                      "xrCreateSwapchain(modal quad)",
+                                      &modal_quad_swapchain);
+        if (modal_quad_layer_available) {
+            viewer_modal_layer_mode = "head_locked_quad";
+            std::cerr << "Immersive bridge modal layer mode: "
+                      << viewer_modal_layer_mode
+                      << " max_width=" << modal_quad_swapchain.width
+                      << " max_height=" << modal_quad_swapchain.height
+                      << " z_offset=" << -kModalHeadLockedDistanceMeters << "\n";
+        } else {
+            std::cerr << "Immersive bridge modal layer unavailable; "
+                      << "falling back to Python/source-frame modal path if enabled.\n";
+        }
+    }
     if (requested_viewer_upload_mode == ImmersiveViewerUploadMode::Pbo) {
         std::string pbo_error;
         if (!InitializeImmersivePboUploadSlots(shared_frame.header->width,
                                                shared_frame.header->height,
                                                static_cast<size_t>(eye_frame_bytes),
+                                               modal_max_width,
+                                               modal_max_height,
                                                viewer_upload_ring_slots,
                                                &immersive_upload_slots,
                                                &pbo_error)) {
@@ -2492,6 +3209,10 @@ int main(int argc, char** argv) {
     if (program == 0) {
 #ifdef BOBA_IMMERSIVE_BRIDGE
         DestroyImmersiveUploadSlots(&immersive_upload_slots);
+        DestroySwapchainView(&modal_quad_swapchain);
+        if (active_modal_texture != 0) {
+            glDeleteTextures(1, &active_modal_texture);
+        }
 #endif
         glDeleteTextures(source_texture_count, source_textures);
         DestroyViewSwapchains(&swapchain_views);
@@ -2513,6 +3234,11 @@ int main(int argc, char** argv) {
     GLuint overlay_vao = 0;
     GLuint overlay_vbo = 0;
     GLint overlay_source_size_location = -1;
+    GLuint modal_program = 0;
+    GLuint modal_vao = 0;
+    GLuint modal_vbo = 0;
+    GLint modal_source_size_location = -1;
+    GLint modal_texture_location = -1;
     if (overlay_enabled) {
         overlay_program = CreateOverlayProgram();
         if (overlay_program != 0) {
@@ -2533,6 +3259,36 @@ int main(int argc, char** argv) {
             glBindVertexArray(0);
         }
     }
+    if (modal_enabled) {
+        modal_program = CreateModalProgram();
+        if (modal_program != 0) {
+            modal_source_size_location =
+                glGetUniformLocation(modal_program, "uSourceSize");
+            modal_texture_location =
+                glGetUniformLocation(modal_program, "uModal");
+            glGenVertexArrays(1, &modal_vao);
+            glGenBuffers(1, &modal_vbo);
+            glBindVertexArray(modal_vao);
+            glBindBuffer(GL_ARRAY_BUFFER, modal_vbo);
+            glEnableVertexAttribArray(0);
+            glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE,
+                                  static_cast<GLsizei>(4 * sizeof(float)),
+                                  reinterpret_cast<void*>(0));
+            glEnableVertexAttribArray(1);
+            glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE,
+                                  static_cast<GLsizei>(4 * sizeof(float)),
+                                  reinterpret_cast<void*>(2 * sizeof(float)));
+            glBindBuffer(GL_ARRAY_BUFFER, 0);
+            glBindVertexArray(0);
+        }
+    }
+#ifdef BOBA_IMMERSIVE_BRIDGE
+    if (modal_enabled && modal_quad_layer_available && modal_program == 0) {
+        modal_quad_layer_available = false;
+        viewer_modal_layer_mode = "disabled";
+        std::cerr << "Immersive bridge modal layer disabled: modal shader unavailable.\n";
+    }
+#endif
 
     XrReferenceSpaceCreateInfo local_space_info =
         MakeXrStruct<XrReferenceSpaceCreateInfo>(XR_TYPE_REFERENCE_SPACE_CREATE_INFO);
@@ -2544,6 +3300,10 @@ int main(int argc, char** argv) {
         glDeleteFramebuffers(1, &framebuffer);
 #ifdef BOBA_IMMERSIVE_BRIDGE
         DestroyImmersiveUploadSlots(&immersive_upload_slots);
+        DestroySwapchainView(&modal_quad_swapchain);
+        if (active_modal_texture != 0) {
+            glDeleteTextures(1, &active_modal_texture);
+        }
 #endif
         if (overlay_vbo != 0) {
             glDeleteBuffers(1, &overlay_vbo);
@@ -2553,6 +3313,15 @@ int main(int argc, char** argv) {
         }
         if (overlay_program != 0) {
             glDeleteProgram(overlay_program);
+        }
+        if (modal_vbo != 0) {
+            glDeleteBuffers(1, &modal_vbo);
+        }
+        if (modal_vao != 0) {
+            glDeleteVertexArrays(1, &modal_vao);
+        }
+        if (modal_program != 0) {
+            glDeleteProgram(modal_program);
         }
         glDeleteVertexArrays(1, &vao);
         glDeleteProgram(program);
@@ -2662,6 +3431,9 @@ int main(int argc, char** argv) {
     uint64_t viewer_overlay_latched_match_count = 0;
     uint64_t viewer_overlay_latched_mismatch_count = 0;
     uint64_t viewer_overlay_latched_empty_count = 0;
+    uint64_t viewer_modal_latched_match_count = 0;
+    uint64_t viewer_modal_latched_mismatch_count = 0;
+    uint64_t viewer_modal_latched_empty_count = 0;
     if (requested_viewer_upload_thread != ImmersiveViewerUploadThreadRequest::Render &&
         viewer_upload_mode == ImmersiveViewerUploadMode::Pbo) {
         async_upload_window =
@@ -2807,6 +3579,12 @@ int main(int argc, char** argv) {
                                             source_frame_slot,
                                             &upload_overlay_commands_left,
                                             &upload_overlay_commands_right);
+        ModalReadPayload upload_modal_payload;
+        const OverlayLatchReadStatus modal_latch_status =
+            ReadModalForFrameSlot(shared_modal,
+                                  latest_frame_id,
+                                  source_frame_slot,
+                                  &upload_modal_payload);
         const double elapsed_s =
             std::chrono::duration<double>(
                 source_update_time - first_source_update_time).count();
@@ -2918,6 +3696,7 @@ int main(int argc, char** argv) {
                     viewer_upload_mode = ImmersiveViewerUploadMode::LegacyCopy;
                     upload_completed = false;
                 } else {
+                    UploadModalTexture(upload_slot.modal_texture, upload_modal_payload);
                     if (upload_slot.fence != nullptr) {
                         glDeleteSync(upload_slot.fence);
                         upload_slot.fence = nullptr;
@@ -2928,6 +3707,7 @@ int main(int argc, char** argv) {
                     upload_slot.pose_metadata = upload_pose_metadata;
                     upload_slot.overlay_commands[0] = upload_overlay_commands_left;
                     upload_slot.overlay_commands[1] = upload_overlay_commands_right;
+                    upload_slot.modal_overlay = upload_modal_payload.data;
                     active_immersive_upload_slot = upload_slot_index;
                     next_immersive_upload_slot =
                         (upload_slot_index + 1) %
@@ -2960,6 +3740,8 @@ int main(int argc, char** argv) {
             active_source_pose_metadata = upload_pose_metadata;
             overlay_commands_left = upload_overlay_commands_left;
             overlay_commands_right = upload_overlay_commands_right;
+            UploadModalTexture(active_modal_texture, upload_modal_payload);
+            active_modal_overlay = upload_modal_payload.data;
         }
         const auto upload_end = std::chrono::steady_clock::now();
         if (upload_completed) {
@@ -2983,6 +3765,13 @@ int main(int argc, char** argv) {
                 ++viewer_overlay_latched_empty_count;
             } else if (overlay_latch_status == OverlayLatchReadStatus::Mismatch) {
                 ++viewer_overlay_latched_mismatch_count;
+            }
+            if (modal_latch_status == OverlayLatchReadStatus::Match) {
+                ++viewer_modal_latched_match_count;
+            } else if (modal_latch_status == OverlayLatchReadStatus::Empty) {
+                ++viewer_modal_latched_empty_count;
+            } else if (modal_latch_status == OverlayLatchReadStatus::Mismatch) {
+                ++viewer_modal_latched_mismatch_count;
             }
             ++texture_upload_count;
         }
@@ -3103,6 +3892,12 @@ int main(int argc, char** argv) {
                                                     header.latest_slot,
                                                     &upload_overlay_commands_left,
                                                     &upload_overlay_commands_right);
+                ModalReadPayload upload_modal_payload;
+                const OverlayLatchReadStatus modal_latch_status =
+                    ReadModalForFrameSlot(shared_modal,
+                                          header.latest_frame_id,
+                                          header.latest_slot,
+                                          &upload_modal_payload);
                 const uint32_t local_eye_frame_bytes =
                     header.width * header.height * header.channels;
                 const size_t slot_offset =
@@ -3176,6 +3971,7 @@ int main(int argc, char** argv) {
                     std::this_thread::sleep_for(std::chrono::microseconds(250));
                     continue;
                 }
+                UploadModalTexture(upload_slot.modal_texture, upload_modal_payload);
 
                 GLsync upload_fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
                 glFlush();
@@ -3214,6 +4010,7 @@ int main(int argc, char** argv) {
                 upload_slot.pose_metadata = upload_pose_metadata;
                 upload_slot.overlay_commands[0] = upload_overlay_commands_left;
                 upload_slot.overlay_commands[1] = upload_overlay_commands_right;
+                upload_slot.modal_overlay = upload_modal_payload.data;
                 {
                     std::lock_guard<std::mutex> state_lock(async_upload_state_mutex);
                     async_ready_upload_slot = upload_slot_index;
@@ -3308,6 +4105,13 @@ int main(int argc, char** argv) {
                         ++viewer_overlay_latched_empty_count;
                     } else if (overlay_latch_status == OverlayLatchReadStatus::Mismatch) {
                         ++viewer_overlay_latched_mismatch_count;
+                    }
+                    if (modal_latch_status == OverlayLatchReadStatus::Match) {
+                        ++viewer_modal_latched_match_count;
+                    } else if (modal_latch_status == OverlayLatchReadStatus::Empty) {
+                        ++viewer_modal_latched_empty_count;
+                    } else if (modal_latch_status == OverlayLatchReadStatus::Mismatch) {
+                        ++viewer_modal_latched_mismatch_count;
                     }
                     ++texture_upload_count;
                     ++viewer_async_upload_count;
@@ -3483,6 +4287,10 @@ int main(int argc, char** argv) {
         std::vector<const XrCompositionLayerBaseHeader*> layers;
         XrCompositionLayerProjection projection_layer =
             MakeXrStruct<XrCompositionLayerProjection>(XR_TYPE_COMPOSITION_LAYER_PROJECTION);
+#ifdef BOBA_IMMERSIVE_BRIDGE
+        XrCompositionLayerQuad modal_quad_layer =
+            MakeXrStruct<XrCompositionLayerQuad>(XR_TYPE_COMPOSITION_LAYER_QUAD);
+#endif
 
         if (frame_state.shouldRender == XR_TRUE) {
             const auto now = std::chrono::steady_clock::now();
@@ -3684,7 +4492,17 @@ int main(int argc, char** argv) {
                           << "viewer_overlay_latched_mismatch_count="
                           << viewer_overlay_latched_mismatch_count << " "
                           << "viewer_overlay_latched_empty_count="
-                          << viewer_overlay_latched_empty_count
+                          << viewer_overlay_latched_empty_count << " "
+                          << "viewer_modal_latched_match_count="
+                          << viewer_modal_latched_match_count << " "
+                          << "viewer_modal_latched_mismatch_count="
+                          << viewer_modal_latched_mismatch_count << " "
+                          << "viewer_modal_latched_empty_count="
+                          << viewer_modal_latched_empty_count << " "
+                          << "viewer_modal_layer_present_count="
+                          << viewer_modal_layer_present_count << " "
+                          << "viewer_modal_layer_mode="
+                          << viewer_modal_layer_mode
 #else
                           << "viewer_async_upload_count=0 "
                           << "viewer_async_ready_slot_count=0 "
@@ -3695,7 +4513,12 @@ int main(int argc, char** argv) {
                           << "viewer_source_pose_metadata_fallback_count=0 "
                           << "viewer_overlay_latched_match_count=0 "
                           << "viewer_overlay_latched_mismatch_count=0 "
-                          << "viewer_overlay_latched_empty_count=0"
+                          << "viewer_overlay_latched_empty_count=0 "
+                          << "viewer_modal_latched_match_count=0 "
+                          << "viewer_modal_latched_mismatch_count=0 "
+                          << "viewer_modal_latched_empty_count=0 "
+                          << "viewer_modal_layer_present_count=0 "
+                          << "viewer_modal_layer_mode=disabled"
 #endif
                           << "\n";
                 last_render_log_time = now;
@@ -4004,6 +4827,43 @@ int main(int argc, char** argv) {
                                             shared_frame.header->height);
 #endif
                     }
+                    if (
+                        !render_as_panel &&
+                        modal_program != 0
+#ifdef BOBA_IMMERSIVE_BRIDGE
+                        &&
+                        !modal_quad_layer_available
+#endif
+                    ) {
+#ifdef BOBA_IMMERSIVE_BRIDGE
+                        const uint32_t modal_eye_index =
+                            std::min<uint32_t>(view_index, 1u);
+                        const ModalOverlayData* modal_overlay = &active_modal_overlay;
+                        GLuint modal_texture_for_view = active_modal_texture;
+                        if (
+                            viewer_upload_mode == ImmersiveViewerUploadMode::Pbo &&
+                            active_immersive_upload_slot >= 0 &&
+                            static_cast<size_t>(active_immersive_upload_slot) <
+                                immersive_upload_slots.size()
+                        ) {
+                            const ImmersiveUploadSlot& active_upload_slot =
+                                immersive_upload_slots[
+                                    static_cast<size_t>(active_immersive_upload_slot)];
+                            modal_overlay = &active_upload_slot.modal_overlay;
+                            modal_texture_for_view = active_upload_slot.modal_texture;
+                        }
+                        DrawModalOverlay(*modal_overlay,
+                                         modal_texture_for_view,
+                                         modal_program,
+                                         modal_vao,
+                                         modal_vbo,
+                                         modal_source_size_location,
+                                         modal_texture_location,
+                                         modal_eye_index,
+                                         shared_frame.header->width,
+                                         shared_frame.header->height);
+#endif
+                    }
                     glBindTexture(GL_TEXTURE_2D, 0);
                     glBindVertexArray(0);
                     glUseProgram(0);
@@ -4050,6 +4910,93 @@ int main(int argc, char** argv) {
                 layers.push_back(
                     reinterpret_cast<const XrCompositionLayerBaseHeader*>(&projection_layer));
             }
+
+#ifdef BOBA_IMMERSIVE_BRIDGE
+            if (
+                !exit_requested &&
+                modal_quad_layer_available &&
+                modal_program != 0 &&
+                view_count_output > 0
+            ) {
+                const ModalOverlayData* modal_overlay = &active_modal_overlay;
+                GLuint modal_texture_for_layer = active_modal_texture;
+                if (
+                    viewer_upload_mode == ImmersiveViewerUploadMode::Pbo &&
+                    active_immersive_upload_slot >= 0 &&
+                    static_cast<size_t>(active_immersive_upload_slot) <
+                        immersive_upload_slots.size()
+                ) {
+                    const ImmersiveUploadSlot& active_upload_slot =
+                        immersive_upload_slots[
+                            static_cast<size_t>(active_immersive_upload_slot)];
+                    modal_overlay = &active_upload_slot.modal_overlay;
+                    modal_texture_for_layer = active_upload_slot.modal_texture;
+                }
+                if (
+                    modal_overlay != nullptr &&
+                    modal_overlay->visible &&
+                    modal_overlay->width > 0 &&
+                    modal_overlay->height > 0 &&
+                    modal_texture_for_layer != 0
+                ) {
+                    const uint32_t modal_width =
+                        std::min(modal_overlay->width, modal_quad_swapchain.width);
+                    const uint32_t modal_height =
+                        std::min(modal_overlay->height, modal_quad_swapchain.height);
+                    if (
+                        modal_width > 0 &&
+                        modal_height > 0 &&
+                        RenderModalTextureToQuadSwapchain(
+                            instance,
+                            *modal_overlay,
+                            modal_texture_for_layer,
+                            &modal_quad_swapchain,
+                            framebuffer,
+                            modal_program,
+                            modal_vao,
+                            modal_vbo,
+                            modal_source_size_location,
+                            modal_texture_location)
+                    ) {
+                        const float fallback_width_m = 0.72f;
+                        const float layer_width_m =
+                            (std::isfinite(modal_overlay->width_m) &&
+                             modal_overlay->width_m > 0.0f)
+                                ? modal_overlay->width_m
+                                : fallback_width_m;
+                        const float fallback_height_m =
+                            layer_width_m *
+                            (static_cast<float>(modal_height) /
+                             std::max(1.0f, static_cast<float>(modal_width)));
+                        const float layer_height_m =
+                            (std::isfinite(modal_overlay->height_m) &&
+                             modal_overlay->height_m > 0.0f)
+                                ? modal_overlay->height_m
+                                : fallback_height_m;
+                        modal_quad_layer.layerFlags =
+                            XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT |
+                            XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT;
+                        modal_quad_layer.space = local_space;
+                        modal_quad_layer.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+                        modal_quad_layer.subImage.swapchain =
+                            modal_quad_swapchain.handle;
+                        modal_quad_layer.subImage.imageRect.offset = {0, 0};
+                        modal_quad_layer.subImage.imageRect.extent = {
+                            static_cast<int32_t>(modal_width),
+                            static_cast<int32_t>(modal_height),
+                        };
+                        modal_quad_layer.subImage.imageArrayIndex = 0;
+                        modal_quad_layer.pose =
+                            MakeHeadLockedModalPose(views, view_count_output);
+                        modal_quad_layer.size = {layer_width_m, layer_height_m};
+                        layers.push_back(
+                            reinterpret_cast<const XrCompositionLayerBaseHeader*>(
+                                &modal_quad_layer));
+                        ++viewer_modal_layer_present_count;
+                    }
+                }
+            }
+#endif
         }
 
         XrFrameEndInfo end_info = MakeXrStruct<XrFrameEndInfo>(XR_TYPE_FRAME_END_INFO);
@@ -4092,10 +5039,23 @@ int main(int argc, char** argv) {
     if (overlay_program != 0) {
         glDeleteProgram(overlay_program);
     }
+    if (modal_vbo != 0) {
+        glDeleteBuffers(1, &modal_vbo);
+    }
+    if (modal_vao != 0) {
+        glDeleteVertexArrays(1, &modal_vao);
+    }
+    if (modal_program != 0) {
+        glDeleteProgram(modal_program);
+    }
     glDeleteVertexArrays(1, &vao);
     glDeleteProgram(program);
 #ifdef BOBA_IMMERSIVE_BRIDGE
     DestroyImmersiveUploadSlots(&immersive_upload_slots);
+    DestroySwapchainView(&modal_quad_swapchain);
+    if (active_modal_texture != 0) {
+        glDeleteTextures(1, &active_modal_texture);
+    }
 #endif
     glDeleteTextures(source_texture_count, source_textures);
     DestroyViewSwapchains(&swapchain_views);
@@ -4104,6 +5064,7 @@ int main(int argc, char** argv) {
     xrDestroyInstance(instance);
     glfwDestroyWindow(window);
     glfwTerminate();
+    CloseSharedModalFile(&shared_modal);
     CloseSharedOverlayFile(&shared_overlay);
     CloseSharedFrameFile(&shared_frame);
     return 0;

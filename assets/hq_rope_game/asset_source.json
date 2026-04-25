@@ -1,0 +1,39 @@
+{
+  "description": "hq_rope_game object assets use the original PhysTwin rope payloads, not the retrained assets/hq_rope package.",
+  "expected_original_object_node_count": 1495,
+  "object_assets": {
+    "final_data.pkl": {
+      "source_repo": "https://huggingface.co/shashuo0104/phystwin-rope",
+      "source_path": "data/rope_0001/final_data.pkl",
+      "size_bytes": 62825945,
+      "sha256": "519817d2b7f1b652de20bd1b2a9b92eebc7f8a596df1b592a609eda04423bc24"
+    },
+    "best_model.pth": {
+      "source_repo": "https://huggingface.co/shashuo0104/phystwin-rope",
+      "source_path": "experiments/rope_0001/train/best_100.pth",
+      "size_bytes": 215666,
+      "sha256": "9ff355fb08206bcf5cc954e2c5f58d8032ac09b43929960c862edc24670a758d"
+    },
+    "optimal_params.pkl": {
+      "source_repo": "https://huggingface.co/shashuo0104/phystwin-rope",
+      "source_path": "experiments_optimization/rope_0001/optimal_params.pkl",
+      "size_bytes": 551,
+      "sha256": "5f2e6db94b65c0252b76a2c541e619c7a50e49bbc8c472d31946c91e67afbf9e"
+    },
+    "phystwin_rope.ply": {
+      "source_repo": "https://huggingface.co/shashuo0104/gs-scans",
+      "source_archive_path": "gs_scans.zip",
+      "source_archive_size_bytes": 152329584,
+      "source_archive_sha256": "3a31ab5d2c15aacd6ad1fafd39e3df486cb1d2f917a1ecf18e53a32e27d8def8",
+      "source_path": "rope/rope.ply",
+      "size_bytes": 8650282,
+      "sha256": "c552a93bd4a4fe14a940a4ab0be0602f81af2513da3d2cf78265dd28dc79527c"
+    }
+  },
+  "non_object_runtime_scaffolding": {
+    "calibrate.pkl": "Copied from the previous packaged hq_rope_game scaffold for launcher compatibility.",
+    "metadata.json": "Copied from the previous packaged hq_rope_game scaffold for launcher compatibility.",
+    "course_v1.json": "Copied from rope_game.",
+    "tutorial_rope_game_goal.png": "Copied from rope_game."
+  }
+}

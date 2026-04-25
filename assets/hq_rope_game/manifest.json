@@ -3,7 +3,7 @@
   "calibrate": "calibrate.pkl",
   "config": "configs/real.yaml",
   "final_data": "final_data.pkl",
-  "gaussian_ply": "hq_rope.ply",
+  "gaussian_ply": "phystwin_rope.ply",
   "metadata": "metadata.json",
   "optimal_params": "optimal_params.pkl",
   "game_mode": "rope_pick_place_v1",

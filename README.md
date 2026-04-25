@@ -33,9 +33,9 @@ For the shipped runtime Gaussian PLYs:
 - `assets/sloth/sloth.ply` is copied from `Boba/gaussian_output/double_stretch_sloth/.../iteration_10000/point_cloud.ply`
 - `assets/rope/rope.ply` is copied from `Boba/gaussian_output/single_lift_rope/.../iteration_10000/point_cloud.ply`
 - `assets/hq_rope/hq_rope.ply` is rebaked from `feng_rope/data/different_types/feng_rope_v8_0000/shape/object.ply`
-- `assets/hq_rope_game/hq_rope.ply` is a self-contained copy of the `hq_rope` runtime Gaussian PLY for the rope game.
+- `assets/hq_rope_game/phystwin_rope.ply` is extracted from `shashuo0104/gs-scans` at `rope/rope.ply`.
 
-`hq_rope_game` uses the same game logic, tutorial, and course as `rope_game`, but its target zone sizing is resolved from the high-quality rope span at startup.
+`hq_rope_game` uses the same game logic, tutorial, and course as `rope_game`, but its object assets come from the original PhysTwin rope release (`shashuo0104/phystwin-rope`, `1495` object spring-mass nodes), not the retrained `assets/hq_rope` package. Target zone sizing is resolved from the original rope span at startup.
 
 The packaged runtime no longer requires `multi_ctrls.pkl`; controller traces come from `final_data.pkl` for every shipped case.
 

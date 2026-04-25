@@ -7,6 +7,7 @@ The public packaged demo cases in this branch are:
 - `rope`
 - `hq_rope`
 - `rope_game`
+- `hq_rope_game`
 
 Compatibility alias:
 - `hq_rope_0 -> hq_rope`
@@ -26,11 +27,15 @@ The packaged runtime bundles live under:
 - `assets/rope/`
 - `assets/hq_rope/`
 - `assets/rope_game/`
+- `assets/hq_rope_game/`
 
 For the shipped runtime Gaussian PLYs:
 - `assets/sloth/sloth.ply` is copied from `Boba/gaussian_output/double_stretch_sloth/.../iteration_10000/point_cloud.ply`
 - `assets/rope/rope.ply` is copied from `Boba/gaussian_output/single_lift_rope/.../iteration_10000/point_cloud.ply`
 - `assets/hq_rope/hq_rope.ply` is rebaked from `feng_rope/data/different_types/feng_rope_v8_0000/shape/object.ply`
+- `assets/hq_rope_game/hq_rope.ply` is a self-contained copy of the `hq_rope` runtime Gaussian PLY for the rope game.
+
+`hq_rope_game` uses the same game logic, tutorial, and course as `rope_game`, but its target zone sizing is resolved from the high-quality rope span at startup.
 
 The packaged runtime no longer requires `multi_ctrls.pkl`; controller traces come from `final_data.pkl` for every shipped case.
 
@@ -98,6 +103,11 @@ python boba_quest_immersive.py \
 
 python boba_quest_immersive.py \
   --case_name hq_rope \
+  --n_dup 0 \
+  --interactive_window_mode hidden
+
+python boba_quest_immersive.py \
+  --case_name hq_rope_game \
   --n_dup 0 \
   --interactive_window_mode hidden
 ```

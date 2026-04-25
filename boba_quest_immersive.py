@@ -19,7 +19,7 @@ np = None
 torch = None
 REPO_ROOT = Path(__file__).resolve().parent
 DEFAULT_SCENE_ASSETS_ROOT = REPO_ROOT / "assets" / "scenes"
-PUBLIC_DEMO_CASES = ("sloth", "rope", "hq_rope", "rope_game")
+PUBLIC_DEMO_CASES = ("sloth", "rope", "hq_rope", "rope_game", "hq_rope_game")
 COMPAT_DEMO_CASE_ALIASES = {
     "hq_rope_0": "hq_rope",
 }
@@ -30,6 +30,7 @@ SHARED_TUTORIAL_SLIDES = (
 )
 DEMO_CASE_WORLD_SCALE = {
     "hq_rope": 0.3932700391790796,
+    "hq_rope_game": 0.3932700391790796,
 }
 DEMO_CASE_LENGTH_LIKE_CFG_KEYS = (
     "object_radius",

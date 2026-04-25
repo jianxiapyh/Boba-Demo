@@ -7196,7 +7196,7 @@ class InvPhyTrainerWarp:
         if case_name is None:
             case_name = self._interaction_anchor_case_name()
         case_name = str(case_name).strip().lower()
-        return case_name in {"rope", "hq_rope", "rope_game"}
+        return case_name in {"rope", "hq_rope", "rope_game", "hq_rope_game"}
 
     def _live_controller_case_profile(self, case_name=None):
         if case_name is None:
@@ -11401,7 +11401,10 @@ class InvPhyTrainerWarp:
             )
 
     def _rope_game_enabled(self):
-        return self._interaction_anchor_case_name() == "rope_game"
+        return (
+            str(getattr(cfg, "demo_game_mode", "")).strip().lower()
+            == "rope_pick_place_v1"
+        )
 
     def _rope_game_component_alias(self, component_id):
         if component_id is None:
@@ -31784,13 +31787,13 @@ class InvPhyTrainerWarp:
         gaussians = GaussianModel(sh_degree=3)
         gaussians.load_ply(gs_path)
         raw_gaussian_count = int(gaussians._xyz.shape[0])
-        disable_opacity_pruning = case_name == "hq_rope"
+        disable_opacity_pruning = case_name in {"hq_rope", "hq_rope_game"}
         kept_gaussian_count = raw_gaussian_count
         if not disable_opacity_pruning:
             gaussians = remove_gaussians_with_low_opacity(gaussians, 0.1)
             kept_gaussian_count = int(gaussians._xyz.shape[0])
         gaussians.isotropic = True
-        if case_name == "hq_rope":
+        if case_name in {"hq_rope", "hq_rope_game"}:
             gaussian_bounds_min = (
                 gaussians._xyz.min(dim=0).values.detach().cpu().numpy().tolist()
             )

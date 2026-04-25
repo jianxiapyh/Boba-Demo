@@ -7197,7 +7197,13 @@ class InvPhyTrainerWarp:
         if case_name is None:
             case_name = self._interaction_anchor_case_name()
         case_name = str(case_name).strip().lower()
-        return case_name in {"rope", "hq_rope", "rope_game", "hq_rope_game"}
+        return case_name in {
+            "rope",
+            "hq_rope",
+            "rope_game",
+            "hq_rope_game",
+            "hybrid_rope_game",
+        }
 
     def _live_controller_case_profile(self, case_name=None):
         if case_name is None:
@@ -14717,6 +14723,92 @@ class InvPhyTrainerWarp:
             dim=0,
         )
 
+    def _principal_axis_fit_torch(self, points, fallback_axis=None):
+        points = torch.as_tensor(points, dtype=torch.float32, device=cfg.device)
+        finite_mask = torch.isfinite(points).all(dim=1)
+        finite_points = points[finite_mask]
+        if finite_points.ndim != 2 or int(finite_points.shape[0]) == 0:
+            center = torch.zeros(3, dtype=torch.float32, device=cfg.device)
+            axis = (
+                torch.as_tensor(fallback_axis, dtype=torch.float32, device=cfg.device)
+                if fallback_axis is not None
+                else torch.tensor([0.0, 1.0, 0.0], dtype=torch.float32, device=cfg.device)
+            )
+            axis = axis / torch.linalg.norm(axis).clamp_min(1e-6)
+            return {
+                "center": center,
+                "axis": axis,
+                "span": 0.0,
+                "bounds_min": center.clone(),
+                "bounds_max": center.clone(),
+                "finite_count": 0,
+                "total_count": int(points.shape[0]) if points.ndim >= 1 else 0,
+            }
+
+        center = finite_points.mean(dim=0)
+        centered = finite_points - center.unsqueeze(0)
+        try:
+            covariance = centered.t().matmul(centered)
+            eigenvalues, eigenvectors = torch.linalg.eigh(covariance)
+            axis = eigenvectors[:, int(torch.argmax(eigenvalues).item())]
+        except RuntimeError:
+            bounds_delta = finite_points.max(dim=0).values - finite_points.min(dim=0).values
+            axis = bounds_delta
+        if fallback_axis is not None and float(torch.linalg.norm(axis).item()) <= 1e-6:
+            axis = torch.as_tensor(fallback_axis, dtype=torch.float32, device=cfg.device)
+        axis = axis / torch.linalg.norm(axis).clamp_min(1e-6)
+        major_axis = int(torch.argmax(torch.abs(axis)).item())
+        if float(axis[major_axis].item()) < 0.0:
+            axis = -axis
+        projected = centered @ axis
+        span = 0.0
+        if int(projected.numel()) > 0:
+            span = float((projected.max() - projected.min()).item())
+        return {
+            "center": center,
+            "axis": axis,
+            "span": span,
+            "bounds_min": finite_points.min(dim=0).values,
+            "bounds_max": finite_points.max(dim=0).values,
+            "finite_count": int(finite_points.shape[0]),
+            "total_count": int(points.shape[0]),
+        }
+
+    def _axis_alignment_rotation_torch(self, source_axis, target_axis, dtype=torch.float32):
+        source_axis = torch.as_tensor(source_axis, dtype=dtype, device=cfg.device)
+        target_axis = torch.as_tensor(target_axis, dtype=dtype, device=cfg.device)
+        source_axis = source_axis / torch.linalg.norm(source_axis).clamp_min(1e-6)
+        target_axis = target_axis / torch.linalg.norm(target_axis).clamp_min(1e-6)
+        dot = torch.clamp(torch.dot(source_axis, target_axis), -1.0, 1.0)
+        if float(dot.item()) > 1.0 - 1e-6:
+            axis = torch.tensor([1.0, 0.0, 0.0], dtype=dtype, device=cfg.device)
+            angle = torch.tensor(0.0, dtype=dtype, device=cfg.device)
+        elif float(dot.item()) < -1.0 + 1e-6:
+            basis = torch.tensor([1.0, 0.0, 0.0], dtype=dtype, device=cfg.device)
+            if abs(float(torch.dot(source_axis, basis).item())) > 0.9:
+                basis = torch.tensor([0.0, 1.0, 0.0], dtype=dtype, device=cfg.device)
+            axis = torch.cross(source_axis, basis, dim=0)
+            axis = axis / torch.linalg.norm(axis).clamp_min(1e-6)
+            angle = torch.tensor(math.pi, dtype=dtype, device=cfg.device)
+        else:
+            axis = torch.cross(source_axis, target_axis, dim=0)
+            axis_norm = torch.linalg.norm(axis).clamp_min(1e-6)
+            axis = axis / axis_norm
+            angle = torch.atan2(axis_norm, dot)
+        rotation_matrix = self._axis_angle_rotation_matrix_torch(
+            axis,
+            angle,
+            device=cfg.device,
+            dtype=dtype,
+        )
+        rotation_quaternion = self._axis_angle_to_gaussian_quaternion_wxyz(
+            axis,
+            angle,
+            device=cfg.device,
+            dtype=dtype,
+        )
+        return rotation_matrix, rotation_quaternion, axis, float(angle.item())
+
     def _rotate_gaussian_quaternions_about_axis(self, quaternions, axis, angle):
         quaternions = torch.as_tensor(quaternions, dtype=torch.float32, device=cfg.device)
         rotation_quaternion = self._axis_angle_to_gaussian_quaternion_wxyz(
@@ -14731,11 +14823,144 @@ class InvPhyTrainerWarp:
         )
         return F.normalize(rotated, dim=-1)
 
+    def _rotate_gaussian_quaternions_by_wxyz(self, quaternions, rotation_quaternion):
+        quaternions = torch.as_tensor(quaternions, dtype=torch.float32, device=cfg.device)
+        rotation_quaternion = torch.as_tensor(
+            rotation_quaternion,
+            dtype=quaternions.dtype,
+            device=quaternions.device,
+        )
+        rotated = self._gaussian_quaternion_multiply_wxyz(
+            rotation_quaternion.unsqueeze(0),
+            quaternions,
+        )
+        return F.normalize(rotated, dim=-1)
+
+    def _apply_visual_gaussian_retarget_to_sim_rest(
+        self,
+        gaussians,
+        driver_points,
+        *,
+        mode,
+        gs_path,
+    ):
+        mode = str(mode or "").strip().lower()
+        if not mode:
+            return None
+        if mode != "principal_axis_to_sim_rest":
+            raise ValueError(f"Unsupported visual_gaussian_retarget mode: {mode}")
+
+        case_name = self._interaction_anchor_case_name()
+        driver_fit = self._principal_axis_fit_torch(driver_points)
+        visual_xyz = gaussians._xyz.detach().to(device=cfg.device, dtype=torch.float32)
+        visual_fit = self._principal_axis_fit_torch(
+            visual_xyz,
+            fallback_axis=driver_fit["axis"],
+        )
+        visual_span = max(float(visual_fit["span"]), 1e-6)
+        driver_span = max(float(driver_fit["span"]), 1e-6)
+        length_scale = float(driver_span / visual_span)
+        rotation_matrix, rotation_quaternion, rotation_axis, rotation_angle = (
+            self._axis_alignment_rotation_torch(
+                visual_fit["axis"],
+                driver_fit["axis"],
+                dtype=torch.float32,
+            )
+        )
+        transformed_xyz = (
+            (visual_xyz - visual_fit["center"].unsqueeze(0))
+            @ rotation_matrix.to(device=visual_xyz.device, dtype=visual_xyz.dtype).T
+        )
+        transformed_xyz = (
+            transformed_xyz * length_scale + driver_fit["center"].unsqueeze(0)
+        )
+        with torch.no_grad():
+            gaussians._xyz.copy_(transformed_xyz.to(dtype=gaussians._xyz.dtype))
+            gaussians._rotation.copy_(
+                self._rotate_gaussian_quaternions_by_wxyz(
+                    gaussians.get_rotation,
+                    rotation_quaternion,
+                ).to(dtype=gaussians._rotation.dtype)
+            )
+
+        post_fit = self._principal_axis_fit_torch(gaussians._xyz.detach())
+        aligned_axis = rotation_matrix @ visual_fit["axis"]
+        axis_alignment_dot = float(
+            torch.dot(
+                aligned_axis / torch.linalg.norm(aligned_axis).clamp_min(1e-6),
+                driver_fit["axis"],
+            ).item()
+        )
+        finite_xyz = int(torch.isfinite(gaussians._xyz).sum().item())
+        total_xyz = int(gaussians._xyz.numel())
+        finite_rotation = int(torch.isfinite(gaussians._rotation).sum().item())
+        total_rotation = int(gaussians._rotation.numel())
+        finite_opacity = int(torch.isfinite(gaussians._opacity).sum().item())
+        total_opacity = int(gaussians._opacity.numel())
+        debug = {
+            "case": case_name,
+            "mode": mode,
+            "driver_case": str(getattr(cfg, "visual_gaussian_driver_case", "") or "rope"),
+            "source_case": str(getattr(cfg, "visual_gaussian_source_case", "") or ""),
+            "gaussian_source": str(gs_path),
+            "gaussian_count": int(gaussians._xyz.shape[0]),
+            "driver_node_count": int(driver_points.shape[0]),
+            "driver_span": float(driver_span),
+            "visual_span_before": float(visual_span),
+            "visual_span_after": float(post_fit["span"]),
+            "length_scale": float(length_scale),
+            "axis_alignment_dot": axis_alignment_dot,
+            "rotation_angle": float(rotation_angle),
+            "rotation_axis": rotation_axis.detach().cpu().numpy().tolist(),
+            "driver_bounds_min": driver_fit["bounds_min"].detach().cpu().numpy().tolist(),
+            "driver_bounds_max": driver_fit["bounds_max"].detach().cpu().numpy().tolist(),
+            "visual_bounds_min_before": visual_fit["bounds_min"].detach().cpu().numpy().tolist(),
+            "visual_bounds_max_before": visual_fit["bounds_max"].detach().cpu().numpy().tolist(),
+            "visual_bounds_min_after": post_fit["bounds_min"].detach().cpu().numpy().tolist(),
+            "visual_bounds_max_after": post_fit["bounds_max"].detach().cpu().numpy().tolist(),
+            "gaussian_xyz_finite": finite_xyz,
+            "gaussian_xyz_total": total_xyz,
+            "gaussian_rotation_finite": finite_rotation,
+            "gaussian_rotation_total": total_rotation,
+            "gaussian_opacity_finite": finite_opacity,
+            "gaussian_opacity_total": total_opacity,
+        }
+        print(
+            "[quest_display] hybrid rope visual retarget: "
+            f"case={debug['case']} "
+            f"mode={debug['mode']} "
+            f"driver_case={debug['driver_case']} "
+            f"source_case={debug['source_case']} "
+            f"gaussian_source={debug['gaussian_source']} "
+            f"gaussians={debug['gaussian_count']} "
+            f"driver_nodes={debug['driver_node_count']} "
+            f"driver_span={debug['driver_span']:.8f} "
+            f"visual_span_before={debug['visual_span_before']:.8f} "
+            f"visual_span_after={debug['visual_span_after']:.8f} "
+            f"length_scale={debug['length_scale']:.8f} "
+            f"axis_alignment_dot={debug['axis_alignment_dot']:.6f} "
+            f"rotation_angle={debug['rotation_angle']:.6f} "
+            "gaussian_xyz_finite="
+            f"{debug['gaussian_xyz_finite']}/{debug['gaussian_xyz_total']} "
+            "gaussian_rotation_finite="
+            f"{debug['gaussian_rotation_finite']}/{debug['gaussian_rotation_total']} "
+            "gaussian_opacity_finite="
+            f"{debug['gaussian_opacity_finite']}/{debug['gaussian_opacity_total']} "
+            f"driver_bounds_min={debug['driver_bounds_min']} "
+            f"driver_bounds_max={debug['driver_bounds_max']} "
+            f"visual_bounds_min_before={debug['visual_bounds_min_before']} "
+            f"visual_bounds_max_before={debug['visual_bounds_max_before']} "
+            f"visual_bounds_min_after={debug['visual_bounds_min_after']} "
+            f"visual_bounds_max_after={debug['visual_bounds_max_after']}",
+            flush=True,
+        )
+        return debug
+
     def _is_finite_tensor(self, tensor):
         return bool(torch.isfinite(torch.as_tensor(tensor)).all().item())
 
     def _sanitize_hq_rope_game_gaussians(self, gaussians, case_name):
-        if case_name != "hq_rope_game":
+        if case_name not in {"hq_rope_game", "hybrid_rope_game"}:
             return {}
         tensor_fields = {
             "xyz": gaussians._xyz,
@@ -31914,13 +32139,23 @@ class InvPhyTrainerWarp:
             gaussians,
             case_name,
         )
-        disable_opacity_pruning = case_name in {"hq_rope", "hq_rope_game"}
+        disable_opacity_pruning = case_name in {
+            "hq_rope",
+            "hq_rope_game",
+            "hybrid_rope_game",
+        }
         kept_gaussian_count = raw_gaussian_count
         if not disable_opacity_pruning:
             gaussians = remove_gaussians_with_low_opacity(gaussians, 0.1)
             kept_gaussian_count = int(gaussians._xyz.shape[0])
         gaussians.isotropic = True
-        if case_name in {"hq_rope", "hq_rope_game"}:
+        visual_retarget_debug = self._apply_visual_gaussian_retarget_to_sim_rest(
+            gaussians,
+            obj_init_vertices,
+            mode=getattr(cfg, "visual_gaussian_retarget", ""),
+            gs_path=gs_path,
+        )
+        if case_name in {"hq_rope", "hq_rope_game", "hybrid_rope_game"}:
             gaussian_bounds_min = (
                 gaussians._xyz.min(dim=0).values.detach().cpu().numpy().tolist()
             )
@@ -31952,7 +32187,9 @@ class InvPhyTrainerWarp:
                 f"gaussian_bounds_max={gaussian_bounds_max} "
                 f"frame0_object_bounds_min={object_bounds_min} "
                 f"frame0_object_bounds_max={object_bounds_max} "
-                f"frame0_object_span_m={scaled_object_span:.8f}",
+                f"frame0_object_span_m={scaled_object_span:.8f} "
+                "visual_retarget="
+                f"{'none' if visual_retarget_debug is None else visual_retarget_debug['mode']}",
                 flush=True,
             )
 

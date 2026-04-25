@@ -62,7 +62,9 @@ class Config:
         for key, value in config_dict.items():
             if hasattr(self, key):
                 current_value = getattr(self, key)
-                if isinstance(current_value, int):
+                if isinstance(current_value, bool):
+                    value = bool(value)
+                elif isinstance(current_value, int):
                     value = int(value)
                 elif isinstance(current_value, float):
                     value = float(value)

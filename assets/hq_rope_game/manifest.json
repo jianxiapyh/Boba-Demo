@@ -1,7 +1,7 @@
 {
   "best_model": "best_model.pth",
   "calibrate": "calibrate.pkl",
-  "config": "configs/real.yaml",
+  "config": "configs/hq_rope_game.yaml",
   "final_data": "final_data.pkl",
   "gaussian_ply": "phystwin_rope.ply",
   "metadata": "metadata.json",

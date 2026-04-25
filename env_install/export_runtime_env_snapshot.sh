@@ -6,8 +6,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 WORKSPACE_ROOT="$(cd "${REPO_ROOT}/.." && pwd)"
 DEFAULT_OUTPUT_REL="env_install/runtime_env_snapshot.md"
-RUNTIME_ENV_NAME="${BOBA_SNAPSHOT_CONDA_ENV:-phystwin}"
-BASELINE_SCRIPT="${SCRIPT_DIR}/5090_env_install.sh"
+RUNTIME_ENV_NAME="${BOBA_SNAPSHOT_CONDA_ENV:-boba}"
+BASELINE_SCRIPT="${BOBA_SNAPSHOT_BASELINE_SCRIPT:-${SCRIPT_DIR}/RTX6000_env_install.sh}"
 
 usage() {
   cat <<'EOF'
@@ -63,7 +63,7 @@ OUTPUT_PATH="$(resolve_output_path "${1:-${DEFAULT_OUTPUT_REL}}")"
 mkdir -p "$(dirname "${OUTPUT_PATH}")"
 
 if ! command -v conda >/dev/null 2>&1; then
-  echo "conda was not found in PATH; cannot capture the phystwin runtime." >&2
+  echo "conda was not found in PATH; cannot capture the ${RUNTIME_ENV_NAME} runtime." >&2
   exit 1
 fi
 
@@ -213,7 +213,7 @@ result["launch_imports"]["gsplat_source_root"] = os.environ.get(
     GSPLAT_SOURCE_ENV_VAR,
     str(
         Path(repo_root).resolve().parents[0]
-        / "Boba_OpenSource"
+        / "Boba"
         / "gaussian_splatting"
         / "submodules"
         / "gsplat"
@@ -415,7 +415,6 @@ def parse_pip_show_blocks(text: str) -> dict[str, dict[str, str]]:
 
 repo_infos = {
     "Boba-Demo-upload": git_info(repo_root),
-    "Boba_OpenSource": git_info(workspace_root / "Boba_OpenSource"),
     "Boba": git_info(workspace_root / "Boba"),
 }
 
@@ -439,7 +438,6 @@ summary_lines = [
     (
         "- Key repos: "
         f"`Boba-Demo-upload@{repo_infos['Boba-Demo-upload']['head']}` ({repo_infos['Boba-Demo-upload']['dirty']}), "
-        f"`Boba_OpenSource@{repo_infos['Boba_OpenSource']['head']}` ({repo_infos['Boba_OpenSource']['dirty']}), "
         f"`Boba@{repo_infos['Boba']['head']}` ({repo_infos['Boba']['dirty']})"
     ),
     (
@@ -469,7 +467,7 @@ summary_lines = [
     ),
     (
         "- Caveat: `gsplat` resolves from "
-        f"`{package_file('gsplat', launch=True)}` via the vendored Boba_OpenSource path."
+        f"`{package_file('gsplat', launch=True)}` via the vendored sibling Boba path."
     ),
     (
         "- Caveat: `pytorch3d` currently resolves from "
@@ -495,11 +493,11 @@ paste_block = "\n".join(
         "Please compare this machine against the known-good snapshot below and tell me what is missing or mismatched.",
         "",
         f"Repo SHAs: Boba-Demo-upload@{repo_infos['Boba-Demo-upload']['head']}, "
-        f"Boba@{repo_infos['Boba']['head']}, Boba_OpenSource@{repo_infos['Boba_OpenSource']['head']}",
+        f"Boba@{repo_infos['Boba']['head']}",
         f"Expected conda env: {runtime_probe['env'].get('conda_default_env') or runtime_env_name}",
         (
             "Expected launch command: "
-            "conda run -n phystwin env PYTHONNOUSERSITE=1 python boba_quest_immersive.py "
+            f"conda run -n {runtime_env_name} env PYTHONNOUSERSITE=1 python boba_quest_immersive.py "
             "--case_name sloth --n_dup 0 --interactive_window_mode hidden"
         ),
         "",
@@ -540,7 +538,7 @@ paste_block = "\n".join(
 )
 
 baseline_section_lines = [
-    "### Parsed package specs from `env_install/5090_env_install.sh`",
+    f"### Parsed package specs from `{baseline_script}`",
     code_block("\n".join(baseline_specs)),
     "### Important baseline-to-runtime notes",
     f"- Baseline pins `numpy==1.26.4`; import-time runtime observed `numpy=={package_version('numpy')}`.",

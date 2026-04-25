@@ -8,9 +8,12 @@ import os
 import pickle
 import random
 import shutil
+import subprocess
 import sys
 from argparse import ArgumentDefaultsHelpFormatter, ArgumentParser
 from pathlib import Path
+
+from tools.fetch_demo_case_assets import DemoAssetValidationError, validate_demo_case_assets
 
 np = None
 torch = None
@@ -33,6 +36,138 @@ DEMO_CASE_LENGTH_LIKE_CFG_KEYS = (
     "controller_radius",
     "collision_dist",
 )
+RUNTIME_ENV_READY_SENTINEL = "BOBA_IMMERSIVE_RUNTIME_READY"
+DEFAULT_CUDA_HOME = "/usr/local/cuda"
+DEFAULT_GSPLAT_SOURCE_ROOT = (
+    REPO_ROOT.parent / "Boba" / "gaussian_splatting" / "submodules" / "gsplat"
+)
+BRIDGE_DEPS_CHECK_SCRIPT = (
+    REPO_ROOT / "linux_pose_probe" / "check_boba_immersive_bridge_deps.sh"
+)
+CUDA_STARTUP_DEBUG_ENV = "BOBA_CUDA_STARTUP_DEBUG"
+
+
+class StartupConfigurationError(RuntimeError):
+    pass
+
+
+def detected_conda_prefix() -> str | None:
+    conda_prefix = os.environ.get("CONDA_PREFIX")
+    if conda_prefix and Path(conda_prefix).is_dir():
+        return conda_prefix
+
+    inferred_prefix = Path(sys.prefix)
+    if (inferred_prefix / "conda-meta").is_dir():
+        return str(inferred_prefix)
+    return None
+
+
+def prepend_env_entries(current_value: str | None, leading_entries: list[str]) -> str:
+    cleaned_leading_entries = [entry for entry in leading_entries if entry]
+    existing_entries = [entry for entry in (current_value or "").split(os.pathsep) if entry]
+    filtered_entries = [entry for entry in existing_entries if entry not in cleaned_leading_entries]
+    return os.pathsep.join(cleaned_leading_entries + filtered_entries)
+
+
+def ensure_direct_launch_runtime_env(argv: list[str] | None = None) -> None:
+    current_env = os.environ.copy()
+    launch_env = current_env.copy()
+    launch_env["PYTHONNOUSERSITE"] = "1"
+
+    cuda_home = str(Path(current_env.get("CUDA_HOME") or DEFAULT_CUDA_HOME))
+    launch_env["CUDA_HOME"] = cuda_home
+    launch_env["PATH"] = prepend_env_entries(
+        current_env.get("PATH"),
+        [str(Path(cuda_home) / "bin")],
+    )
+
+    conda_prefix = detected_conda_prefix()
+    ld_library_leading_entries = []
+    if conda_prefix:
+        ld_library_leading_entries.append(str(Path(conda_prefix) / "lib"))
+    ld_library_leading_entries.append(str(Path(cuda_home) / "lib64"))
+    launch_env["LD_LIBRARY_PATH"] = prepend_env_entries(
+        current_env.get("LD_LIBRARY_PATH"),
+        ld_library_leading_entries,
+    )
+
+    launch_env.setdefault("BOBA_GSPLAT_SOURCE_ROOT", str(DEFAULT_GSPLAT_SOURCE_ROOT))
+
+    reexec_keys = ("PYTHONNOUSERSITE", "LD_LIBRARY_PATH")
+    needs_reexec = any(current_env.get(key) != launch_env.get(key) for key in reexec_keys)
+    if not needs_reexec:
+        for key in ("CUDA_HOME", "PATH", "BOBA_GSPLAT_SOURCE_ROOT"):
+            os.environ[key] = launch_env[key]
+        return
+
+    if current_env.get(RUNTIME_ENV_READY_SENTINEL) == "1":
+        return
+
+    launch_env[RUNTIME_ENV_READY_SENTINEL] = "1"
+    print(
+        "[startup] re-executing with conda/CUDA runtime libraries for RTX6000 compatibility",
+        flush=True,
+    )
+    exec_argv = [sys.executable, str(Path(__file__).resolve())]
+    exec_argv.extend(list(argv) if argv is not None else sys.argv[1:])
+    os.execvpe(sys.executable, exec_argv, launch_env)
+
+
+def ensure_immersive_bridge_system_deps() -> None:
+    clean_env = os.environ.copy()
+    clean_env.pop("LD_LIBRARY_PATH", None)
+    result = subprocess.run(
+        ["bash", str(BRIDGE_DEPS_CHECK_SCRIPT)],
+        cwd=REPO_ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+        env=clean_env,
+    )
+    if result.returncode == 0:
+        return
+
+    detail = result.stderr.strip() or result.stdout.strip() or (
+        "Immersive bridge dependency preflight failed."
+    )
+    raise StartupConfigurationError(detail)
+
+
+def env_flag_enabled(name: str) -> bool:
+    value = str(os.environ.get(name, "")).strip().lower()
+    return value not in {"", "0", "false", "off", "no"}
+
+
+def print_cuda_startup_debug_banner(torch_module) -> None:
+    if not env_flag_enabled(CUDA_STARTUP_DEBUG_ENV):
+        return
+
+    if torch_module.cuda.is_available():
+        try:
+            current_device = int(torch_module.cuda.current_device())
+            current_device_name = torch_module.cuda.get_device_name(current_device)
+            capability = torch_module.cuda.get_device_capability(current_device)
+        except Exception as exc:
+            current_device = None
+            current_device_name = f"unavailable ({type(exc).__name__}: {exc})"
+            capability = "unavailable"
+    else:
+        current_device = None
+        current_device_name = "cuda_unavailable"
+        capability = "unavailable"
+
+    print(
+        "[quest_display] startup cuda debug: "
+        f"python={sys.executable} "
+        f"conda_prefix={os.environ.get('CONDA_PREFIX', '<unset>')} "
+        f"ld_library_path={os.environ.get('LD_LIBRARY_PATH', '<unset>')} "
+        f"torch={getattr(torch_module, '__version__', '<unknown>')} "
+        f"torch_cuda={getattr(torch_module.version, 'cuda', '<unknown>')} "
+        f"current_device={current_device} "
+        f"current_device_name={current_device_name} "
+        f"capability={capability}",
+        flush=True,
+    )
 
 
 def canonical_demo_case_name(case_name: str) -> str:
@@ -240,6 +375,43 @@ def prioritize_conda_bin():
     path_parts = [part for part in os.environ.get("PATH", "").split(os.pathsep) if part]
     path_parts = [part for part in path_parts if part != conda_bin]
     os.environ["PATH"] = os.pathsep.join([conda_bin] + path_parts)
+
+
+def prioritize_conda_runtime_libs():
+    conda_prefix = os.environ.get("CONDA_PREFIX")
+    if not conda_prefix:
+        return
+
+    conda_lib = os.path.join(conda_prefix, "lib")
+    if not os.path.isdir(conda_lib):
+        return
+
+    lib_parts = [part for part in os.environ.get("LD_LIBRARY_PATH", "").split(os.pathsep) if part]
+    lib_parts = [part for part in lib_parts if part != conda_lib]
+    os.environ["LD_LIBRARY_PATH"] = os.pathsep.join([conda_lib] + lib_parts)
+
+
+def configure_immersive_viewer_upload_runtime(args) -> None:
+    upload_mode = str(args.immersive_viewer_upload_mode).strip().lower()
+    upload_thread = str(args.immersive_viewer_upload_thread).strip().lower()
+    late_wait_us = int(args.immersive_viewer_upload_late_wait_us)
+    ring_slots = int(args.immersive_viewer_upload_ring_slots)
+    busy_backoff_us = int(args.immersive_viewer_upload_busy_backoff_us)
+    if late_wait_us < 0:
+        raise ValueError("--immersive_viewer_upload_late_wait_us must be >= 0.")
+    if ring_slots < 3 or ring_slots > 8:
+        raise ValueError("--immersive_viewer_upload_ring_slots must be between 3 and 8.")
+    if busy_backoff_us < 0:
+        raise ValueError("--immersive_viewer_upload_busy_backoff_us must be >= 0.")
+
+    # The C++ OpenXR bridge consumes these as process environment settings.
+    # Keep the user-facing control as launcher flags so runs are reproducible
+    # and not affected by stale shell exports.
+    os.environ["BOBA_IMMERSIVE_VIEWER_UPLOAD_MODE"] = upload_mode
+    os.environ["BOBA_IMMERSIVE_VIEWER_UPLOAD_THREAD"] = upload_thread
+    os.environ["BOBA_IMMERSIVE_VIEWER_UPLOAD_LATE_WAIT_US"] = str(late_wait_us)
+    os.environ["BOBA_IMMERSIVE_VIEWER_UPLOAD_RING_SLOTS"] = str(ring_slots)
+    os.environ["BOBA_IMMERSIVE_VIEWER_UPLOAD_BUSY_BACKOFF_US"] = str(busy_backoff_us)
 
 
 def build_parser() -> ArgumentParser:
@@ -472,10 +644,60 @@ def build_parser() -> ArgumentParser:
             "to map real controller motion into immersive world-space motion"
         ),
     )
+    parser.add_argument(
+        "--immersive_viewer_upload_mode",
+        choices=("pbo", "direct", "legacy"),
+        default="pbo",
+        help=(
+            "viewer texture upload implementation: "
+            "'pbo' uses the asynchronous pixel-buffer path, "
+            "'direct' uploads directly from shared mmap pointers on the render thread, "
+            "'legacy' keeps the rollback vector-copy path"
+        ),
+    )
+    parser.add_argument(
+        "--immersive_viewer_upload_thread",
+        choices=("auto", "render", "async"),
+        default="auto",
+        help=(
+            "viewer upload scheduling: "
+            "'auto' tries the async uploader and falls back to render-thread upload, "
+            "'render' keeps uploads on the OpenXR render thread, "
+            "'async' requires the shared-context async uploader"
+        ),
+    )
+    parser.add_argument(
+        "--immersive_viewer_upload_late_wait_us",
+        type=int,
+        default=0,
+        help=(
+            "bounded render-thread late-poll wait in microseconds. "
+            "0 disables waiting; async upload should normally keep this at 0"
+        ),
+    )
+    parser.add_argument(
+        "--immersive_viewer_upload_ring_slots",
+        type=int,
+        default=5,
+        help=(
+            "number of PBO/texture slots in the immersive viewer upload ring. "
+            "Allowed range is 3..8; async upload defaults to 5 to avoid slot pressure"
+        ),
+    )
+    parser.add_argument(
+        "--immersive_viewer_upload_busy_backoff_us",
+        type=int,
+        default=100,
+        help=(
+            "async uploader backoff in microseconds when no upload slot is reusable. "
+            "0 keeps yield-only debug behavior"
+        ),
+    )
     return parser
 
 
 def main(argv: list[str] | None = None):
+    ensure_direct_launch_runtime_env(argv)
     parser = build_parser()
     args = parser.parse_args(argv)
     immersive_present_pipeline_enabled = (
@@ -486,6 +708,7 @@ def main(argv: list[str] | None = None):
         raise ValueError("The shipped Quest immersive launcher supports only --n_dup 0.")
     if int(args.immersive_eye_resolution) <= 0:
         raise ValueError("--immersive_eye_resolution must be a positive integer.")
+    configure_immersive_viewer_upload_runtime(args)
     immersive_static_scene_backend = str(
         args.immersive_static_scene_backend
     ).strip().lower()
@@ -509,6 +732,17 @@ def main(argv: list[str] | None = None):
             if immersive_static_scene_backend == "native_gl"
             else "serial"
         )
+
+    case_name = args.case_name
+    canonical_case_name, manifest_dir, case_manifest = resolve_demo_case_manifest(case_name)
+    validate_demo_case_assets(REPO_ROOT, canonical_case_name, manifest_dir, case_manifest)
+    if canonical_case_name != case_name:
+        print(
+            "[quest_display] demo case alias resolved: "
+            f"requested={case_name} canonical={canonical_case_name}",
+            flush=True,
+        )
+    ensure_immersive_bridge_system_deps()
 
     global np, torch
     import numpy as np  # type: ignore[assignment]
@@ -590,6 +824,15 @@ def main(argv: list[str] | None = None):
         flush=True,
     )
     print(
+        "[quest_display] immersive_viewer_upload="
+        f"mode={args.immersive_viewer_upload_mode} "
+        f"thread={args.immersive_viewer_upload_thread} "
+        f"late_wait_us={int(args.immersive_viewer_upload_late_wait_us)} "
+        f"ring_slots={int(args.immersive_viewer_upload_ring_slots)} "
+        f"busy_backoff_us={int(args.immersive_viewer_upload_busy_backoff_us)}",
+        flush=True,
+    )
+    print(
         f"[quest_display] interactive_window_mode={args.interactive_window_mode}",
         flush=True,
     )
@@ -607,24 +850,17 @@ def main(argv: list[str] | None = None):
         )
 
     _ = torch.empty(1, device="cuda")
+    print_cuda_startup_debug_banner(torch)
     set_all_seeds(42)
 
     ctx = attach_pycuda_context_for_current_torch_device()
 
     prioritize_conda_bin()
+    prioritize_conda_runtime_libs()
     prefer_system_ninja_binary()
     configure_local_python_paths()
     from qqtt import InvPhyTrainerWarp
     from qqtt.utils import logger, cfg
-
-    case_name = args.case_name
-    canonical_case_name, manifest_dir, case_manifest = resolve_demo_case_manifest(case_name)
-    if canonical_case_name != case_name:
-        print(
-            "[quest_display] demo case alias resolved: "
-            f"requested={case_name} canonical={canonical_case_name}",
-            flush=True,
-        )
 
     cfg.load_from_yaml(case_manifest.get("config", "configs/real.yaml"))
     cfg.demo_case_name = canonical_case_name
@@ -737,4 +973,7 @@ def main(argv: list[str] | None = None):
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except (DemoAssetValidationError, StartupConfigurationError) as exc:
+        raise SystemExit(str(exc)) from exc

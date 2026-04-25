@@ -44,7 +44,7 @@ import torch.nn.functional as F
 import glfw
 from OpenGL import GL as gl
 import pycuda.driver as cuda_driver
-from PIL import Image
+from PIL import Image, ImageChops, ImageDraw, ImageFont
 
 from pathlib import Path
 from sklearn.cluster import KMeans
@@ -6641,6 +6641,78 @@ class InvPhyTrainerWarp:
     IMMERSIVE_TUTORIAL_SAFE_HEIGHT_FRACTION = 0.80
     IMMERSIVE_TUTORIAL_SAMPLE_POLL_INTERVAL_SECONDS = 0.05
     IMMERSIVE_STARTUP_SETTLE_STEPS_PER_TICK = 4
+    IMMERSIVE_TUTORIAL_SETTLE_STEPS_PER_TICK = 1
+    IMMERSIVE_TUTORIAL_STATUS_PROGRESS_BUCKETS = 100
+    IMMERSIVE_TUTORIAL_STATUS_SOURCE_WIDTH = 1920
+    IMMERSIVE_TUTORIAL_STATUS_SOURCE_HEIGHT = 1080
+    IMMERSIVE_TUTORIAL_STATUS_SOURCE_CONTENT_BOTTOM = 948
+    IMMERSIVE_TUTORIAL_STATUS_SOURCE_SURFACE_X0 = 60
+    IMMERSIVE_TUTORIAL_STATUS_SOURCE_SURFACE_Y0 = 60
+    IMMERSIVE_TUTORIAL_STATUS_SOURCE_SURFACE_X1 = 1860
+    IMMERSIVE_TUTORIAL_STATUS_SOURCE_SURFACE_Y1 = 1068
+    IMMERSIVE_TUTORIAL_STATUS_SOURCE_SURFACE_RADIUS = 34
+    IMMERSIVE_TUTORIAL_STATUS_SOURCE_SURFACE_BORDER_WIDTH = 4
+    IMMERSIVE_TUTORIAL_STATUS_SOURCE_FOOTER_X0 = 84
+    IMMERSIVE_TUTORIAL_STATUS_SOURCE_FOOTER_X1 = 1836
+    IMMERSIVE_TUTORIAL_STATUS_SOURCE_FOOTER_Y0 = 966
+    IMMERSIVE_TUTORIAL_STATUS_SOURCE_FOOTER_Y1 = 1056
+    IMMERSIVE_TUTORIAL_STATUS_SURFACE_RGBA = [20, 27, 44, 255]
+    IMMERSIVE_TUTORIAL_STATUS_SURFACE_BORDER_RGBA = [43, 58, 92, 255]
+    IMMERSIVE_STARTUP_BOOTSTRAP_SUBSTAGES = (
+        "await_scene_renderer_prewarm",
+        "compute_live_head_alignment_and_initial_eye_state",
+        "build_layout",
+        "apply_scene_layout_and_check_readback_mode",
+        "validate_table_alignment_and_log_layout",
+        "apply_spawn_shift",
+        "build_center_view_and_resolve_rope_endpoints",
+        "assign_controller_sources_and_default_anchor_names",
+        "build_two_point_runtime_and_batch_buffers",
+        "init_simulator",
+        "build_rotation_cache",
+        "prime_live_controller_runtime_and_handedness",
+        "prepare_balanced_runtime_state",
+        "warmup_balanced_paths_and_seed_layer_cache",
+        "start_eye_workers_if_enabled",
+        "start_static_scene_worker_if_enabled",
+        "prepare_colliders_support_boxes_idle_lock_and_cuda_graph",
+        "settle_scene_rest_chunk",
+        "restore_settled_state_and_build_anchor_templates",
+        "validate_startup_scene_mode",
+        "startup_validation_prepare",
+        "startup_validation_scene_frames",
+        "startup_validation_left_eye",
+        "startup_validation_right_eye",
+        "startup_validation_finalize",
+    )
+    IMMERSIVE_STARTUP_BOOTSTRAP_PHASE_LABELS = {
+        "await_scene_renderer_prewarm": "Loading room renderer",
+        "compute_live_head_alignment_and_initial_eye_state": "Reading headset pose",
+        "build_layout": "Aligning room layout",
+        "apply_scene_layout_and_check_readback_mode": "Preparing scene layout",
+        "validate_table_alignment_and_log_layout": "Checking table alignment",
+        "apply_spawn_shift": "Placing the rope",
+        "build_center_view_and_resolve_rope_endpoints": "Resolving rope anchors",
+        "assign_controller_sources_and_default_anchor_names": "Preparing controllers",
+        "build_two_point_runtime_and_batch_buffers": "Building simulation buffers",
+        "init_simulator": "Initializing simulation",
+        "build_rotation_cache": "Preparing deformation cache",
+        "prime_live_controller_runtime_and_handedness": "Checking controllers",
+        "prepare_balanced_runtime_state": "Preparing render state",
+        "warmup_balanced_paths_and_seed_layer_cache": "Warming scene layers",
+        "start_eye_workers_if_enabled": "Starting eye workers",
+        "start_static_scene_worker_if_enabled": "Starting static scene worker",
+        "prepare_colliders_support_boxes_idle_lock_and_cuda_graph": "Preparing physics graph",
+        "settle_scene_rest_chunk": "Settling the rope",
+        "restore_settled_state_and_build_anchor_templates": "Finalizing anchors",
+        "validate_startup_scene_mode": "Checking startup scene",
+        "startup_validation_prepare": "Preparing validation",
+        "startup_validation_scene_frames": "Rendering validation scene",
+        "startup_validation_left_eye": "Validating left eye",
+        "startup_validation_right_eye": "Validating right eye",
+        "startup_validation_finalize": "Finishing startup",
+        "complete": "Ready",
+    }
     IMMERSIVE_GAUSSIAN_COMPOSE_ROI_PADDING = 24
     IMMERSIVE_GAUSSIAN_FUSION_ROI_ENABLED = False
     IMMERSIVE_GAUSSIAN_FUSION_OUTPUT_BUFFER_RING_SIZE = 8
@@ -10597,7 +10669,6 @@ class InvPhyTrainerWarp:
         lower_right_color,
         radius,
         blend=0.78,
-        divider_blend=0.94,
     ):
         height, width = frame.shape[:2]
         x = int(round(float(pixel[0].item())))
@@ -10613,16 +10684,6 @@ class InvPhyTrainerWarp:
         self._blend_rect(frame, x0, y0, x0 + 1, y1, upper_left_color, blend=blend)
         self._blend_rect(frame, x0, y1 - 1, x1, y1, lower_right_color, blend=blend)
         self._blend_rect(frame, x1 - 1, y0, x1, y1, lower_right_color, blend=blend)
-        divider_start = frame.new_tensor([float(x0), float(y0)], dtype=torch.float32)
-        divider_end = frame.new_tensor([float(x1 - 1), float(y1 - 1)], dtype=torch.float32)
-        self._draw_marker_line(
-            frame,
-            divider_start,
-            divider_end,
-            self.LIVE_CONTROLLER_SELECT_COLOR,
-            radius=0,
-            blend=divider_blend,
-        )
 
     def _draw_live_controller_candidate_markers(self, frame, controller_overlays):
         candidate_groups = {}
@@ -16149,6 +16210,354 @@ class InvPhyTrainerWarp:
             )
         return tutorial_frames
 
+    def _immersive_startup_bootstrap_progress(self, bootstrap_state) -> dict:
+        substages = tuple(self.IMMERSIVE_STARTUP_BOOTSTRAP_SUBSTAGES)
+        total_count = max(1, len(substages))
+        if not isinstance(bootstrap_state, dict):
+            return {
+                "progress_fraction": 0.0,
+                "progress_percent": 0,
+                "phase_label": "Preparing demo",
+                "complete": False,
+            }
+
+        complete = bool(bootstrap_state.get("complete", False))
+        raw_substage_index = int(bootstrap_state.get("substage_index", 0))
+        substage_index = max(0, min(raw_substage_index, total_count))
+        if complete:
+            fraction = 1.0
+            phase_name = "complete"
+        else:
+            phase_name = str(
+                bootstrap_state.get(
+                    "substage_name",
+                    substages[substage_index] if substage_index < total_count else "complete",
+                )
+            )
+            substage_fraction = 0.0
+            if phase_name == "settle_scene_rest_chunk":
+                settle_state = bootstrap_state.get("settle_state")
+                if not isinstance(settle_state, dict):
+                    settle_state = {}
+                if bool(settle_state.get("done", False)):
+                    substage_fraction = 1.0
+                else:
+                    total_steps = max(1, int(self.IMMERSIVE_SCENE_REST_SETTLE_STEPS))
+                    substage_fraction = max(
+                        0.0,
+                        min(1.0, float(int(settle_state.get("step_idx", 0))) / total_steps),
+                    )
+            fraction = max(
+                0.0,
+                min(
+                    0.999,
+                    (float(substage_index) + float(substage_fraction)) / total_count,
+                ),
+            )
+        percent = int(round(fraction * 100.0))
+        if complete:
+            percent = 100
+        phase_label = str(
+            self.IMMERSIVE_STARTUP_BOOTSTRAP_PHASE_LABELS.get(
+                phase_name,
+                phase_name.replace("_", " ").strip().capitalize() or "Preparing demo",
+            )
+        )
+        progress = {
+            "progress_fraction": float(fraction),
+            "progress_percent": int(percent),
+            "phase_label": phase_label,
+            "complete": bool(complete),
+            "substage_index": int(substage_index),
+            "substage_name": phase_name,
+        }
+        bootstrap_state.update(progress)
+        return progress
+
+    def _load_immersive_tutorial_status_font(self, size: int, *, bold: bool = False):
+        cache = getattr(self, "_immersive_tutorial_status_font_cache", None)
+        if cache is None:
+            cache = {}
+            self._immersive_tutorial_status_font_cache = cache
+        key = (int(size), bool(bold))
+        if key in cache:
+            return cache[key]
+        candidates = (
+            (
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+                "DejaVuSans-Bold.ttf",
+            )
+            if bold
+            else (
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+                "DejaVuSans.ttf",
+            )
+        )
+        for font_path in candidates:
+            try:
+                font = ImageFont.truetype(font_path, size=max(1, int(size)))
+                cache[key] = font
+                return font
+            except OSError:
+                continue
+        font = ImageFont.load_default()
+        cache[key] = font
+        return font
+
+    @staticmethod
+    def _immersive_tutorial_text_size(draw, text: str, font) -> tuple[int, int]:
+        bbox = draw.textbbox((0, 0), str(text), font=font)
+        return int(bbox[2] - bbox[0]), int(bbox[3] - bbox[1])
+
+    def _render_immersive_tutorial_status_frame(
+        self,
+        base_frame,
+        progress,
+        *,
+        ready: bool,
+        cache=None,
+    ):
+        if not torch.is_tensor(base_frame):
+            return base_frame
+        if base_frame.ndim != 3 or int(base_frame.shape[-1]) != 4:
+            return base_frame
+        progress = dict(progress or {})
+        percent = int(progress.get("progress_percent", 0))
+        percent = max(0, min(100, percent))
+        bucket_count = max(1, int(self.IMMERSIVE_TUTORIAL_STATUS_PROGRESS_BUCKETS))
+        bucket = int(round(percent * bucket_count / 100.0))
+        cache_key = (
+            bool(ready),
+            int(bucket),
+            tuple(int(v) for v in base_frame.shape),
+            str(base_frame.device),
+        )
+        if cache is not None and cache_key in cache:
+            return cache[cache_key]
+
+        frame_cpu = base_frame.detach().to(device="cpu", dtype=torch.uint8).contiguous()
+        image = Image.fromarray(frame_cpu.numpy(), mode="RGBA")
+        draw = ImageDraw.Draw(image, "RGBA")
+        frame_w, frame_h = image.size
+
+        safe_w = max(
+            1,
+            int(round(frame_w * float(self.IMMERSIVE_TUTORIAL_SAFE_WIDTH_FRACTION))),
+        )
+        safe_h = max(
+            1,
+            int(round(frame_h * float(self.IMMERSIVE_TUTORIAL_SAFE_HEIGHT_FRACTION))),
+        )
+        source_w = float(self.IMMERSIVE_TUTORIAL_STATUS_SOURCE_WIDTH)
+        source_h = float(self.IMMERSIVE_TUTORIAL_STATUS_SOURCE_HEIGHT)
+        fit_scale = min(float(safe_w) / source_w, float(safe_h) / source_h, 1.0)
+        slide_w = int(round(source_w * fit_scale))
+        slide_h = int(round(source_h * fit_scale))
+        offset_x = max(0, (frame_w - slide_w) // 2)
+        offset_y = max(0, (frame_h - slide_h) // 2)
+        slide_y1 = offset_y + slide_h
+        content_bottom_y = offset_y + int(
+            round(
+                float(self.IMMERSIVE_TUTORIAL_STATUS_SOURCE_CONTENT_BOTTOM)
+                * fit_scale
+            )
+        )
+        footer_y0 = offset_y + int(
+            round(float(self.IMMERSIVE_TUTORIAL_STATUS_SOURCE_FOOTER_Y0) * fit_scale)
+        )
+        footer_y1 = offset_y + int(
+            round(float(self.IMMERSIVE_TUTORIAL_STATUS_SOURCE_FOOTER_Y1) * fit_scale)
+        )
+        footer_h = max(1, footer_y1 - footer_y0)
+        panel_h = max(54, footer_h, int(round(frame_h * 0.056)))
+        panel_h = min(panel_h, max(54, int(round(frame_h * 0.072))))
+        panel_w = max(1, int(round(frame_w * 0.58)))
+        panel_x0 = max(12, (frame_w - panel_w) // 2)
+        panel_x1 = min(frame_w - 12, panel_x0 + panel_w)
+        panel_gap = max(4, int(round(8.0 * fit_scale)))
+        panel_y0 = max(content_bottom_y + panel_gap, footer_y0)
+        max_panel_y1 = min(
+            frame_h - 12,
+            slide_y1 + max(0, int(round(20.0 * fit_scale))),
+        )
+        if panel_y0 + panel_h > max_panel_y1:
+            panel_h = max(38, max_panel_y1 - panel_y0)
+        panel_y1 = panel_y0 + panel_h
+        surface_fill = tuple(
+            int(value) for value in self.IMMERSIVE_TUTORIAL_STATUS_SURFACE_RGBA
+        )
+        surface_border = tuple(
+            int(value) for value in self.IMMERSIVE_TUTORIAL_STATUS_SURFACE_BORDER_RGBA
+        )
+        surface_x0 = offset_x + int(
+            round(float(self.IMMERSIVE_TUTORIAL_STATUS_SOURCE_SURFACE_X0) * fit_scale)
+        )
+        surface_y0 = offset_y + int(
+            round(float(self.IMMERSIVE_TUTORIAL_STATUS_SOURCE_SURFACE_Y0) * fit_scale)
+        )
+        surface_x1 = offset_x + int(
+            round(float(self.IMMERSIVE_TUTORIAL_STATUS_SOURCE_SURFACE_X1) * fit_scale)
+        )
+        surface_y1 = offset_y + int(
+            round(float(self.IMMERSIVE_TUTORIAL_STATUS_SOURCE_SURFACE_Y1) * fit_scale)
+        )
+        surface_radius = max(
+            2,
+            int(
+                round(
+                    float(self.IMMERSIVE_TUTORIAL_STATUS_SOURCE_SURFACE_RADIUS)
+                    * fit_scale
+                )
+            ),
+        )
+        surface_border_w = max(
+            1,
+            int(
+                round(
+                    float(self.IMMERSIVE_TUTORIAL_STATUS_SOURCE_SURFACE_BORDER_WIDTH)
+                    * fit_scale
+                )
+            ),
+        )
+        expanded_surface_y1 = min(
+            frame_h - 12,
+            max(surface_y1, panel_y1 + max(4, int(round(8.0 * fit_scale)))),
+        )
+        lower_band_y0 = max(
+            content_bottom_y,
+            footer_y0 - max(2, int(round(10.0 * fit_scale))),
+        )
+        lower_band_y0 = max(0, min(frame_h, lower_band_y0))
+        if expanded_surface_y1 >= lower_band_y0:
+            clip_mask = Image.new("L", image.size, 0)
+            clip_draw = ImageDraw.Draw(clip_mask)
+            clip_draw.rectangle((0, lower_band_y0, frame_w, frame_h), fill=255)
+
+            fill_mask = Image.new("L", image.size, 0)
+            fill_mask_draw = ImageDraw.Draw(fill_mask)
+            fill_mask_draw.rounded_rectangle(
+                (surface_x0, surface_y0, surface_x1, expanded_surface_y1),
+                radius=surface_radius,
+                fill=255,
+            )
+            fill_mask = ImageChops.multiply(fill_mask, clip_mask)
+            image.paste(surface_fill, (0, 0), fill_mask)
+
+            outline_mask = Image.new("L", image.size, 0)
+            outline_mask_draw = ImageDraw.Draw(outline_mask)
+            outline_mask_draw.rounded_rectangle(
+                (surface_x0, surface_y0, surface_x1, expanded_surface_y1),
+                radius=surface_radius,
+                outline=255,
+                width=surface_border_w,
+            )
+            outline_mask = ImageChops.multiply(outline_mask, clip_mask)
+            image.paste(surface_border, (0, 0), outline_mask)
+
+        radius = max(8, int(round(panel_h * 0.18)))
+        draw.rounded_rectangle(
+            (panel_x0, panel_y0, panel_x1, panel_y1),
+            radius=radius,
+            fill=(13, 27, 52, 216),
+            outline=(70, 98, 148, 185),
+            width=max(1, int(round(frame_h * 0.0013))),
+        )
+
+        title_font = self._load_immersive_tutorial_status_font(
+            max(18, int(round(panel_h * 0.34))),
+            bold=True,
+        )
+        body_font = self._load_immersive_tutorial_status_font(
+            max(15, int(round(panel_h * 0.27))),
+            bold=False,
+        )
+        pad_x = max(18, int(round(panel_w * 0.045)))
+        pad_y = max(8, int(round(panel_h * 0.16)))
+        if ready:
+            title = "Ready - press select to start the demo"
+            available_w = max(1, panel_x1 - panel_x0 - pad_x * 2)
+            ready_font = title_font
+            title_w, title_h = self._immersive_tutorial_text_size(
+                draw,
+                title,
+                title_font,
+            )
+            if title_w > available_w:
+                shrink_size = max(
+                    12,
+                    int(round(panel_h * 0.34 * float(available_w) / float(title_w))),
+                )
+                ready_font = self._load_immersive_tutorial_status_font(
+                    shrink_size,
+                    bold=True,
+                )
+                title_w, title_h = self._immersive_tutorial_text_size(
+                    draw,
+                    title,
+                    ready_font,
+                )
+            draw.text(
+                (
+                    panel_x0 + (panel_x1 - panel_x0 - title_w) // 2,
+                    panel_y0 + (panel_h - title_h) // 2 - 1,
+                ),
+                title,
+                font=ready_font,
+                fill=(255, 255, 255, 255),
+            )
+        else:
+            title = "Preparing demo"
+            percent_text = f"{percent}%"
+            title_w, title_h = self._immersive_tutorial_text_size(
+                draw,
+                title,
+                title_font,
+            )
+            percent_w, percent_h = self._immersive_tutorial_text_size(
+                draw,
+                percent_text,
+                body_font,
+            )
+            title_y = panel_y0 + pad_y
+            draw.text(
+                (panel_x0 + pad_x, title_y),
+                title,
+                font=title_font,
+                fill=(238, 245, 255, 255),
+            )
+            draw.text(
+                (
+                    panel_x1 - pad_x - percent_w,
+                    title_y + max(0, (title_h - percent_h) // 2),
+                ),
+                percent_text,
+                font=body_font,
+                fill=(184, 207, 238, 255),
+            )
+            bar_x0 = panel_x0 + pad_x
+            bar_x1 = panel_x1 - pad_x
+            bar_h = max(3, int(round(panel_h * 0.055)))
+            bar_y0 = panel_y1 - pad_y - bar_h
+            bar_y1 = bar_y0 + bar_h
+            draw.rounded_rectangle(
+                (bar_x0, bar_y0, bar_x1, bar_y1),
+                radius=max(2, bar_h // 2),
+                fill=(45, 64, 94, 210),
+            )
+            fill_x1 = bar_x0 + int(round((bar_x1 - bar_x0) * percent / 100.0))
+            if fill_x1 > bar_x0:
+                draw.rounded_rectangle(
+                    (bar_x0, bar_y0, fill_x1, bar_y1),
+                    radius=max(2, bar_h // 2),
+                    fill=(92, 171, 246, 235),
+                )
+
+        frame_np = np.asarray(image, dtype=np.uint8).copy()
+        result = torch.from_numpy(frame_np).to(device=base_frame.device, dtype=torch.uint8)
+        if cache is not None:
+            cache[cache_key] = result
+        return result
+
     def _launch_immersive_scene_renderer_prewarm(
         self,
         *,
@@ -16511,33 +16920,7 @@ class InvPhyTrainerWarp:
             startup_context["static_scene_layer_cache"],
         )
 
-        bootstrap_substages = (
-            "await_scene_renderer_prewarm",
-            "compute_live_head_alignment_and_initial_eye_state",
-            "build_layout",
-            "apply_scene_layout_and_check_readback_mode",
-            "validate_table_alignment_and_log_layout",
-            "apply_spawn_shift",
-            "build_center_view_and_resolve_rope_endpoints",
-            "assign_controller_sources_and_default_anchor_names",
-            "build_two_point_runtime_and_batch_buffers",
-            "init_simulator",
-            "build_rotation_cache",
-            "prime_live_controller_runtime_and_handedness",
-            "prepare_balanced_runtime_state",
-            "warmup_balanced_paths_and_seed_layer_cache",
-            "start_eye_workers_if_enabled",
-            "start_static_scene_worker_if_enabled",
-            "prepare_colliders_support_boxes_idle_lock_and_cuda_graph",
-            "settle_scene_rest_chunk",
-            "restore_settled_state_and_build_anchor_templates",
-            "validate_startup_scene_mode",
-            "startup_validation_prepare",
-            "startup_validation_scene_frames",
-            "startup_validation_left_eye",
-            "startup_validation_right_eye",
-            "startup_validation_finalize",
-        )
+        bootstrap_substages = tuple(self.IMMERSIVE_STARTUP_BOOTSTRAP_SUBSTAGES)
         coarse_stage_to_substage_index = {
             0: 0,
             1: 1,
@@ -16572,6 +16955,7 @@ class InvPhyTrainerWarp:
                 if substage_index >= len(bootstrap_substages)
                 else bootstrap_substages[substage_index]
             )
+            self._immersive_startup_bootstrap_progress(bootstrap_state)
 
         def _complete_substage(name, *, stage_index=None):
             nonlocal substage_index
@@ -17541,131 +17925,236 @@ class InvPhyTrainerWarp:
                 scene_depth_reproject_enabled = bootstrap_output[
                     "scene_depth_reproject_enabled"
                 ]
-                if (
-                    bootstrap_output["active_scene_stereo_mode"]
+                active_scene_stereo_mode = bootstrap_output["active_scene_stereo_mode"]
+                worker_validation_request = bootstrap_output.get(
+                    "worker_validation_request"
+                )
+                balanced_warmup_kwargs = bootstrap_output.get("balanced_warmup_kwargs")
+                layout = bootstrap_output["layout"]
+                should_start_balanced_static_worker = (
+                    active_scene_stereo_mode
                     == self.IMMERSIVE_BALANCED_INTERNAL_STEREO_MODE
-                    and bootstrap_output.get("worker_validation_request") is not None
+                    and worker_validation_request is not None
                     and static_scene_overlap_requested
-                ):
-                    try:
-                        static_scene_worker = _ImmersiveStaticSceneRenderWorker(
-                            scene_assets_root=scene_assets_root,
-                            scene_width=scene_width,
-                            scene_height=scene_height,
-                            lighting_mode=immersive_render_options["lighting_mode"],
-                            balanced_render_backend=immersive_static_scene_backend_mode,
-                            static_scene_mode=immersive_static_scene_mode,
-                            layout=bootstrap_output["layout"],
-                            cuda_device_index=int(torch.cuda.current_device()),
-                            native_gl_texture_mode=immersive_native_gl_texture_mode,
-                            native_gl_anisotropy=immersive_native_gl_anisotropy,
-                            native_gl_msaa_samples=immersive_native_gl_msaa_samples,
-                            native_gl_depth_format=immersive_native_gl_depth_format,
-                        )
-                        worker_startup_debug = static_scene_worker.start(
-                            validation_request=bootstrap_output["worker_validation_request"],
-                            warmup_kwargs=bootstrap_output["balanced_warmup_kwargs"],
-                        )
-                        bootstrap_output["balanced_worker_warmup_paths"] = list(
-                            worker_startup_debug.get("warmup_paths") or []
-                        )
-                        static_scene_overlap_enabled = True
-                    except Exception as exc:
-                        if static_scene_worker is not None:
-                            try:
-                                static_scene_worker.stop()
-                            except Exception:
-                                pass
-                        static_scene_worker = None
-                        static_scene_overlap_enabled = False
-                        if scene_depth_reproject_requested:
-                            raise RuntimeError(
-                                "immersive_timewarp scene_depth_reproject requires "
-                                "static-scene worker startup; "
-                                f"worker_init_error={type(exc).__name__}: {exc}"
-                            ) from exc
-                        if framegen_requested:
-                            raise RuntimeError(
-                                f"immersive_framegen {immersive_framegen_mode} requires "
-                                "static-scene worker startup; "
-                                f"worker_init_error={type(exc).__name__}: {exc}"
-                            ) from exc
-                        scene_depth_reproject_enabled = False
-                        print(
-                            "[quest_display] immersive static-scene overlap unavailable; "
-                            "falling back to serial room render: "
-                            f"{type(exc).__name__}: {exc}",
-                            flush=True,
-                        )
-                elif (
-                    bootstrap_output["active_scene_stereo_mode"] == "per_eye"
+                )
+                should_start_native_gl_static_worker = (
+                    active_scene_stereo_mode == "per_eye"
                     and immersive_static_scene_backend_mode == "native_gl"
                     and static_scene_overlap_requested
-                ):
-                    try:
-                        static_scene_worker = _ImmersiveStaticSceneRenderWorker(
-                            scene_assets_root=scene_assets_root,
-                            scene_width=scene_width,
-                            scene_height=scene_height,
-                            lighting_mode=immersive_render_options["lighting_mode"],
-                            balanced_render_backend=immersive_static_scene_backend_mode,
-                            static_scene_mode=immersive_static_scene_mode,
-                            layout=bootstrap_output["layout"],
-                            cuda_device_index=int(torch.cuda.current_device()),
-                            native_gl_texture_mode=immersive_native_gl_texture_mode,
-                            native_gl_anisotropy=immersive_native_gl_anisotropy,
-                            native_gl_msaa_samples=immersive_native_gl_msaa_samples,
-                            native_gl_depth_format=immersive_native_gl_depth_format,
+                )
+                cuda_device_index = (
+                    int(torch.cuda.current_device())
+                    if (
+                        should_start_balanced_static_worker
+                        or should_start_native_gl_static_worker
+                    )
+                    else 0
+                )
+                native_gl_validation_request = None
+                if should_start_native_gl_static_worker:
+                    native_gl_validation_request = (
+                        self._build_immersive_native_gl_full_scene_worker_request(
+                            bootstrap_output["last_left_eye_pose_world"],
+                            bootstrap_output["last_right_eye_pose_world"],
+                            bootstrap_output["initial_left_intrinsic"],
+                            bootstrap_output["initial_right_intrinsic"],
+                            eye_width,
+                            eye_height,
+                            scene_width,
+                            scene_height,
                         )
-                        native_gl_validation_request = (
-                            self._build_immersive_native_gl_full_scene_worker_request(
-                                bootstrap_output["last_left_eye_pose_world"],
-                                bootstrap_output["last_right_eye_pose_world"],
-                                bootstrap_output["initial_left_intrinsic"],
-                                bootstrap_output["initial_right_intrinsic"],
-                                eye_width,
-                                eye_height,
-                                scene_width,
-                                scene_height,
+                    )
+
+                def _run_static_scene_worker_start():
+                    result = {
+                        "static_scene_worker": static_scene_worker,
+                        "static_scene_overlap_enabled": static_scene_overlap_enabled,
+                        "scene_depth_reproject_enabled": scene_depth_reproject_enabled,
+                        "balanced_worker_warmup_paths": None,
+                        "native_gl_static_overlap_status": None,
+                        "native_gl_static_overlap_failure_reason": None,
+                    }
+                    if should_start_balanced_static_worker:
+                        worker = None
+                        try:
+                            worker = _ImmersiveStaticSceneRenderWorker(
+                                scene_assets_root=scene_assets_root,
+                                scene_width=scene_width,
+                                scene_height=scene_height,
+                                lighting_mode=immersive_render_options["lighting_mode"],
+                                balanced_render_backend=immersive_static_scene_backend_mode,
+                                static_scene_mode=immersive_static_scene_mode,
+                                layout=layout,
+                                cuda_device_index=cuda_device_index,
+                                native_gl_texture_mode=immersive_native_gl_texture_mode,
+                                native_gl_anisotropy=immersive_native_gl_anisotropy,
+                                native_gl_msaa_samples=immersive_native_gl_msaa_samples,
+                                native_gl_depth_format=immersive_native_gl_depth_format,
                             )
+                            worker_startup_debug = worker.start(
+                                validation_request=worker_validation_request,
+                                warmup_kwargs=balanced_warmup_kwargs,
+                            )
+                            result["static_scene_worker"] = worker
+                            result["static_scene_overlap_enabled"] = True
+                            result["balanced_worker_warmup_paths"] = list(
+                                worker_startup_debug.get("warmup_paths") or []
+                            )
+                        except Exception as exc:
+                            if worker is not None:
+                                try:
+                                    worker.stop()
+                                except Exception:
+                                    pass
+                            if scene_depth_reproject_requested:
+                                raise RuntimeError(
+                                    "immersive_timewarp scene_depth_reproject requires "
+                                    "static-scene worker startup; "
+                                    f"worker_init_error={type(exc).__name__}: {exc}"
+                                ) from exc
+                            if framegen_requested:
+                                raise RuntimeError(
+                                    f"immersive_framegen {immersive_framegen_mode} requires "
+                                    "static-scene worker startup; "
+                                    f"worker_init_error={type(exc).__name__}: {exc}"
+                                ) from exc
+                            result["static_scene_worker"] = None
+                            result["static_scene_overlap_enabled"] = False
+                            result["scene_depth_reproject_enabled"] = False
+                            print(
+                                "[quest_display] immersive static-scene overlap unavailable; "
+                                "falling back to serial room render: "
+                                f"{type(exc).__name__}: {exc}",
+                                flush=True,
+                            )
+                    elif should_start_native_gl_static_worker:
+                        worker = None
+                        try:
+                            worker = _ImmersiveStaticSceneRenderWorker(
+                                scene_assets_root=scene_assets_root,
+                                scene_width=scene_width,
+                                scene_height=scene_height,
+                                lighting_mode=immersive_render_options["lighting_mode"],
+                                balanced_render_backend=immersive_static_scene_backend_mode,
+                                static_scene_mode=immersive_static_scene_mode,
+                                layout=layout,
+                                cuda_device_index=cuda_device_index,
+                                native_gl_texture_mode=immersive_native_gl_texture_mode,
+                                native_gl_anisotropy=immersive_native_gl_anisotropy,
+                                native_gl_msaa_samples=immersive_native_gl_msaa_samples,
+                                native_gl_depth_format=immersive_native_gl_depth_format,
+                            )
+                            worker_startup_debug = worker.start(
+                                validation_request=native_gl_validation_request,
+                                warmup_kwargs=None,
+                            )
+                            result["static_scene_worker"] = worker
+                            result["static_scene_overlap_enabled"] = True
+                            result["native_gl_static_overlap_status"] = "active"
+                            result["native_gl_static_overlap_failure_reason"] = ""
+                            print(
+                                "[quest_display] immersive static-scene overlap: "
+                                "mode=native_gl_full_scene_worker",
+                                flush=True,
+                            )
+                            print(
+                                "[quest_display] static_scene_worker_readback_mode="
+                                f"{worker_startup_debug.get('readback_mode')}",
+                                flush=True,
+                            )
+                        except Exception as exc:
+                            if worker is not None:
+                                try:
+                                    worker.stop()
+                                except Exception:
+                                    pass
+                            failure_reason = f"{type(exc).__name__}: {exc}"
+                            result["static_scene_worker"] = None
+                            result["static_scene_overlap_enabled"] = False
+                            result["native_gl_static_overlap_status"] = "startup_failed"
+                            result[
+                                "native_gl_static_overlap_failure_reason"
+                            ] = failure_reason
+                            raise RuntimeError(
+                                "Native GL static-scene overlap startup failed; "
+                                "Stage 1 overlap is required for this run. "
+                                f"{failure_reason}"
+                            ) from exc
+                    return result
+
+                worker_start_state = bootstrap_state.get(
+                    "static_scene_worker_start_state"
+                )
+                if isinstance(worker_start_state, dict):
+                    worker_future = worker_start_state.get("future")
+                    worker_executor = worker_start_state.get("executor")
+                    if (
+                        worker_future is not None
+                        and not worker_future.done()
+                        and not force
+                    ):
+                        return current_sample
+                    try:
+                        worker_start_result = (
+                            worker_future.result()
+                            if worker_future is not None
+                            else _run_static_scene_worker_start()
                         )
-                        worker_startup_debug = static_scene_worker.start(
-                            validation_request=native_gl_validation_request,
-                            warmup_kwargs=None,
+                    finally:
+                        if worker_executor is not None:
+                            worker_executor.shutdown(wait=False)
+                        bootstrap_state.pop("static_scene_worker_start_state", None)
+                elif not force and (
+                    should_start_balanced_static_worker
+                    or should_start_native_gl_static_worker
+                ):
+                    worker_executor = concurrent.futures.ThreadPoolExecutor(
+                        max_workers=1,
+                        thread_name_prefix="immersive_static_worker_start",
+                    )
+                    worker_future = worker_executor.submit(_run_static_scene_worker_start)
+                    bootstrap_state["static_scene_worker_start_state"] = {
+                        "executor": worker_executor,
+                        "future": worker_future,
+                    }
+                    print(
+                        "[quest_display] immersive static-scene worker startup launched; "
+                        "tutorial remains responsive while it initializes",
+                        flush=True,
+                    )
+                    return current_sample
+                else:
+                    worker_start_result = _run_static_scene_worker_start()
+
+                static_scene_worker = worker_start_result["static_scene_worker"]
+                static_scene_overlap_enabled = worker_start_result[
+                    "static_scene_overlap_enabled"
+                ]
+                scene_depth_reproject_enabled = worker_start_result[
+                    "scene_depth_reproject_enabled"
+                ]
+                balanced_worker_warmup_paths = worker_start_result.get(
+                    "balanced_worker_warmup_paths"
+                )
+                if balanced_worker_warmup_paths is not None:
+                    bootstrap_output["balanced_worker_warmup_paths"] = list(
+                        balanced_worker_warmup_paths
+                    )
+                native_gl_overlap_status = worker_start_result.get(
+                    "native_gl_static_overlap_status"
+                )
+                if native_gl_overlap_status is not None:
+                    bootstrap_output[
+                        "native_gl_static_overlap_status"
+                    ] = native_gl_overlap_status
+                    bootstrap_output[
+                        "native_gl_static_overlap_failure_reason"
+                    ] = str(
+                        worker_start_result.get(
+                            "native_gl_static_overlap_failure_reason",
+                            "",
                         )
-                        static_scene_overlap_enabled = True
-                        bootstrap_output["native_gl_static_overlap_status"] = "active"
-                        bootstrap_output["native_gl_static_overlap_failure_reason"] = ""
-                        print(
-                            "[quest_display] immersive static-scene overlap: "
-                            "mode=native_gl_full_scene_worker",
-                            flush=True,
-                        )
-                        print(
-                            "[quest_display] static_scene_worker_readback_mode="
-                            f"{worker_startup_debug.get('readback_mode')}",
-                            flush=True,
-                        )
-                    except Exception as exc:
-                        if static_scene_worker is not None:
-                            try:
-                                static_scene_worker.stop()
-                            except Exception:
-                                pass
-                        static_scene_worker = None
-                        static_scene_overlap_enabled = False
-                        failure_reason = f"{type(exc).__name__}: {exc}"
-                        bootstrap_output["native_gl_static_overlap_status"] = (
-                            "startup_failed"
-                        )
-                        bootstrap_output[
-                            "native_gl_static_overlap_failure_reason"
-                        ] = failure_reason
-                        raise RuntimeError(
-                            "Native GL static-scene overlap startup failed; "
-                            "Stage 1 overlap is required for this run. "
-                            f"{failure_reason}"
-                        ) from exc
+                    )
                 bootstrap_output["static_scene_worker"] = static_scene_worker
                 bootstrap_output["static_scene_overlap_enabled"] = (
                     static_scene_overlap_enabled
@@ -17772,9 +18261,14 @@ class InvPhyTrainerWarp:
                         reason=reason,
                         startup_timeline=startup_timeline,
                     ),
-                    max_steps=self.IMMERSIVE_STARTUP_SETTLE_STEPS_PER_TICK,
+                    max_steps=(
+                        self.IMMERSIVE_STARTUP_SETTLE_STEPS_PER_TICK
+                        if force
+                        else self.IMMERSIVE_TUTORIAL_SETTLE_STEPS_PER_TICK
+                    ),
                 )
                 bootstrap_state["settle_state"] = settle_state
+                self._immersive_startup_bootstrap_progress(bootstrap_state)
                 if not bool(settle_state.get("done", False)):
                     return current_sample
                 bootstrap_output["scene_rest_state"] = settle_state.get("last_state")
@@ -18248,6 +18742,7 @@ class InvPhyTrainerWarp:
         tutorial_frames,
         *,
         startup_timeline=None,
+        startup_bootstrap_state=None,
         progress_callback=None,
     ):
         tutorial_frames = [frame for frame in tutorial_frames if torch.is_tensor(frame)]
@@ -18258,20 +18753,79 @@ class InvPhyTrainerWarp:
         previous_select_active = self._immersive_sample_any_select_active(initial_sample)
         slide_index = 0
         total_slide_count = len(tutorial_frames)
-        self._set_immersive_startup_keepalive_frames(
-            keepalive_state,
-            left_frame=tutorial_frames[slide_index],
-        )
+        final_slide_index = total_slide_count - 1
+        status_frame_cache = {}
+        last_published_status_key = None
+        final_ready_logged = False
+
+        def _current_progress():
+            if startup_bootstrap_state is None:
+                progress = {
+                    "progress_fraction": 1.0 if progress_callback is None else 0.0,
+                    "progress_percent": 100 if progress_callback is None else 0,
+                    "phase_label": "Ready" if progress_callback is None else "Preparing demo",
+                    "complete": progress_callback is None,
+                }
+                return progress
+            return self._immersive_startup_bootstrap_progress(startup_bootstrap_state)
+
+        def _advance_startup(*, force=False):
+            nonlocal last_sample
+            if progress_callback is not None:
+                progressed_sample = progress_callback(last_sample, force=force)
+                if progressed_sample is not None:
+                    last_sample = progressed_sample
+            return _current_progress()
+
+        def _refresh_current_slide(reason, *, force=False):
+            nonlocal last_published_status_key, final_ready_logged
+            progress = _current_progress()
+            ready = bool(progress.get("complete", False))
+            frame = tutorial_frames[slide_index]
+            status_key = ("slide", int(slide_index))
+            if slide_index == final_slide_index:
+                frame = self._render_immersive_tutorial_status_frame(
+                    frame,
+                    progress,
+                    ready=ready,
+                    cache=status_frame_cache,
+                )
+                status_key = (
+                    "final",
+                    bool(ready),
+                    int(progress.get("progress_percent", 0)),
+                    str(progress.get("phase_label", "")),
+                )
+                if ready and not final_ready_logged:
+                    print(
+                        "[quest_display] immersive tutorial ready: "
+                        "startup complete; final slide unlocked",
+                        flush=True,
+                    )
+                    final_ready_logged = True
+            status_changed = status_key != last_published_status_key
+            if force or status_changed:
+                self._set_immersive_startup_keepalive_frames(
+                    keepalive_state,
+                    left_frame=frame,
+                )
+                last_published_status_key = status_key
+            self._maybe_publish_immersive_startup_keepalive(
+                immersive_bridge,
+                keepalive_state,
+                reason=reason,
+                startup_timeline=startup_timeline,
+                force=bool(force or status_changed),
+            )
+            return progress
+
         print(
             "[quest_display] immersive tutorial slide: "
             f"index={slide_index + 1}/{total_slide_count}",
             flush=True,
         )
-        self._maybe_publish_immersive_startup_keepalive(
-            immersive_bridge,
-            keepalive_state,
-            reason=f"tutorial_slide_{slide_index + 1}",
-            startup_timeline=startup_timeline,
+        _refresh_current_slide(
+            f"tutorial_slide_{slide_index + 1}",
             force=True,
         )
 
@@ -18282,15 +18836,10 @@ class InvPhyTrainerWarp:
                 timeout_s=float(self.IMMERSIVE_TUTORIAL_SAMPLE_POLL_INTERVAL_SECONDS),
             )
             if sample is None:
-                if progress_callback is not None:
-                    progressed_sample = progress_callback(last_sample, force=False)
-                    if progressed_sample is not None:
-                        last_sample = progressed_sample
-                self._maybe_publish_immersive_startup_keepalive(
-                    immersive_bridge,
-                    keepalive_state,
-                    reason=f"tutorial_keepalive_{slide_index + 1}",
-                    startup_timeline=startup_timeline,
+                _advance_startup(force=False)
+                _refresh_current_slide(
+                    f"tutorial_keepalive_{slide_index + 1}",
+                    force=False,
                 )
                 continue
 
@@ -18299,29 +18848,31 @@ class InvPhyTrainerWarp:
             select_edge = bool(select_active and not previous_select_active)
             previous_select_active = select_active
             if not select_edge:
-                if progress_callback is not None:
-                    progressed_sample = progress_callback(last_sample, force=False)
-                    if progressed_sample is not None:
-                        last_sample = progressed_sample
+                _advance_startup(force=False)
+                _refresh_current_slide(
+                    f"tutorial_keepalive_{slide_index + 1}",
+                    force=False,
+                )
                 continue
-            if slide_index >= total_slide_count - 1:
-                break
+            if slide_index >= final_slide_index:
+                progress = _current_progress()
+                if bool(progress.get("complete", False)):
+                    break
+                _advance_startup(force=False)
+                _refresh_current_slide(
+                    f"tutorial_wait_for_startup_{slide_index + 1}",
+                    force=True,
+                )
+                continue
 
             slide_index += 1
-            self._set_immersive_startup_keepalive_frames(
-                keepalive_state,
-                left_frame=tutorial_frames[slide_index],
-            )
             print(
                 "[quest_display] immersive tutorial slide: "
                 f"index={slide_index + 1}/{total_slide_count}",
                 flush=True,
             )
-            self._maybe_publish_immersive_startup_keepalive(
-                immersive_bridge,
-                keepalive_state,
-                reason=f"tutorial_slide_{slide_index + 1}",
-                startup_timeline=startup_timeline,
+            _refresh_current_slide(
+                f"tutorial_slide_{slide_index + 1}",
                 force=True,
             )
 
@@ -27410,6 +27961,111 @@ class InvPhyTrainerWarp:
             ]
         )
 
+    def _append_viewer_overlay_square_marker_commands(
+        self,
+        commands,
+        pixel,
+        color,
+        *,
+        radius,
+        blend=0.86,
+        line_radius=0.75,
+    ):
+        xy = self._viewer_overlay_pixel_xy(pixel)
+        if xy is None:
+            return
+        x, y = xy
+        radius_f = float(radius)
+        x0 = x - radius_f
+        x1 = x + radius_f
+        y0 = y - radius_f
+        y1 = y + radius_f
+        self._append_viewer_overlay_line_command(
+            commands,
+            (x0, y0),
+            (x1, y0),
+            color,
+            radius=line_radius,
+            blend=blend,
+        )
+        self._append_viewer_overlay_line_command(
+            commands,
+            (x0, y1),
+            (x1, y1),
+            color,
+            radius=line_radius,
+            blend=blend,
+        )
+        self._append_viewer_overlay_line_command(
+            commands,
+            (x0, y0),
+            (x0, y1),
+            color,
+            radius=line_radius,
+            blend=blend,
+        )
+        self._append_viewer_overlay_line_command(
+            commands,
+            (x1, y0),
+            (x1, y1),
+            color,
+            radius=line_radius,
+            blend=blend,
+        )
+
+    def _append_viewer_overlay_split_square_marker_commands(
+        self,
+        commands,
+        pixel,
+        upper_left_color,
+        lower_right_color,
+        *,
+        radius,
+        blend=0.86,
+        line_radius=0.75,
+    ):
+        xy = self._viewer_overlay_pixel_xy(pixel)
+        if xy is None:
+            return
+        x, y = xy
+        radius_f = float(radius)
+        x0 = x - radius_f
+        x1 = x + radius_f
+        y0 = y - radius_f
+        y1 = y + radius_f
+        self._append_viewer_overlay_line_command(
+            commands,
+            (x0, y0),
+            (x1, y0),
+            upper_left_color,
+            radius=line_radius,
+            blend=blend,
+        )
+        self._append_viewer_overlay_line_command(
+            commands,
+            (x0, y0),
+            (x0, y1),
+            upper_left_color,
+            radius=line_radius,
+            blend=blend,
+        )
+        self._append_viewer_overlay_line_command(
+            commands,
+            (x0, y1),
+            (x1, y1),
+            lower_right_color,
+            radius=line_radius,
+            blend=blend,
+        )
+        self._append_viewer_overlay_line_command(
+            commands,
+            (x1, y0),
+            (x1, y1),
+            lower_right_color,
+            radius=line_radius,
+            blend=blend,
+        )
+
     def _build_live_controller_viewer_overlay_commands(self, controller_overlays):
         commands = []
         if not controller_overlays:
@@ -27461,23 +28117,17 @@ class InvPhyTrainerWarp:
                     None,
                 )
                 if left_entry is not None and right_entry is not None:
-                    self._append_viewer_overlay_marker_command(
+                    self._append_viewer_overlay_split_square_marker_commands(
                         commands,
                         candidate_pixel,
                         self.LIVE_CONTROLLER_LEFT_COLOR,
-                        radius=self.LIVE_CONTROLLER_CANDIDATE_SQUARE_RADIUS,
-                        blend=0.65,
-                    )
-                    self._append_viewer_overlay_marker_command(
-                        commands,
-                        candidate_pixel,
                         self.LIVE_CONTROLLER_RIGHT_COLOR,
-                        radius=max(1, self.LIVE_CONTROLLER_CANDIDATE_SQUARE_RADIUS - 2),
-                        blend=0.65,
+                        radius=self.LIVE_CONTROLLER_CANDIDATE_SQUARE_RADIUS,
+                        blend=0.86,
                     )
                 else:
                     entry = group_entries[0]
-                    self._append_viewer_overlay_marker_command(
+                    self._append_viewer_overlay_square_marker_commands(
                         commands,
                         candidate_pixel,
                         entry["color"],
@@ -32352,7 +33002,7 @@ class InvPhyTrainerWarp:
                 eye_width,
                 eye_height,
                 left_frame=(tutorial_frames[0] if tutorial_frames else None),
-                presentation_mode="mono_panel",
+                presentation_mode="head_locked_panel",
             )
             startup_keepalive_state["preview_present_callback"] = (
                 _present_startup_preview_frame if preview_display_active else None
@@ -32429,6 +33079,7 @@ class InvPhyTrainerWarp:
                     initial_sample,
                     tutorial_frames,
                     startup_timeline=startup_timeline,
+                    startup_bootstrap_state=startup_bootstrap_state,
                     progress_callback=lambda sample, force=False: self._progress_immersive_startup_bootstrap(
                         startup_bootstrap_state,
                         latest_sample=sample,
@@ -37542,6 +38193,7 @@ class InvPhyTrainerWarp:
                         )()
                     )
                     viewer_overlay_published = False
+                    viewer_overlay_commands_for_publish = None
                     overlay_world_entries = list(controller_overlay_by_source.values())
                     left_eye_overlay_entries = []
                     right_eye_overlay_entries = []
@@ -37588,26 +38240,15 @@ class InvPhyTrainerWarp:
                                 time.perf_counter()
                                 - viewer_overlay_command_build_start,
                             )
-                        viewer_overlay_publish_start = (
-                            time.perf_counter()
-                            if render_profile_frame is not None
-                            else None
+                        viewer_overlay_commands_for_publish = (
+                            left_viewer_overlay_commands,
+                            right_viewer_overlay_commands,
                         )
-                        try:
-                            viewer_overlay_published = bool(
-                                immersive_bridge.publish_overlay_commands(
-                                    left_viewer_overlay_commands,
-                                    right_viewer_overlay_commands,
-                                )
-                            )
-                        except Exception:
-                            viewer_overlay_published = False
-                        if viewer_overlay_publish_start is not None:
-                            self._render_profile_add_wall_time(
-                                render_profile_frame,
-                                "viewer_overlay_sidecar_publish_wall",
-                                time.perf_counter() - viewer_overlay_publish_start,
-                            )
+                        viewer_overlay_published = True
+                        if render_profile_frame is not None:
+                            render_profile_frame[
+                                "viewer_overlay_sidecar_publish_wall"
+                            ] = 0.0
                         if render_profile_frame is not None:
                             render_profile_frame[
                                 "viewer_overlay_sidecar_active_ratio"
@@ -38343,6 +38984,17 @@ class InvPhyTrainerWarp:
                     publish_ok, publish_stats = immersive_bridge.publish_stereo_frames(
                         left_eye_frame,
                         right_eye_frame,
+                        overlay_commands_by_eye=viewer_overlay_commands_for_publish,
+                        left_eye_sample=(
+                            render_sample.left_eye
+                            if render_sample is not None
+                            else None
+                        ),
+                        right_eye_sample=(
+                            render_sample.right_eye
+                            if render_sample is not None
+                            else None
+                        ),
                     )
                     publish_stage_wall_s = time.perf_counter() - publish_stage_start
                     overlay_publish_wall_s = overlay_draw_wall_s + publish_stage_wall_s
@@ -39161,12 +39813,44 @@ class InvPhyTrainerWarp:
                 bridge_publish_sample_check_count = None
                 bridge_publish_sample_mismatch_count = None
                 bridge_direct_commit_enabled = None
+                bridge_direct_commit_mode = None
                 bridge_direct_commit_warning = None
+                bridge_direct_commit_registration_warning = None
                 viewer_applied_update_fps = None
                 viewer_source_frame_delta_fps = None
                 viewer_texture_upload_fps = None
                 viewer_texture_upload_count = None
                 viewer_texture_upload_avg_ms = None
+                viewer_texture_upload_mode = None
+                viewer_upload_thread_mode = None
+                viewer_upload_thread_fallback_reason = None
+                viewer_upload_ring_slots = None
+                viewer_upload_late_wait_us = None
+                viewer_upload_busy_backoff_us = None
+                viewer_projection_pose_mode = None
+                viewer_source_pose_metadata_valid_count = None
+                viewer_source_pose_metadata_invalid_count = None
+                viewer_source_pose_metadata_fallback_count = None
+                viewer_overlay_latched_match_count = None
+                viewer_overlay_latched_mismatch_count = None
+                viewer_overlay_latched_empty_count = None
+                viewer_texture_upload_mmap_copy_avg_ms = None
+                viewer_texture_upload_gl_avg_ms = None
+                viewer_texture_upload_gl_left_avg_ms = None
+                viewer_texture_upload_gl_right_avg_ms = None
+                viewer_texture_upload_slot_miss_count = None
+                viewer_texture_upload_slot_drop_count = None
+                viewer_texture_upload_slot_busy_count = None
+                viewer_texture_upload_busy_backoff_count = None
+                viewer_texture_upload_busy_backoff_avg_ms = None
+                viewer_render_without_upload_count = None
+                viewer_texture_upload_no_new_frame_count = None
+                viewer_texture_upload_late_wait_hit_count = None
+                viewer_texture_upload_late_wait_miss_count = None
+                viewer_texture_upload_late_wait_avg_ms = None
+                viewer_async_upload_count = None
+                viewer_async_ready_slot_count = None
+                viewer_async_poll_no_new_count = None
                 viewer_coalesced_source_count = None
                 viewer_coalesced_source_ratio = None
                 viewer_accounting_inconsistency_count = None
@@ -39288,11 +39972,23 @@ class InvPhyTrainerWarp:
                     bridge_direct_commit_enabled = bool(
                         bridge_commit_stats.get("direct_commit_enabled", False)
                     )
+                    direct_commit_mode_value = bridge_commit_stats.get(
+                        "direct_commit_mode", None
+                    )
+                    if direct_commit_mode_value is not None:
+                        bridge_direct_commit_mode = str(direct_commit_mode_value)
                     direct_commit_warning_value = bridge_commit_stats.get(
                         "direct_commit_warning", None
                     )
                     if direct_commit_warning_value is not None:
                         bridge_direct_commit_warning = str(direct_commit_warning_value)
+                    direct_commit_registration_warning_value = bridge_commit_stats.get(
+                        "direct_commit_registration_warning", None
+                    )
+                    if direct_commit_registration_warning_value is not None:
+                        bridge_direct_commit_registration_warning = str(
+                            direct_commit_registration_warning_value
+                        )
                     viewer_render_stats = immersive_bridge.viewer_render_stats(
                         scope="steady_state",
                         elapsed_override_s=total_time_seconds,
@@ -39312,6 +40008,133 @@ class InvPhyTrainerWarp:
                         )
                     viewer_texture_upload_avg_ms = float(
                         viewer_render_stats.get("texture_upload_avg_ms", 0.0)
+                    )
+                    viewer_texture_upload_mode = str(
+                        viewer_render_stats.get("texture_upload_mode", "unknown")
+                    )
+                    viewer_upload_thread_mode = str(
+                        viewer_render_stats.get(
+                            "viewer_upload_thread_mode",
+                            "unknown",
+                        )
+                    )
+                    viewer_upload_thread_fallback_reason = str(
+                        viewer_render_stats.get(
+                            "viewer_upload_thread_fallback_reason",
+                            "none",
+                        )
+                    )
+                    viewer_upload_ring_slots = int(
+                        viewer_render_stats.get("viewer_upload_ring_slots", 0)
+                    )
+                    viewer_upload_late_wait_us = int(
+                        viewer_render_stats.get("viewer_upload_late_wait_us", 0)
+                    )
+                    viewer_upload_busy_backoff_us = int(
+                        viewer_render_stats.get("viewer_upload_busy_backoff_us", 0)
+                    )
+                    viewer_projection_pose_mode = str(
+                        viewer_render_stats.get(
+                            "viewer_projection_pose_mode",
+                            "unknown",
+                        )
+                    )
+                    viewer_source_pose_metadata_valid_count = int(
+                        viewer_render_stats.get(
+                            "viewer_source_pose_metadata_valid_count",
+                            0,
+                        )
+                    )
+                    viewer_source_pose_metadata_invalid_count = int(
+                        viewer_render_stats.get(
+                            "viewer_source_pose_metadata_invalid_count",
+                            0,
+                        )
+                    )
+                    viewer_source_pose_metadata_fallback_count = int(
+                        viewer_render_stats.get(
+                            "viewer_source_pose_metadata_fallback_count",
+                            0,
+                        )
+                    )
+                    viewer_overlay_latched_match_count = int(
+                        viewer_render_stats.get(
+                            "viewer_overlay_latched_match_count",
+                            0,
+                        )
+                    )
+                    viewer_overlay_latched_mismatch_count = int(
+                        viewer_render_stats.get(
+                            "viewer_overlay_latched_mismatch_count",
+                            0,
+                        )
+                    )
+                    viewer_overlay_latched_empty_count = int(
+                        viewer_render_stats.get(
+                            "viewer_overlay_latched_empty_count",
+                            0,
+                        )
+                    )
+                    viewer_texture_upload_mmap_copy_avg_ms = float(
+                        viewer_render_stats.get(
+                            "texture_upload_mmap_copy_avg_ms", 0.0
+                        )
+                    )
+                    viewer_texture_upload_gl_avg_ms = float(
+                        viewer_render_stats.get("texture_upload_gl_avg_ms", 0.0)
+                    )
+                    viewer_texture_upload_gl_left_avg_ms = float(
+                        viewer_render_stats.get(
+                            "texture_upload_gl_left_avg_ms", 0.0
+                        )
+                    )
+                    viewer_texture_upload_gl_right_avg_ms = float(
+                        viewer_render_stats.get(
+                            "texture_upload_gl_right_avg_ms", 0.0
+                        )
+                    )
+                    viewer_texture_upload_slot_miss_count = int(
+                        viewer_render_stats.get("texture_upload_slot_miss_count", 0)
+                    )
+                    viewer_texture_upload_slot_drop_count = int(
+                        viewer_render_stats.get("texture_upload_slot_drop_count", 0)
+                    )
+                    viewer_texture_upload_slot_busy_count = int(
+                        viewer_render_stats.get("texture_upload_slot_busy_count", 0)
+                    )
+                    viewer_texture_upload_busy_backoff_count = int(
+                        viewer_render_stats.get(
+                            "texture_upload_busy_backoff_count", 0
+                        )
+                    )
+                    viewer_texture_upload_busy_backoff_avg_ms = float(
+                        viewer_render_stats.get(
+                            "texture_upload_busy_backoff_avg_ms", 0.0
+                        )
+                    )
+                    viewer_render_without_upload_count = int(
+                        viewer_render_stats.get("render_without_upload_count", 0)
+                    )
+                    viewer_texture_upload_no_new_frame_count = int(
+                        viewer_render_stats.get("texture_upload_no_new_frame_count", 0)
+                    )
+                    viewer_texture_upload_late_wait_hit_count = int(
+                        viewer_render_stats.get("texture_upload_late_wait_hit_count", 0)
+                    )
+                    viewer_texture_upload_late_wait_miss_count = int(
+                        viewer_render_stats.get("texture_upload_late_wait_miss_count", 0)
+                    )
+                    viewer_texture_upload_late_wait_avg_ms = float(
+                        viewer_render_stats.get("texture_upload_late_wait_avg_ms", 0.0)
+                    )
+                    viewer_async_upload_count = int(
+                        viewer_render_stats.get("viewer_async_upload_count", 0)
+                    )
+                    viewer_async_ready_slot_count = int(
+                        viewer_render_stats.get("viewer_async_ready_slot_count", 0)
+                    )
+                    viewer_async_poll_no_new_count = int(
+                        viewer_render_stats.get("viewer_async_poll_no_new_count", 0)
                     )
                     viewer_applied_stats = immersive_bridge.viewer_applied_update_stats(
                         scope="steady_state",
@@ -39509,6 +40332,177 @@ class InvPhyTrainerWarp:
                     f"{average_frame_time * 1000.0:.2f} ms "
                     "(average steady-state time per source frame)"
                 )
+
+                viewer_upload_lines = ["Viewer Upload Details:"]
+                if viewer_texture_upload_mode:
+                    viewer_upload_lines.append(
+                        f"viewer_upload_mode: {viewer_texture_upload_mode}"
+                    )
+                if viewer_upload_thread_mode:
+                    viewer_upload_lines.append(
+                        f"viewer_upload_thread_mode: {viewer_upload_thread_mode}"
+                    )
+                if viewer_upload_thread_fallback_reason:
+                    viewer_upload_lines.append(
+                        "viewer_upload_thread_fallback_reason: "
+                        f"{viewer_upload_thread_fallback_reason}"
+                    )
+                if viewer_upload_ring_slots is not None:
+                    viewer_upload_lines.append(
+                        "viewer_upload_ring_slots: "
+                        f"{int(viewer_upload_ring_slots)}"
+                    )
+                if viewer_upload_late_wait_us is not None:
+                    viewer_upload_lines.append(
+                        "viewer_upload_late_wait_us: "
+                        f"{int(viewer_upload_late_wait_us)}"
+                    )
+                if viewer_upload_busy_backoff_us is not None:
+                    viewer_upload_lines.append(
+                        "viewer_upload_busy_backoff_us: "
+                        f"{int(viewer_upload_busy_backoff_us)}"
+                    )
+                if viewer_projection_pose_mode:
+                    viewer_upload_lines.append(
+                        f"viewer_projection_pose_mode: {viewer_projection_pose_mode}"
+                    )
+                if viewer_source_pose_metadata_valid_count is not None:
+                    viewer_upload_lines.append(
+                        "viewer_source_pose_metadata_valid_count: "
+                        f"{int(viewer_source_pose_metadata_valid_count)}"
+                    )
+                if viewer_source_pose_metadata_invalid_count is not None:
+                    viewer_upload_lines.append(
+                        "viewer_source_pose_metadata_invalid_count: "
+                        f"{int(viewer_source_pose_metadata_invalid_count)}"
+                    )
+                if viewer_source_pose_metadata_fallback_count is not None:
+                    viewer_upload_lines.append(
+                        "viewer_source_pose_metadata_fallback_count: "
+                        f"{int(viewer_source_pose_metadata_fallback_count)}"
+                    )
+                if viewer_overlay_latched_match_count is not None:
+                    viewer_upload_lines.append(
+                        "viewer_overlay_latched_match_count: "
+                        f"{int(viewer_overlay_latched_match_count)}"
+                    )
+                if viewer_overlay_latched_mismatch_count is not None:
+                    viewer_upload_lines.append(
+                        "viewer_overlay_latched_mismatch_count: "
+                        f"{int(viewer_overlay_latched_mismatch_count)}"
+                    )
+                if viewer_overlay_latched_empty_count is not None:
+                    viewer_upload_lines.append(
+                        "viewer_overlay_latched_empty_count: "
+                        f"{int(viewer_overlay_latched_empty_count)}"
+                    )
+                if viewer_texture_upload_count is not None:
+                    viewer_upload_lines.append(
+                        "viewer_texture_upload_count: "
+                        f"{int(viewer_texture_upload_count)}"
+                    )
+                if viewer_texture_upload_avg_ms is not None:
+                    viewer_upload_lines.append(
+                        "viewer_texture_upload_total_ms: "
+                        f"{viewer_texture_upload_avg_ms:.2f}"
+                    )
+                if viewer_texture_upload_mmap_copy_avg_ms is not None:
+                    viewer_upload_lines.append(
+                        "viewer_mmap_copy_ms: "
+                        f"{viewer_texture_upload_mmap_copy_avg_ms:.2f}"
+                    )
+                if viewer_texture_upload_gl_avg_ms is not None:
+                    viewer_gl_line = (
+                        "viewer_gl_upload_ms: "
+                        f"{viewer_texture_upload_gl_avg_ms:.2f}"
+                    )
+                    if (
+                        viewer_texture_upload_gl_left_avg_ms is not None
+                        and viewer_texture_upload_gl_right_avg_ms is not None
+                    ):
+                        viewer_gl_line += (
+                            " "
+                            f"(left={viewer_texture_upload_gl_left_avg_ms:.2f}, "
+                            f"right={viewer_texture_upload_gl_right_avg_ms:.2f})"
+                        )
+                    viewer_upload_lines.append(viewer_gl_line)
+                if viewer_texture_upload_gl_left_avg_ms is not None:
+                    viewer_upload_lines.append(
+                        "viewer_gl_upload_left_ms: "
+                        f"{viewer_texture_upload_gl_left_avg_ms:.2f}"
+                    )
+                if viewer_texture_upload_gl_right_avg_ms is not None:
+                    viewer_upload_lines.append(
+                        "viewer_gl_upload_right_ms: "
+                        f"{viewer_texture_upload_gl_right_avg_ms:.2f}"
+                    )
+                if viewer_texture_upload_slot_miss_count is not None:
+                    viewer_upload_lines.append(
+                        "viewer_upload_slot_miss_count: "
+                        f"{int(viewer_texture_upload_slot_miss_count)}"
+                    )
+                if viewer_texture_upload_slot_drop_count is not None:
+                    viewer_upload_lines.append(
+                        "viewer_upload_slot_drop_count: "
+                        f"{int(viewer_texture_upload_slot_drop_count)}"
+                    )
+                if viewer_texture_upload_slot_miss_count is not None:
+                    viewer_upload_lines.append("viewer_upload_slot_wait_count: 0")
+                if viewer_texture_upload_slot_busy_count is not None:
+                    viewer_upload_lines.append(
+                        "viewer_upload_slot_busy_probe_count: "
+                        f"{int(viewer_texture_upload_slot_busy_count)}"
+                    )
+                if viewer_texture_upload_busy_backoff_count is not None:
+                    viewer_upload_lines.append(
+                        "viewer_upload_busy_backoff_count: "
+                        f"{int(viewer_texture_upload_busy_backoff_count)}"
+                    )
+                if viewer_texture_upload_busy_backoff_avg_ms is not None:
+                    viewer_upload_lines.append(
+                        "viewer_upload_busy_backoff_avg_ms: "
+                        f"{viewer_texture_upload_busy_backoff_avg_ms:.2f}"
+                    )
+                if viewer_render_without_upload_count is not None:
+                    viewer_upload_lines.append(
+                        "viewer_render_without_upload_count: "
+                        f"{int(viewer_render_without_upload_count)}"
+                    )
+                if viewer_texture_upload_no_new_frame_count is not None:
+                    viewer_upload_lines.append(
+                        "viewer_upload_no_new_frame_count: "
+                        f"{int(viewer_texture_upload_no_new_frame_count)}"
+                    )
+                if viewer_texture_upload_late_wait_hit_count is not None:
+                    viewer_upload_lines.append(
+                        "viewer_upload_late_wait_hit_count: "
+                        f"{int(viewer_texture_upload_late_wait_hit_count)}"
+                    )
+                if viewer_texture_upload_late_wait_miss_count is not None:
+                    viewer_upload_lines.append(
+                        "viewer_upload_late_wait_miss_count: "
+                        f"{int(viewer_texture_upload_late_wait_miss_count)}"
+                    )
+                if viewer_texture_upload_late_wait_avg_ms is not None:
+                    viewer_upload_lines.append(
+                        "viewer_upload_late_wait_avg_ms: "
+                        f"{viewer_texture_upload_late_wait_avg_ms:.2f}"
+                    )
+                if viewer_async_upload_count is not None:
+                    viewer_upload_lines.append(
+                        "viewer_async_upload_count: "
+                        f"{int(viewer_async_upload_count)}"
+                    )
+                if viewer_async_ready_slot_count is not None:
+                    viewer_upload_lines.append(
+                        "viewer_async_ready_slot_count: "
+                        f"{int(viewer_async_ready_slot_count)}"
+                    )
+                if viewer_async_poll_no_new_count is not None:
+                    viewer_upload_lines.append(
+                        "viewer_async_poll_no_new_count: "
+                        f"{int(viewer_async_poll_no_new_count)}"
+                    )
 
                 if startup_render_debug is not None:
                     startup_compose_line = (
@@ -39880,6 +40874,10 @@ class InvPhyTrainerWarp:
                         "Bridge Direct Commit Path: "
                         f"{bridge_direct_commit_status}"
                     )
+                    if bridge_direct_commit_mode:
+                        bridge_direct_commit_line += (
+                            f" mode={bridge_direct_commit_mode}"
+                        )
                     if (
                         not bridge_direct_commit_enabled
                         and bridge_direct_commit_warning
@@ -39888,6 +40886,14 @@ class InvPhyTrainerWarp:
                             f" ({bridge_direct_commit_warning})"
                         )
                     diagnostics_lines.append(bridge_direct_commit_line)
+                    if (
+                        bridge_direct_commit_enabled
+                        and bridge_direct_commit_registration_warning
+                    ):
+                        diagnostics_lines.append(
+                            "Bridge Direct Commit Registered Mmap Fallback: "
+                            f"{bridge_direct_commit_registration_warning}"
+                        )
                 if (
                     bridge_publish_sample_check_count is not None
                     and bridge_publish_sample_check_count > 0
@@ -40523,6 +41529,7 @@ class InvPhyTrainerWarp:
 
                 _append_section(high_level_lines)
                 _append_section(timing_configuration_lines)
+                _append_section(viewer_upload_lines)
                 _append_section(component_lines)
                 if diagnostic_collection_enabled:
                     _append_section(render_stage_lines)

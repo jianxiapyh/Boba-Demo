@@ -38,6 +38,8 @@ class OpenXRFramePanelMirror:
     BRIDGE_PUBLISH_SAMPLE_BYTE_COUNT = 16
     PRESENTATION_MODE_STEREO_FULLSCREEN = 0
     PRESENTATION_MODE_MONO_PANEL = 1
+    PRESENTATION_MODE_HEAD_LOCKED_PANEL = 2
+    DIRECT_COMMIT_MODE_ENV = "BOBA_IMMERSIVE_DIRECT_COMMIT_MODE"
 
     def __init__(self, repo_root: Path, width: int, height: int):
         self.repo_root = Path(repo_root)
@@ -84,7 +86,9 @@ class OpenXRFramePanelMirror:
         self._commit_thread: Optional[threading.Thread] = None
         self._commit_stop_requested = False
         self._direct_commit_enabled = False
+        self._direct_commit_mode = "disabled"
         self._direct_commit_warning: Optional[str] = None
+        self._direct_commit_registration_warning: Optional[str] = None
         self._direct_commit_cudart = None
         self._direct_commit_registered_slots: list[tuple[int, int]] = []
         self._bridge_publish_sample_indices = np.zeros((0,), dtype=np.int64)
@@ -121,11 +125,14 @@ class OpenXRFramePanelMirror:
                 return int(self.PRESENTATION_MODE_STEREO_FULLSCREEN)
             if mode_key in ("mono_panel", "panel", "mono"):
                 return int(self.PRESENTATION_MODE_MONO_PANEL)
+            if mode_key in ("head_locked_panel", "head_locked", "hud_panel"):
+                return int(self.PRESENTATION_MODE_HEAD_LOCKED_PANEL)
             raise ValueError(f"Unsupported immersive presentation mode: {presentation_mode}")
         mode_value = int(presentation_mode)
         if mode_value not in (
             int(self.PRESENTATION_MODE_STEREO_FULLSCREEN),
             int(self.PRESENTATION_MODE_MONO_PANEL),
+            int(self.PRESENTATION_MODE_HEAD_LOCKED_PANEL),
         ):
             raise ValueError(f"Unsupported immersive presentation mode: {presentation_mode}")
         return mode_value
@@ -320,7 +327,20 @@ class OpenXRFramePanelMirror:
             f"source_mtime={int(self.source_path.stat().st_mtime)}",
             flush=True,
         )
-        if self._direct_commit_warning is not None:
+        if self.FRESHNESS_FIRST_COMMIT and self._direct_commit_enabled:
+            print(
+                "[quest_display] immersive bridge direct commit enabled: "
+                f"mode={self._direct_commit_mode}",
+                flush=True,
+            )
+            if self._direct_commit_registration_warning is not None:
+                print(
+                    "[quest_display] immersive bridge registered mmap unavailable; "
+                    f"using {self._direct_commit_mode}: "
+                    f"{self._direct_commit_registration_warning}",
+                    flush=True,
+                )
+        elif self._direct_commit_warning is not None:
             print(
                 "[quest_display] immersive bridge direct commit disabled: "
                 f"{self._direct_commit_warning}",
@@ -515,6 +535,8 @@ class OpenXRFramePanelMirror:
         *,
         expected_publish_sample_bytes: Optional[bytes] = None,
         presentation_mode: Optional[int] = None,
+        frame_slot_metadata=None,
+        overlay_slot_commands=None,
     ) -> dict[str, float]:
         copy_start = time.perf_counter()
         slot_view = self._slot_views[slot]
@@ -528,6 +550,18 @@ class OpenXRFramePanelMirror:
             actual_sample_bytes=actual_publish_sample_bytes,
         )
         header_start = time.perf_counter()
+        overlay_writer = getattr(self, "_write_frame_slot_overlay", None)
+        if overlay_writer is not None:
+            overlay_writer(
+                slot=slot,
+                frame_id=frame_id,
+                overlay_slot_commands=overlay_slot_commands,
+            )
+        self._write_frame_slot_metadata(
+            slot=slot,
+            frame_id=frame_id,
+            frame_slot_metadata=frame_slot_metadata,
+        )
         self._write_header(
             latest_frame_id=frame_id,
             latest_slot=slot,
@@ -557,6 +591,8 @@ class OpenXRFramePanelMirror:
                 "expected_publish_sample_bytes"
             ),
             presentation_mode=pending.get("presentation_mode"),
+            frame_slot_metadata=pending.get("frame_slot_metadata"),
+            overlay_slot_commands=pending.get("overlay_slot_commands"),
         )
         submit_to_commit_start_ms = float(
             pending.get("submit_to_commit_start_ms", 0.0)
@@ -787,6 +823,9 @@ class OpenXRFramePanelMirror:
                     "cudaMemcpyAsync",
                 ):
                     getattr(cudart_api, name)
+                if hasattr(cudart_api, "cudaGetErrorName"):
+                    cudart_api.cudaGetErrorName.restype = ctypes.c_char_p
+                    cudart_api.cudaGetErrorName.argtypes = [ctypes.c_int]
                 return cudart_api
             except Exception as exc:
                 last_error = exc
@@ -808,11 +847,32 @@ class OpenXRFramePanelMirror:
                 if status == 0:
                     return
                 last_error = RuntimeError(
-                    f"cudaHostRegister failed with status={status}"
+                    "cudaHostRegister failed with "
+                    f"status={status}{self._cuda_error_suffix(status)}"
                 )
             except Exception as exc:
                 last_error = exc
         raise RuntimeError(f"{last_error}")
+
+    def _cuda_error_suffix(self, status: int) -> str:
+        if self._direct_commit_cudart is None:
+            return ""
+        error_name = getattr(self._direct_commit_cudart, "cudaGetErrorName", None)
+        if error_name is None:
+            return ""
+        try:
+            result = error_name(int(status))
+            if isinstance(result, tuple):
+                result = result[1] if len(result) > 1 else result[0]
+            if isinstance(result, bytes):
+                decoded = result.decode(errors="replace")
+            else:
+                decoded = str(result)
+            if decoded:
+                return f" ({decoded})"
+        except Exception:
+            return ""
+        return ""
 
     def _cudart_host_unregister(self, ptr: int) -> None:
         if self._direct_commit_cudart is None:
@@ -873,16 +933,62 @@ class OpenXRFramePanelMirror:
                 if status == 0:
                     return
                 last_error = RuntimeError(
-                    f"cudaMemcpyAsync failed with status={status}"
+                    "cudaMemcpyAsync failed with "
+                    f"status={status}{self._cuda_error_suffix(status)}"
                 )
             except Exception as exc:
                 last_error = exc
         raise RuntimeError(f"{last_error}")
 
+    def _warm_up_direct_commit_copy(self) -> None:
+        if self._direct_commit_stream is None:
+            raise RuntimeError("CUDA direct commit stream unavailable")
+        warmup_tensor = torch.zeros(
+            (1,),
+            dtype=torch.uint8,
+            device=f"cuda:{self._cuda_device_index}",
+        )
+        warmup_start = torch.cuda.Event(enable_timing=True)
+        warmup_end = torch.cuda.Event(enable_timing=True)
+        with torch.cuda.stream(self._direct_commit_stream):
+            warmup_start.record(self._direct_commit_stream)
+            self._cudart_memcpy_device_to_host_async(
+                dst_ptr=int(self._slot_views[0].ctypes.data),
+                src_ptr=int(warmup_tensor.data_ptr()),
+                size_bytes=1,
+                stream=self._direct_commit_stream,
+            )
+            warmup_end.record(self._direct_commit_stream)
+        warmup_end.synchronize()
+
     def _initialize_direct_commit_path(self) -> None:
         self._teardown_direct_commit_path()
+        self._direct_commit_warning = None
+        self._direct_commit_registration_warning = None
         if not self.FRESHNESS_FIRST_COMMIT:
-            self._direct_commit_warning = None
+            return
+        requested_direct_commit_mode = (
+            os.environ.get(self.DIRECT_COMMIT_MODE_ENV, "auto").strip().lower()
+        )
+        if requested_direct_commit_mode in {"", "default"}:
+            requested_direct_commit_mode = "auto"
+        if requested_direct_commit_mode in {"off", "false", "0", "disabled", "staged"}:
+            self._direct_commit_warning = (
+                f"disabled by {self.DIRECT_COMMIT_MODE_ENV}="
+                f"{requested_direct_commit_mode}"
+            )
+            return
+        if requested_direct_commit_mode not in {
+            "auto",
+            "registered",
+            "registered_mmap",
+            "pageable",
+            "pageable_mmap",
+        }:
+            self._direct_commit_warning = (
+                f"unsupported {self.DIRECT_COMMIT_MODE_ENV}="
+                f"{requested_direct_commit_mode!r}"
+            )
             return
         if (
             not torch.cuda.is_available()
@@ -902,27 +1008,26 @@ class OpenXRFramePanelMirror:
                 ctypes.addressof(ctypes.c_char.from_buffer(self._shared_mmap))
             )
             mapping_size = int(len(self._shared_mmap))
-            self._cudart_host_register(mapping_ptr, mapping_size)
-            self._direct_commit_registered_slots.append((mapping_ptr, mapping_size))
+            direct_commit_mode = "registered_mmap"
+            try:
+                self._cudart_host_register(mapping_ptr, mapping_size)
+                self._direct_commit_registered_slots.append((mapping_ptr, mapping_size))
+            except Exception as exc:
+                registration_warning = f"{type(exc).__name__}: {exc}"
+                self._direct_commit_registration_warning = registration_warning
+                if requested_direct_commit_mode in {"pageable", "pageable_mmap"}:
+                    direct_commit_mode = "pageable_mmap"
+                else:
+                    self._direct_commit_warning = (
+                        "registered mmap unavailable; falling back to staged commit "
+                        f"({registration_warning})"
+                    )
+                    self._teardown_direct_commit_path()
+                    return
             # Warm up the direct path once so runtime failures fall back before gameplay.
-            warmup_tensor = torch.zeros(
-                (1,),
-                dtype=torch.uint8,
-                device=f"cuda:{self._cuda_device_index}",
-            )
-            warmup_start = torch.cuda.Event(enable_timing=True)
-            warmup_end = torch.cuda.Event(enable_timing=True)
-            with torch.cuda.stream(self._direct_commit_stream):
-                warmup_start.record(self._direct_commit_stream)
-                self._cudart_memcpy_device_to_host_async(
-                    dst_ptr=int(self._slot_views[0].ctypes.data),
-                    src_ptr=int(warmup_tensor.data_ptr()),
-                    size_bytes=1,
-                    stream=self._direct_commit_stream,
-                )
-                warmup_end.record(self._direct_commit_stream)
-            warmup_end.synchronize()
+            self._warm_up_direct_commit_copy()
             self._direct_commit_enabled = True
+            self._direct_commit_mode = direct_commit_mode
             self._direct_commit_warning = None
         except Exception as exc:
             self._direct_commit_warning = f"{type(exc).__name__}: {exc}"
@@ -937,6 +1042,7 @@ class OpenXRFramePanelMirror:
             except Exception:
                 pass
         self._direct_commit_enabled = False
+        self._direct_commit_mode = "disabled"
         self._direct_commit_cudart = None
 
     def _commit_pending_stage_copy_direct(self, pending: dict) -> dict[str, float]:
@@ -999,6 +1105,18 @@ class OpenXRFramePanelMirror:
             actual_sample_bytes=actual_publish_sample_bytes,
         )
         header_start = time.perf_counter()
+        overlay_writer = getattr(self, "_write_frame_slot_overlay", None)
+        if overlay_writer is not None:
+            overlay_writer(
+                slot=slot,
+                frame_id=int(pending["frame_id"]),
+                overlay_slot_commands=pending.get("overlay_slot_commands"),
+            )
+        self._write_frame_slot_metadata(
+            slot=slot,
+            frame_id=int(pending["frame_id"]),
+            frame_slot_metadata=pending.get("frame_slot_metadata"),
+        )
         self._write_header(
             latest_frame_id=int(pending["frame_id"]),
             latest_slot=slot,
@@ -1158,6 +1276,36 @@ class OpenXRFramePanelMirror:
             self._viewer_texture_upload_count = 0
             self._viewer_texture_upload_recent_fps = 0.0
             self._viewer_texture_upload_avg_ms = 0.0
+            self._viewer_texture_upload_mode = "unknown"
+            self._viewer_upload_thread_mode = "unknown"
+            self._viewer_upload_thread_fallback_reason = "none"
+            self._viewer_upload_ring_slots = 0
+            self._viewer_upload_late_wait_us = 0
+            self._viewer_upload_busy_backoff_us = 0
+            self._viewer_projection_pose_mode = "unknown"
+            self._viewer_source_pose_metadata_valid_count = 0
+            self._viewer_source_pose_metadata_invalid_count = 0
+            self._viewer_source_pose_metadata_fallback_count = 0
+            self._viewer_texture_upload_mmap_copy_avg_ms = 0.0
+            self._viewer_texture_upload_gl_avg_ms = 0.0
+            self._viewer_texture_upload_gl_left_avg_ms = 0.0
+            self._viewer_texture_upload_gl_right_avg_ms = 0.0
+            self._viewer_texture_upload_slot_miss_count = 0
+            self._viewer_texture_upload_slot_drop_count = 0
+            self._viewer_texture_upload_slot_busy_count = 0
+            self._viewer_texture_upload_busy_backoff_count = 0
+            self._viewer_texture_upload_busy_backoff_avg_ms = 0.0
+            self._viewer_render_without_upload_count = 0
+            self._viewer_texture_upload_no_new_frame_count = 0
+            self._viewer_texture_upload_late_wait_hit_count = 0
+            self._viewer_texture_upload_late_wait_miss_count = 0
+            self._viewer_texture_upload_late_wait_avg_ms = 0.0
+            self._viewer_async_upload_count = 0
+            self._viewer_async_ready_slot_count = 0
+            self._viewer_async_poll_no_new_count = 0
+            self._viewer_overlay_latched_match_count = 0
+            self._viewer_overlay_latched_mismatch_count = 0
+            self._viewer_overlay_latched_empty_count = 0
 
     def _reset_bridge_commit_stats(self) -> None:
         with self._stage_condition:
@@ -1212,6 +1360,23 @@ class OpenXRFramePanelMirror:
             self._steady_state_viewer_coalesced_source_frame_count = 0
             self._steady_state_viewer_render_baseline_count = 0
             self._steady_state_viewer_texture_upload_baseline_count = 0
+            self._steady_state_viewer_texture_upload_slot_miss_baseline_count = 0
+            self._steady_state_viewer_texture_upload_slot_drop_baseline_count = 0
+            self._steady_state_viewer_texture_upload_slot_busy_baseline_count = 0
+            self._steady_state_viewer_texture_upload_busy_backoff_baseline_count = 0
+            self._steady_state_viewer_render_without_upload_baseline_count = 0
+            self._steady_state_viewer_texture_upload_no_new_frame_baseline_count = 0
+            self._steady_state_viewer_texture_upload_late_wait_hit_baseline_count = 0
+            self._steady_state_viewer_texture_upload_late_wait_miss_baseline_count = 0
+            self._steady_state_viewer_async_upload_baseline_count = 0
+            self._steady_state_viewer_async_ready_slot_baseline_count = 0
+            self._steady_state_viewer_async_poll_no_new_baseline_count = 0
+            self._steady_state_viewer_source_pose_metadata_valid_baseline_count = 0
+            self._steady_state_viewer_source_pose_metadata_invalid_baseline_count = 0
+            self._steady_state_viewer_source_pose_metadata_fallback_baseline_count = 0
+            self._steady_state_viewer_overlay_latched_match_baseline_count = 0
+            self._steady_state_viewer_overlay_latched_mismatch_baseline_count = 0
+            self._steady_state_viewer_overlay_latched_empty_baseline_count = 0
             self._steady_state_viewer_epoch_baseline_applied_update_count = 0
             self._steady_state_viewer_epoch_baseline_source_frame_delta_count = 0
             self._steady_state_viewer_epoch_baseline_coalesced_source_frame_count = 0
@@ -1340,6 +1505,57 @@ class OpenXRFramePanelMirror:
             )
             self._steady_state_viewer_texture_upload_baseline_count = int(
                 self._viewer_texture_upload_count
+            )
+            self._steady_state_viewer_texture_upload_slot_miss_baseline_count = int(
+                self._viewer_texture_upload_slot_miss_count
+            )
+            self._steady_state_viewer_texture_upload_slot_drop_baseline_count = int(
+                self._viewer_texture_upload_slot_drop_count
+            )
+            self._steady_state_viewer_texture_upload_slot_busy_baseline_count = int(
+                self._viewer_texture_upload_slot_busy_count
+            )
+            self._steady_state_viewer_texture_upload_busy_backoff_baseline_count = int(
+                self._viewer_texture_upload_busy_backoff_count
+            )
+            self._steady_state_viewer_render_without_upload_baseline_count = int(
+                self._viewer_render_without_upload_count
+            )
+            self._steady_state_viewer_texture_upload_no_new_frame_baseline_count = int(
+                self._viewer_texture_upload_no_new_frame_count
+            )
+            self._steady_state_viewer_texture_upload_late_wait_hit_baseline_count = int(
+                self._viewer_texture_upload_late_wait_hit_count
+            )
+            self._steady_state_viewer_texture_upload_late_wait_miss_baseline_count = int(
+                self._viewer_texture_upload_late_wait_miss_count
+            )
+            self._steady_state_viewer_async_upload_baseline_count = int(
+                self._viewer_async_upload_count
+            )
+            self._steady_state_viewer_async_ready_slot_baseline_count = int(
+                self._viewer_async_ready_slot_count
+            )
+            self._steady_state_viewer_async_poll_no_new_baseline_count = int(
+                self._viewer_async_poll_no_new_count
+            )
+            self._steady_state_viewer_source_pose_metadata_valid_baseline_count = int(
+                self._viewer_source_pose_metadata_valid_count
+            )
+            self._steady_state_viewer_source_pose_metadata_invalid_baseline_count = int(
+                self._viewer_source_pose_metadata_invalid_count
+            )
+            self._steady_state_viewer_source_pose_metadata_fallback_baseline_count = int(
+                self._viewer_source_pose_metadata_fallback_count
+            )
+            self._steady_state_viewer_overlay_latched_match_baseline_count = int(
+                self._viewer_overlay_latched_match_count
+            )
+            self._steady_state_viewer_overlay_latched_mismatch_baseline_count = int(
+                self._viewer_overlay_latched_mismatch_count
+            )
+            self._steady_state_viewer_overlay_latched_empty_baseline_count = int(
+                self._viewer_overlay_latched_empty_count
             )
 
     def _record_bridge_submit_locked(
@@ -1872,8 +2088,14 @@ class OpenXRFramePanelMirror:
             parts.append(
                 "bridge direct commit: "
                 f"enabled={int(bool(bridge_commit_stats.get('direct_commit_enabled', False)))} "
+                f"mode={bridge_commit_stats.get('direct_commit_mode', 'disabled')} "
                 f"reason={bridge_commit_stats.get('direct_commit_warning', 'none') or 'none'}"
             )
+            if bridge_commit_stats.get("direct_commit_registration_warning"):
+                parts.append(
+                    "bridge direct commit registration: "
+                    f"{bridge_commit_stats.get('direct_commit_registration_warning')}"
+                )
             parts.append(
                 "bridge submits: "
                 f"latest_frame_id={bridge_commit_stats.get('latest_submitted_frame_id', 0)} "
@@ -1954,7 +2176,34 @@ class OpenXRFramePanelMirror:
                 f"recent_fps={viewer_render_stats.get('recent_fps', 0.0):.2f} "
                 f"texture_upload_count={viewer_render_stats.get('texture_upload_count', 0)} "
                 f"texture_upload_recent_fps={viewer_render_stats.get('texture_upload_recent_fps', 0.0):.2f} "
-                f"texture_upload_avg_ms={viewer_render_stats.get('texture_upload_avg_ms', 0.0):.2f}"
+                f"texture_upload_avg_ms={viewer_render_stats.get('texture_upload_avg_ms', 0.0):.2f} "
+                f"texture_upload_mode={viewer_render_stats.get('texture_upload_mode', 'unknown')} "
+                f"viewer_upload_thread_mode={viewer_render_stats.get('viewer_upload_thread_mode', 'unknown')} "
+                f"viewer_upload_thread_fallback_reason={viewer_render_stats.get('viewer_upload_thread_fallback_reason', 'none')} "
+                f"viewer_upload_ring_slots={viewer_render_stats.get('viewer_upload_ring_slots', 0)} "
+                f"viewer_upload_late_wait_us={viewer_render_stats.get('viewer_upload_late_wait_us', 0)} "
+                f"viewer_upload_busy_backoff_us={viewer_render_stats.get('viewer_upload_busy_backoff_us', 0)} "
+                f"texture_upload_mmap_copy_avg_ms={viewer_render_stats.get('texture_upload_mmap_copy_avg_ms', 0.0):.2f} "
+                f"texture_upload_gl_avg_ms={viewer_render_stats.get('texture_upload_gl_avg_ms', 0.0):.2f} "
+                f"texture_upload_slot_miss_count={viewer_render_stats.get('texture_upload_slot_miss_count', 0)} "
+                f"texture_upload_slot_drop_count={viewer_render_stats.get('texture_upload_slot_drop_count', 0)} "
+                f"texture_upload_busy_backoff_count={viewer_render_stats.get('texture_upload_busy_backoff_count', 0)} "
+                f"texture_upload_busy_backoff_avg_ms={viewer_render_stats.get('texture_upload_busy_backoff_avg_ms', 0.0):.2f} "
+                f"render_without_upload_count={viewer_render_stats.get('render_without_upload_count', 0)} "
+                f"texture_upload_no_new_frame_count={viewer_render_stats.get('texture_upload_no_new_frame_count', 0)} "
+                f"texture_upload_late_wait_hit_count={viewer_render_stats.get('texture_upload_late_wait_hit_count', 0)} "
+                f"texture_upload_late_wait_miss_count={viewer_render_stats.get('texture_upload_late_wait_miss_count', 0)} "
+                f"texture_upload_late_wait_avg_ms={viewer_render_stats.get('texture_upload_late_wait_avg_ms', 0.0):.2f} "
+                f"viewer_async_upload_count={viewer_render_stats.get('viewer_async_upload_count', 0)} "
+                f"viewer_async_ready_slot_count={viewer_render_stats.get('viewer_async_ready_slot_count', 0)} "
+                f"viewer_async_poll_no_new_count={viewer_render_stats.get('viewer_async_poll_no_new_count', 0)} "
+                f"viewer_projection_pose_mode={viewer_render_stats.get('viewer_projection_pose_mode', 'unknown')} "
+                f"viewer_source_pose_metadata_valid_count={viewer_render_stats.get('viewer_source_pose_metadata_valid_count', 0)} "
+                f"viewer_source_pose_metadata_invalid_count={viewer_render_stats.get('viewer_source_pose_metadata_invalid_count', 0)} "
+                f"viewer_source_pose_metadata_fallback_count={viewer_render_stats.get('viewer_source_pose_metadata_fallback_count', 0)} "
+                f"viewer_overlay_latched_match_count={viewer_render_stats.get('viewer_overlay_latched_match_count', 0)} "
+                f"viewer_overlay_latched_mismatch_count={viewer_render_stats.get('viewer_overlay_latched_mismatch_count', 0)} "
+                f"viewer_overlay_latched_empty_count={viewer_render_stats.get('viewer_overlay_latched_empty_count', 0)}"
             )
         if self._stdout_tail:
             parts.append("stdout:\n" + "".join(self._stdout_tail).strip())
@@ -2035,6 +2284,15 @@ class OpenXRFramePanelMirror:
             0,
         )
 
+    def _write_frame_slot_metadata(
+        self,
+        *,
+        slot: int,
+        frame_id: int,
+        frame_slot_metadata=None,
+    ) -> None:
+        _ = (slot, frame_id, frame_slot_metadata)
+
     def _read_stdout(self) -> None:
         assert self.process is not None and self.process.stdout is not None
         for line in self.process.stdout:
@@ -2071,6 +2329,7 @@ class OpenXRFramePanelMirror:
                 "Immersive bridge received source frame",
                 "Immersive bridge viewer_source_stats",
                 "Immersive bridge viewer_render_stats",
+                "Immersive bridge viewer upload mode:",
                 "Immersive bridge presentation mode:",
                 "Panel received source frame",
                 "Presentation path:",
@@ -2246,6 +2505,186 @@ class OpenXRFramePanelMirror:
                         self._viewer_texture_upload_avg_ms,
                     )
                 )
+                self._viewer_texture_upload_mode = str(
+                    parsed.get(
+                        "texture_upload_mode",
+                        self._viewer_texture_upload_mode,
+                    )
+                )
+                self._viewer_upload_thread_mode = str(
+                    parsed.get(
+                        "viewer_upload_thread_mode",
+                        self._viewer_upload_thread_mode,
+                    )
+                )
+                self._viewer_upload_thread_fallback_reason = str(
+                    parsed.get(
+                        "viewer_upload_thread_fallback_reason",
+                        self._viewer_upload_thread_fallback_reason,
+                    )
+                )
+                self._viewer_upload_ring_slots = int(
+                    parsed.get(
+                        "viewer_upload_ring_slots",
+                        self._viewer_upload_ring_slots,
+                    )
+                )
+                self._viewer_upload_late_wait_us = int(
+                    parsed.get(
+                        "viewer_upload_late_wait_us",
+                        self._viewer_upload_late_wait_us,
+                    )
+                )
+                self._viewer_upload_busy_backoff_us = int(
+                    parsed.get(
+                        "viewer_upload_busy_backoff_us",
+                        self._viewer_upload_busy_backoff_us,
+                    )
+                )
+                self._viewer_projection_pose_mode = str(
+                    parsed.get(
+                        "viewer_projection_pose_mode",
+                        self._viewer_projection_pose_mode,
+                    )
+                )
+                self._viewer_source_pose_metadata_valid_count = int(
+                    parsed.get(
+                        "viewer_source_pose_metadata_valid_count",
+                        self._viewer_source_pose_metadata_valid_count,
+                    )
+                )
+                self._viewer_source_pose_metadata_invalid_count = int(
+                    parsed.get(
+                        "viewer_source_pose_metadata_invalid_count",
+                        self._viewer_source_pose_metadata_invalid_count,
+                    )
+                )
+                self._viewer_source_pose_metadata_fallback_count = int(
+                    parsed.get(
+                        "viewer_source_pose_metadata_fallback_count",
+                        self._viewer_source_pose_metadata_fallback_count,
+                    )
+                )
+                self._viewer_overlay_latched_match_count = int(
+                    parsed.get(
+                        "viewer_overlay_latched_match_count",
+                        self._viewer_overlay_latched_match_count,
+                    )
+                )
+                self._viewer_overlay_latched_mismatch_count = int(
+                    parsed.get(
+                        "viewer_overlay_latched_mismatch_count",
+                        self._viewer_overlay_latched_mismatch_count,
+                    )
+                )
+                self._viewer_overlay_latched_empty_count = int(
+                    parsed.get(
+                        "viewer_overlay_latched_empty_count",
+                        self._viewer_overlay_latched_empty_count,
+                    )
+                )
+                self._viewer_texture_upload_mmap_copy_avg_ms = float(
+                    parsed.get(
+                        "texture_upload_mmap_copy_avg_ms",
+                        self._viewer_texture_upload_mmap_copy_avg_ms,
+                    )
+                )
+                self._viewer_texture_upload_gl_avg_ms = float(
+                    parsed.get(
+                        "texture_upload_gl_avg_ms",
+                        self._viewer_texture_upload_gl_avg_ms,
+                    )
+                )
+                self._viewer_texture_upload_gl_left_avg_ms = float(
+                    parsed.get(
+                        "texture_upload_gl_left_avg_ms",
+                        self._viewer_texture_upload_gl_left_avg_ms,
+                    )
+                )
+                self._viewer_texture_upload_gl_right_avg_ms = float(
+                    parsed.get(
+                        "texture_upload_gl_right_avg_ms",
+                        self._viewer_texture_upload_gl_right_avg_ms,
+                    )
+                )
+                self._viewer_texture_upload_slot_miss_count = int(
+                    parsed.get(
+                        "texture_upload_slot_miss_count",
+                        self._viewer_texture_upload_slot_miss_count,
+                    )
+                )
+                self._viewer_texture_upload_slot_drop_count = int(
+                    parsed.get(
+                        "texture_upload_slot_drop_count",
+                        self._viewer_texture_upload_slot_drop_count,
+                    )
+                )
+                self._viewer_texture_upload_slot_busy_count = int(
+                    parsed.get(
+                        "texture_upload_slot_busy_count",
+                        self._viewer_texture_upload_slot_busy_count,
+                    )
+                )
+                self._viewer_texture_upload_busy_backoff_count = int(
+                    parsed.get(
+                        "texture_upload_busy_backoff_count",
+                        self._viewer_texture_upload_busy_backoff_count,
+                    )
+                )
+                self._viewer_texture_upload_busy_backoff_avg_ms = float(
+                    parsed.get(
+                        "texture_upload_busy_backoff_avg_ms",
+                        self._viewer_texture_upload_busy_backoff_avg_ms,
+                    )
+                )
+                self._viewer_render_without_upload_count = int(
+                    parsed.get(
+                        "render_without_upload_count",
+                        self._viewer_render_without_upload_count,
+                    )
+                )
+                self._viewer_texture_upload_no_new_frame_count = int(
+                    parsed.get(
+                        "texture_upload_no_new_frame_count",
+                        self._viewer_texture_upload_no_new_frame_count,
+                    )
+                )
+                self._viewer_texture_upload_late_wait_hit_count = int(
+                    parsed.get(
+                        "texture_upload_late_wait_hit_count",
+                        self._viewer_texture_upload_late_wait_hit_count,
+                    )
+                )
+                self._viewer_texture_upload_late_wait_miss_count = int(
+                    parsed.get(
+                        "texture_upload_late_wait_miss_count",
+                        self._viewer_texture_upload_late_wait_miss_count,
+                    )
+                )
+                self._viewer_texture_upload_late_wait_avg_ms = float(
+                    parsed.get(
+                        "texture_upload_late_wait_avg_ms",
+                        self._viewer_texture_upload_late_wait_avg_ms,
+                    )
+                )
+                self._viewer_async_upload_count = int(
+                    parsed.get(
+                        "viewer_async_upload_count",
+                        self._viewer_async_upload_count,
+                    )
+                )
+                self._viewer_async_ready_slot_count = int(
+                    parsed.get(
+                        "viewer_async_ready_slot_count",
+                        self._viewer_async_ready_slot_count,
+                    )
+                )
+                self._viewer_async_poll_no_new_count = int(
+                    parsed.get(
+                        "viewer_async_poll_no_new_count",
+                        self._viewer_async_poll_no_new_count,
+                    )
+                )
         except Exception as exc:
             self._parse_errors.append(f"{exc}: {str(line).strip()}")
 
@@ -2414,11 +2853,169 @@ class OpenXRFramePanelMirror:
                     int(self._viewer_texture_upload_count)
                     - int(self._steady_state_viewer_texture_upload_baseline_count),
                 )
+                texture_upload_slot_miss_count = max(
+                    0,
+                    int(self._viewer_texture_upload_slot_miss_count)
+                    - int(
+                        self._steady_state_viewer_texture_upload_slot_miss_baseline_count
+                    ),
+                )
+                texture_upload_slot_drop_count = max(
+                    0,
+                    int(self._viewer_texture_upload_slot_drop_count)
+                    - int(
+                        self._steady_state_viewer_texture_upload_slot_drop_baseline_count
+                    ),
+                )
+                texture_upload_slot_busy_count = max(
+                    0,
+                    int(self._viewer_texture_upload_slot_busy_count)
+                    - int(
+                        self._steady_state_viewer_texture_upload_slot_busy_baseline_count
+                    ),
+                )
+                texture_upload_busy_backoff_count = max(
+                    0,
+                    int(self._viewer_texture_upload_busy_backoff_count)
+                    - int(
+                        self._steady_state_viewer_texture_upload_busy_backoff_baseline_count
+                    ),
+                )
+                render_without_upload_count = max(
+                    0,
+                    int(self._viewer_render_without_upload_count)
+                    - int(
+                        self._steady_state_viewer_render_without_upload_baseline_count
+                    ),
+                )
+                texture_upload_no_new_frame_count = max(
+                    0,
+                    int(self._viewer_texture_upload_no_new_frame_count)
+                    - int(
+                        self._steady_state_viewer_texture_upload_no_new_frame_baseline_count
+                    ),
+                )
+                texture_upload_late_wait_hit_count = max(
+                    0,
+                    int(self._viewer_texture_upload_late_wait_hit_count)
+                    - int(
+                        self._steady_state_viewer_texture_upload_late_wait_hit_baseline_count
+                    ),
+                )
+                texture_upload_late_wait_miss_count = max(
+                    0,
+                    int(self._viewer_texture_upload_late_wait_miss_count)
+                    - int(
+                        self._steady_state_viewer_texture_upload_late_wait_miss_baseline_count
+                    ),
+                )
+                async_upload_count = max(
+                    0,
+                    int(self._viewer_async_upload_count)
+                    - int(self._steady_state_viewer_async_upload_baseline_count),
+                )
+                async_ready_slot_count = max(
+                    0,
+                    int(self._viewer_async_ready_slot_count)
+                    - int(self._steady_state_viewer_async_ready_slot_baseline_count),
+                )
+                async_poll_no_new_count = max(
+                    0,
+                    int(self._viewer_async_poll_no_new_count)
+                    - int(self._steady_state_viewer_async_poll_no_new_baseline_count),
+                )
+                source_pose_metadata_valid_count = max(
+                    0,
+                    int(self._viewer_source_pose_metadata_valid_count)
+                    - int(
+                        self._steady_state_viewer_source_pose_metadata_valid_baseline_count
+                    ),
+                )
+                source_pose_metadata_invalid_count = max(
+                    0,
+                    int(self._viewer_source_pose_metadata_invalid_count)
+                    - int(
+                        self._steady_state_viewer_source_pose_metadata_invalid_baseline_count
+                    ),
+                )
+                source_pose_metadata_fallback_count = max(
+                    0,
+                    int(self._viewer_source_pose_metadata_fallback_count)
+                    - int(
+                        self._steady_state_viewer_source_pose_metadata_fallback_baseline_count
+                    ),
+                )
+                overlay_latched_match_count = max(
+                    0,
+                    int(self._viewer_overlay_latched_match_count)
+                    - int(
+                        self._steady_state_viewer_overlay_latched_match_baseline_count
+                    ),
+                )
+                overlay_latched_mismatch_count = max(
+                    0,
+                    int(self._viewer_overlay_latched_mismatch_count)
+                    - int(
+                        self._steady_state_viewer_overlay_latched_mismatch_baseline_count
+                    ),
+                )
+                overlay_latched_empty_count = max(
+                    0,
+                    int(self._viewer_overlay_latched_empty_count)
+                    - int(
+                        self._steady_state_viewer_overlay_latched_empty_baseline_count
+                    ),
+                )
                 recent_fps = float(count) / elapsed_s if elapsed_s > 0.0 and count > 0 else 0.0
             else:
                 elapsed_s = float(self._viewer_render_elapsed_s)
                 count = int(self._viewer_rendered_frame_count)
                 texture_upload_count = int(self._viewer_texture_upload_count)
+                texture_upload_slot_miss_count = int(
+                    self._viewer_texture_upload_slot_miss_count
+                )
+                texture_upload_slot_drop_count = int(
+                    self._viewer_texture_upload_slot_drop_count
+                )
+                texture_upload_slot_busy_count = int(
+                    self._viewer_texture_upload_slot_busy_count
+                )
+                texture_upload_busy_backoff_count = int(
+                    self._viewer_texture_upload_busy_backoff_count
+                )
+                render_without_upload_count = int(
+                    self._viewer_render_without_upload_count
+                )
+                texture_upload_no_new_frame_count = int(
+                    self._viewer_texture_upload_no_new_frame_count
+                )
+                texture_upload_late_wait_hit_count = int(
+                    self._viewer_texture_upload_late_wait_hit_count
+                )
+                texture_upload_late_wait_miss_count = int(
+                    self._viewer_texture_upload_late_wait_miss_count
+                )
+                async_upload_count = int(self._viewer_async_upload_count)
+                async_ready_slot_count = int(self._viewer_async_ready_slot_count)
+                async_poll_no_new_count = int(self._viewer_async_poll_no_new_count)
+                source_pose_metadata_valid_count = int(
+                    self._viewer_source_pose_metadata_valid_count
+                )
+                source_pose_metadata_invalid_count = int(
+                    self._viewer_source_pose_metadata_invalid_count
+                )
+                source_pose_metadata_fallback_count = int(
+                    self._viewer_source_pose_metadata_fallback_count
+                )
+                overlay_latched_match_count = int(
+                    self._viewer_overlay_latched_match_count
+                )
+                overlay_latched_mismatch_count = int(
+                    self._viewer_overlay_latched_mismatch_count
+                )
+                overlay_latched_empty_count = int(
+                    self._viewer_overlay_latched_empty_count
+                )
                 recent_fps = float(self._viewer_recent_render_fps)
         average_fps = 0.0
         if elapsed_s > 0.0 and count > 0:
@@ -2435,6 +3032,52 @@ class OpenXRFramePanelMirror:
             "texture_upload_recent_fps": float(self._viewer_texture_upload_recent_fps),
             "texture_upload_average_fps": texture_upload_average_fps,
             "texture_upload_avg_ms": float(self._viewer_texture_upload_avg_ms),
+            "texture_upload_mode": str(self._viewer_texture_upload_mode),
+            "viewer_upload_thread_mode": str(self._viewer_upload_thread_mode),
+            "viewer_upload_thread_fallback_reason": str(
+                self._viewer_upload_thread_fallback_reason
+            ),
+            "viewer_upload_ring_slots": int(self._viewer_upload_ring_slots),
+            "viewer_upload_late_wait_us": int(self._viewer_upload_late_wait_us),
+            "viewer_upload_busy_backoff_us": int(
+                self._viewer_upload_busy_backoff_us
+            ),
+            "texture_upload_mmap_copy_avg_ms": float(
+                self._viewer_texture_upload_mmap_copy_avg_ms
+            ),
+            "texture_upload_gl_avg_ms": float(self._viewer_texture_upload_gl_avg_ms),
+            "texture_upload_gl_left_avg_ms": float(
+                self._viewer_texture_upload_gl_left_avg_ms
+            ),
+            "texture_upload_gl_right_avg_ms": float(
+                self._viewer_texture_upload_gl_right_avg_ms
+            ),
+            "texture_upload_slot_miss_count": texture_upload_slot_miss_count,
+            "texture_upload_slot_drop_count": texture_upload_slot_drop_count,
+            "texture_upload_slot_busy_count": texture_upload_slot_busy_count,
+            "texture_upload_busy_backoff_count": texture_upload_busy_backoff_count,
+            "texture_upload_busy_backoff_avg_ms": float(
+                self._viewer_texture_upload_busy_backoff_avg_ms
+            ),
+            "render_without_upload_count": render_without_upload_count,
+            "texture_upload_no_new_frame_count": texture_upload_no_new_frame_count,
+            "texture_upload_late_wait_hit_count": texture_upload_late_wait_hit_count,
+            "texture_upload_late_wait_miss_count": texture_upload_late_wait_miss_count,
+            "texture_upload_late_wait_avg_ms": float(
+                self._viewer_texture_upload_late_wait_avg_ms
+            ),
+            "viewer_async_upload_count": async_upload_count,
+            "viewer_async_ready_slot_count": async_ready_slot_count,
+            "viewer_async_poll_no_new_count": async_poll_no_new_count,
+            "viewer_projection_pose_mode": str(self._viewer_projection_pose_mode),
+            "viewer_source_pose_metadata_valid_count": source_pose_metadata_valid_count,
+            "viewer_source_pose_metadata_invalid_count": source_pose_metadata_invalid_count,
+            "viewer_source_pose_metadata_fallback_count": (
+                source_pose_metadata_fallback_count
+            ),
+            "viewer_overlay_latched_match_count": overlay_latched_match_count,
+            "viewer_overlay_latched_mismatch_count": overlay_latched_mismatch_count,
+            "viewer_overlay_latched_empty_count": overlay_latched_empty_count,
         }
 
     def bridge_commit_stats(
@@ -2642,10 +3285,16 @@ class OpenXRFramePanelMirror:
                     else 0.0
                 )
             direct_commit_enabled = bool(self._direct_commit_enabled)
+            direct_commit_mode = str(self._direct_commit_mode)
             direct_commit_warning = (
                 None
                 if self._direct_commit_warning is None
                 else str(self._direct_commit_warning)
+            )
+            direct_commit_registration_warning = (
+                None
+                if self._direct_commit_registration_warning is None
+                else str(self._direct_commit_registration_warning)
             )
         bridge_submit_fps = 0.0
         if submit_elapsed_s > 0.0 and submitted_frame_count > 0:
@@ -2694,7 +3343,9 @@ class OpenXRFramePanelMirror:
             "bridge_publish_sample_check_count": publish_sample_check_count,
             "bridge_publish_sample_mismatch_count": publish_sample_mismatch_count,
             "direct_commit_enabled": direct_commit_enabled,
+            "direct_commit_mode": direct_commit_mode,
             "direct_commit_warning": direct_commit_warning,
+            "direct_commit_registration_warning": direct_commit_registration_warning,
             "bridge_submit_to_commit_start_ms": average_submit_to_commit_start_ms,
             "bridge_commit_wait_for_gpu_ready_ms": average_commit_wait_for_gpu_ready_ms,
             "bridge_commit_thread_wake_delay_ms": average_commit_thread_wake_delay_ms,
@@ -2749,15 +3400,20 @@ class OpenXRFramePanelMirror:
 
 class OpenXRImmersiveBridge(OpenXRFramePanelMirror):
     HEADER_MAGIC = b"BOBAQIM1"
+    HEADER_VERSION = 3
     EYE_COUNT = 2
     SLOT_COUNT = 4
     STAGING_BUFFER_COUNT = 4
     FRESHNESS_FIRST_COMMIT = True
+    POSE_METADATA_SLOT_STRUCT = struct.Struct("<QII3f4f4f3f4f4f24x")
+    POSE_METADATA_VALID_LEFT = 1 << 0
+    POSE_METADATA_VALID_RIGHT = 1 << 1
     OVERLAY_HEADER_MAGIC = b"BOBAOVL1"
-    OVERLAY_HEADER_VERSION = 1
+    OVERLAY_HEADER_VERSION = 2
     OVERLAY_COMMAND_STRIDE_FLOATS = 14
     OVERLAY_MAX_COMMANDS_PER_EYE = 256
     OVERLAY_HEADER_STRUCT = struct.Struct("<8sIIIQIII24x")
+    OVERLAY_SLOT_METADATA_STRUCT = struct.Struct("<QIIII8x")
 
     def __init__(self, repo_root: Path, width: int, height: int):
         super().__init__(repo_root=repo_root, width=width, height=height)
@@ -2765,8 +3421,14 @@ class OpenXRImmersiveBridge(OpenXRFramePanelMirror):
         self.shared_overlay_path: Optional[Path] = None
         self._overlay_file = None
         self._overlay_mmap: Optional[mmap.mmap] = None
+        self._overlay_slot_metadata_offset = self.OVERLAY_HEADER_STRUCT.size
+        self._overlay_payload_offset = (
+            self.OVERLAY_HEADER_STRUCT.size
+            + self.SLOT_COUNT * self.OVERLAY_SLOT_METADATA_STRUCT.size
+        )
         self._overlay_command_array: Optional[np.ndarray] = None
         self._overlay_frame_counter = 0
+        self._pending_overlay_commands_by_eye = None
         pin_memory = torch.cuda.is_available()
         self._cpu_stage_buffers = [
             torch.empty(
@@ -2809,15 +3471,113 @@ class OpenXRImmersiveBridge(OpenXRFramePanelMirror):
             self.shared_overlay_path = None
         self._overlay_command_array = None
         self._overlay_frame_counter = 0
+        self._pending_overlay_commands_by_eye = None
+
+    @property
+    def _pose_metadata_bytes(self) -> int:
+        return int(self.SLOT_COUNT) * int(self.POSE_METADATA_SLOT_STRUCT.size)
+
+    @staticmethod
+    def _normalize_eye_pose_metadata(
+        eye_sample: Optional[EyePoseSample],
+    ) -> Optional[tuple[np.ndarray, np.ndarray, np.ndarray]]:
+        if eye_sample is None or not bool(eye_sample.pose_valid):
+            return None
+        position = np.asarray(eye_sample.position, dtype=np.float32).reshape(-1)
+        orientation = np.asarray(eye_sample.orientation, dtype=np.float32).reshape(-1)
+        fov = np.asarray(
+            [
+                float(eye_sample.fov.angle_left),
+                float(eye_sample.fov.angle_right),
+                float(eye_sample.fov.angle_up),
+                float(eye_sample.fov.angle_down),
+            ],
+            dtype=np.float32,
+        )
+        if position.shape != (3,) or orientation.shape != (4,) or fov.shape != (4,):
+            return None
+        if (
+            not np.all(np.isfinite(position))
+            or not np.all(np.isfinite(orientation))
+            or not np.all(np.isfinite(fov))
+        ):
+            return None
+        return position.copy(), orientation.copy(), fov.copy()
+
+    def _make_frame_slot_metadata(
+        self,
+        *,
+        left_eye_sample: Optional[EyePoseSample] = None,
+        right_eye_sample: Optional[EyePoseSample] = None,
+    ) -> tuple[
+        Optional[tuple[np.ndarray, np.ndarray, np.ndarray]],
+        Optional[tuple[np.ndarray, np.ndarray, np.ndarray]],
+    ]:
+        return (
+            self._normalize_eye_pose_metadata(left_eye_sample),
+            self._normalize_eye_pose_metadata(right_eye_sample),
+        )
+
+    def _write_frame_slot_metadata(
+        self,
+        *,
+        slot: int,
+        frame_id: int,
+        frame_slot_metadata=None,
+    ) -> None:
+        if self._shared_mmap is None:
+            return
+        metadata_offset = (
+            self.HEADER_STRUCT.size
+            + int(slot) * self.POSE_METADATA_SLOT_STRUCT.size
+        )
+        left_metadata = None
+        right_metadata = None
+        if frame_slot_metadata is not None:
+            try:
+                left_metadata, right_metadata = frame_slot_metadata
+            except (TypeError, ValueError):
+                left_metadata = None
+                right_metadata = None
+        valid_flags = 0
+        zero3 = np.zeros((3,), dtype=np.float32)
+        zero4 = np.zeros((4,), dtype=np.float32)
+        left_position = zero3
+        left_orientation = zero4
+        left_fov = zero4
+        right_position = zero3
+        right_orientation = zero4
+        right_fov = zero4
+        if left_metadata is not None:
+            left_position, left_orientation, left_fov = left_metadata
+            valid_flags |= self.POSE_METADATA_VALID_LEFT
+        if right_metadata is not None:
+            right_position, right_orientation, right_fov = right_metadata
+            valid_flags |= self.POSE_METADATA_VALID_RIGHT
+        self.POSE_METADATA_SLOT_STRUCT.pack_into(
+            self._shared_mmap,
+            metadata_offset,
+            int(frame_id),
+            int(valid_flags),
+            0,
+            *[float(v) for v in left_position],
+            *[float(v) for v in left_orientation],
+            *[float(v) for v in left_fov],
+            *[float(v) for v in right_position],
+            *[float(v) for v in right_orientation],
+            *[float(v) for v in right_fov],
+        )
 
     def _create_shared_overlay_file(self) -> None:
         command_bytes = (
-            self.EYE_COUNT
+            self.SLOT_COUNT
+            * self.EYE_COUNT
             * self.OVERLAY_MAX_COMMANDS_PER_EYE
             * self.OVERLAY_COMMAND_STRIDE_FLOATS
             * np.dtype(np.float32).itemsize
         )
-        total_bytes = self.OVERLAY_HEADER_STRUCT.size + command_bytes
+        metadata_bytes = self.SLOT_COUNT * self.OVERLAY_SLOT_METADATA_STRUCT.size
+        total_bytes = self.OVERLAY_HEADER_STRUCT.size + metadata_bytes + command_bytes
         fd, path = tempfile.mkstemp(
             prefix="boba_quest_overlay_",
             suffix=".bin",
@@ -2827,15 +3587,19 @@ class OpenXRImmersiveBridge(OpenXRFramePanelMirror):
         self._overlay_file = os.fdopen(fd, "r+b", buffering=0)
         self._overlay_file.truncate(total_bytes)
         self._overlay_mmap = mmap.mmap(self._overlay_file.fileno(), total_bytes)
+        self._overlay_mmap[
+            self._overlay_slot_metadata_offset : self._overlay_payload_offset
+        ] = b"\x00" * metadata_bytes
         self._overlay_command_array = np.ndarray(
             (
+                self.SLOT_COUNT,
                 self.EYE_COUNT,
                 self.OVERLAY_MAX_COMMANDS_PER_EYE,
                 self.OVERLAY_COMMAND_STRIDE_FLOATS,
             ),
             dtype=np.float32,
             buffer=self._overlay_mmap,
-            offset=self.OVERLAY_HEADER_STRUCT.size,
+            offset=self._overlay_payload_offset,
         )
         self._overlay_command_array.fill(0.0)
         self._write_overlay_header(latest_overlay_id=0, left_count=0, right_count=0)
@@ -2859,11 +3623,97 @@ class OpenXRImmersiveBridge(OpenXRFramePanelMirror):
             int(latest_overlay_id),
             int(left_count),
             int(right_count),
-            0,
+            int(self.SLOT_COUNT),
         )
 
     def viewer_overlay_enabled(self) -> bool:
         return self._overlay_mmap is not None and self._overlay_command_array is not None
+
+    def _normalize_overlay_commands(self, commands) -> np.ndarray:
+        normalized = []
+        for command in commands or []:
+            values = np.asarray(command, dtype=np.float32).reshape(-1)
+            if int(values.size) != int(self.OVERLAY_COMMAND_STRIDE_FLOATS):
+                continue
+            normalized.append(values)
+            if len(normalized) >= int(self.OVERLAY_MAX_COMMANDS_PER_EYE):
+                break
+        if not normalized:
+            return np.zeros(
+                (0, self.OVERLAY_COMMAND_STRIDE_FLOATS),
+                dtype=np.float32,
+            )
+        return np.stack(normalized, axis=0).astype(np.float32, copy=False)
+
+    def _normalize_overlay_commands_by_eye(self, overlay_commands_by_eye=None):
+        if overlay_commands_by_eye is None:
+            overlay_commands_by_eye = self._pending_overlay_commands_by_eye
+            self._pending_overlay_commands_by_eye = None
+        left_commands = []
+        right_commands = []
+        if overlay_commands_by_eye is not None:
+            try:
+                left_commands, right_commands = overlay_commands_by_eye
+            except (TypeError, ValueError):
+                left_commands = []
+                right_commands = []
+        return (
+            self._normalize_overlay_commands(left_commands),
+            self._normalize_overlay_commands(right_commands),
+        )
+
+    def _write_frame_slot_overlay(
+        self,
+        *,
+        slot: int,
+        frame_id: int,
+        overlay_slot_commands=None,
+    ) -> None:
+        if self._overlay_mmap is None or self._overlay_command_array is None:
+            return
+        slot = int(slot)
+        if slot < 0 or slot >= int(self.SLOT_COUNT):
+            return
+        if overlay_slot_commands is None:
+            left_array = self._normalize_overlay_commands([])
+            right_array = self._normalize_overlay_commands([])
+        else:
+            left_array, right_array = overlay_slot_commands
+        left_count = int(left_array.shape[0])
+        right_count = int(right_array.shape[0])
+        metadata_offset = (
+            self._overlay_slot_metadata_offset
+            + slot * self.OVERLAY_SLOT_METADATA_STRUCT.size
+        )
+        self.OVERLAY_SLOT_METADATA_STRUCT.pack_into(
+            self._overlay_mmap,
+            metadata_offset,
+            0,
+            0,
+            0,
+            0,
+            0,
+        )
+        self._overlay_command_array[slot].fill(0.0)
+        if left_count:
+            self._overlay_command_array[slot, 0, :left_count, :] = left_array
+        if right_count:
+            self._overlay_command_array[slot, 1, :right_count, :] = right_array
+        self.OVERLAY_SLOT_METADATA_STRUCT.pack_into(
+            self._overlay_mmap,
+            metadata_offset,
+            int(frame_id),
+            int(left_count),
+            int(right_count),
+            0,
+            0,
+        )
+        self._overlay_frame_counter += 1
+        self._write_overlay_header(
+            latest_overlay_id=int(self._overlay_frame_counter),
+            left_count=left_count,
+            right_count=right_count,
+        )
 
     def publish_overlay_commands(
         self,
@@ -2872,38 +3722,7 @@ class OpenXRImmersiveBridge(OpenXRFramePanelMirror):
     ) -> bool:
         if self._overlay_mmap is None or self._overlay_command_array is None:
             return False
-
-        def _normalize(commands):
-            normalized = []
-            for command in commands or []:
-                values = np.asarray(command, dtype=np.float32).reshape(-1)
-                if int(values.size) != int(self.OVERLAY_COMMAND_STRIDE_FLOATS):
-                    continue
-                normalized.append(values)
-                if len(normalized) >= int(self.OVERLAY_MAX_COMMANDS_PER_EYE):
-                    break
-            if not normalized:
-                return np.zeros(
-                    (0, self.OVERLAY_COMMAND_STRIDE_FLOATS),
-                    dtype=np.float32,
-                )
-            return np.stack(normalized, axis=0).astype(np.float32, copy=False)
-
-        left_array = _normalize(left_commands)
-        right_array = _normalize(right_commands)
-        left_count = int(left_array.shape[0])
-        right_count = int(right_array.shape[0])
-        self._overlay_command_array.fill(0.0)
-        if left_count:
-            self._overlay_command_array[0, :left_count, :] = left_array
-        if right_count:
-            self._overlay_command_array[1, :right_count, :] = right_array
-        self._overlay_frame_counter += 1
-        self._write_overlay_header(
-            latest_overlay_id=int(self._overlay_frame_counter),
-            left_count=left_count,
-            right_count=right_count,
-        )
+        self._pending_overlay_commands_by_eye = (left_commands, right_commands)
         return True
 
     def publish_stereo_frames(
@@ -2912,6 +3731,9 @@ class OpenXRImmersiveBridge(OpenXRFramePanelMirror):
         right_frame_rgba: torch.Tensor,
         presentation_mode=None,
         producer_ready_event=None,
+        left_eye_sample: Optional[EyePoseSample] = None,
+        right_eye_sample: Optional[EyePoseSample] = None,
+        overlay_commands_by_eye=None,
     ) -> tuple[bool, dict[str, float]]:
         timing = {
             "process_check_wall": 0.0,
@@ -2947,6 +3769,13 @@ class OpenXRImmersiveBridge(OpenXRFramePanelMirror):
         )
         normalized_presentation_mode = self._normalize_presentation_mode(
             presentation_mode
+        )
+        frame_slot_metadata = self._make_frame_slot_metadata(
+            left_eye_sample=left_eye_sample,
+            right_eye_sample=right_eye_sample,
+        )
+        overlay_slot_commands = self._normalize_overlay_commands_by_eye(
+            overlay_commands_by_eye
         )
         process_check_start = time.perf_counter()
         if self.process is not None and self.process.poll() is not None:
@@ -2991,6 +3820,8 @@ class OpenXRImmersiveBridge(OpenXRFramePanelMirror):
                 frame_id=frame_id,
                 expected_publish_sample_bytes=expected_publish_sample_bytes,
                 presentation_mode=normalized_presentation_mode,
+                frame_slot_metadata=frame_slot_metadata,
+                overlay_slot_commands=overlay_slot_commands,
             )
             timing["fallback_copy_wall"] = time.perf_counter() - fallback_start
             timing["cpu_mmap_copy_wall"] += commit_stats["cpu_mmap_copy_wall"]
@@ -3028,6 +3859,8 @@ class OpenXRImmersiveBridge(OpenXRFramePanelMirror):
             expected_publish_sample_bytes=expected_publish_sample_bytes,
             presentation_mode=normalized_presentation_mode,
             producer_ready_event=producer_ready_event,
+            frame_slot_metadata=frame_slot_metadata,
+            overlay_slot_commands=overlay_slot_commands,
         )
         timing["total_wall"] = time.perf_counter() - publish_start
         self._last_published_frame_id = frame_id
@@ -3044,6 +3877,8 @@ class OpenXRImmersiveBridge(OpenXRFramePanelMirror):
         expected_publish_sample_bytes: Optional[bytes] = None,
         presentation_mode: Optional[int] = None,
         producer_ready_event=None,
+        frame_slot_metadata=None,
+        overlay_slot_commands=None,
     ) -> float:
         if submit_wall_s is None:
             submit_wall_s = time.perf_counter()
@@ -3094,6 +3929,8 @@ class OpenXRImmersiveBridge(OpenXRFramePanelMirror):
                     "presentation_mode": self._normalize_presentation_mode(
                         presentation_mode
                     ),
+                    "frame_slot_metadata": frame_slot_metadata,
+                    "overlay_slot_commands": overlay_slot_commands,
                 }
                 if self._direct_commit_enabled:
                     pending.update(
@@ -3184,8 +4021,40 @@ class OpenXRImmersiveBridge(OpenXRFramePanelMirror):
             "Timed out waiting for Quest immersive pose sample.\n" + self.debug_summary()
         )
 
+    def _write_header(
+        self,
+        latest_frame_id: int,
+        latest_slot: int,
+        *,
+        presentation_mode=None,
+    ) -> None:
+        assert self._shared_mmap is not None
+        normalized_presentation_mode = self._normalize_presentation_mode(
+            presentation_mode
+        )
+        self.HEADER_STRUCT.pack_into(
+            self._shared_mmap,
+            0,
+            self.HEADER_MAGIC,
+            self.HEADER_VERSION,
+            self.width,
+            self.height,
+            self.channels,
+            self.frame_bytes,
+            self.SLOT_COUNT,
+            int(latest_frame_id),
+            int(latest_slot),
+            int(normalized_presentation_mode),
+            int(self._pose_metadata_bytes),
+        )
+
     def _create_shared_frame_file(self) -> None:
-        total_bytes = self.HEADER_STRUCT.size + self.SLOT_COUNT * self.frame_bytes
+        metadata_bytes = self._pose_metadata_bytes
+        total_bytes = (
+            self.HEADER_STRUCT.size
+            + metadata_bytes
+            + self.SLOT_COUNT * self.frame_bytes
+        )
         fd, path = tempfile.mkstemp(
             prefix="boba_quest_immersive_",
             suffix=".bin",
@@ -3195,10 +4064,13 @@ class OpenXRImmersiveBridge(OpenXRFramePanelMirror):
         self._shared_file = os.fdopen(fd, "r+b", buffering=0)
         self._shared_file.truncate(total_bytes)
         self._shared_mmap = mmap.mmap(self._shared_file.fileno(), total_bytes)
+        self._shared_mmap[
+            self.HEADER_STRUCT.size : self.HEADER_STRUCT.size + metadata_bytes
+        ] = b"\x00" * metadata_bytes
         self._write_header(latest_frame_id=0, latest_slot=0)
         self._slot_views = []
         for slot_index in range(self.SLOT_COUNT):
-            offset = self.HEADER_STRUCT.size + slot_index * self.frame_bytes
+            offset = self.HEADER_STRUCT.size + metadata_bytes + slot_index * self.frame_bytes
             self._slot_views.append(
                 np.ndarray(
                     (self.EYE_COUNT, self.height, self.width, self.channels),

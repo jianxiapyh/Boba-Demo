@@ -14,14 +14,18 @@
 #include <openxr/openxr_platform.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <cctype>
 #include <csignal>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
 #include <iomanip>
 #include <iostream>
+#include <mutex>
 #include <string>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -33,12 +37,14 @@ namespace {
 
 constexpr int kPanelWindowWidth = 64;
 constexpr int kPanelWindowHeight = 64;
-constexpr uint32_t kExpectedHeaderVersion = 2;
 #ifdef BOBA_IMMERSIVE_BRIDGE
+constexpr uint32_t kMinExpectedHeaderVersion = 2;
+constexpr uint32_t kMaxExpectedHeaderVersion = 3;
 constexpr const char* kExpectedSharedFrameMagic = "BOBAQIM1";
 constexpr const char* kBinaryUsageName = "boba_immersive_bridge";
 constexpr const char* kApplicationName = "Boba Immersive Demo";
 #else
+constexpr uint32_t kExpectedHeaderVersion = 2;
 constexpr const char* kExpectedSharedFrameMagic = "BOBAQST1";
 constexpr const char* kBinaryUsageName = "boba_immersive_demo";
 constexpr const char* kApplicationName = "Boba Immersive Demo";
@@ -52,8 +58,9 @@ constexpr float kSelectPressedThreshold = 0.75f;
 constexpr float kExitPressedThreshold = 0.85f;
 constexpr uint32_t kPresentationModeStereoFullscreen = 0u;
 constexpr uint32_t kPresentationModeMonoPanel = 1u;
+constexpr uint32_t kPresentationModeHeadLockedPanel = 2u;
 constexpr const char* kExpectedOverlayMagic = "BOBAOVL1";
-constexpr uint32_t kOverlayHeaderVersion = 1u;
+constexpr uint32_t kOverlayHeaderVersion = 2u;
 constexpr uint32_t kOverlayCommandStrideFloats = 14u;
 volatile std::sig_atomic_t g_stop_requested = 0;
 
@@ -79,8 +86,123 @@ struct SharedFrameFile {
     void* mapped = MAP_FAILED;
     size_t mapped_size = 0;
     const SharedFrameHeader* header = nullptr;
+#ifdef BOBA_IMMERSIVE_BRIDGE
+    const struct SharedFramePoseMetadataSlot* pose_metadata = nullptr;
+    uint32_t pose_metadata_slot_count = 0;
+#endif
     const uint8_t* payload = nullptr;
 };
+
+#ifdef BOBA_IMMERSIVE_BRIDGE
+constexpr uint32_t kSharedFramePoseMetadataValidLeft = 1u << 0;
+constexpr uint32_t kSharedFramePoseMetadataValidRight = 1u << 1;
+
+#pragma pack(push, 1)
+struct SharedFramePoseMetadataSlot {
+    uint64_t frame_id;
+    uint32_t valid_flags;
+    uint32_t reserved0;
+    float left_position[3];
+    float left_orientation[4];
+    float left_fov[4];
+    float right_position[3];
+    float right_orientation[4];
+    float right_fov[4];
+    uint8_t padding[24];
+};
+#pragma pack(pop)
+
+static_assert(
+    sizeof(SharedFramePoseMetadataSlot) == 128,
+    "SharedFramePoseMetadataSlot size mismatch");
+
+struct ImmersiveFramePoseMetadata {
+    uint64_t frame_id = 0;
+    bool valid[2] = {false, false};
+    XrPosef pose[2] = {};
+    XrFovf fov[2] = {};
+};
+
+bool FloatArrayIsFinite(const float* values, size_t count) {
+    for (size_t index = 0; index < count; ++index) {
+        if (!std::isfinite(values[index])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool ReadPoseMetadataEye(const float* position,
+                         const float* orientation,
+                         const float* fov,
+                         XrPosef* pose_out,
+                         XrFovf* fov_out) {
+    if (
+        !FloatArrayIsFinite(position, 3) ||
+        !FloatArrayIsFinite(orientation, 4) ||
+        !FloatArrayIsFinite(fov, 4)
+    ) {
+        return false;
+    }
+    pose_out->position = {position[0], position[1], position[2]};
+    pose_out->orientation = {
+        orientation[0],
+        orientation[1],
+        orientation[2],
+        orientation[3],
+    };
+    fov_out->angleLeft = fov[0];
+    fov_out->angleRight = fov[1];
+    fov_out->angleUp = fov[2];
+    fov_out->angleDown = fov[3];
+    return true;
+}
+
+ImmersiveFramePoseMetadata ReadImmersiveFramePoseMetadata(
+    const SharedFrameFile& file,
+    const SharedFrameHeader& header) {
+    ImmersiveFramePoseMetadata metadata;
+    metadata.frame_id = header.latest_frame_id;
+    if (
+        file.pose_metadata == nullptr ||
+        header.latest_slot >= file.pose_metadata_slot_count
+    ) {
+        return metadata;
+    }
+    const SharedFramePoseMetadataSlot& slot_metadata =
+        file.pose_metadata[header.latest_slot];
+    if (slot_metadata.frame_id != header.latest_frame_id) {
+        return metadata;
+    }
+    metadata.frame_id = slot_metadata.frame_id;
+    if (
+        (slot_metadata.valid_flags & kSharedFramePoseMetadataValidLeft) != 0 &&
+        ReadPoseMetadataEye(slot_metadata.left_position,
+                            slot_metadata.left_orientation,
+                            slot_metadata.left_fov,
+                            &metadata.pose[0],
+                            &metadata.fov[0])
+    ) {
+        metadata.valid[0] = true;
+    }
+    if (
+        (slot_metadata.valid_flags & kSharedFramePoseMetadataValidRight) != 0 &&
+        ReadPoseMetadataEye(slot_metadata.right_position,
+                            slot_metadata.right_orientation,
+                            slot_metadata.right_fov,
+                            &metadata.pose[1],
+                            &metadata.fov[1])
+    ) {
+        metadata.valid[1] = true;
+    }
+    return metadata;
+}
+
+bool ImmersiveFramePoseMetadataStereoValid(
+    const ImmersiveFramePoseMetadata& metadata) {
+    return metadata.valid[0] && metadata.valid[1];
+}
+#endif
 
 #pragma pack(push, 1)
 struct SharedOverlayHeader {
@@ -98,11 +220,28 @@ struct SharedOverlayHeader {
 
 static_assert(sizeof(SharedOverlayHeader) == 64, "SharedOverlayHeader size mismatch");
 
+#pragma pack(push, 1)
+struct SharedOverlaySlotMetadata {
+    uint64_t frame_id;
+    uint32_t left_count;
+    uint32_t right_count;
+    uint32_t reserved0;
+    uint32_t reserved1;
+    uint8_t padding[8];
+};
+#pragma pack(pop)
+
+static_assert(
+    sizeof(SharedOverlaySlotMetadata) == 32,
+    "SharedOverlaySlotMetadata size mismatch");
+
 struct SharedOverlayFile {
     int fd = -1;
     void* mapped = MAP_FAILED;
     size_t mapped_size = 0;
     const SharedOverlayHeader* header = nullptr;
+    const SharedOverlaySlotMetadata* slot_metadata = nullptr;
+    uint32_t slot_count = 0;
     const float* payload = nullptr;
 };
 
@@ -179,9 +318,17 @@ const char* PresentationModeLabel(uint32_t presentation_mode) {
             return "stereo_fullscreen";
         case kPresentationModeMonoPanel:
             return "mono_panel";
+        case kPresentationModeHeadLockedPanel:
+            return "head_locked_panel";
         default:
             return "unknown";
     }
+}
+
+bool IsValidPresentationMode(uint32_t presentation_mode) {
+    return presentation_mode == kPresentationModeStereoFullscreen ||
+           presentation_mode == kPresentationModeMonoPanel ||
+           presentation_mode == kPresentationModeHeadLockedPanel;
 }
 #endif
 
@@ -212,6 +359,282 @@ bool ParseArgs(int argc, char** argv, std::string* frame_path, std::string* over
     }
     return true;
 }
+
+#ifdef BOBA_IMMERSIVE_BRIDGE
+enum class ImmersiveViewerUploadMode {
+    Pbo,
+    DirectMmap,
+    LegacyCopy,
+};
+
+enum class ImmersiveViewerUploadThreadRequest {
+    Auto,
+    Render,
+    Async,
+};
+
+enum class ImmersiveViewerUploadThreadMode {
+    Render,
+    Async,
+};
+
+const char* ImmersiveViewerUploadModeLabel(ImmersiveViewerUploadMode mode) {
+    switch (mode) {
+        case ImmersiveViewerUploadMode::Pbo:
+            return "pbo";
+        case ImmersiveViewerUploadMode::DirectMmap:
+            return "direct";
+        case ImmersiveViewerUploadMode::LegacyCopy:
+            return "legacy";
+        default:
+            return "unknown";
+    }
+}
+
+const char* ImmersiveViewerUploadThreadModeLabel(ImmersiveViewerUploadThreadMode mode) {
+    switch (mode) {
+        case ImmersiveViewerUploadThreadMode::Render:
+            return "render";
+        case ImmersiveViewerUploadThreadMode::Async:
+            return "async";
+        default:
+            return "unknown";
+    }
+}
+
+ImmersiveViewerUploadMode ReadImmersiveViewerUploadMode() {
+    const char* raw_mode = std::getenv("BOBA_IMMERSIVE_VIEWER_UPLOAD_MODE");
+    if (raw_mode == nullptr || raw_mode[0] == '\0') {
+        return ImmersiveViewerUploadMode::Pbo;
+    }
+
+    std::string mode(raw_mode);
+    std::transform(mode.begin(), mode.end(), mode.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+
+    if (mode == "pbo" || mode == "auto" || mode == "default") {
+        return ImmersiveViewerUploadMode::Pbo;
+    }
+    if (mode == "direct" || mode == "mmap" || mode == "zero_copy" ||
+        mode == "zerocopy") {
+        return ImmersiveViewerUploadMode::DirectMmap;
+    }
+    if (mode == "legacy" || mode == "copy" || mode == "vector") {
+        return ImmersiveViewerUploadMode::LegacyCopy;
+    }
+    std::cerr << "Unknown BOBA_IMMERSIVE_VIEWER_UPLOAD_MODE='" << raw_mode
+              << "', using pbo upload.\n";
+    return ImmersiveViewerUploadMode::Pbo;
+}
+
+ImmersiveViewerUploadThreadRequest ReadImmersiveViewerUploadThreadRequest() {
+    const char* raw_mode = std::getenv("BOBA_IMMERSIVE_VIEWER_UPLOAD_THREAD");
+    if (raw_mode == nullptr || raw_mode[0] == '\0') {
+        return ImmersiveViewerUploadThreadRequest::Auto;
+    }
+
+    std::string mode(raw_mode);
+    std::transform(mode.begin(), mode.end(), mode.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    if (mode == "auto" || mode == "default") {
+        return ImmersiveViewerUploadThreadRequest::Auto;
+    }
+    if (mode == "render" || mode == "render_thread" || mode == "off") {
+        return ImmersiveViewerUploadThreadRequest::Render;
+    }
+    if (mode == "async" || mode == "thread" || mode == "upload_thread") {
+        return ImmersiveViewerUploadThreadRequest::Async;
+    }
+    std::cerr << "Unknown BOBA_IMMERSIVE_VIEWER_UPLOAD_THREAD='" << raw_mode
+              << "', using auto.\n";
+    return ImmersiveViewerUploadThreadRequest::Auto;
+}
+
+constexpr uint64_t kDefaultImmersiveUploadSlotCount = 5;
+constexpr uint64_t kMinImmersiveUploadSlotCount = 3;
+constexpr uint64_t kMaxImmersiveUploadSlotCount = 8;
+constexpr uint64_t kDefaultImmersiveViewerUploadLateWaitUs = 0;
+constexpr uint64_t kDefaultImmersiveViewerUploadBusyBackoffUs = 100;
+
+struct ImmersiveUploadSlot {
+    GLuint textures[2] = {0, 0};
+    GLuint pbos[2] = {0, 0};
+    GLsync fence = nullptr;
+    bool has_frame = false;
+    uint64_t frame_id = 0;
+    std::vector<float> overlay_commands[2];
+#ifdef BOBA_IMMERSIVE_BRIDGE
+    ImmersiveFramePoseMetadata pose_metadata;
+#endif
+};
+
+void ConfigureSourceTexture(GLuint texture, uint32_t width, uint32_t height) {
+    glBindTexture(GL_TEXTURE_2D, texture);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0,
+                 GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+}
+
+void DestroyImmersiveUploadSlots(std::vector<ImmersiveUploadSlot>* slots) {
+    if (slots == nullptr) {
+        return;
+    }
+    for (auto& slot : *slots) {
+        if (slot.fence != nullptr) {
+            glDeleteSync(slot.fence);
+            slot.fence = nullptr;
+        }
+        glDeleteBuffers(2, slot.pbos);
+        slot.pbos[0] = 0;
+        slot.pbos[1] = 0;
+        glDeleteTextures(2, slot.textures);
+        slot.textures[0] = 0;
+        slot.textures[1] = 0;
+        slot.has_frame = false;
+    }
+    slots->clear();
+}
+
+bool InitializeImmersivePboUploadSlots(uint32_t width,
+                                       uint32_t height,
+                                       size_t eye_frame_bytes,
+                                       uint64_t requested_slot_count,
+                                       std::vector<ImmersiveUploadSlot>* slots,
+                                       std::string* error_message) {
+    if (slots == nullptr) {
+        return false;
+    }
+    DestroyImmersiveUploadSlots(slots);
+    slots->resize(static_cast<size_t>(requested_slot_count));
+    for (auto& slot : *slots) {
+        glGenTextures(2, slot.textures);
+        glGenBuffers(2, slot.pbos);
+        for (int eye = 0; eye < 2; ++eye) {
+            if (slot.textures[eye] == 0 || slot.pbos[eye] == 0) {
+                if (error_message != nullptr) {
+                    *error_message = "failed to allocate texture or PBO";
+                }
+                DestroyImmersiveUploadSlots(slots);
+                return false;
+            }
+            ConfigureSourceTexture(slot.textures[eye], width, height);
+            glBindBuffer(GL_PIXEL_UNPACK_BUFFER, slot.pbos[eye]);
+            glBufferData(GL_PIXEL_UNPACK_BUFFER,
+                         static_cast<GLsizeiptr>(eye_frame_bytes),
+                         nullptr,
+                         GL_STREAM_DRAW);
+        }
+    }
+    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    const GLenum error = glGetError();
+    if (error != GL_NO_ERROR) {
+        if (error_message != nullptr) {
+            *error_message = "OpenGL error during PBO initialization: " +
+                             std::to_string(static_cast<unsigned int>(error));
+        }
+        DestroyImmersiveUploadSlots(slots);
+        return false;
+    }
+    return true;
+}
+
+bool RetireUploadSlotFence(ImmersiveUploadSlot* slot) {
+    if (slot == nullptr || slot->fence == nullptr) {
+        return true;
+    }
+    const GLenum wait_result = glClientWaitSync(slot->fence, 0, 0);
+    if (wait_result == GL_ALREADY_SIGNALED || wait_result == GL_CONDITION_SATISFIED) {
+        glDeleteSync(slot->fence);
+        slot->fence = nullptr;
+        return true;
+    }
+    return false;
+}
+
+int FindReusableUploadSlot(std::vector<ImmersiveUploadSlot>* slots,
+                           int preferred_slot,
+                           uint64_t* busy_slot_count) {
+    if (slots == nullptr || slots->empty()) {
+        return -1;
+    }
+    const int slot_count = static_cast<int>(slots->size());
+    preferred_slot = ((preferred_slot % slot_count) + slot_count) % slot_count;
+    for (int offset = 0; offset < slot_count; ++offset) {
+        const int slot_index = (preferred_slot + offset) % slot_count;
+        ImmersiveUploadSlot& slot = (*slots)[slot_index];
+        if (RetireUploadSlotFence(&slot)) {
+            return slot_index;
+        }
+        if (busy_slot_count != nullptr) {
+            ++(*busy_slot_count);
+        }
+    }
+    return -1;
+}
+
+int FindReusableUploadSlotExcluding(std::vector<ImmersiveUploadSlot>* slots,
+                                    int preferred_slot,
+                                    int excluded_slot_a,
+                                    int excluded_slot_b,
+                                    int excluded_slot_c,
+                                    uint64_t* busy_slot_count) {
+    if (slots == nullptr || slots->empty()) {
+        return -1;
+    }
+    const int slot_count = static_cast<int>(slots->size());
+    preferred_slot = ((preferred_slot % slot_count) + slot_count) % slot_count;
+    for (int offset = 0; offset < slot_count; ++offset) {
+        const int slot_index = (preferred_slot + offset) % slot_count;
+        if (slot_index == excluded_slot_a ||
+            slot_index == excluded_slot_b ||
+            slot_index == excluded_slot_c) {
+            continue;
+        }
+        ImmersiveUploadSlot& slot = (*slots)[slot_index];
+        if (RetireUploadSlotFence(&slot)) {
+            return slot_index;
+        }
+        if (busy_slot_count != nullptr) {
+            ++(*busy_slot_count);
+        }
+    }
+    return -1;
+}
+
+uint64_t ReadUnsignedEnvOrDefault(const char* name, uint64_t default_value) {
+    const char* raw_value = std::getenv(name);
+    if (raw_value == nullptr || raw_value[0] == '\0') {
+        return default_value;
+    }
+    char* end_ptr = nullptr;
+    const unsigned long long parsed = std::strtoull(raw_value, &end_ptr, 10);
+    if (end_ptr == raw_value || (end_ptr != nullptr && *end_ptr != '\0')) {
+        std::cerr << "Invalid " << name << "='" << raw_value
+                  << "', using " << default_value << ".\n";
+        return default_value;
+    }
+    return static_cast<uint64_t>(parsed);
+}
+
+uint64_t ReadUnsignedEnvClamped(const char* name,
+                                uint64_t default_value,
+                                uint64_t min_value,
+                                uint64_t max_value) {
+    uint64_t value = ReadUnsignedEnvOrDefault(name, default_value);
+    if (value < min_value || value > max_value) {
+        std::cerr << "Invalid " << name << "=" << value
+                  << ", using " << default_value << ".\n";
+        return default_value;
+    }
+    return value;
+}
+#endif
 
 bool SuggestBindingsForProfile(
     XrInstance instance,
@@ -657,6 +1080,44 @@ bool OpenSharedFrameFile(const std::string& frame_path, SharedFrameFile* file) {
         file->fd = -1;
         return false;
     }
+#ifdef BOBA_IMMERSIVE_BRIDGE
+    if (
+        file->header->version < kMinExpectedHeaderVersion ||
+        file->header->version > kMaxExpectedHeaderVersion
+    ) {
+        std::cerr << "Shared frame header version mismatch: " << file->header->version
+                  << " (expected " << kMinExpectedHeaderVersion << ".."
+                  << kMaxExpectedHeaderVersion << ")\n";
+        munmap(file->mapped, file->mapped_size);
+        close(file->fd);
+        file->mapped = MAP_FAILED;
+        file->fd = -1;
+        return false;
+    }
+    size_t metadata_bytes = 0;
+    if (file->header->version >= 3) {
+        metadata_bytes = static_cast<size_t>(file->header->reserved0);
+        const size_t required_metadata_bytes =
+            static_cast<size_t>(file->header->slot_count) *
+            sizeof(SharedFramePoseMetadataSlot);
+        if (metadata_bytes < required_metadata_bytes) {
+            std::cerr << "Immersive shared frame metadata is smaller than expected: got "
+                      << metadata_bytes << " expected at least "
+                      << required_metadata_bytes << "\n";
+            munmap(file->mapped, file->mapped_size);
+            close(file->fd);
+            file->mapped = MAP_FAILED;
+            file->fd = -1;
+            return false;
+        }
+        file->pose_metadata =
+            reinterpret_cast<const SharedFramePoseMetadataSlot*>(
+                static_cast<const uint8_t*>(file->mapped) + sizeof(SharedFrameHeader));
+        file->pose_metadata_slot_count =
+            static_cast<uint32_t>(metadata_bytes / sizeof(SharedFramePoseMetadataSlot));
+    }
+    const size_t payload_offset = sizeof(SharedFrameHeader) + metadata_bytes;
+#else
     if (file->header->version != kExpectedHeaderVersion) {
         std::cerr << "Shared frame header version mismatch: " << file->header->version << "\n";
         munmap(file->mapped, file->mapped_size);
@@ -665,9 +1126,11 @@ bool OpenSharedFrameFile(const std::string& frame_path, SharedFrameFile* file) {
         file->fd = -1;
         return false;
     }
+    const size_t payload_offset = sizeof(SharedFrameHeader);
+#endif
 
     const size_t expected_size =
-        sizeof(SharedFrameHeader) +
+        payload_offset +
         static_cast<size_t>(file->header->slot_count) * file->header->frame_bytes;
     if (file->mapped_size < expected_size) {
         std::cerr << "Shared frame file is smaller than expected.\n";
@@ -692,11 +1155,16 @@ bool OpenSharedFrameFile(const std::string& frame_path, SharedFrameFile* file) {
     }
 #endif
 
-    file->payload = static_cast<const uint8_t*>(file->mapped) + sizeof(SharedFrameHeader);
+    file->payload = static_cast<const uint8_t*>(file->mapped) + payload_offset;
     std::cerr << "Opened shared frame file " << frame_path << " ("
               << file->header->width << "x" << file->header->height
               << " channels=" << file->header->channels
-              << " slots=" << file->header->slot_count << ")\n";
+              << " slots=" << file->header->slot_count
+              << " version=" << file->header->version
+#ifdef BOBA_IMMERSIVE_BRIDGE
+              << " metadata_bytes=" << metadata_bytes
+#endif
+              << ")\n";
     return true;
 }
 
@@ -711,6 +1179,10 @@ void CloseSharedFrameFile(SharedFrameFile* file) {
     }
     file->mapped_size = 0;
     file->header = nullptr;
+#ifdef BOBA_IMMERSIVE_BRIDGE
+    file->pose_metadata = nullptr;
+    file->pose_metadata_slot_count = 0;
+#endif
     file->payload = nullptr;
 }
 
@@ -761,10 +1233,23 @@ bool OpenSharedOverlayFile(const std::string& overlay_path, SharedOverlayFile* f
         file->fd = -1;
         return false;
     }
+    file->slot_count = file->header->reserved0;
+    if (file->slot_count == 0) {
+        std::cerr << "Shared overlay header has zero slot_count.\n";
+        munmap(file->mapped, file->mapped_size);
+        close(file->fd);
+        file->mapped = MAP_FAILED;
+        file->fd = -1;
+        return false;
+    }
+    const size_t metadata_bytes =
+        static_cast<size_t>(file->slot_count) * sizeof(SharedOverlaySlotMetadata);
+    const size_t payload_bytes =
+        static_cast<size_t>(file->slot_count) * 2u *
+        static_cast<size_t>(file->header->max_commands_per_eye) *
+        static_cast<size_t>(file->header->command_stride_floats) * sizeof(float);
     const size_t expected_size =
-        sizeof(SharedOverlayHeader) +
-        2u * static_cast<size_t>(file->header->max_commands_per_eye) *
-            static_cast<size_t>(file->header->command_stride_floats) * sizeof(float);
+        sizeof(SharedOverlayHeader) + metadata_bytes + payload_bytes;
     if (file->mapped_size < expected_size) {
         std::cerr << "Shared overlay file is smaller than expected.\n";
         munmap(file->mapped, file->mapped_size);
@@ -773,10 +1258,14 @@ bool OpenSharedOverlayFile(const std::string& overlay_path, SharedOverlayFile* f
         file->fd = -1;
         return false;
     }
-    file->payload = reinterpret_cast<const float*>(
+    file->slot_metadata = reinterpret_cast<const SharedOverlaySlotMetadata*>(
         static_cast<const uint8_t*>(file->mapped) + sizeof(SharedOverlayHeader));
+    file->payload = reinterpret_cast<const float*>(
+        static_cast<const uint8_t*>(file->mapped) + sizeof(SharedOverlayHeader) +
+            metadata_bytes);
     std::cerr << "Opened shared overlay file " << overlay_path
               << " max_commands_per_eye=" << file->header->max_commands_per_eye
+              << " slot_count=" << file->slot_count
               << "\n";
     return true;
 }
@@ -792,30 +1281,70 @@ void CloseSharedOverlayFile(SharedOverlayFile* file) {
     }
     file->mapped_size = 0;
     file->header = nullptr;
+    file->slot_metadata = nullptr;
+    file->slot_count = 0;
     file->payload = nullptr;
 }
 
-bool UpdateOverlayCommandsIfNeeded(const SharedOverlayFile& file,
-                                   uint64_t* latest_overlay_id,
-                                   std::vector<float>* left_commands,
-                                   std::vector<float>* right_commands) {
-    if (file.header == nullptr || file.payload == nullptr) {
-        return false;
+enum class OverlayLatchReadStatus {
+    Unavailable,
+    Match,
+    Empty,
+    Mismatch,
+};
+
+OverlayLatchReadStatus ReadOverlayCommandsForFrameSlot(
+    const SharedOverlayFile& file,
+    uint64_t frame_id,
+    uint64_t frame_slot,
+    std::vector<float>* left_commands,
+    std::vector<float>* right_commands) {
+    if (left_commands != nullptr) {
+        left_commands->clear();
+    }
+    if (right_commands != nullptr) {
+        right_commands->clear();
+    }
+    if (
+        file.header == nullptr ||
+        file.slot_metadata == nullptr ||
+        file.payload == nullptr
+    ) {
+        return OverlayLatchReadStatus::Unavailable;
+    }
+    if (frame_slot >= file.slot_count) {
+        return OverlayLatchReadStatus::Mismatch;
     }
     const SharedOverlayHeader header = *file.header;
-    if (header.latest_overlay_id == *latest_overlay_id) {
-        return false;
+    const SharedOverlaySlotMetadata metadata =
+        file.slot_metadata[static_cast<size_t>(frame_slot)];
+    if (metadata.frame_id != frame_id) {
+        return OverlayLatchReadStatus::Mismatch;
     }
     const uint32_t max_commands = header.max_commands_per_eye;
     const uint32_t stride = header.command_stride_floats;
-    const uint32_t left_count = std::min(header.left_count, max_commands);
-    const uint32_t right_count = std::min(header.right_count, max_commands);
-    const float* left_base = file.payload;
-    const float* right_base = file.payload + static_cast<size_t>(max_commands) * stride;
-    left_commands->assign(left_base, left_base + static_cast<size_t>(left_count) * stride);
-    right_commands->assign(right_base, right_base + static_cast<size_t>(right_count) * stride);
-    *latest_overlay_id = header.latest_overlay_id;
-    return true;
+    const uint32_t left_count = std::min(metadata.left_count, max_commands);
+    const uint32_t right_count = std::min(metadata.right_count, max_commands);
+    const size_t slot_stride_floats =
+        2u * static_cast<size_t>(max_commands) * static_cast<size_t>(stride);
+    const float* slot_base =
+        file.payload + static_cast<size_t>(frame_slot) * slot_stride_floats;
+    const float* left_base = slot_base;
+    const float* right_base =
+        slot_base + static_cast<size_t>(max_commands) * static_cast<size_t>(stride);
+    if (left_commands != nullptr) {
+        left_commands->assign(
+            left_base,
+            left_base + static_cast<size_t>(left_count) * stride);
+    }
+    if (right_commands != nullptr) {
+        right_commands->assign(
+            right_base,
+            right_base + static_cast<size_t>(right_count) * stride);
+    }
+    return (left_count == 0 && right_count == 0)
+        ? OverlayLatchReadStatus::Empty
+        : OverlayLatchReadStatus::Match;
 }
 
 bool UpdateDisplayFrameIfNeeded(const SharedFrameFile& file, uint64_t* latest_frame_id,
@@ -837,11 +1366,14 @@ bool UpdateDisplayFrameIfNeeded(const SharedFrameFile& file, uint64_t* latest_fr
 }
 
 #ifdef BOBA_IMMERSIVE_BRIDGE
-bool UpdateStereoFramesIfNeeded(const SharedFrameFile& file, uint64_t* latest_frame_id,
-                                uint64_t* frame_id_delta,
-                                uint32_t* presentation_mode,
-                                std::vector<uint8_t>* left_eye_rgba,
-                                std::vector<uint8_t>* right_eye_rgba) {
+bool UpdateStereoFramePointersIfNeeded(const SharedFrameFile& file,
+                                       uint64_t* latest_frame_id,
+                                       uint64_t* frame_id_delta,
+                                       uint64_t* latest_slot,
+                                       uint32_t* presentation_mode,
+                                       const uint8_t** left_eye_rgba,
+                                       const uint8_t** right_eye_rgba,
+                                       ImmersiveFramePoseMetadata* pose_metadata) {
     const SharedFrameHeader header = *file.header;
     if (header.latest_frame_id == *latest_frame_id) {
         if (frame_id_delta != nullptr) {
@@ -862,13 +1394,22 @@ bool UpdateStereoFramesIfNeeded(const SharedFrameFile& file, uint64_t* latest_fr
     const size_t slot_offset = static_cast<size_t>(header.latest_slot) * header.frame_bytes;
     const uint8_t* source = file.payload + slot_offset;
     const uint64_t previous_frame_id = *latest_frame_id;
-    left_eye_rgba->assign(source, source + eye_frame_bytes);
-    right_eye_rgba->assign(source + eye_frame_bytes, source + header.frame_bytes);
+    if (left_eye_rgba != nullptr) {
+        *left_eye_rgba = source;
+    }
+    if (right_eye_rgba != nullptr) {
+        *right_eye_rgba = source + eye_frame_bytes;
+    }
+    if (pose_metadata != nullptr) {
+        *pose_metadata = ReadImmersiveFramePoseMetadata(file, header);
+    }
     *latest_frame_id = header.latest_frame_id;
+    if (latest_slot != nullptr) {
+        *latest_slot = header.latest_slot;
+    }
     if (presentation_mode != nullptr) {
         const uint32_t header_presentation_mode = header.presentation_mode;
-        if (header_presentation_mode == kPresentationModeMonoPanel ||
-            header_presentation_mode == kPresentationModeStereoFullscreen) {
+        if (IsValidPresentationMode(header_presentation_mode)) {
             *presentation_mode = header_presentation_mode;
         } else {
             std::cerr << "Invalid immersive presentation_mode in shared frame header: "
@@ -882,6 +1423,34 @@ bool UpdateStereoFramesIfNeeded(const SharedFrameFile& file, uint64_t* latest_fr
                 ? (header.latest_frame_id - previous_frame_id)
                 : 1;
     }
+    return true;
+}
+
+bool UpdateStereoFramesIfNeeded(const SharedFrameFile& file, uint64_t* latest_frame_id,
+                                uint64_t* frame_id_delta,
+                                uint64_t* latest_slot,
+                                uint32_t* presentation_mode,
+                                std::vector<uint8_t>* left_eye_rgba,
+                                std::vector<uint8_t>* right_eye_rgba,
+                                ImmersiveFramePoseMetadata* pose_metadata = nullptr) {
+    const uint8_t* left_source = nullptr;
+    const uint8_t* right_source = nullptr;
+    const bool updated = UpdateStereoFramePointersIfNeeded(file,
+                                                           latest_frame_id,
+                                                           frame_id_delta,
+                                                           latest_slot,
+                                                           presentation_mode,
+                                                           &left_source,
+                                                           &right_source,
+                                                           pose_metadata);
+    if (!updated) {
+        return false;
+    }
+
+    const SharedFrameHeader header = *file.header;
+    const uint32_t eye_frame_bytes = header.width * header.height * header.channels;
+    left_eye_rgba->assign(left_source, left_source + eye_frame_bytes);
+    right_eye_rgba->assign(right_source, right_source + eye_frame_bytes);
     return true;
 }
 #endif
@@ -1331,17 +1900,12 @@ void AppendOverlayMarker(std::vector<float>* vertices, const float* cmd) {
     const float r = cmd[7];
     const float g = cmd[8];
     const float b = cmd[9];
-    constexpr int kSegments = 16;
-    constexpr float kPi = 3.14159265358979323846f;
-    for (int i = 0; i < kSegments; ++i) {
-        const float a0 = (2.0f * kPi * i) / kSegments;
-        const float a1 = (2.0f * kPi * (i + 1)) / kSegments;
-        AppendOverlayTriangle(vertices,
-                              cx, cy,
-                              cx + std::cos(a0) * radius, cy + std::sin(a0) * radius,
-                              cx + std::cos(a1) * radius, cy + std::sin(a1) * radius,
-                              r, g, b, alpha);
-    }
+    const float x0 = cx - radius;
+    const float y0 = cy - radius;
+    const float x1 = cx + radius;
+    const float y1 = cy + radius;
+    AppendOverlayTriangle(vertices, x0, y0, x1, y0, x1, y1, r, g, b, alpha);
+    AppendOverlayTriangle(vertices, x0, y0, x1, y1, x0, y1, r, g, b, alpha);
 }
 
 void DrawOverlayCommands(const std::vector<float>& commands,
@@ -1856,6 +2420,31 @@ int main(int argc, char** argv) {
 
     const uint32_t eye_frame_bytes =
         shared_frame.header->width * shared_frame.header->height * shared_frame.header->channels;
+#ifdef BOBA_IMMERSIVE_BRIDGE
+    const ImmersiveViewerUploadMode requested_viewer_upload_mode =
+        ReadImmersiveViewerUploadMode();
+    ImmersiveViewerUploadMode viewer_upload_mode = requested_viewer_upload_mode;
+    const ImmersiveViewerUploadThreadRequest requested_viewer_upload_thread =
+        ReadImmersiveViewerUploadThreadRequest();
+    ImmersiveViewerUploadThreadMode viewer_upload_thread_mode =
+        ImmersiveViewerUploadThreadMode::Render;
+    std::string viewer_upload_thread_fallback_reason = "none";
+    const uint64_t viewer_upload_late_wait_us = ReadUnsignedEnvOrDefault(
+        "BOBA_IMMERSIVE_VIEWER_UPLOAD_LATE_WAIT_US",
+        kDefaultImmersiveViewerUploadLateWaitUs);
+    const uint64_t viewer_upload_ring_slots = ReadUnsignedEnvClamped(
+        "BOBA_IMMERSIVE_VIEWER_UPLOAD_RING_SLOTS",
+        kDefaultImmersiveUploadSlotCount,
+        kMinImmersiveUploadSlotCount,
+        kMaxImmersiveUploadSlotCount);
+    const uint64_t viewer_upload_busy_backoff_us = ReadUnsignedEnvOrDefault(
+        "BOBA_IMMERSIVE_VIEWER_UPLOAD_BUSY_BACKOFF_US",
+        kDefaultImmersiveViewerUploadBusyBackoffUs);
+    std::vector<ImmersiveUploadSlot> immersive_upload_slots;
+    int active_immersive_upload_slot = -1;
+    int next_immersive_upload_slot = 0;
+    ImmersiveFramePoseMetadata active_source_pose_metadata;
+#endif
     GLuint source_textures[2] = {0, 0};
 #ifdef BOBA_IMMERSIVE_BRIDGE
     glGenTextures(2, source_textures);
@@ -1874,9 +2463,36 @@ int main(int argc, char** argv) {
                      shared_frame.header->height, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
     }
     glBindTexture(GL_TEXTURE_2D, 0);
+#ifdef BOBA_IMMERSIVE_BRIDGE
+    if (requested_viewer_upload_mode == ImmersiveViewerUploadMode::Pbo) {
+        std::string pbo_error;
+        if (!InitializeImmersivePboUploadSlots(shared_frame.header->width,
+                                               shared_frame.header->height,
+                                               static_cast<size_t>(eye_frame_bytes),
+                                               viewer_upload_ring_slots,
+                                               &immersive_upload_slots,
+                                               &pbo_error)) {
+            std::cerr << "Immersive bridge viewer PBO upload unavailable; "
+                      << "falling back to legacy upload";
+            if (!pbo_error.empty()) {
+                std::cerr << ": " << pbo_error;
+            }
+            std::cerr << "\n";
+            viewer_upload_mode = ImmersiveViewerUploadMode::LegacyCopy;
+        }
+    }
+    std::cerr << "Immersive bridge viewer upload mode: "
+              << ImmersiveViewerUploadModeLabel(viewer_upload_mode)
+              << " late_wait_us=" << viewer_upload_late_wait_us
+              << " ring_slots=" << viewer_upload_ring_slots
+              << " busy_backoff_us=" << viewer_upload_busy_backoff_us << "\n";
+#endif
 
     const GLuint program = CreatePanelProgram();
     if (program == 0) {
+#ifdef BOBA_IMMERSIVE_BRIDGE
+        DestroyImmersiveUploadSlots(&immersive_upload_slots);
+#endif
         glDeleteTextures(source_texture_count, source_textures);
         DestroyViewSwapchains(&swapchain_views);
         xrDestroySession(session);
@@ -1926,6 +2542,9 @@ int main(int argc, char** argv) {
     if (!CheckXr(instance, xrCreateReferenceSpace(session, &local_space_info, &local_space),
                  "xrCreateReferenceSpace(LOCAL)")) {
         glDeleteFramebuffers(1, &framebuffer);
+#ifdef BOBA_IMMERSIVE_BRIDGE
+        DestroyImmersiveUploadSlots(&immersive_upload_slots);
+#endif
         if (overlay_vbo != 0) {
             glDeleteBuffers(1, &overlay_vbo);
         }
@@ -1972,6 +2591,40 @@ int main(int argc, char** argv) {
     uint64_t logged_texture_upload_count = 0;
     double texture_upload_ms_sum = 0.0;
     double logged_texture_upload_ms_sum = 0.0;
+    double texture_upload_mmap_copy_ms_sum = 0.0;
+    double logged_texture_upload_mmap_copy_ms_sum = 0.0;
+    double texture_upload_gl_ms_sum = 0.0;
+    double logged_texture_upload_gl_ms_sum = 0.0;
+    double texture_upload_gl_left_ms_sum = 0.0;
+    double logged_texture_upload_gl_left_ms_sum = 0.0;
+    double texture_upload_gl_right_ms_sum = 0.0;
+    double logged_texture_upload_gl_right_ms_sum = 0.0;
+    uint64_t texture_upload_slot_miss_count = 0;
+    uint64_t logged_texture_upload_slot_miss_count = 0;
+    uint64_t texture_upload_slot_drop_count = 0;
+    uint64_t logged_texture_upload_slot_drop_count = 0;
+    uint64_t texture_upload_slot_busy_count = 0;
+    uint64_t logged_texture_upload_slot_busy_count = 0;
+    uint64_t texture_upload_busy_backoff_count = 0;
+    uint64_t logged_texture_upload_busy_backoff_count = 0;
+    double texture_upload_busy_backoff_ms_sum = 0.0;
+    double logged_texture_upload_busy_backoff_ms_sum = 0.0;
+    uint64_t render_without_upload_count = 0;
+    uint64_t logged_render_without_upload_count = 0;
+    uint64_t texture_upload_no_new_frame_count = 0;
+    uint64_t logged_texture_upload_no_new_frame_count = 0;
+    uint64_t texture_upload_late_wait_hit_count = 0;
+    uint64_t logged_texture_upload_late_wait_hit_count = 0;
+    uint64_t texture_upload_late_wait_miss_count = 0;
+    uint64_t logged_texture_upload_late_wait_miss_count = 0;
+    double texture_upload_late_wait_ms_sum = 0.0;
+    double logged_texture_upload_late_wait_ms_sum = 0.0;
+#ifdef BOBA_IMMERSIVE_BRIDGE
+    std::string viewer_projection_pose_mode = "current_view_fallback";
+    uint64_t viewer_source_pose_metadata_valid_count = 0;
+    uint64_t viewer_source_pose_metadata_invalid_count = 0;
+    uint64_t viewer_source_pose_metadata_fallback_count = 0;
+#endif
     uint64_t controller_sample_count = 0;
     auto first_source_update_time = std::chrono::steady_clock::time_point{};
     auto last_source_update_log_time = std::chrono::steady_clock::time_point{};
@@ -1984,14 +2637,63 @@ int main(int argc, char** argv) {
     Mat4 panel_model = IdentityMatrix();
     bool panel_anchor_initialized = false;
 #ifdef BOBA_IMMERSIVE_BRIDGE
-    std::vector<uint8_t> display_rgba_left(eye_frame_bytes, 0);
-    std::vector<uint8_t> display_rgba_right(eye_frame_bytes, 0);
+    std::vector<uint8_t> display_rgba_left;
+    std::vector<uint8_t> display_rgba_right;
+    if (viewer_upload_mode == ImmersiveViewerUploadMode::LegacyCopy) {
+        display_rgba_left.assign(eye_frame_bytes, 0);
+        display_rgba_right.assign(eye_frame_bytes, 0);
+    }
     std::vector<float> overlay_commands_left;
     std::vector<float> overlay_commands_right;
-    uint64_t latest_overlay_id = 0;
     uint32_t current_presentation_mode = kPresentationModeStereoFullscreen;
     uint32_t logged_presentation_mode = current_presentation_mode;
     uint32_t previous_presentation_mode = current_presentation_mode;
+    GLFWwindow* async_upload_window = nullptr;
+    std::atomic<bool> async_upload_stop_requested(false);
+    std::thread async_upload_thread;
+    std::mutex viewer_upload_stats_mutex;
+    std::mutex async_upload_state_mutex;
+    int async_ready_upload_slot = -1;
+    int async_recently_rendered_slot = -1;
+    uint32_t async_ready_presentation_mode = kPresentationModeStereoFullscreen;
+    uint64_t viewer_async_upload_count = 0;
+    uint64_t viewer_async_ready_slot_count = 0;
+    uint64_t viewer_async_poll_no_new_count = 0;
+    uint64_t viewer_overlay_latched_match_count = 0;
+    uint64_t viewer_overlay_latched_mismatch_count = 0;
+    uint64_t viewer_overlay_latched_empty_count = 0;
+    if (requested_viewer_upload_thread != ImmersiveViewerUploadThreadRequest::Render &&
+        viewer_upload_mode == ImmersiveViewerUploadMode::Pbo) {
+        async_upload_window =
+            glfwCreateWindow(1, 1, "Boba Immersive Upload", nullptr, window);
+        if (async_upload_window != nullptr) {
+            viewer_upload_thread_mode = ImmersiveViewerUploadThreadMode::Async;
+            viewer_upload_thread_fallback_reason = "none";
+            glfwMakeContextCurrent(window);
+        } else {
+            viewer_upload_thread_fallback_reason = "glfwCreateWindow_failed";
+            std::cerr << "Immersive bridge async viewer upload unavailable: "
+                      << viewer_upload_thread_fallback_reason
+                      << "; using render-thread upload.\n";
+        }
+    } else if (
+        requested_viewer_upload_thread == ImmersiveViewerUploadThreadRequest::Async &&
+        viewer_upload_mode != ImmersiveViewerUploadMode::Pbo
+    ) {
+        viewer_upload_thread_fallback_reason = "async_requires_pbo";
+        std::cerr << "Immersive bridge async viewer upload unavailable: "
+                  << viewer_upload_thread_fallback_reason
+                  << "; using render-thread upload.\n";
+    } else if (
+        requested_viewer_upload_thread == ImmersiveViewerUploadThreadRequest::Auto &&
+        viewer_upload_mode != ImmersiveViewerUploadMode::Pbo
+    ) {
+        viewer_upload_thread_fallback_reason = "async_requires_pbo";
+    }
+    std::cerr << "Immersive bridge viewer upload thread: mode="
+              << ImmersiveViewerUploadThreadModeLabel(viewer_upload_thread_mode)
+              << " fallback_reason=" << viewer_upload_thread_fallback_reason
+              << "\n";
 #else
     std::vector<uint8_t> display_rgba(shared_frame.header->frame_bytes, 0);
 #endif
@@ -1999,6 +2701,626 @@ int main(int argc, char** argv) {
     XrActionsSyncInfo sync_info = MakeXrStruct<XrActionsSyncInfo>(XR_TYPE_ACTIONS_SYNC_INFO);
     sync_info.countActiveActionSets = 1;
     sync_info.activeActionSets = &active_action_set;
+
+#ifdef BOBA_IMMERSIVE_BRIDGE
+    auto try_upload_latest_stereo_frame = [&]() -> bool {
+        uint64_t source_frame_delta = 0;
+        uint64_t source_frame_slot = 0;
+        const uint8_t* upload_left_rgba = nullptr;
+        const uint8_t* upload_right_rgba = nullptr;
+        ImmersiveFramePoseMetadata upload_pose_metadata;
+        std::vector<float> upload_overlay_commands_left;
+        std::vector<float> upload_overlay_commands_right;
+        double frame_mmap_copy_ms = 0.0;
+        double frame_gl_upload_left_ms = 0.0;
+        double frame_gl_upload_right_ms = 0.0;
+
+        auto poll_stereo_source = [&]() -> bool {
+            if (viewer_upload_mode == ImmersiveViewerUploadMode::LegacyCopy) {
+                const auto copy_start = std::chrono::steady_clock::now();
+                const bool updated =
+                    UpdateStereoFramesIfNeeded(shared_frame,
+                                               &latest_frame_id,
+                                               &source_frame_delta,
+                                               &source_frame_slot,
+                                               &current_presentation_mode,
+                                               &display_rgba_left,
+                                               &display_rgba_right,
+                                               &upload_pose_metadata);
+                const auto copy_end = std::chrono::steady_clock::now();
+                if (updated) {
+                    frame_mmap_copy_ms +=
+                        std::chrono::duration<double, std::milli>(
+                            copy_end - copy_start).count();
+                    upload_left_rgba = display_rgba_left.data();
+                    upload_right_rgba = display_rgba_right.data();
+                }
+                return updated;
+            }
+            return UpdateStereoFramePointersIfNeeded(shared_frame,
+                                                     &latest_frame_id,
+                                                     &source_frame_delta,
+                                                     &source_frame_slot,
+                                                     &current_presentation_mode,
+                                                     &upload_left_rgba,
+                                                     &upload_right_rgba,
+                                                     &upload_pose_metadata);
+        };
+
+        bool stereo_source_updated = poll_stereo_source();
+        if (!stereo_source_updated && viewer_upload_late_wait_us > 0) {
+            const auto late_wait_start = std::chrono::steady_clock::now();
+            const auto late_wait_deadline =
+                late_wait_start +
+                std::chrono::microseconds(viewer_upload_late_wait_us);
+            while (std::chrono::steady_clock::now() < late_wait_deadline) {
+                std::this_thread::yield();
+                stereo_source_updated = poll_stereo_source();
+                if (stereo_source_updated) {
+                    break;
+                }
+            }
+            const auto late_wait_end = std::chrono::steady_clock::now();
+            texture_upload_late_wait_ms_sum +=
+                std::chrono::duration<double, std::milli>(
+                    late_wait_end - late_wait_start).count();
+            if (stereo_source_updated) {
+                ++texture_upload_late_wait_hit_count;
+            } else {
+                ++texture_upload_late_wait_miss_count;
+            }
+        }
+        if (!stereo_source_updated) {
+            ++texture_upload_no_new_frame_count;
+            return false;
+        }
+
+        const auto source_update_time = std::chrono::steady_clock::now();
+        ++applied_source_update_count;
+        source_frame_delta_count += source_frame_delta;
+        if (source_frame_delta > 0) {
+            coalesced_source_frame_count += source_frame_delta - 1;
+        }
+        if (applied_source_update_count == 1) {
+            first_source_update_time = source_update_time;
+            last_source_update_log_time = source_update_time;
+            logged_applied_source_update_count = 0;
+            logged_source_frame_delta_count = 0;
+        }
+        if (current_presentation_mode != logged_presentation_mode) {
+            std::cerr << "Immersive bridge presentation mode: "
+                      << PresentationModeLabel(current_presentation_mode) << "\n";
+            logged_presentation_mode = current_presentation_mode;
+        }
+        if (current_presentation_mode == kPresentationModeMonoPanel &&
+            previous_presentation_mode != kPresentationModeMonoPanel) {
+            panel_anchor_initialized = false;
+        }
+        if (latest_frame_id == 1 || latest_frame_id >= logged_source_frame_id + 120) {
+            std::cerr << "Immersive bridge received source frame " << latest_frame_id
+                      << "\n";
+            logged_source_frame_id = latest_frame_id;
+        }
+        const OverlayLatchReadStatus overlay_latch_status =
+            ReadOverlayCommandsForFrameSlot(shared_overlay,
+                                            latest_frame_id,
+                                            source_frame_slot,
+                                            &upload_overlay_commands_left,
+                                            &upload_overlay_commands_right);
+        const double elapsed_s =
+            std::chrono::duration<double>(
+                source_update_time - first_source_update_time).count();
+        const double since_last_log_s =
+            std::chrono::duration<double>(
+                source_update_time - last_source_update_log_time).count();
+        if (applied_source_update_count == 1 || since_last_log_s >= 1.0) {
+            const uint64_t applied_updates_since_last_log =
+                applied_source_update_count - logged_applied_source_update_count;
+            const uint64_t source_frame_delta_since_last_log =
+                source_frame_delta_count - logged_source_frame_delta_count;
+            const double update_recent_fps =
+                (since_last_log_s > 0.0)
+                    ? (static_cast<double>(applied_updates_since_last_log) /
+                       since_last_log_s)
+                    : 0.0;
+            const double source_delta_recent_fps =
+                (since_last_log_s > 0.0)
+                    ? (static_cast<double>(source_frame_delta_since_last_log) /
+                       since_last_log_s)
+                    : 0.0;
+            std::cerr << std::fixed << std::setprecision(2)
+                      << "Immersive bridge viewer_source_stats "
+                      << "latest_frame_id=" << latest_frame_id << " "
+                      << "update_count=" << applied_source_update_count << " "
+                      << "source_frame_delta_count=" << source_frame_delta_count << " "
+                      << "coalesced_frame_count=" << coalesced_source_frame_count << " "
+                      << "elapsed_s=" << elapsed_s << " "
+                      << "update_recent_fps=" << update_recent_fps << " "
+                      << "source_delta_recent_fps=" << source_delta_recent_fps << "\n";
+            last_source_update_log_time = source_update_time;
+            logged_applied_source_update_count = applied_source_update_count;
+            logged_source_frame_delta_count = source_frame_delta_count;
+        }
+
+        const auto upload_start = std::chrono::steady_clock::now();
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+        bool upload_completed = true;
+        if (viewer_upload_mode == ImmersiveViewerUploadMode::Pbo) {
+            uint64_t busy_slot_count = 0;
+            const int upload_slot_index =
+                FindReusableUploadSlot(&immersive_upload_slots,
+                                       next_immersive_upload_slot,
+                                       &busy_slot_count);
+            texture_upload_slot_busy_count += busy_slot_count;
+            if (upload_slot_index < 0) {
+                ++texture_upload_slot_miss_count;
+                upload_completed = false;
+            } else {
+                ImmersiveUploadSlot& upload_slot =
+                    immersive_upload_slots[static_cast<size_t>(upload_slot_index)];
+                const uint8_t* eye_sources[2] = {
+                    upload_left_rgba,
+                    upload_right_rgba,
+                };
+                bool pbo_upload_ok = true;
+                for (int eye = 0; eye < 2; ++eye) {
+                    const auto copy_start = std::chrono::steady_clock::now();
+                    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, upload_slot.pbos[eye]);
+                    glBufferData(GL_PIXEL_UNPACK_BUFFER,
+                                 static_cast<GLsizeiptr>(eye_frame_bytes),
+                                 nullptr,
+                                 GL_STREAM_DRAW);
+                    void* mapped = glMapBufferRange(
+                        GL_PIXEL_UNPACK_BUFFER,
+                        0,
+                        static_cast<GLsizeiptr>(eye_frame_bytes),
+                        GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT);
+                    if (mapped == nullptr) {
+                        pbo_upload_ok = false;
+                        break;
+                    }
+                    std::memcpy(mapped, eye_sources[eye], eye_frame_bytes);
+                    if (glUnmapBuffer(GL_PIXEL_UNPACK_BUFFER) != GL_TRUE) {
+                        pbo_upload_ok = false;
+                        break;
+                    }
+                    const auto copy_end = std::chrono::steady_clock::now();
+                    frame_mmap_copy_ms +=
+                        std::chrono::duration<double, std::milli>(
+                            copy_end - copy_start).count();
+
+                    const auto eye_upload_start = std::chrono::steady_clock::now();
+                    glBindTexture(GL_TEXTURE_2D, upload_slot.textures[eye]);
+                    glTexSubImage2D(GL_TEXTURE_2D,
+                                    0,
+                                    0,
+                                    0,
+                                    shared_frame.header->width,
+                                    shared_frame.header->height,
+                                    GL_RGBA,
+                                    GL_UNSIGNED_BYTE,
+                                    reinterpret_cast<const void*>(0));
+                    const auto eye_upload_end = std::chrono::steady_clock::now();
+                    const double eye_upload_ms =
+                        std::chrono::duration<double, std::milli>(
+                            eye_upload_end - eye_upload_start).count();
+                    if (eye == 0) {
+                        frame_gl_upload_left_ms += eye_upload_ms;
+                    } else {
+                        frame_gl_upload_right_ms += eye_upload_ms;
+                    }
+                }
+                glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+                glBindTexture(GL_TEXTURE_2D, 0);
+                if (!pbo_upload_ok) {
+                    std::cerr << "Immersive bridge PBO upload failed; "
+                              << "falling back to legacy upload.\n";
+                    viewer_upload_mode = ImmersiveViewerUploadMode::LegacyCopy;
+                    upload_completed = false;
+                } else {
+                    if (upload_slot.fence != nullptr) {
+                        glDeleteSync(upload_slot.fence);
+                        upload_slot.fence = nullptr;
+                    }
+                    upload_slot.fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+                    upload_slot.has_frame = true;
+                    upload_slot.frame_id = latest_frame_id;
+                    upload_slot.pose_metadata = upload_pose_metadata;
+                    upload_slot.overlay_commands[0] = upload_overlay_commands_left;
+                    upload_slot.overlay_commands[1] = upload_overlay_commands_right;
+                    active_immersive_upload_slot = upload_slot_index;
+                    next_immersive_upload_slot =
+                        (upload_slot_index + 1) %
+                        static_cast<int>(immersive_upload_slots.size());
+                }
+            }
+        }
+        if (viewer_upload_mode != ImmersiveViewerUploadMode::Pbo) {
+            const auto left_upload_start = std::chrono::steady_clock::now();
+            glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+            glBindTexture(GL_TEXTURE_2D, source_textures[0]);
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, shared_frame.header->width,
+                            shared_frame.header->height, GL_RGBA, GL_UNSIGNED_BYTE,
+                            upload_left_rgba);
+            const auto left_upload_end = std::chrono::steady_clock::now();
+            frame_gl_upload_left_ms =
+                std::chrono::duration<double, std::milli>(
+                    left_upload_end - left_upload_start).count();
+            const auto right_upload_start = std::chrono::steady_clock::now();
+            glBindTexture(GL_TEXTURE_2D, source_textures[1]);
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, shared_frame.header->width,
+                            shared_frame.header->height, GL_RGBA, GL_UNSIGNED_BYTE,
+                            upload_right_rgba);
+            const auto right_upload_end = std::chrono::steady_clock::now();
+            frame_gl_upload_right_ms =
+                std::chrono::duration<double, std::milli>(
+                    right_upload_end - right_upload_start).count();
+            glBindTexture(GL_TEXTURE_2D, 0);
+            upload_completed = true;
+            active_source_pose_metadata = upload_pose_metadata;
+            overlay_commands_left = upload_overlay_commands_left;
+            overlay_commands_right = upload_overlay_commands_right;
+        }
+        const auto upload_end = std::chrono::steady_clock::now();
+        if (upload_completed) {
+            texture_upload_ms_sum +=
+                std::chrono::duration<double, std::milli>(
+                    upload_end - upload_start).count();
+            texture_upload_mmap_copy_ms_sum += frame_mmap_copy_ms;
+            texture_upload_gl_left_ms_sum += frame_gl_upload_left_ms;
+            texture_upload_gl_right_ms_sum += frame_gl_upload_right_ms;
+            texture_upload_gl_ms_sum += (
+                frame_gl_upload_left_ms + frame_gl_upload_right_ms
+            );
+            if (ImmersiveFramePoseMetadataStereoValid(upload_pose_metadata)) {
+                ++viewer_source_pose_metadata_valid_count;
+            } else {
+                ++viewer_source_pose_metadata_invalid_count;
+            }
+            if (overlay_latch_status == OverlayLatchReadStatus::Match) {
+                ++viewer_overlay_latched_match_count;
+            } else if (overlay_latch_status == OverlayLatchReadStatus::Empty) {
+                ++viewer_overlay_latched_empty_count;
+            } else if (overlay_latch_status == OverlayLatchReadStatus::Mismatch) {
+                ++viewer_overlay_latched_mismatch_count;
+            }
+            ++texture_upload_count;
+        }
+        return upload_completed;
+    };
+    if (
+        viewer_upload_thread_mode == ImmersiveViewerUploadThreadMode::Async &&
+        async_upload_window != nullptr
+    ) {
+        async_upload_thread = std::thread([&]() {
+            glfwMakeContextCurrent(async_upload_window);
+            glfwSwapInterval(0);
+
+            uint64_t async_latest_frame_id = 0;
+            uint64_t async_applied_source_update_count = 0;
+            uint64_t async_logged_applied_source_update_count = 0;
+            uint64_t async_source_frame_delta_count = 0;
+            uint64_t async_logged_source_frame_delta_count = 0;
+            uint64_t async_coalesced_source_frame_count = 0;
+            auto async_first_source_update_time =
+                std::chrono::steady_clock::time_point{};
+            auto async_last_source_update_log_time =
+                std::chrono::steady_clock::time_point{};
+            int async_next_upload_slot = 0;
+            uint64_t async_slot_pressure_frame_id = 0;
+
+            while (
+                !async_upload_stop_requested.load(std::memory_order_relaxed) &&
+                !g_stop_requested
+            ) {
+                const SharedFrameHeader header = *shared_frame.header;
+                if (
+                    async_slot_pressure_frame_id != 0 &&
+                    header.latest_frame_id != async_slot_pressure_frame_id
+                ) {
+                    {
+                        std::lock_guard<std::mutex> stats_lock(
+                            viewer_upload_stats_mutex);
+                        ++texture_upload_slot_drop_count;
+                    }
+                    async_slot_pressure_frame_id = 0;
+                }
+                if (header.latest_frame_id == async_latest_frame_id) {
+                    {
+                        std::lock_guard<std::mutex> stats_lock(
+                            viewer_upload_stats_mutex);
+                        ++viewer_async_poll_no_new_count;
+                    }
+                    std::this_thread::sleep_for(std::chrono::microseconds(100));
+                    continue;
+                }
+                if (header.latest_slot >= header.slot_count) {
+                    std::cerr << "Invalid latest_slot in shared frame header: "
+                              << header.latest_slot << "\n";
+                    std::this_thread::sleep_for(std::chrono::microseconds(250));
+                    continue;
+                }
+
+                uint64_t busy_slot_count = 0;
+                int excluded_active_slot = -1;
+                int excluded_ready_slot = -1;
+                int excluded_recently_rendered_slot = -1;
+                {
+                    std::lock_guard<std::mutex> state_lock(
+                        async_upload_state_mutex);
+                    excluded_active_slot = active_immersive_upload_slot;
+                    excluded_ready_slot = async_ready_upload_slot;
+                    excluded_recently_rendered_slot = async_recently_rendered_slot;
+                }
+                const int upload_slot_index =
+                    FindReusableUploadSlotExcluding(&immersive_upload_slots,
+                                                    async_next_upload_slot,
+                                                    excluded_active_slot,
+                                                    excluded_ready_slot,
+                                                    excluded_recently_rendered_slot,
+                                                    &busy_slot_count);
+                {
+                    std::lock_guard<std::mutex> stats_lock(viewer_upload_stats_mutex);
+                    texture_upload_slot_busy_count += busy_slot_count;
+                }
+                if (upload_slot_index < 0) {
+                    if (async_slot_pressure_frame_id != header.latest_frame_id) {
+                        std::lock_guard<std::mutex> stats_lock(
+                            viewer_upload_stats_mutex);
+                        ++texture_upload_slot_miss_count;
+                        async_slot_pressure_frame_id = header.latest_frame_id;
+                    }
+                    const auto backoff_start = std::chrono::steady_clock::now();
+                    std::this_thread::yield();
+                    if (viewer_upload_busy_backoff_us > 0) {
+                        std::this_thread::sleep_for(
+                            std::chrono::microseconds(
+                                viewer_upload_busy_backoff_us));
+                    }
+                    const auto backoff_end = std::chrono::steady_clock::now();
+                    {
+                        std::lock_guard<std::mutex> stats_lock(
+                            viewer_upload_stats_mutex);
+                        ++texture_upload_busy_backoff_count;
+                        texture_upload_busy_backoff_ms_sum +=
+                            std::chrono::duration<double, std::milli>(
+                                backoff_end - backoff_start).count();
+                    }
+                    continue;
+                }
+
+                const uint32_t header_presentation_mode =
+                    IsValidPresentationMode(header.presentation_mode)
+                        ? header.presentation_mode
+                        : kPresentationModeStereoFullscreen;
+                const ImmersiveFramePoseMetadata upload_pose_metadata =
+                    ReadImmersiveFramePoseMetadata(shared_frame, header);
+                std::vector<float> upload_overlay_commands_left;
+                std::vector<float> upload_overlay_commands_right;
+                const OverlayLatchReadStatus overlay_latch_status =
+                    ReadOverlayCommandsForFrameSlot(shared_overlay,
+                                                    header.latest_frame_id,
+                                                    header.latest_slot,
+                                                    &upload_overlay_commands_left,
+                                                    &upload_overlay_commands_right);
+                const uint32_t local_eye_frame_bytes =
+                    header.width * header.height * header.channels;
+                const size_t slot_offset =
+                    static_cast<size_t>(header.latest_slot) * header.frame_bytes;
+                const uint8_t* source = shared_frame.payload + slot_offset;
+                const uint8_t* eye_sources[2] = {
+                    source,
+                    source + local_eye_frame_bytes,
+                };
+
+                ImmersiveUploadSlot& upload_slot =
+                    immersive_upload_slots[static_cast<size_t>(upload_slot_index)];
+                double frame_mmap_copy_ms = 0.0;
+                double frame_gl_upload_left_ms = 0.0;
+                double frame_gl_upload_right_ms = 0.0;
+                const auto upload_start = std::chrono::steady_clock::now();
+                glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+                bool pbo_upload_ok = true;
+                for (int eye = 0; eye < 2; ++eye) {
+                    const auto copy_start = std::chrono::steady_clock::now();
+                    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, upload_slot.pbos[eye]);
+                    glBufferData(GL_PIXEL_UNPACK_BUFFER,
+                                 static_cast<GLsizeiptr>(eye_frame_bytes),
+                                 nullptr,
+                                 GL_STREAM_DRAW);
+                    void* mapped = glMapBufferRange(
+                        GL_PIXEL_UNPACK_BUFFER,
+                        0,
+                        static_cast<GLsizeiptr>(eye_frame_bytes),
+                        GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT);
+                    if (mapped == nullptr) {
+                        pbo_upload_ok = false;
+                        break;
+                    }
+                    std::memcpy(mapped, eye_sources[eye], eye_frame_bytes);
+                    if (glUnmapBuffer(GL_PIXEL_UNPACK_BUFFER) != GL_TRUE) {
+                        pbo_upload_ok = false;
+                        break;
+                    }
+                    const auto copy_end = std::chrono::steady_clock::now();
+                    frame_mmap_copy_ms +=
+                        std::chrono::duration<double, std::milli>(
+                            copy_end - copy_start).count();
+
+                    const auto eye_upload_start = std::chrono::steady_clock::now();
+                    glBindTexture(GL_TEXTURE_2D, upload_slot.textures[eye]);
+                    glTexSubImage2D(GL_TEXTURE_2D,
+                                    0,
+                                    0,
+                                    0,
+                                    shared_frame.header->width,
+                                    shared_frame.header->height,
+                                    GL_RGBA,
+                                    GL_UNSIGNED_BYTE,
+                                    reinterpret_cast<const void*>(0));
+                    const auto eye_upload_end = std::chrono::steady_clock::now();
+                    const double eye_upload_ms =
+                        std::chrono::duration<double, std::milli>(
+                            eye_upload_end - eye_upload_start).count();
+                    if (eye == 0) {
+                        frame_gl_upload_left_ms += eye_upload_ms;
+                    } else {
+                        frame_gl_upload_right_ms += eye_upload_ms;
+                    }
+                }
+                glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+                glBindTexture(GL_TEXTURE_2D, 0);
+                if (!pbo_upload_ok) {
+                    std::cerr << "Immersive bridge async PBO upload failed; "
+                              << "dropping upload.\n";
+                    std::this_thread::sleep_for(std::chrono::microseconds(250));
+                    continue;
+                }
+
+                GLsync upload_fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+                glFlush();
+                bool upload_fence_complete = upload_fence == nullptr;
+                while (
+                    upload_fence != nullptr &&
+                    !async_upload_stop_requested.load(std::memory_order_relaxed) &&
+                    !g_stop_requested
+                ) {
+                    const GLenum wait_result =
+                        glClientWaitSync(upload_fence,
+                                         GL_SYNC_FLUSH_COMMANDS_BIT,
+                                         1000000);
+                    if (
+                        wait_result == GL_ALREADY_SIGNALED ||
+                        wait_result == GL_CONDITION_SATISFIED
+                    ) {
+                        upload_fence_complete = true;
+                        break;
+                    }
+                    if (wait_result == GL_WAIT_FAILED) {
+                        std::cerr << "Immersive bridge async upload fence wait failed.\n";
+                        break;
+                    }
+                }
+                if (upload_fence != nullptr) {
+                    glDeleteSync(upload_fence);
+                }
+                if (!upload_fence_complete) {
+                    continue;
+                }
+
+                const auto upload_end = std::chrono::steady_clock::now();
+                upload_slot.has_frame = true;
+                upload_slot.frame_id = header.latest_frame_id;
+                upload_slot.pose_metadata = upload_pose_metadata;
+                upload_slot.overlay_commands[0] = upload_overlay_commands_left;
+                upload_slot.overlay_commands[1] = upload_overlay_commands_right;
+                {
+                    std::lock_guard<std::mutex> state_lock(async_upload_state_mutex);
+                    async_ready_upload_slot = upload_slot_index;
+                    async_ready_presentation_mode = header_presentation_mode;
+                }
+                async_next_upload_slot =
+                    (upload_slot_index + 1) %
+                    static_cast<int>(immersive_upload_slots.size());
+
+                const uint64_t previous_frame_id = async_latest_frame_id;
+                async_latest_frame_id = header.latest_frame_id;
+                if (async_slot_pressure_frame_id == async_latest_frame_id) {
+                    async_slot_pressure_frame_id = 0;
+                }
+                const uint64_t source_frame_delta =
+                    (header.latest_frame_id > previous_frame_id)
+                        ? (header.latest_frame_id - previous_frame_id)
+                        : 1;
+                const auto source_update_time = std::chrono::steady_clock::now();
+                ++async_applied_source_update_count;
+                async_source_frame_delta_count += source_frame_delta;
+                if (source_frame_delta > 0) {
+                    async_coalesced_source_frame_count += source_frame_delta - 1;
+                }
+                if (async_applied_source_update_count == 1) {
+                    async_first_source_update_time = source_update_time;
+                    async_last_source_update_log_time = source_update_time;
+                    async_logged_applied_source_update_count = 0;
+                    async_logged_source_frame_delta_count = 0;
+                }
+                const double elapsed_s =
+                    std::chrono::duration<double>(
+                        source_update_time - async_first_source_update_time).count();
+                const double since_last_log_s =
+                    std::chrono::duration<double>(
+                        source_update_time - async_last_source_update_log_time).count();
+                if (async_applied_source_update_count == 1 || since_last_log_s >= 1.0) {
+                    const uint64_t applied_updates_since_last_log =
+                        async_applied_source_update_count -
+                        async_logged_applied_source_update_count;
+                    const uint64_t source_frame_delta_since_last_log =
+                        async_source_frame_delta_count -
+                        async_logged_source_frame_delta_count;
+                    const double update_recent_fps =
+                        (since_last_log_s > 0.0)
+                            ? (static_cast<double>(applied_updates_since_last_log) /
+                               since_last_log_s)
+                            : 0.0;
+                    const double source_delta_recent_fps =
+                        (since_last_log_s > 0.0)
+                            ? (static_cast<double>(source_frame_delta_since_last_log) /
+                               since_last_log_s)
+                            : 0.0;
+                    std::cerr << std::fixed << std::setprecision(2)
+                              << "Immersive bridge viewer_source_stats "
+                              << "latest_frame_id=" << async_latest_frame_id << " "
+                              << "update_count=" << async_applied_source_update_count << " "
+                              << "source_frame_delta_count="
+                              << async_source_frame_delta_count << " "
+                              << "coalesced_frame_count="
+                              << async_coalesced_source_frame_count << " "
+                              << "elapsed_s=" << elapsed_s << " "
+                              << "update_recent_fps=" << update_recent_fps << " "
+                              << "source_delta_recent_fps="
+                              << source_delta_recent_fps << "\n";
+                    async_last_source_update_log_time = source_update_time;
+                    async_logged_applied_source_update_count =
+                        async_applied_source_update_count;
+                    async_logged_source_frame_delta_count =
+                        async_source_frame_delta_count;
+                }
+
+                {
+                    std::lock_guard<std::mutex> stats_lock(viewer_upload_stats_mutex);
+                    texture_upload_ms_sum +=
+                        std::chrono::duration<double, std::milli>(
+                            upload_end - upload_start).count();
+                    texture_upload_mmap_copy_ms_sum += frame_mmap_copy_ms;
+                    texture_upload_gl_left_ms_sum += frame_gl_upload_left_ms;
+                    texture_upload_gl_right_ms_sum += frame_gl_upload_right_ms;
+                    texture_upload_gl_ms_sum += (
+                        frame_gl_upload_left_ms + frame_gl_upload_right_ms
+                    );
+                    if (ImmersiveFramePoseMetadataStereoValid(upload_pose_metadata)) {
+                        ++viewer_source_pose_metadata_valid_count;
+                    } else {
+                        ++viewer_source_pose_metadata_invalid_count;
+                    }
+                    if (overlay_latch_status == OverlayLatchReadStatus::Match) {
+                        ++viewer_overlay_latched_match_count;
+                    } else if (overlay_latch_status == OverlayLatchReadStatus::Empty) {
+                        ++viewer_overlay_latched_empty_count;
+                    } else if (overlay_latch_status == OverlayLatchReadStatus::Mismatch) {
+                        ++viewer_overlay_latched_mismatch_count;
+                    }
+                    ++texture_upload_count;
+                    ++viewer_async_upload_count;
+                    ++viewer_async_ready_slot_count;
+                }
+            }
+
+            glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+            glBindTexture(GL_TEXTURE_2D, 0);
+            glfwMakeContextCurrent(nullptr);
+        });
+    }
+#endif
 
     while (!g_stop_requested && !exit_requested) {
         glfwPollEvents();
@@ -2175,12 +3497,55 @@ int main(int argc, char** argv) {
             const double render_since_last_log_s =
                 std::chrono::duration<double>(now - last_render_log_time).count();
             if (rendered_frame_count == 1 || render_since_last_log_s >= 1.0) {
+#ifdef BOBA_IMMERSIVE_BRIDGE
+                std::lock_guard<std::mutex> upload_stats_lock(viewer_upload_stats_mutex);
+#endif
                 const uint64_t rendered_since_last_log =
                     rendered_frame_count - logged_rendered_frame_count;
                 const uint64_t texture_uploads_since_last_log =
                     texture_upload_count - logged_texture_upload_count;
+                const uint64_t texture_upload_slot_misses_since_last_log =
+                    texture_upload_slot_miss_count - logged_texture_upload_slot_miss_count;
+                const uint64_t texture_upload_slot_drops_since_last_log =
+                    texture_upload_slot_drop_count - logged_texture_upload_slot_drop_count;
+                const uint64_t texture_upload_busy_slots_since_last_log =
+                    texture_upload_slot_busy_count - logged_texture_upload_slot_busy_count;
+                const uint64_t texture_upload_busy_backoffs_since_last_log =
+                    texture_upload_busy_backoff_count -
+                    logged_texture_upload_busy_backoff_count;
+                const uint64_t render_without_upload_since_last_log =
+                    render_without_upload_count - logged_render_without_upload_count;
+                const uint64_t texture_upload_no_new_since_last_log =
+                    texture_upload_no_new_frame_count -
+                    logged_texture_upload_no_new_frame_count;
+                const uint64_t texture_upload_late_wait_hits_since_last_log =
+                    texture_upload_late_wait_hit_count -
+                    logged_texture_upload_late_wait_hit_count;
+                const uint64_t texture_upload_late_wait_misses_since_last_log =
+                    texture_upload_late_wait_miss_count -
+                    logged_texture_upload_late_wait_miss_count;
+                const uint64_t texture_upload_late_waits_since_last_log =
+                    texture_upload_late_wait_hits_since_last_log +
+                    texture_upload_late_wait_misses_since_last_log;
                 const double texture_upload_ms_since_last_log =
                     texture_upload_ms_sum - logged_texture_upload_ms_sum;
+                const double texture_upload_mmap_copy_ms_since_last_log =
+                    texture_upload_mmap_copy_ms_sum -
+                    logged_texture_upload_mmap_copy_ms_sum;
+                const double texture_upload_gl_ms_since_last_log =
+                    texture_upload_gl_ms_sum - logged_texture_upload_gl_ms_sum;
+                const double texture_upload_gl_left_ms_since_last_log =
+                    texture_upload_gl_left_ms_sum -
+                    logged_texture_upload_gl_left_ms_sum;
+                const double texture_upload_gl_right_ms_since_last_log =
+                    texture_upload_gl_right_ms_sum -
+                    logged_texture_upload_gl_right_ms_sum;
+                const double texture_upload_late_wait_ms_since_last_log =
+                    texture_upload_late_wait_ms_sum -
+                    logged_texture_upload_late_wait_ms_sum;
+                const double texture_upload_busy_backoff_ms_since_last_log =
+                    texture_upload_busy_backoff_ms_sum -
+                    logged_texture_upload_busy_backoff_ms_sum;
                 const double render_recent_fps =
                     (render_since_last_log_s > 0.0)
                         ? (static_cast<double>(rendered_since_last_log) / render_since_last_log_s)
@@ -2195,6 +3560,37 @@ int main(int argc, char** argv) {
                         ? (texture_upload_ms_since_last_log /
                            static_cast<double>(texture_uploads_since_last_log))
                         : 0.0;
+                const double texture_upload_mmap_copy_avg_ms =
+                    (texture_uploads_since_last_log > 0)
+                        ? (texture_upload_mmap_copy_ms_since_last_log /
+                           static_cast<double>(texture_uploads_since_last_log))
+                        : 0.0;
+                const double texture_upload_gl_avg_ms =
+                    (texture_uploads_since_last_log > 0)
+                        ? (texture_upload_gl_ms_since_last_log /
+                           static_cast<double>(texture_uploads_since_last_log))
+                        : 0.0;
+                const double texture_upload_gl_left_avg_ms =
+                    (texture_uploads_since_last_log > 0)
+                        ? (texture_upload_gl_left_ms_since_last_log /
+                           static_cast<double>(texture_uploads_since_last_log))
+                        : 0.0;
+                const double texture_upload_gl_right_avg_ms =
+                    (texture_uploads_since_last_log > 0)
+                        ? (texture_upload_gl_right_ms_since_last_log /
+                           static_cast<double>(texture_uploads_since_last_log))
+                        : 0.0;
+                const double texture_upload_late_wait_avg_ms =
+                    (texture_upload_late_waits_since_last_log > 0)
+                        ? (texture_upload_late_wait_ms_since_last_log /
+                           static_cast<double>(texture_upload_late_waits_since_last_log))
+                        : 0.0;
+                const double texture_upload_busy_backoff_avg_ms =
+                    (texture_upload_busy_backoffs_since_last_log > 0)
+                        ? (texture_upload_busy_backoff_ms_since_last_log /
+                           static_cast<double>(
+                               texture_upload_busy_backoffs_since_last_log))
+                        : 0.0;
                 std::cerr << std::fixed << std::setprecision(2)
                           << "Immersive bridge viewer_render_stats "
                           << "rendered_count=" << rendered_frame_count << " "
@@ -2202,100 +3598,136 @@ int main(int argc, char** argv) {
                           << "recent_fps=" << render_recent_fps << " "
                           << "texture_upload_count=" << texture_upload_count << " "
                           << "texture_upload_recent_fps=" << texture_upload_recent_fps << " "
-                          << "texture_upload_avg_ms=" << texture_upload_avg_ms << "\n";
+                          << "texture_upload_avg_ms=" << texture_upload_avg_ms << " "
+#ifdef BOBA_IMMERSIVE_BRIDGE
+                          << "texture_upload_mode="
+                          << ImmersiveViewerUploadModeLabel(viewer_upload_mode) << " "
+                          << "viewer_upload_thread_mode="
+                          << ImmersiveViewerUploadThreadModeLabel(viewer_upload_thread_mode)
+                          << " "
+                          << "viewer_upload_thread_fallback_reason="
+                          << viewer_upload_thread_fallback_reason << " "
+                          << "viewer_upload_ring_slots="
+                          << viewer_upload_ring_slots << " "
+                          << "viewer_upload_late_wait_us="
+                          << viewer_upload_late_wait_us << " "
+                          << "viewer_upload_busy_backoff_us="
+                          << viewer_upload_busy_backoff_us << " "
+#else
+                          << "texture_upload_mode=legacy "
+                          << "viewer_upload_thread_mode=render "
+                          << "viewer_upload_thread_fallback_reason=none "
+                          << "viewer_upload_ring_slots=0 "
+                          << "viewer_upload_late_wait_us=0 "
+                          << "viewer_upload_busy_backoff_us=0 "
+#endif
+                          << "texture_upload_mmap_copy_avg_ms="
+                          << texture_upload_mmap_copy_avg_ms << " "
+                          << "texture_upload_gl_avg_ms=" << texture_upload_gl_avg_ms << " "
+                          << "texture_upload_gl_left_avg_ms="
+                          << texture_upload_gl_left_avg_ms << " "
+                          << "texture_upload_gl_right_avg_ms="
+                          << texture_upload_gl_right_avg_ms << " "
+                          << "texture_upload_slot_miss_count="
+                          << texture_upload_slot_miss_count << " "
+                          << "texture_upload_slot_miss_recent_count="
+                          << texture_upload_slot_misses_since_last_log << " "
+                          << "texture_upload_slot_drop_count="
+                          << texture_upload_slot_drop_count << " "
+                          << "texture_upload_slot_drop_recent_count="
+                          << texture_upload_slot_drops_since_last_log << " "
+                          << "texture_upload_slot_busy_count="
+                          << texture_upload_slot_busy_count << " "
+                          << "texture_upload_slot_busy_recent_count="
+                          << texture_upload_busy_slots_since_last_log << " "
+                          << "texture_upload_busy_backoff_count="
+                          << texture_upload_busy_backoff_count << " "
+                          << "texture_upload_busy_backoff_recent_count="
+                          << texture_upload_busy_backoffs_since_last_log << " "
+                          << "texture_upload_busy_backoff_avg_ms="
+                          << texture_upload_busy_backoff_avg_ms << " "
+                          << "render_without_upload_count="
+                          << render_without_upload_count << " "
+                          << "render_without_upload_recent_count="
+                          << render_without_upload_since_last_log << " "
+                          << "texture_upload_no_new_frame_count="
+                          << texture_upload_no_new_frame_count << " "
+                          << "texture_upload_no_new_frame_recent_count="
+                          << texture_upload_no_new_since_last_log << " "
+                          << "texture_upload_late_wait_hit_count="
+                          << texture_upload_late_wait_hit_count << " "
+                          << "texture_upload_late_wait_hit_recent_count="
+                          << texture_upload_late_wait_hits_since_last_log << " "
+                          << "texture_upload_late_wait_miss_count="
+                          << texture_upload_late_wait_miss_count << " "
+                          << "texture_upload_late_wait_miss_recent_count="
+                          << texture_upload_late_wait_misses_since_last_log << " "
+                          << "texture_upload_late_wait_avg_ms="
+                          << texture_upload_late_wait_avg_ms << " "
+#ifdef BOBA_IMMERSIVE_BRIDGE
+                          << "viewer_async_upload_count="
+                          << viewer_async_upload_count << " "
+                          << "viewer_async_ready_slot_count="
+                          << viewer_async_ready_slot_count << " "
+                          << "viewer_async_poll_no_new_count="
+                          << viewer_async_poll_no_new_count << " "
+                          << "viewer_projection_pose_mode="
+                          << viewer_projection_pose_mode << " "
+                          << "viewer_source_pose_metadata_valid_count="
+                          << viewer_source_pose_metadata_valid_count << " "
+                          << "viewer_source_pose_metadata_invalid_count="
+                          << viewer_source_pose_metadata_invalid_count << " "
+                          << "viewer_source_pose_metadata_fallback_count="
+                          << viewer_source_pose_metadata_fallback_count << " "
+                          << "viewer_overlay_latched_match_count="
+                          << viewer_overlay_latched_match_count << " "
+                          << "viewer_overlay_latched_mismatch_count="
+                          << viewer_overlay_latched_mismatch_count << " "
+                          << "viewer_overlay_latched_empty_count="
+                          << viewer_overlay_latched_empty_count
+#else
+                          << "viewer_async_upload_count=0 "
+                          << "viewer_async_ready_slot_count=0 "
+                          << "viewer_async_poll_no_new_count=0 "
+                          << "viewer_projection_pose_mode=current_view_fallback "
+                          << "viewer_source_pose_metadata_valid_count=0 "
+                          << "viewer_source_pose_metadata_invalid_count=0 "
+                          << "viewer_source_pose_metadata_fallback_count=0 "
+                          << "viewer_overlay_latched_match_count=0 "
+                          << "viewer_overlay_latched_mismatch_count=0 "
+                          << "viewer_overlay_latched_empty_count=0"
+#endif
+                          << "\n";
                 last_render_log_time = now;
                 logged_rendered_frame_count = rendered_frame_count;
                 logged_texture_upload_count = texture_upload_count;
                 logged_texture_upload_ms_sum = texture_upload_ms_sum;
+                logged_texture_upload_mmap_copy_ms_sum = texture_upload_mmap_copy_ms_sum;
+                logged_texture_upload_gl_ms_sum = texture_upload_gl_ms_sum;
+                logged_texture_upload_gl_left_ms_sum = texture_upload_gl_left_ms_sum;
+                logged_texture_upload_gl_right_ms_sum = texture_upload_gl_right_ms_sum;
+                logged_texture_upload_slot_miss_count = texture_upload_slot_miss_count;
+                logged_texture_upload_slot_drop_count = texture_upload_slot_drop_count;
+                logged_texture_upload_slot_busy_count = texture_upload_slot_busy_count;
+                logged_texture_upload_busy_backoff_count =
+                    texture_upload_busy_backoff_count;
+                logged_texture_upload_busy_backoff_ms_sum =
+                    texture_upload_busy_backoff_ms_sum;
+                logged_render_without_upload_count = render_without_upload_count;
+                logged_texture_upload_no_new_frame_count =
+                    texture_upload_no_new_frame_count;
+                logged_texture_upload_late_wait_hit_count =
+                    texture_upload_late_wait_hit_count;
+                logged_texture_upload_late_wait_miss_count =
+                    texture_upload_late_wait_miss_count;
+                logged_texture_upload_late_wait_ms_sum =
+                    texture_upload_late_wait_ms_sum;
             }
 #ifdef BOBA_IMMERSIVE_BRIDGE
-            uint64_t source_frame_delta = 0;
             previous_presentation_mode = current_presentation_mode;
-            const bool stereo_source_updated =
-                UpdateStereoFramesIfNeeded(shared_frame, &latest_frame_id, &source_frame_delta,
-                                           &current_presentation_mode,
-                                           &display_rgba_left, &display_rgba_right);
-            if (stereo_source_updated) {
-                ++applied_source_update_count;
-                source_frame_delta_count += source_frame_delta;
-                if (source_frame_delta > 0) {
-                    coalesced_source_frame_count += source_frame_delta - 1;
-                }
-                if (applied_source_update_count == 1) {
-                    first_source_update_time = now;
-                    last_source_update_log_time = now;
-                    logged_applied_source_update_count = 0;
-                    logged_source_frame_delta_count = 0;
-                }
-                if (current_presentation_mode != logged_presentation_mode) {
-                    std::cerr << "Immersive bridge presentation mode: "
-                              << PresentationModeLabel(current_presentation_mode) << "\n";
-                    logged_presentation_mode = current_presentation_mode;
-                }
-                if (current_presentation_mode == kPresentationModeMonoPanel &&
-                    previous_presentation_mode != kPresentationModeMonoPanel) {
-                    panel_anchor_initialized = false;
-                }
-                if (latest_frame_id == 1 || latest_frame_id >= logged_source_frame_id + 120) {
-                    std::cerr << "Immersive bridge received source frame " << latest_frame_id
-                              << "\n";
-                    logged_source_frame_id = latest_frame_id;
-                }
-                const double elapsed_s =
-                    std::chrono::duration<double>(now - first_source_update_time).count();
-                const double since_last_log_s =
-                    std::chrono::duration<double>(now - last_source_update_log_time).count();
-                if (applied_source_update_count == 1 || since_last_log_s >= 1.0) {
-                    const uint64_t applied_updates_since_last_log =
-                        applied_source_update_count - logged_applied_source_update_count;
-                    const uint64_t source_frame_delta_since_last_log =
-                        source_frame_delta_count - logged_source_frame_delta_count;
-                    const double update_recent_fps =
-                        (since_last_log_s > 0.0)
-                            ? (static_cast<double>(applied_updates_since_last_log) /
-                               since_last_log_s)
-                            : 0.0;
-                    const double source_delta_recent_fps =
-                        (since_last_log_s > 0.0)
-                            ? (static_cast<double>(source_frame_delta_since_last_log) /
-                               since_last_log_s)
-                            : 0.0;
-                    std::cerr << std::fixed << std::setprecision(2)
-                              << "Immersive bridge viewer_source_stats "
-                              << "latest_frame_id=" << latest_frame_id << " "
-                              << "update_count=" << applied_source_update_count << " "
-                              << "source_frame_delta_count=" << source_frame_delta_count << " "
-                              << "coalesced_frame_count=" << coalesced_source_frame_count << " "
-                              << "elapsed_s=" << elapsed_s << " "
-                              << "update_recent_fps=" << update_recent_fps << " "
-                              << "source_delta_recent_fps=" << source_delta_recent_fps << "\n";
-                    last_source_update_log_time = now;
-                    logged_applied_source_update_count = applied_source_update_count;
-                    logged_source_frame_delta_count = source_frame_delta_count;
-                }
-
-                const auto upload_start = std::chrono::steady_clock::now();
-                glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-                glBindTexture(GL_TEXTURE_2D, source_textures[0]);
-                glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, shared_frame.header->width,
-                                shared_frame.header->height, GL_RGBA, GL_UNSIGNED_BYTE,
-                                display_rgba_left.data());
-                glBindTexture(GL_TEXTURE_2D, source_textures[1]);
-                glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, shared_frame.header->width,
-                                shared_frame.header->height, GL_RGBA, GL_UNSIGNED_BYTE,
-                                display_rgba_right.data());
-                glBindTexture(GL_TEXTURE_2D, 0);
-                const auto upload_end = std::chrono::steady_clock::now();
-                texture_upload_ms_sum +=
-                    std::chrono::duration<double, std::milli>(upload_end - upload_start).count();
-                ++texture_upload_count;
-            }
-            if (overlay_enabled) {
-                UpdateOverlayCommandsIfNeeded(shared_overlay,
-                                              &latest_overlay_id,
-                                              &overlay_commands_left,
-                                              &overlay_commands_right);
-            }
+            bool upload_attempted_this_render_frame = false;
+            bool uploaded_this_render_frame = false;
+            bool source_projection_pose_used_this_render_frame = false;
 #else
             if (UpdateDisplayFrameIfNeeded(shared_frame, &latest_frame_id, &display_rgba)) {
                 if (latest_frame_id == 1 || latest_frame_id >= logged_source_frame_id + 120) {
@@ -2317,12 +3749,17 @@ int main(int argc, char** argv) {
             }
 #endif
 
-            const bool render_as_world_locked_panel =
 #ifdef BOBA_IMMERSIVE_BRIDGE
+            bool render_as_world_locked_panel =
                 current_presentation_mode == kPresentationModeMonoPanel;
+            bool render_as_head_locked_panel =
+                current_presentation_mode == kPresentationModeHeadLockedPanel;
+            bool render_as_panel =
+                render_as_world_locked_panel || render_as_head_locked_panel;
 #else
-                true;
-#endif
+            const bool render_as_world_locked_panel = true;
+            const bool render_as_head_locked_panel = false;
+            const bool render_as_panel = true;
             if (render_as_world_locked_panel && !panel_anchor_initialized && view_count_output > 0) {
                 const Mat4 initial_head_pose = PoseMatrix(views[0].pose);
                 panel_model = Multiply(
@@ -2336,6 +3773,7 @@ int main(int argc, char** argv) {
                           << " width=" << kPanelWidthMeters
                           << " height=" << panel_height_meters << "\n";
             }
+#endif
 
             projection_layer.space = local_space;
             projection_layer.viewCount = view_count_output;
@@ -2372,6 +3810,100 @@ int main(int argc, char** argv) {
                     break;
                 }
 
+#ifdef BOBA_IMMERSIVE_BRIDGE
+                if (view_index == 0 && !upload_attempted_this_render_frame) {
+                    upload_attempted_this_render_frame = true;
+                    if (viewer_upload_thread_mode == ImmersiveViewerUploadThreadMode::Async) {
+                        int adopted_upload_slot = -1;
+                        uint32_t adopted_presentation_mode =
+                            current_presentation_mode;
+                        {
+                            std::lock_guard<std::mutex> state_lock(
+                                async_upload_state_mutex);
+                            if (async_ready_upload_slot >= 0) {
+                                adopted_upload_slot = async_ready_upload_slot;
+                                async_recently_rendered_slot =
+                                    active_immersive_upload_slot;
+                                adopted_presentation_mode =
+                                    async_ready_presentation_mode;
+                                async_ready_upload_slot = -1;
+                            }
+                        }
+                        if (adopted_upload_slot >= 0) {
+                            active_immersive_upload_slot = adopted_upload_slot;
+                            current_presentation_mode = adopted_presentation_mode;
+                            uploaded_this_render_frame = true;
+                        } else {
+                            uploaded_this_render_frame = false;
+                        }
+                    } else {
+                        uploaded_this_render_frame = try_upload_latest_stereo_frame();
+                    }
+                    if (!uploaded_this_render_frame) {
+                        ++render_without_upload_count;
+                    }
+                    render_as_world_locked_panel =
+                        current_presentation_mode == kPresentationModeMonoPanel;
+                    render_as_head_locked_panel =
+                        current_presentation_mode == kPresentationModeHeadLockedPanel;
+                    render_as_panel =
+                        render_as_world_locked_panel || render_as_head_locked_panel;
+                    if (
+                        render_as_world_locked_panel &&
+                        previous_presentation_mode != kPresentationModeMonoPanel
+                    ) {
+                        panel_anchor_initialized = false;
+                    }
+                    if (
+                        render_as_world_locked_panel &&
+                        !panel_anchor_initialized &&
+                        view_count_output > 0
+                    ) {
+                        const Mat4 initial_head_pose = PoseMatrix(views[0].pose);
+                        panel_model = Multiply(
+                            initial_head_pose,
+                            Multiply(
+                                TranslationMatrix(0.0f,
+                                                  kPanelYOffsetMeters,
+                                                  -kPanelDistanceMeters),
+                                ScaleMatrix(kPanelWidthMeters,
+                                            panel_height_meters,
+                                            1.0f)));
+                        panel_anchor_initialized = true;
+                        std::cerr
+                            << "Presentation path: LOCAL-space world-locked "
+                            << "textured panel anchored at initial head pose, "
+                            << "z-offset=" << -kPanelDistanceMeters
+                            << " width=" << kPanelWidthMeters
+                            << " height=" << panel_height_meters << "\n";
+                    }
+                }
+                if (!render_as_panel && view_index < 2) {
+                    const ImmersiveFramePoseMetadata* active_pose_metadata =
+                        &active_source_pose_metadata;
+                    if (
+                        viewer_upload_mode == ImmersiveViewerUploadMode::Pbo &&
+                        active_immersive_upload_slot >= 0 &&
+                        static_cast<size_t>(active_immersive_upload_slot) <
+                            immersive_upload_slots.size()
+                    ) {
+                        const ImmersiveUploadSlot& active_upload_slot =
+                            immersive_upload_slots[
+                                static_cast<size_t>(active_immersive_upload_slot)];
+                        active_pose_metadata = &active_upload_slot.pose_metadata;
+                    }
+                    if (
+                        active_pose_metadata != nullptr &&
+                        ImmersiveFramePoseMetadataStereoValid(*active_pose_metadata)
+                    ) {
+                        const uint32_t eye_index = std::min<uint32_t>(view_index, 1u);
+                        projection_view.pose = active_pose_metadata->pose[eye_index];
+                        projection_view.fov = active_pose_metadata->fov[eye_index];
+                        source_projection_pose_used_this_render_frame = true;
+                    }
+                }
+#endif
+
                 glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
                 glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
                                        swapchain_view.images[image_index].image, 0);
@@ -2380,13 +3912,26 @@ int main(int argc, char** argv) {
                     exit_requested = true;
                 } else {
                     Mat4 mvp_matrix = IdentityMatrix();
-                    if (render_as_world_locked_panel) {
+                    if (render_as_panel) {
+                        Mat4 panel_model_for_view = panel_model;
+                        if (render_as_head_locked_panel) {
+                            panel_model_for_view = Multiply(
+                                PoseMatrix(views[view_index].pose),
+                                Multiply(
+                                    TranslationMatrix(0.0f,
+                                                      kPanelYOffsetMeters,
+                                                      -kPanelDistanceMeters),
+                                    ScaleMatrix(kPanelWidthMeters,
+                                                panel_height_meters,
+                                                1.0f)));
+                        }
                         const Mat4 view_matrix =
                             InverseRigidTransform(PoseMatrix(views[view_index].pose));
                         const Mat4 projection_matrix =
                             ProjectionMatrix(views[view_index].fov, kNearZ, kFarZ);
                         mvp_matrix =
-                            Multiply(projection_matrix, Multiply(view_matrix, panel_model));
+                            Multiply(projection_matrix,
+                                     Multiply(view_matrix, panel_model_for_view));
                     } else {
                         mvp_matrix = ScaleMatrix(2.0f, 2.0f, 1.0f);
                     }
@@ -2399,24 +3944,58 @@ int main(int argc, char** argv) {
                     glUseProgram(program);
                     glBindVertexArray(vao);
                     glActiveTexture(GL_TEXTURE0);
-                    glBindTexture(
-                        GL_TEXTURE_2D,
-                        render_as_world_locked_panel
+                    GLuint source_texture_for_view =
+                        render_as_panel
                             ? source_textures[0]
 #ifdef BOBA_IMMERSIVE_BRIDGE
                             : source_textures[std::min<uint32_t>(view_index, 1u)]
 #else
                             : source_textures[0]
 #endif
-                    );
+                        ;
+#ifdef BOBA_IMMERSIVE_BRIDGE
+                    if (
+                        viewer_upload_mode == ImmersiveViewerUploadMode::Pbo &&
+                        active_immersive_upload_slot >= 0 &&
+                        static_cast<size_t>(active_immersive_upload_slot) <
+                            immersive_upload_slots.size()
+                    ) {
+                        const ImmersiveUploadSlot& active_upload_slot =
+                            immersive_upload_slots[
+                                static_cast<size_t>(active_immersive_upload_slot)];
+                        const uint32_t eye_texture_index =
+                            render_as_panel
+                                ? 0u
+                                : std::min<uint32_t>(view_index, 1u);
+                        source_texture_for_view =
+                            active_upload_slot.textures[eye_texture_index];
+                    }
+#endif
+                    glBindTexture(GL_TEXTURE_2D, source_texture_for_view);
                     glUniform1i(source_location, 0);
                     glUniformMatrix4fv(mvp_location, 1, GL_FALSE, mvp_matrix.m);
                     glDrawArrays(GL_TRIANGLES, 0, 6);
-                    if (!render_as_world_locked_panel && overlay_program != 0) {
+                    if (!render_as_panel && overlay_program != 0) {
 #ifdef BOBA_IMMERSIVE_BRIDGE
-                        const std::vector<float>& overlay_commands =
-                            (view_index == 0) ? overlay_commands_left : overlay_commands_right;
-                        DrawOverlayCommands(overlay_commands,
+                        const uint32_t overlay_eye_index =
+                            std::min<uint32_t>(view_index, 1u);
+                        const std::vector<float>* overlay_commands =
+                            (overlay_eye_index == 0u)
+                                ? &overlay_commands_left
+                                : &overlay_commands_right;
+                        if (
+                            viewer_upload_mode == ImmersiveViewerUploadMode::Pbo &&
+                            active_immersive_upload_slot >= 0 &&
+                            static_cast<size_t>(active_immersive_upload_slot) <
+                                immersive_upload_slots.size()
+                        ) {
+                            const ImmersiveUploadSlot& active_upload_slot =
+                                immersive_upload_slots[
+                                    static_cast<size_t>(active_immersive_upload_slot)];
+                            overlay_commands =
+                                &active_upload_slot.overlay_commands[overlay_eye_index];
+                        }
+                        DrawOverlayCommands(*overlay_commands,
                                             overlay_program,
                                             overlay_vao,
                                             overlay_vbo,
@@ -2449,6 +4028,24 @@ int main(int argc, char** argv) {
                 projection_view.subImage.imageArrayIndex = 0;
             }
 
+#ifdef BOBA_IMMERSIVE_BRIDGE
+            if (!upload_attempted_this_render_frame) {
+                ++render_without_upload_count;
+            }
+            if (render_as_head_locked_panel) {
+                viewer_projection_pose_mode = "head_locked_panel";
+            } else if (!render_as_world_locked_panel) {
+                if (source_projection_pose_used_this_render_frame) {
+                    viewer_projection_pose_mode = "source_frame_pose";
+                } else {
+                    viewer_projection_pose_mode = "current_view_fallback";
+                    ++viewer_source_pose_metadata_fallback_count;
+                }
+            } else {
+                viewer_projection_pose_mode = "current_view_fallback";
+            }
+#endif
+
             if (!exit_requested) {
                 layers.push_back(
                     reinterpret_cast<const XrCompositionLayerBaseHeader*>(&projection_layer));
@@ -2464,6 +4061,18 @@ int main(int argc, char** argv) {
             break;
         }
     }
+
+#ifdef BOBA_IMMERSIVE_BRIDGE
+    async_upload_stop_requested.store(true, std::memory_order_relaxed);
+    if (async_upload_thread.joinable()) {
+        async_upload_thread.join();
+    }
+    glfwMakeContextCurrent(window);
+    if (async_upload_window != nullptr) {
+        glfwDestroyWindow(async_upload_window);
+        async_upload_window = nullptr;
+    }
+#endif
 
     if (session_running) {
         xrEndSession(session);
@@ -2485,6 +4094,9 @@ int main(int argc, char** argv) {
     }
     glDeleteVertexArrays(1, &vao);
     glDeleteProgram(program);
+#ifdef BOBA_IMMERSIVE_BRIDGE
+    DestroyImmersiveUploadSlots(&immersive_upload_slots);
+#endif
     glDeleteTextures(source_texture_count, source_textures);
     DestroyViewSwapchains(&swapchain_views);
     xrDestroyActionSet(action_set);

@@ -6,15 +6,23 @@ import sys
 from pathlib import Path
 
 
-EXPECTED_CONDA_ENV = "phystwin"
+EXPECTED_CONDA_ENV = os.environ.get("BOBA_EXPECTED_CONDA_ENV", "boba")
 GSPLAT_SOURCE_ENV_VAR = "BOBA_GSPLAT_SOURCE_ROOT"
-DEFAULT_GSPLAT_ROOT = (
-    Path(__file__).resolve().parents[2]
-    / "Boba_OpenSource"
-    / "gaussian_splatting"
-    / "submodules"
-    / "gsplat"
+_WORKSPACE_ROOT = Path(__file__).resolve().parents[2]
+_DEFAULT_GSPLAT_ROOT_CANDIDATES = (
+    _WORKSPACE_ROOT / "Boba" / "gaussian_splatting" / "submodules" / "gsplat",
+    _WORKSPACE_ROOT / "Boba_OpenSource" / "gaussian_splatting" / "submodules" / "gsplat",
 )
+
+
+def _default_gsplat_root() -> Path:
+    for candidate in _DEFAULT_GSPLAT_ROOT_CANDIDATES:
+        if candidate.is_dir():
+            return candidate.resolve()
+    return _DEFAULT_GSPLAT_ROOT_CANDIDATES[0].resolve()
+
+
+DEFAULT_GSPLAT_ROOT = _default_gsplat_root()
 
 
 def _active_env_name() -> str:
@@ -37,7 +45,7 @@ def _expected_gsplat_package(root: Path) -> Path:
 
 def _install_hint(root: Path) -> str:
     return (
-        "Install or expose the vendored gsplat from Boba_OpenSource:\n"
+        "Install or expose the vendored gsplat from the sibling Boba checkout:\n"
         f"  conda run -n {EXPECTED_CONDA_ENV} env PYTHONNOUSERSITE=1 BUILD_NO_CUDA=1 "
         f"python -m pip install -e {root}\n"
         f"Or point {GSPLAT_SOURCE_ENV_VAR} at the gsplat source root."
@@ -108,7 +116,7 @@ def import_gsplat():
         gsplat_module = importlib.import_module("gsplat")
     except ModuleNotFoundError as exc:
         raise RuntimeError(
-            "Boba Demo could not import gsplat from the vendored Boba_OpenSource path.\n"
+            "Boba Demo could not import gsplat from the configured vendored path.\n"
             f"Expected source root: {gsplat_root}\n"
             f"{_install_hint(gsplat_root)}"
         ) from exc

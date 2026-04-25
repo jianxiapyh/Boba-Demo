@@ -321,7 +321,7 @@ def draw_square_marker(draw: ImageDraw.ImageDraw, center: tuple[float, float], *
     x1 = int(round(cx + size / 2))
     y1 = int(round(cy + size / 2))
     draw.rectangle((x0, y0, x1, y1), outline=color, width=width)
-    draw.ellipse((cx - 3, cy - 3, cx + 3, cy + 3), fill=WHITE)
+    draw.rectangle((cx - 3, cy - 3, cx + 3, cy + 3), fill=WHITE)
 
 
 def draw_split_square(draw: ImageDraw.ImageDraw, rect):
@@ -330,10 +330,9 @@ def draw_split_square(draw: ImageDraw.ImageDraw, rect):
     draw.line((x0, y0, x0, y1), fill=ACCENT_RED, width=3)
     draw.line((x0, y1, x1, y1), fill=ACCENT_BLUE, width=3)
     draw.line((x1, y0, x1, y1), fill=ACCENT_BLUE, width=3)
-    draw.line((x0, y0, x1, y1), fill=WHITE, width=3)
     cx = (x0 + x1) // 2
     cy = (y0 + y1) // 2
-    draw.ellipse((cx - 5, cy - 5, cx + 5, cy + 5), fill=WHITE)
+    draw.rectangle((cx - 5, cy - 5, cx + 5, cy + 5), fill=WHITE)
 
 
 def draw_callout_chip(
@@ -896,13 +895,18 @@ def slide_two() -> Image.Image:
         )
         return y + 90
 
+    def draw_legend_square(rect, color):
+        cx = (rect[0] + rect[2]) * 0.5
+        cy = (rect[1] + rect[3]) * 0.5
+        draw_square_marker(draw, (cx, cy), color=color, size=60, width=5)
+
     row_y = legend_row(
-        lambda rect: draw.rectangle(rect, outline=ACCENT_RED, width=5) or draw.ellipse((rect[0] + 25, rect[1] + 25, rect[0] + 35, rect[1] + 35), fill=WHITE),
+        lambda rect: draw_legend_square(rect, ACCENT_RED),
         "Red box: left controller candidate",
         row_y,
     )
     row_y = legend_row(
-        lambda rect: draw.rectangle(rect, outline=ACCENT_BLUE, width=5) or draw.ellipse((rect[0] + 25, rect[1] + 25, rect[0] + 35, rect[1] + 35), fill=WHITE),
+        lambda rect: draw_legend_square(rect, ACCENT_BLUE),
         "Blue box: right controller candidate",
         row_y,
     )

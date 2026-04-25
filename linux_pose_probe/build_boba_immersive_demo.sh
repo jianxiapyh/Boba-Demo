@@ -3,6 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "${SCRIPT_DIR}"
+env -u LD_LIBRARY_PATH bash "${SCRIPT_DIR}/check_boba_immersive_bridge_deps.sh"
 
 if [[ -n "${CXX:-}" ]]; then
   compiler="${CXX}"

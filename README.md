@@ -6,6 +6,7 @@ The public packaged demo cases in this branch are:
 - `sloth`
 - `rope`
 - `hq_rope`
+- `rope_game`
 
 Compatibility alias:
 - `hq_rope_0 -> hq_rope`
@@ -24,6 +25,7 @@ The packaged runtime bundles live under:
 - `assets/sloth/`
 - `assets/rope/`
 - `assets/hq_rope/`
+- `assets/rope_game/`
 
 For the shipped runtime Gaussian PLYs:
 - `assets/sloth/sloth.ply` is copied from `Boba/gaussian_output/double_stretch_sloth/.../iteration_10000/point_cloud.ply`
@@ -36,40 +38,65 @@ No alignment, annotation, filler-training, or candidate-generation workflow is k
 
 ## Environment
 
-The intended environment is the existing `phystwin` Conda environment used for the Boba demo. ALVR/SteamVR/OpenXR runtime setup is assumed to already be installed on the machine.
+The intended environment on RTX6000 Blackwell is the existing `boba` Conda environment from the main `Boba` checkout. ALVR/SteamVR/OpenXR runtime setup is assumed to already be installed on the machine.
 
-This demo still resolves `gsplat` from the sibling `Boba_OpenSource` checkout instead of a stock pip wheel. The default expected source tree is:
+Run the RTX6000 environment preflight/install from an activated `boba` shell:
 
-```text
-../Boba_OpenSource/gaussian_splatting/submodules/gsplat/
+```bash
+conda activate boba
+bash env_install/RTX6000_env_install.sh
 ```
 
-If your `Boba_OpenSource` checkout lives elsewhere, set `BOBA_GSPLAT_SOURCE_ROOT` to that vendored `gsplat` source root before launching.
+The RTX6000 installer installs/uses `git-lfs`, hydrates manifest-referenced demo assets that are still checked out as LFS pointers, rebuilds the local CUDA extensions with `TORCH_CUDA_ARCH_LIST=12.0`, and rebuilds `pycuda` with CUDA/OpenGL interop enabled.
+
+If you only need to recheck or hydrate packaged assets:
+
+```bash
+python tools/fetch_demo_case_assets.py --all
+python tools/fetch_demo_case_assets.py --case sloth
+```
+
+This demo resolves `gsplat` from the sibling `Boba` checkout instead of a stock pip wheel. The default expected source tree is:
+
+```text
+../Boba/gaussian_splatting/submodules/gsplat/
+```
+
+If your `Boba` checkout lives elsewhere, set `BOBA_GSPLAT_SOURCE_ROOT` to that vendored `gsplat` source root before launching.
+
+The launcher expects:
+- `PYTHONNOUSERSITE=1`
+- `CUDA_HOME=/usr/local/cuda`
+- `LD_LIBRARY_PATH` beginning with `$CONDA_PREFIX/lib:$CUDA_HOME/lib64`
+
+Direct `python boba_quest_immersive.py ...` launches self-reexec once with that runtime contract when started from an activated `boba` environment.
 
 ## Main run commands
 
-Default Quest immersive run:
+Canonical RTX6000 Quest immersive run:
 
 ```bash
-conda run -n phystwin env PYTHONNOUSERSITE=1 python boba_quest_immersive.py \
+conda activate boba
+python boba_quest_immersive.py \
+  --case_name rope_game \
+  --n_dup 0 \
+  --interactive_window_mode hidden
+```
+
+Alternate packaged cases:
+
+```bash
+python boba_quest_immersive.py \
   --case_name sloth \
   --n_dup 0 \
   --interactive_window_mode hidden
-```
 
-Alternate packaged case:
-
-```bash
-conda run -n phystwin env PYTHONNOUSERSITE=1 python boba_quest_immersive.py \
+python boba_quest_immersive.py \
   --case_name rope \
   --n_dup 0 \
   --interactive_window_mode hidden
-```
 
-Additional rope-family packaged cases:
-
-```bash
-conda run -n phystwin env PYTHONNOUSERSITE=1 python boba_quest_immersive.py \
+python boba_quest_immersive.py \
   --case_name hq_rope \
   --n_dup 0 \
   --interactive_window_mode hidden
@@ -78,12 +105,18 @@ conda run -n phystwin env PYTHONNOUSERSITE=1 python boba_quest_immersive.py \
 Quest immersive run with render profiling:
 
 ```bash
-conda run -n phystwin env PYTHONNOUSERSITE=1 python boba_quest_immersive.py \
+python boba_quest_immersive.py \
   --case_name sloth \
   --n_dup 0 \
   --interactive_window_mode hidden \
-  --render_profile \
-  --render_profile_every 30
+  --profile \
+  --profile_freq 30
+```
+
+If the native bridge dependency preflight reports missing packages on Ubuntu 22.04:
+
+```bash
+sudo apt install pkg-config libglfw3-dev libgl1-mesa-dev libx11-dev libopenxr-dev
 ```
 
 The launcher is intentionally fixed to:

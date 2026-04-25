@@ -6806,6 +6806,7 @@ class InvPhyTrainerWarp:
         if cfg.data_type == "real":
             self.dataset = RealData(visualize=False, save_gt=False)
             self.structure_points = self.dataset.structure_points
+            self.num_original_points = self.dataset.num_original_points
             self.num_all_points = self.dataset.num_all_points
         elif cfg.data_type == "synthetic":
             print(f"synthetic data detected")
@@ -14733,6 +14734,51 @@ class InvPhyTrainerWarp:
     def _is_finite_tensor(self, tensor):
         return bool(torch.isfinite(torch.as_tensor(tensor)).all().item())
 
+    def _sanitize_hq_rope_game_gaussians(self, gaussians, case_name):
+        if case_name != "hq_rope_game":
+            return {}
+        tensor_fields = {
+            "xyz": gaussians._xyz,
+            "features_dc": gaussians._features_dc,
+            "features_rest": gaussians._features_rest,
+            "scaling": gaussians._scaling,
+            "rotation": gaussians._rotation,
+            "opacity": gaussians._opacity,
+        }
+        finite_debug = {}
+        for name, tensor in tensor_fields.items():
+            finite_mask = torch.isfinite(tensor)
+            finite_debug[f"{name}_finite"] = int(finite_mask.sum().item())
+            finite_debug[f"{name}_total"] = int(tensor.numel())
+            finite_debug[f"{name}_nan"] = int(torch.isnan(tensor).sum().item())
+            finite_debug[f"{name}_inf"] = int(torch.isinf(tensor).sum().item())
+
+        opacity = gaussians._opacity
+        opacity_finite = torch.isfinite(opacity)
+        nonfinite_opacity_count = int((~opacity_finite).sum().item())
+        finite_debug["opacity_nonfinite_sanitized"] = nonfinite_opacity_count
+        if nonfinite_opacity_count > 0:
+            finite_values = opacity[opacity_finite]
+            replacement_min = 0.0
+            replacement_max = 0.0
+            if int(finite_values.numel()) > 0:
+                replacement_min = float(finite_values.min().item())
+                replacement_max = float(finite_values.max().item())
+            cleaned_opacity = torch.nan_to_num(
+                opacity,
+                nan=0.0,
+                posinf=replacement_max,
+                neginf=replacement_min,
+            )
+            with torch.no_grad():
+                gaussians._opacity.copy_(cleaned_opacity)
+            finite_debug["opacity_finite_after_sanitize"] = int(
+                torch.isfinite(gaussians._opacity).sum().item()
+            )
+            finite_debug["opacity_replacement_min"] = replacement_min
+            finite_debug["opacity_replacement_max"] = replacement_max
+        return finite_debug
+
     def _compute_live_controller_alignment(
         self,
         live_left_anchor,
@@ -17570,6 +17616,17 @@ class InvPhyTrainerWarp:
                 self.simulator.set_init_state(
                     self.simulator.wp_init_vertices, self.simulator.wp_init_velocities
                 )
+                print(
+                    "[quest_display] immersive simulator init: "
+                    f"case={str(getattr(cfg, 'demo_case_name', '')).strip().lower()} "
+                    f"self_collision={bool(getattr(cfg, 'self_collision', False))} "
+                    "object_collision_flag="
+                    f"{int(getattr(self.simulator, 'object_collision_flag', 0))} "
+                    f"dt={float(getattr(self.simulator, 'dt', cfg.dt)):.8g} "
+                    "num_substeps="
+                    f"{int(getattr(self.simulator, 'num_substeps', cfg.num_substeps))}",
+                    flush=True,
+                )
                 self._record_immersive_startup_milestone(
                     startup_timeline,
                     "sim_init_done",
@@ -18315,10 +18372,27 @@ class InvPhyTrainerWarp:
                 settled_bounds_max = (
                     x[: self.num_all_points].max(dim=0).values.detach().cpu().numpy().tolist()
                 )
+                settled_object_finite = int(
+                    torch.isfinite(x[: self.num_all_points]).sum().item()
+                )
+                settled_object_total = int(x[: self.num_all_points].numel())
+                settled_gaussian_xyz_finite = int(
+                    torch.isfinite(gaussians._xyz).sum().item()
+                )
+                settled_gaussian_xyz_total = int(gaussians._xyz.numel())
+                settled_gaussian_rotation_finite = int(
+                    torch.isfinite(gaussians._rotation).sum().item()
+                )
+                settled_gaussian_rotation_total = int(gaussians._rotation.numel())
                 print(
                     "[quest_display] immersive settled rest state: "
                     f"support_center={settled_support_center.detach().cpu().numpy().tolist()} "
                     f"xy_error={settled_xy_error:.4f} z_error={settled_z_error:.4f} "
+                    f"object_finite={settled_object_finite}/{settled_object_total} "
+                    "gaussian_xyz_finite="
+                    f"{settled_gaussian_xyz_finite}/{settled_gaussian_xyz_total} "
+                    "gaussian_rotation_finite="
+                    f"{settled_gaussian_rotation_finite}/{settled_gaussian_rotation_total} "
                     f"bounds_min={settled_bounds_min} bounds_max={settled_bounds_max}",
                     flush=True,
                 )
@@ -26633,6 +26707,34 @@ class InvPhyTrainerWarp:
         wp_v = wp.from_torch(state["v"].contiguous(), dtype=wp.vec3, requires_grad=False)
         self.simulator.set_init_state(wp_x, wp_v)
 
+    def _sim_state_is_finite(self, state):
+        if state is None:
+            return False
+        x = state.get("x")
+        v = state.get("v")
+        if x is None or v is None:
+            return False
+        return self._is_finite_tensor(x) and self._is_finite_tensor(v)
+
+    def _log_nonfinite_settle_recovery(self, step_idx, state, source):
+        case_name = str(getattr(cfg, "demo_case_name", "")).strip().lower()
+        x = None if state is None else state.get("x")
+        v = None if state is None else state.get("v")
+        x_finite = 0 if x is None else int(torch.isfinite(x).sum().item())
+        x_total = 0 if x is None else int(x.numel())
+        v_finite = 0 if v is None else int(torch.isfinite(v).sum().item())
+        v_total = 0 if v is None else int(v.numel())
+        print(
+            "[quest_display] immersive rest settle recovered non-finite state: "
+            f"case={case_name} "
+            f"source={source} "
+            f"hq_rope_game_nonfinite_settle_recovered={int(case_name == 'hq_rope_game')} "
+            f"step_idx={int(step_idx)} "
+            f"x_finite={x_finite}/{x_total} "
+            f"v_finite={v_finite}/{v_total}",
+            flush=True,
+        )
+
     def _set_scene_collider_boxes(self, layout):
         if layout.static_collider_boxes is not None:
             boxes_np = np.asarray(layout.static_collider_boxes, dtype=np.float32)
@@ -26649,7 +26751,7 @@ class InvPhyTrainerWarp:
 
     def _settle_scene_rest_state(self, rest_target, progress_callback=None):
         self.simulator.set_controller_interactive(rest_target, rest_target)
-        last_state = None
+        last_state = self._capture_sim_state()
         for step_idx in range(self.IMMERSIVE_SCENE_REST_SETTLE_STEPS):
             if progress_callback is not None:
                 progress_callback(f"settle_step_{step_idx}")
@@ -26659,13 +26761,20 @@ class InvPhyTrainerWarp:
             wp.synchronize()
             x = wp.to_torch(self.simulator.wp_states[-1].wp_x, requires_grad=False).clone()
             v = wp.to_torch(self.simulator.wp_states[-1].wp_v, requires_grad=False).clone()
-            last_state = {"x": x, "v": v}
+            candidate_state = {"x": x, "v": v}
+            if not self._sim_state_is_finite(candidate_state):
+                self._restore_sim_state(last_state)
+                self._log_nonfinite_settle_recovery(
+                    step_idx,
+                    candidate_state,
+                    "blocking",
+                )
+                break
+            last_state = candidate_state
             self._restore_sim_state(last_state)
             max_speed = float(torch.linalg.norm(v, dim=1).max().item())
             if max_speed <= self.IMMERSIVE_SCENE_REST_VELOCITY_EPS:
                 break
-        if last_state is None:
-            last_state = self._capture_sim_state()
         if progress_callback is not None:
             progress_callback("settle_complete")
         return last_state
@@ -26688,6 +26797,8 @@ class InvPhyTrainerWarp:
             settle_state["initialized"] = True
             settle_state["step_idx"] = int(settle_state.get("step_idx", 0))
             settle_state["last_state"] = settle_state.get("last_state")
+            if settle_state["last_state"] is None:
+                settle_state["last_state"] = self._capture_sim_state()
             settle_state["done"] = bool(settle_state.get("done", False))
             settle_state["completion_notified"] = bool(
                 settle_state.get("completion_notified", False)
@@ -26702,6 +26813,8 @@ class InvPhyTrainerWarp:
 
         step_idx = int(settle_state.get("step_idx", 0))
         last_state = settle_state.get("last_state")
+        if last_state is None:
+            last_state = self._capture_sim_state()
         done = False
         for _ in range(max_steps):
             if step_idx >= int(self.IMMERSIVE_SCENE_REST_SETTLE_STEPS):
@@ -26715,7 +26828,19 @@ class InvPhyTrainerWarp:
             wp.synchronize()
             x = wp.to_torch(self.simulator.wp_states[-1].wp_x, requires_grad=False).clone()
             v = wp.to_torch(self.simulator.wp_states[-1].wp_v, requires_grad=False).clone()
-            last_state = {"x": x, "v": v}
+            candidate_state = {"x": x, "v": v}
+            if not self._sim_state_is_finite(candidate_state):
+                self._restore_sim_state(last_state)
+                settle_state["nonfinite_recovered"] = True
+                settle_state["nonfinite_recovery_step_idx"] = step_idx
+                self._log_nonfinite_settle_recovery(
+                    step_idx,
+                    candidate_state,
+                    "cooperative",
+                )
+                done = True
+                break
+            last_state = candidate_state
             self._restore_sim_state(last_state)
             step_idx += 1
             max_speed = float(torch.linalg.norm(v, dim=1).max().item())
@@ -26724,8 +26849,6 @@ class InvPhyTrainerWarp:
                 break
         if step_idx >= int(self.IMMERSIVE_SCENE_REST_SETTLE_STEPS):
             done = True
-        if last_state is None:
-            last_state = self._capture_sim_state()
         settle_state["step_idx"] = step_idx
         settle_state["last_state"] = last_state
         settle_state["done"] = bool(done)
@@ -31787,6 +31910,10 @@ class InvPhyTrainerWarp:
         gaussians = GaussianModel(sh_degree=3)
         gaussians.load_ply(gs_path)
         raw_gaussian_count = int(gaussians._xyz.shape[0])
+        gaussian_finite_debug = self._sanitize_hq_rope_game_gaussians(
+            gaussians,
+            case_name,
+        )
         disable_opacity_pruning = case_name in {"hq_rope", "hq_rope_game"}
         kept_gaussian_count = raw_gaussian_count
         if not disable_opacity_pruning:
@@ -31813,12 +31940,19 @@ class InvPhyTrainerWarp:
                 f"gaussian_source={gs_path} "
                 f"total_gaussians={raw_gaussian_count} "
                 f"kept_gaussians={kept_gaussian_count} "
+                f"object_nodes={int(getattr(self, 'num_original_points', 0))} "
+                f"mass_nodes={int(self.num_all_points)} "
                 "opacity_pruning=disabled "
+                "gaussian_xyz_finite="
+                f"{gaussian_finite_debug.get('xyz_finite', int(gaussians._xyz.numel()))}/"
+                f"{gaussian_finite_debug.get('xyz_total', int(gaussians._xyz.numel()))} "
+                "gaussian_opacity_nonfinite_sanitized="
+                f"{gaussian_finite_debug.get('opacity_nonfinite_sanitized', 0)} "
                 f"gaussian_bounds_min={gaussian_bounds_min} "
                 f"gaussian_bounds_max={gaussian_bounds_max} "
                 f"frame0_object_bounds_min={object_bounds_min} "
                 f"frame0_object_bounds_max={object_bounds_max} "
-                f"frame0_object_span_after_scale={scaled_object_span:.8f}",
+                f"frame0_object_span_m={scaled_object_span:.8f}",
                 flush=True,
             )
 
@@ -33535,6 +33669,17 @@ class InvPhyTrainerWarp:
             self.simulator.set_init_state(
                 self.simulator.wp_init_vertices, self.simulator.wp_init_velocities
             )
+            print(
+                "[quest_display] immersive simulator init: "
+                f"case={str(getattr(cfg, 'demo_case_name', '')).strip().lower()} "
+                f"self_collision={bool(getattr(cfg, 'self_collision', False))} "
+                "object_collision_flag="
+                f"{int(getattr(self.simulator, 'object_collision_flag', 0))} "
+                f"dt={float(getattr(self.simulator, 'dt', cfg.dt)):.8g} "
+                "num_substeps="
+                f"{int(getattr(self.simulator, 'num_substeps', cfg.num_substeps))}",
+                flush=True,
+            )
             self._record_immersive_startup_milestone(
                 startup_timeline,
                 "sim_init_done",
@@ -34164,10 +34309,27 @@ class InvPhyTrainerWarp:
             settled_bounds_max = (
                 x[: self.num_all_points].max(dim=0).values.detach().cpu().numpy().tolist()
             )
+            settled_object_finite = int(
+                torch.isfinite(x[: self.num_all_points]).sum().item()
+            )
+            settled_object_total = int(x[: self.num_all_points].numel())
+            settled_gaussian_xyz_finite = int(
+                torch.isfinite(gaussians._xyz).sum().item()
+            )
+            settled_gaussian_xyz_total = int(gaussians._xyz.numel())
+            settled_gaussian_rotation_finite = int(
+                torch.isfinite(gaussians._rotation).sum().item()
+            )
+            settled_gaussian_rotation_total = int(gaussians._rotation.numel())
             print(
                 "[quest_display] immersive settled rest state: "
                 f"support_center={settled_support_center.detach().cpu().numpy().tolist()} "
                 f"xy_error={settled_xy_error:.4f} z_error={settled_z_error:.4f} "
+                f"object_finite={settled_object_finite}/{settled_object_total} "
+                "gaussian_xyz_finite="
+                f"{settled_gaussian_xyz_finite}/{settled_gaussian_xyz_total} "
+                "gaussian_rotation_finite="
+                f"{settled_gaussian_rotation_finite}/{settled_gaussian_rotation_total} "
                 f"bounds_min={settled_bounds_min} bounds_max={settled_bounds_max}",
                 flush=True,
             )

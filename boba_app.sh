@@ -74,7 +74,7 @@ python boba_quest_immersive.py \
 
 
 python boba_quest_immersive.py \
-  --case_name rope_game \
+  --case_name hq_rope_game \
   --n_dup 0 \
   --interactive_window_mode hidden \
   --immersive_static_scene_backend native_gl \

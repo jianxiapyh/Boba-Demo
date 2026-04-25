@@ -30,13 +30,19 @@ SHARED_TUTORIAL_SLIDES = (
 )
 DEMO_CASE_WORLD_SCALE = {
     "hq_rope": 0.3932700391790796,
-    "hq_rope_game": 0.3932700391790796,
 }
 DEMO_CASE_LENGTH_LIKE_CFG_KEYS = (
     "object_radius",
     "controller_radius",
     "collision_dist",
 )
+DEMO_CASE_PHYSICS_PROFILES = {
+    "hq_rope_game": {
+        "dt": 5e-5,
+        "num_substeps": 667,
+        "self_collision": True,
+    },
+}
 RUNTIME_ENV_READY_SENTINEL = "BOBA_IMMERSIVE_RUNTIME_READY"
 DEFAULT_CUDA_HOME = "/usr/local/cuda"
 DEFAULT_GSPLAT_SOURCE_ROOT = (
@@ -234,6 +240,24 @@ def apply_demo_case_world_scale_to_cfg(cfg, case_name: str) -> float:
             continue
         setattr(cfg, attr_name, float(getattr(cfg, attr_name)) * scale)
     return scale
+
+
+def apply_demo_case_physics_profile_to_cfg(cfg, case_name: str) -> dict | None:
+    case_key = canonical_demo_case_name(case_name)
+    profile = DEMO_CASE_PHYSICS_PROFILES.get(case_key)
+    if profile is None:
+        return None
+    previous = {}
+    if "dt" in profile:
+        previous["dt"] = float(getattr(cfg, "dt"))
+        cfg.dt = float(profile["dt"])
+    if "num_substeps" in profile:
+        previous["num_substeps"] = int(getattr(cfg, "num_substeps"))
+        cfg.num_substeps = int(profile["num_substeps"])
+    if "self_collision" in profile:
+        previous["self_collision"] = bool(getattr(cfg, "self_collision", False))
+        cfg.self_collision = bool(profile["self_collision"])
+    return previous
 
 
 def set_all_seeds(seed: int):
@@ -884,6 +908,10 @@ def main(argv: list[str] | None = None):
         optimal_params = pickle.load(f)
     cfg.set_optimal_params(optimal_params)
     demo_case_scale = apply_demo_case_world_scale_to_cfg(cfg, canonical_case_name)
+    previous_physics_profile = apply_demo_case_physics_profile_to_cfg(
+        cfg,
+        canonical_case_name,
+    )
     if abs(demo_case_scale - 1.0) > 1e-8:
         print(
             "[quest_display] demo case world scale: "
@@ -891,6 +919,22 @@ def main(argv: list[str] | None = None):
             f"object_radius={float(cfg.object_radius):.8f} "
             f"controller_radius={float(cfg.controller_radius):.8f} "
             f"collision_dist={float(cfg.collision_dist):.8f}",
+            flush=True,
+        )
+    if previous_physics_profile is not None:
+        print(
+            "[quest_display] demo case physics profile: "
+            f"case={canonical_case_name} "
+            f"dt={float(cfg.dt):.8g} "
+            f"num_substeps={int(cfg.num_substeps)} "
+            f"self_collision={bool(getattr(cfg, 'self_collision', False))} "
+            f"previous_dt={previous_physics_profile.get('dt', float(cfg.dt)):.8g} "
+            "previous_num_substeps="
+            f"{previous_physics_profile.get('num_substeps', int(cfg.num_substeps))} "
+            "previous_self_collision="
+            f"{bool(previous_physics_profile.get('self_collision', getattr(cfg, 'self_collision', False)))} "
+            "reason=original_phystwin_rope_stability_self_collision "
+            "size_scale=1.0",
             flush=True,
         )
 

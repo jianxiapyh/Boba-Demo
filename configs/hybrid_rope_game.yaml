@@ -10,6 +10,9 @@ vis_interval: 20
 init_spring_Y: 3e4
 collide_elas: 0.5
 collide_fric: 0.3
+runtime_static_collider_mode: "scene_replace_active_table_with_smooth_top"
+runtime_smooth_table_top_offset_m: 0.002
+runtime_smooth_table_top_thickness_m: 0.035
 collide_object_elas: 0.7
 collide_object_fric: 0.3
 object_radius: 0.02

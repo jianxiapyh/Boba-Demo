@@ -26960,10 +26960,140 @@ class InvPhyTrainerWarp:
             flush=True,
         )
 
+    def _build_runtime_smooth_table_top_aabb(self, layout):
+        tabletop_bounds = getattr(layout, "smooth_tabletop_bounds", None)
+        if tabletop_bounds is None:
+            raise RuntimeError(
+                "runtime_static_collider_mode=scene_replace_active_table_with_smooth_top "
+                "requires layout.smooth_tabletop_bounds."
+            )
+        bounds_np = np.asarray(tabletop_bounds, dtype=np.float32)
+        if bounds_np.shape != (2, 3) or not np.isfinite(bounds_np).all():
+            raise RuntimeError(
+                "layout.smooth_tabletop_bounds must be a finite array with shape (2, 3)."
+            )
+        box_min = np.minimum(bounds_np[0], bounds_np[1]).astype(np.float32).copy()
+        box_max = np.maximum(bounds_np[0], bounds_np[1]).astype(np.float32).copy()
+        scene_up = np.asarray(
+            getattr(layout, "scene_up", np.array([0.0, 0.0, -1.0], dtype=np.float32)),
+            dtype=np.float32,
+        ).reshape(-1)
+        if scene_up.shape[0] != 3 or not np.isfinite(scene_up).all():
+            scene_up = np.array([0.0, 0.0, -1.0], dtype=np.float32)
+
+        vertical_axis = int(np.argmax(np.abs(scene_up)))
+        top_uses_min = bool(float(scene_up[vertical_axis]) < 0.0)
+        top_plane = float(
+            box_min[vertical_axis] if top_uses_min else box_max[vertical_axis]
+        )
+
+        offset_m = float(getattr(cfg, "runtime_smooth_table_top_offset_m", 0.002))
+        if not np.isfinite(offset_m) or offset_m < 0.0:
+            offset_m = 0.002
+        thickness_m = float(getattr(cfg, "runtime_smooth_table_top_thickness_m", 0.035))
+        if not np.isfinite(thickness_m) or thickness_m <= 0.0:
+            thickness_m = 0.035
+
+        slab_min = box_min.copy()
+        slab_max = box_max.copy()
+        if top_uses_min:
+            smooth_top = top_plane - offset_m
+            slab_min[vertical_axis] = smooth_top
+            slab_max[vertical_axis] = smooth_top + thickness_m
+        else:
+            smooth_top = top_plane + offset_m
+            slab_min[vertical_axis] = smooth_top - thickness_m
+            slab_max[vertical_axis] = smooth_top
+
+        return np.stack(
+            [np.minimum(slab_min, slab_max), np.maximum(slab_min, slab_max)],
+            axis=0,
+        ).astype(np.float32)
+
     def _set_scene_collider_boxes(self, layout):
+        runtime_static_collider_mode = str(
+            getattr(cfg, "runtime_static_collider_mode", "scene") or "scene"
+        ).strip().lower()
+        if runtime_static_collider_mode not in {
+            "scene",
+            "scene_replace_active_table_with_smooth_top",
+        }:
+            raise ValueError(
+                "Unsupported runtime_static_collider_mode="
+                f"{runtime_static_collider_mode!r}."
+            )
         if layout.static_collider_boxes is not None:
             boxes_np = np.asarray(layout.static_collider_boxes, dtype=np.float32)
+            if (
+                runtime_static_collider_mode
+                == "scene_replace_active_table_with_smooth_top"
+            ):
+                original_box_count = int(boxes_np.shape[0])
+                metadata = getattr(layout, "static_collider_box_metadata", None)
+                if metadata is None or len(metadata) != original_box_count:
+                    raise RuntimeError(
+                        "runtime_static_collider_mode=scene_replace_active_table_with_smooth_top "
+                        "requires one static_collider_box_metadata entry per static collider box."
+                    )
+                remove_mask = np.array(
+                    [
+                        bool(entry.get("is_active_table", False))
+                        and str(entry.get("category", ""))
+                        in {"support_slab", "blocker_box"}
+                        for entry in metadata
+                    ],
+                    dtype=bool,
+                )
+                removed_active_support_slabs = int(
+                    sum(
+                        bool(entry.get("is_active_table", False))
+                        and str(entry.get("category", "")) == "support_slab"
+                        for entry in metadata
+                    )
+                )
+                removed_active_blocker_boxes = int(
+                    sum(
+                        bool(entry.get("is_active_table", False))
+                        and str(entry.get("category", "")) == "blocker_box"
+                        for entry in metadata
+                    )
+                )
+                kept_non_table_boxes = int(
+                    sum(
+                        not bool(entry.get("is_active_table", False))
+                        for entry in metadata
+                    )
+                )
+                smooth_table_top = self._build_runtime_smooth_table_top_aabb(layout)
+                kept_boxes_np = boxes_np[~remove_mask]
+                kept_active_other_boxes = (
+                    int(kept_boxes_np.shape[0]) - kept_non_table_boxes
+                )
+                boxes_np = np.concatenate(
+                    [kept_boxes_np, smooth_table_top.reshape(1, 2, 3)],
+                    axis=0,
+                ).astype(np.float32)
+                print(
+                    "[quest_display] runtime static colliders: "
+                    f"mode={runtime_static_collider_mode} "
+                    f"original_boxes={original_box_count} "
+                    f"removed_active_table_support_slabs={removed_active_support_slabs} "
+                    f"removed_active_table_blocker_boxes={removed_active_blocker_boxes} "
+                    f"kept_non_table_boxes={kept_non_table_boxes} "
+                    f"kept_active_table_other_boxes={kept_active_other_boxes} "
+                    f"kept_boxes={int(kept_boxes_np.shape[0])} "
+                    f"output_boxes={int(boxes_np.shape[0])} "
+                    "smooth_tabletop_patch_count="
+                    f"{getattr(layout, 'smooth_tabletop_patch_count', 'n/a')} "
+                    f"smooth_table_top_aabb={smooth_table_top.tolist()}",
+                    flush=True,
+                )
         else:
+            if runtime_static_collider_mode == "scene_replace_active_table_with_smooth_top":
+                raise RuntimeError(
+                    "runtime_static_collider_mode=scene_replace_active_table_with_smooth_top "
+                    "requires scene static collider boxes."
+                )
             boxes_np = np.array(
                 [
                     [layout.table_box.mins, layout.table_box.maxs],

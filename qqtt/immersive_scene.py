@@ -72,9 +72,12 @@ class SimpleLabLayout:
     scene_up: np.ndarray
     room_center_xy: np.ndarray | None = None
     static_collider_boxes: np.ndarray | None = None
+    static_collider_box_metadata: list[dict[str, Any]] | None = None
     support_surface_boxes: np.ndarray | None = None
     active_table_bounds: np.ndarray | None = None
     active_table_surface_center: np.ndarray | None = None
+    smooth_tabletop_bounds: np.ndarray | None = None
+    smooth_tabletop_patch_count: int | None = None
 
     @property
     def scene_down(self) -> np.ndarray:
@@ -3114,6 +3117,13 @@ class SimpleLabSceneRenderer:
         visible_tabletop_world_bounds = visible_tabletop_mesh_world.bounds.astype(
             np.float32
         )
+        self.layout.smooth_tabletop_bounds = np.array(
+            visible_tabletop_world_bounds,
+            copy=True,
+        )
+        self.layout.smooth_tabletop_patch_count = int(
+            len(self._asset_visible_tabletop_patches)
+        )
         table_render_world_bounds = self._table_mesh_world.bounds.astype(np.float32)
         self._table_world_bounds = (
             table_render_world_bounds[0].copy(),
@@ -3151,6 +3161,7 @@ class SimpleLabSceneRenderer:
             self._wall_world_bounds[wall_name] = (bounds[0].copy(), bounds[1].copy())
 
         collider_entries: list[dict[str, Any]] = []
+        active_table_component_id_set = {int(v) for v in self._table_component_ids}
 
         floor_bounds_min = self._floor_mesh_world.bounds[0].astype(np.float32).copy()
         floor_bounds_max = self._floor_mesh_world.bounds[1].astype(np.float32).copy()
@@ -3166,6 +3177,7 @@ class SimpleLabSceneRenderer:
             {
                 "category": "floor_slab",
                 "component_id": None,
+                "is_active_table": False,
                 "box": np.stack([floor_bounds_min, floor_bounds_max], axis=0).astype(np.float32),
             }
         )
@@ -3204,12 +3216,14 @@ class SimpleLabSceneRenderer:
                 {
                     "category": "boundary_wall",
                     "component_id": None,
+                    "is_active_table": False,
                     "box": np.stack([wall_min, wall_max], axis=0).astype(np.float32),
                 }
             )
 
         for record in self._collision_component_records:
             component_id = int(record["id"])
+            is_active_table_component = component_id in active_table_component_id_set
             for patch in record.get("support_patches", []):
                 if not _support_patch_is_collision_usable(patch, self._asset_floor_y):
                     continue
@@ -3224,6 +3238,7 @@ class SimpleLabSceneRenderer:
                     {
                         "category": "support_slab",
                         "component_id": component_id,
+                        "is_active_table": bool(is_active_table_component),
                         "box": np.stack([world_min, world_max], axis=0).astype(np.float32),
                     }
                 )
@@ -3239,6 +3254,7 @@ class SimpleLabSceneRenderer:
                     {
                         "category": "blocker_box",
                         "component_id": component_id,
+                        "is_active_table": bool(is_active_table_component),
                         "box": np.stack([world_min, world_max], axis=0).astype(np.float32),
                     }
                 )
@@ -3263,6 +3279,18 @@ class SimpleLabSceneRenderer:
         else:
             self.layout.support_surface_boxes = None
         self.layout.static_collider_boxes = np.array(self._scene_collider_boxes, copy=True)
+        self.layout.static_collider_box_metadata = [
+            {
+                "category": str(entry.get("category", "")),
+                "component_id": (
+                    None
+                    if entry.get("component_id") is None
+                    else int(entry.get("component_id"))
+                ),
+                "is_active_table": bool(entry.get("is_active_table", False)),
+            }
+            for entry in collider_entries
+        ]
         support_slab_count = int(
             sum(1 for entry in collider_entries if entry["category"] == "support_slab")
         )

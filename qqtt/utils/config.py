@@ -18,6 +18,9 @@ class Config:
         self.init_spring_Y = 3e3
         self.collide_elas = 0.5
         self.collide_fric = 0.3
+        self.runtime_static_collider_mode = "scene"
+        self.runtime_smooth_table_top_offset_m = 0.002
+        self.runtime_smooth_table_top_thickness_m = 0.035
         self.collide_object_elas = 0.7
         self.collide_object_fric = 0.3
 

@@ -768,8 +768,10 @@ class SimpleLabSceneRenderer:
         scene_analysis_cache_mode: str = "auto",
         native_gl_texture_mode: str = "stable_mipmap",
         native_gl_anisotropy: int = 8,
+        native_gl_mipmap_lod_bias: float = 0.0,
         native_gl_msaa_samples: int = 4,
         native_gl_depth_format: str = "depth32f",
+        native_gl_progress_callback=None,
     ):
         import pyrender
 
@@ -789,8 +791,10 @@ class SimpleLabSceneRenderer:
         )
         self.native_gl_texture_mode = str(native_gl_texture_mode).strip().lower()
         self.native_gl_anisotropy = int(native_gl_anisotropy)
+        self.native_gl_mipmap_lod_bias = float(native_gl_mipmap_lod_bias)
         self.native_gl_msaa_samples = int(native_gl_msaa_samples)
         self.native_gl_depth_format = str(native_gl_depth_format).strip().lower()
+        self.native_gl_progress_callback = native_gl_progress_callback
         self._pyrender = pyrender
         self.scene_root = ensure_illixr_lab_assets(scene_assets_root)
         self.manifest = load_illixr_lab_manifest(scene_assets_root)
@@ -898,11 +902,13 @@ class SimpleLabSceneRenderer:
                 zfar=100.0,
                 texture_mode=self.native_gl_texture_mode,
                 anisotropy=self.native_gl_anisotropy,
+                mipmap_lod_bias=self.native_gl_mipmap_lod_bias,
                 msaa_samples=self.native_gl_msaa_samples,
                 depth_format=self.native_gl_depth_format,
                 device=torch.device(
                     "cuda" if torch.cuda.is_available() else "cpu"
                 ),
+                progress_callback=self.native_gl_progress_callback,
             )
             self._pyrender_readback_mode = str(
                 self._native_gl_renderer.pyrender_readback_mode()

@@ -161,6 +161,13 @@ def _normalize_immersive_native_gl_anisotropy(anisotropy):
     return normalized_value
 
 
+def _normalize_immersive_native_gl_mipmap_lod_bias(mipmap_lod_bias):
+    normalized_value = float(mipmap_lod_bias)
+    if not np.isfinite(normalized_value):
+        raise ValueError("immersive_native_gl_mipmap_lod_bias must be finite")
+    return normalized_value
+
+
 def _normalize_immersive_native_gl_msaa_samples(msaa_samples):
     normalized_samples = int(msaa_samples)
     if normalized_samples not in {1, 2, 4}:
@@ -1445,6 +1452,7 @@ class _ImmersiveBalancedSceneEyeRenderWorker:
         cuda_device_index,
         native_gl_texture_mode="stable_mipmap",
         native_gl_anisotropy=8,
+        native_gl_mipmap_lod_bias=0.0,
         native_gl_msaa_samples=4,
         native_gl_depth_format="depth32f",
     ):
@@ -1465,6 +1473,9 @@ class _ImmersiveBalancedSceneEyeRenderWorker:
         )
         self._native_gl_anisotropy = _normalize_immersive_native_gl_anisotropy(
             native_gl_anisotropy
+        )
+        self._native_gl_mipmap_lod_bias = (
+            _normalize_immersive_native_gl_mipmap_lod_bias(native_gl_mipmap_lod_bias)
         )
         self._native_gl_msaa_samples = _normalize_immersive_native_gl_msaa_samples(
             native_gl_msaa_samples
@@ -1591,6 +1602,7 @@ class _ImmersiveBalancedSceneEyeRenderWorker:
                 scene_analysis_cache_mode="auto",
                 native_gl_texture_mode=self._native_gl_texture_mode,
                 native_gl_anisotropy=self._native_gl_anisotropy,
+                native_gl_mipmap_lod_bias=self._native_gl_mipmap_lod_bias,
                 native_gl_msaa_samples=self._native_gl_msaa_samples,
                 native_gl_depth_format=self._native_gl_depth_format,
             )
@@ -1707,6 +1719,7 @@ class _ImmersiveStaticSceneRenderWorker:
         cuda_device_index,
         native_gl_texture_mode="stable_mipmap",
         native_gl_anisotropy=8,
+        native_gl_mipmap_lod_bias=0.0,
         native_gl_msaa_samples=4,
         native_gl_depth_format="depth32f",
     ):
@@ -1721,6 +1734,9 @@ class _ImmersiveStaticSceneRenderWorker:
         )
         self._native_gl_anisotropy = _normalize_immersive_native_gl_anisotropy(
             native_gl_anisotropy
+        )
+        self._native_gl_mipmap_lod_bias = (
+            _normalize_immersive_native_gl_mipmap_lod_bias(native_gl_mipmap_lod_bias)
         )
         self._native_gl_msaa_samples = _normalize_immersive_native_gl_msaa_samples(
             native_gl_msaa_samples
@@ -1836,6 +1852,7 @@ class _ImmersiveStaticSceneRenderWorker:
                 scene_analysis_cache_mode="auto",
                 native_gl_texture_mode=self._native_gl_texture_mode,
                 native_gl_anisotropy=self._native_gl_anisotropy,
+                native_gl_mipmap_lod_bias=self._native_gl_mipmap_lod_bias,
                 native_gl_msaa_samples=self._native_gl_msaa_samples,
                 native_gl_depth_format=self._native_gl_depth_format,
             )
@@ -12594,6 +12611,7 @@ class InvPhyTrainerWarp:
         requested_static_scene_backend_mode,
         requested_native_gl_texture_mode,
         requested_native_gl_anisotropy,
+        requested_native_gl_mipmap_lod_bias,
         requested_native_gl_msaa_samples,
         requested_native_gl_depth_format,
         requested_gaussian_source_validation_mode,
@@ -12632,6 +12650,11 @@ class InvPhyTrainerWarp:
             "immersive_native_gl_anisotropy": (
                 _normalize_immersive_native_gl_anisotropy(
                     requested_native_gl_anisotropy
+                )
+            ),
+            "immersive_native_gl_mipmap_lod_bias": (
+                _normalize_immersive_native_gl_mipmap_lod_bias(
+                    requested_native_gl_mipmap_lod_bias
                 )
             ),
             "immersive_native_gl_msaa_samples": (
@@ -12773,6 +12796,7 @@ class InvPhyTrainerWarp:
             f"eye_resolution={requested_flags.get('immersive_eye_resolution', 1408)} "
             f"native_gl_texture_mode={requested_flags.get('immersive_native_gl_texture_mode', 'stable_mipmap')} "
             f"native_gl_anisotropy={requested_flags.get('immersive_native_gl_anisotropy', 8)} "
+            f"native_gl_mipmap_lod_bias={float(requested_flags.get('immersive_native_gl_mipmap_lod_bias', 0.0)):.3f} "
             f"native_gl_msaa_samples={requested_flags.get('immersive_native_gl_msaa_samples', 4)} "
             f"native_gl_depth_format={requested_flags.get('immersive_native_gl_depth_format', 'depth32f')} "
             f"gaussian_source_validation={requested_flags.get('immersive_gaussian_source_validation', 'off')} "
@@ -16521,6 +16545,11 @@ class InvPhyTrainerWarp:
                         0.0,
                         min(1.0, float(int(settle_state.get("step_idx", 0))) / total_steps),
                     )
+            elif phase_name == "await_scene_renderer_prewarm":
+                substage_fraction = max(
+                    0.0,
+                    min(0.999, float(bootstrap_state.get("prewarm_phase_fraction", 0.0))),
+                )
             fraction = max(
                 0.0,
                 min(
@@ -16537,6 +16566,10 @@ class InvPhyTrainerWarp:
                 phase_name.replace("_", " ").strip().capitalize() or "Preparing demo",
             )
         )
+        if not complete and phase_name == "await_scene_renderer_prewarm":
+            phase_label = str(
+                bootstrap_state.get("prewarm_phase_label", phase_label) or phase_label
+            )
         progress = {
             "progress_fraction": float(fraction),
             "progress_percent": int(percent),
@@ -16843,6 +16876,7 @@ class InvPhyTrainerWarp:
         immersive_static_scene_backend_mode,
         immersive_native_gl_texture_mode="stable_mipmap",
         immersive_native_gl_anisotropy=8,
+        immersive_native_gl_mipmap_lod_bias=0.0,
         immersive_native_gl_msaa_samples=4,
         immersive_native_gl_depth_format="depth32f",
         immersive_bridge=None,
@@ -16862,6 +16896,39 @@ class InvPhyTrainerWarp:
             or active_scene_stereo_mode == self.IMMERSIVE_BALANCED_INTERNAL_STEREO_MODE
             else "auto"
         )
+        prewarm_status_lock = threading.Lock()
+        prewarm_status = {
+            "phase": "construct_begin",
+            "phase_label": "Loading room renderer",
+            "phase_fraction": 0.0,
+            "updated_time_s": time.perf_counter(),
+        }
+        native_gl_phase_fraction = {
+            "parse_scene_mesh": 0.25,
+            "init_native_gl": 0.75,
+            "upload_scene_mesh": 0.90,
+        }
+
+        def _native_gl_progress_callback(payload):
+            if not isinstance(payload, dict):
+                return
+            phase = str(payload.get("phase", "native_gl"))
+            label = str(
+                payload.get(
+                    "phase_label",
+                    phase.replace("_", " ").strip().capitalize()
+                    or "Loading room renderer",
+                )
+            )
+            with prewarm_status_lock:
+                prewarm_status.update(payload)
+                prewarm_status["phase"] = phase
+                prewarm_status["phase_label"] = label
+                prewarm_status["phase_fraction"] = float(
+                    native_gl_phase_fraction.get(phase, prewarm_status.get("phase_fraction", 0.0))
+                )
+                prewarm_status["updated_time_s"] = time.perf_counter()
+
         executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=1,
             thread_name_prefix="immersive_scene_prewarm",
@@ -16875,8 +16942,14 @@ class InvPhyTrainerWarp:
             balanced_render_backend=balanced_render_backend,
             native_gl_texture_mode=immersive_native_gl_texture_mode,
             native_gl_anisotropy=immersive_native_gl_anisotropy,
+            native_gl_mipmap_lod_bias=immersive_native_gl_mipmap_lod_bias,
             native_gl_msaa_samples=immersive_native_gl_msaa_samples,
             native_gl_depth_format=immersive_native_gl_depth_format,
+            native_gl_progress_callback=(
+                _native_gl_progress_callback
+                if balanced_render_backend == "native_gl"
+                else None
+            ),
         )
         print(
             "[quest_display] immersive scene renderer prewarm launched: "
@@ -16891,6 +16964,7 @@ class InvPhyTrainerWarp:
                 "static_scene_path=full_scene_per_eye "
                 f"texture_mode={immersive_native_gl_texture_mode} "
                 f"anisotropy={int(immersive_native_gl_anisotropy)} "
+                f"mipmap_lod_bias={float(immersive_native_gl_mipmap_lod_bias):.3f} "
                 f"msaa_samples={int(immersive_native_gl_msaa_samples)} "
                 f"depth_format={immersive_native_gl_depth_format}",
                 flush=True,
@@ -16899,7 +16973,21 @@ class InvPhyTrainerWarp:
             "executor": executor,
             "future": future,
             "balanced_render_backend": balanced_render_backend,
+            "status": prewarm_status,
+            "status_lock": prewarm_status_lock,
         }
+
+    def _immersive_scene_renderer_prewarm_status(self, prewarm_state):
+        if not isinstance(prewarm_state, dict):
+            return {}
+        status = prewarm_state.get("status")
+        if not isinstance(status, dict):
+            return {}
+        lock = prewarm_state.get("status_lock")
+        if lock is None:
+            return dict(status)
+        with lock:
+            return dict(status)
 
     def _await_immersive_scene_renderer_prewarm(
         self,
@@ -16921,8 +17009,12 @@ class InvPhyTrainerWarp:
             return None, latest_sample
 
         wait_logged = False
+        last_logged_phase = None
         try:
             while not future.done():
+                status = self._immersive_scene_renderer_prewarm_status(prewarm_state)
+                phase = str(status.get("phase", "construct_begin"))
+                phase_label = str(status.get("phase_label", "Loading room renderer"))
                 if not wait_logged:
                     print(
                         "[quest_display] immersive scene renderer prewarm still running; "
@@ -16930,10 +17022,17 @@ class InvPhyTrainerWarp:
                         flush=True,
                     )
                     wait_logged = True
+                if phase != last_logged_phase:
+                    print(
+                        "[quest_display] immersive scene renderer prewarm phase: "
+                        f"{phase_label} ({phase})",
+                        flush=True,
+                    )
+                    last_logged_phase = phase
                 self._maybe_publish_immersive_startup_keepalive(
                     immersive_bridge,
                     keepalive_state,
-                    reason="scene_renderer_prewarm_wait",
+                    reason=f"scene_renderer_prewarm_wait_{phase}",
                     startup_timeline=startup_timeline,
                 )
                 min_sample_id = int(getattr(latest_sample, "sample", -1))
@@ -17089,6 +17188,11 @@ class InvPhyTrainerWarp:
         immersive_native_gl_anisotropy = _normalize_immersive_native_gl_anisotropy(
             startup_context.get("immersive_native_gl_anisotropy", 8)
         )
+        immersive_native_gl_mipmap_lod_bias = (
+            _normalize_immersive_native_gl_mipmap_lod_bias(
+                startup_context.get("immersive_native_gl_mipmap_lod_bias", 0.0)
+            )
+        )
         immersive_native_gl_msaa_samples = _normalize_immersive_native_gl_msaa_samples(
             startup_context.get("immersive_native_gl_msaa_samples", 4)
         )
@@ -17222,6 +17326,20 @@ class InvPhyTrainerWarp:
         )
         validation_state = bootstrap_state.get("validation_state")
 
+        def _sync_scene_renderer_prewarm_status():
+            status = self._immersive_scene_renderer_prewarm_status(
+                scene_renderer_prewarm_state
+            )
+            if not status:
+                return
+            phase = str(status.get("phase", "construct_begin"))
+            phase_label = str(status.get("phase_label", "Loading room renderer"))
+            bootstrap_state["prewarm_phase"] = phase
+            bootstrap_state["prewarm_phase_label"] = phase_label
+            bootstrap_state["prewarm_phase_fraction"] = float(
+                status.get("phase_fraction", 0.0)
+            )
+
         def _refresh_substage_cursor():
             bootstrap_state["substage_index"] = substage_index
             bootstrap_state["substage_name"] = (
@@ -17229,6 +17347,8 @@ class InvPhyTrainerWarp:
                 if substage_index >= len(bootstrap_substages)
                 else bootstrap_substages[substage_index]
             )
+            if bootstrap_state["substage_name"] == "await_scene_renderer_prewarm":
+                _sync_scene_renderer_prewarm_status()
             self._immersive_startup_bootstrap_progress(bootstrap_state)
 
         def _complete_substage(name, *, stage_index=None):
@@ -17259,10 +17379,12 @@ class InvPhyTrainerWarp:
             substage_name = bootstrap_substages[substage_index]
 
             if substage_name == "await_scene_renderer_prewarm":
+                _sync_scene_renderer_prewarm_status()
                 prewarm_future = None
                 if scene_renderer_prewarm_state is not None:
                     prewarm_future = scene_renderer_prewarm_state.get("future")
                 if prewarm_future is not None and not prewarm_future.done() and not force:
+                    self._immersive_startup_bootstrap_progress(bootstrap_state)
                     return current_sample
                 scene_renderer, current_sample = self._await_immersive_scene_renderer_prewarm(
                     scene_renderer_prewarm_state,
@@ -17332,6 +17454,7 @@ class InvPhyTrainerWarp:
                         f"resolution={scene_width}x{scene_height} "
                         f"texture_mode={immersive_native_gl_texture_mode} "
                         f"anisotropy={int(immersive_native_gl_anisotropy)} "
+                        f"mipmap_lod_bias={float(immersive_native_gl_mipmap_lod_bias):.3f} "
                         f"msaa_samples={int(immersive_native_gl_msaa_samples)} "
                         f"depth_format={immersive_native_gl_depth_format} "
                         "no_static_scene_roi=1",
@@ -18140,6 +18263,7 @@ class InvPhyTrainerWarp:
                             cuda_device_index=int(torch.cuda.current_device()),
                             native_gl_texture_mode=immersive_native_gl_texture_mode,
                             native_gl_anisotropy=immersive_native_gl_anisotropy,
+                            native_gl_mipmap_lod_bias=immersive_native_gl_mipmap_lod_bias,
                             native_gl_msaa_samples=immersive_native_gl_msaa_samples,
                             native_gl_depth_format=immersive_native_gl_depth_format,
                         )
@@ -18162,6 +18286,7 @@ class InvPhyTrainerWarp:
                             cuda_device_index=int(torch.cuda.current_device()),
                             native_gl_texture_mode=immersive_native_gl_texture_mode,
                             native_gl_anisotropy=immersive_native_gl_anisotropy,
+                            native_gl_mipmap_lod_bias=immersive_native_gl_mipmap_lod_bias,
                             native_gl_msaa_samples=immersive_native_gl_msaa_samples,
                             native_gl_depth_format=immersive_native_gl_depth_format,
                         )
@@ -18273,6 +18398,7 @@ class InvPhyTrainerWarp:
                                 cuda_device_index=cuda_device_index,
                                 native_gl_texture_mode=immersive_native_gl_texture_mode,
                                 native_gl_anisotropy=immersive_native_gl_anisotropy,
+                                native_gl_mipmap_lod_bias=immersive_native_gl_mipmap_lod_bias,
                                 native_gl_msaa_samples=immersive_native_gl_msaa_samples,
                                 native_gl_depth_format=immersive_native_gl_depth_format,
                             )
@@ -18326,6 +18452,7 @@ class InvPhyTrainerWarp:
                                 cuda_device_index=cuda_device_index,
                                 native_gl_texture_mode=immersive_native_gl_texture_mode,
                                 native_gl_anisotropy=immersive_native_gl_anisotropy,
+                                native_gl_mipmap_lod_bias=immersive_native_gl_mipmap_lod_bias,
                                 native_gl_msaa_samples=immersive_native_gl_msaa_samples,
                                 native_gl_depth_format=immersive_native_gl_depth_format,
                             )
@@ -32264,6 +32391,7 @@ class InvPhyTrainerWarp:
         immersive_static_scene_mode=None,
         immersive_native_gl_texture_mode="stable_mipmap",
         immersive_native_gl_anisotropy=8,
+        immersive_native_gl_mipmap_lod_bias=0.0,
         immersive_native_gl_msaa_samples=4,
         immersive_native_gl_depth_format="depth32f",
         immersive_gaussian_source_validation="off",
@@ -32560,6 +32688,11 @@ class InvPhyTrainerWarp:
         immersive_native_gl_anisotropy = _normalize_immersive_native_gl_anisotropy(
             immersive_native_gl_anisotropy
         )
+        immersive_native_gl_mipmap_lod_bias = (
+            _normalize_immersive_native_gl_mipmap_lod_bias(
+                immersive_native_gl_mipmap_lod_bias
+            )
+        )
         immersive_native_gl_msaa_samples = _normalize_immersive_native_gl_msaa_samples(
             immersive_native_gl_msaa_samples
         )
@@ -32823,6 +32956,7 @@ class InvPhyTrainerWarp:
             "immersive_static_scene_backend": immersive_static_scene_backend_mode,
             "immersive_native_gl_texture_mode": immersive_native_gl_texture_mode,
             "immersive_native_gl_anisotropy": immersive_native_gl_anisotropy,
+            "immersive_native_gl_mipmap_lod_bias": immersive_native_gl_mipmap_lod_bias,
             "immersive_native_gl_msaa_samples": immersive_native_gl_msaa_samples,
             "immersive_native_gl_depth_format": immersive_native_gl_depth_format,
             "immersive_gaussian_source_validation": (
@@ -33620,6 +33754,7 @@ class InvPhyTrainerWarp:
                 immersive_static_scene_backend_mode=immersive_static_scene_backend_mode,
                 immersive_native_gl_texture_mode=immersive_native_gl_texture_mode,
                 immersive_native_gl_anisotropy=immersive_native_gl_anisotropy,
+                immersive_native_gl_mipmap_lod_bias=immersive_native_gl_mipmap_lod_bias,
                 immersive_native_gl_msaa_samples=immersive_native_gl_msaa_samples,
                 immersive_native_gl_depth_format=immersive_native_gl_depth_format,
                 immersive_bridge=immersive_bridge,
@@ -34406,6 +34541,7 @@ class InvPhyTrainerWarp:
                             cuda_device_index=int(torch.cuda.current_device()),
                             native_gl_texture_mode=immersive_native_gl_texture_mode,
                             native_gl_anisotropy=immersive_native_gl_anisotropy,
+                            native_gl_mipmap_lod_bias=immersive_native_gl_mipmap_lod_bias,
                             native_gl_msaa_samples=immersive_native_gl_msaa_samples,
                             native_gl_depth_format=immersive_native_gl_depth_format,
                         )
@@ -34428,6 +34564,7 @@ class InvPhyTrainerWarp:
                             cuda_device_index=int(torch.cuda.current_device()),
                             native_gl_texture_mode=immersive_native_gl_texture_mode,
                             native_gl_anisotropy=immersive_native_gl_anisotropy,
+                            native_gl_mipmap_lod_bias=immersive_native_gl_mipmap_lod_bias,
                             native_gl_msaa_samples=immersive_native_gl_msaa_samples,
                             native_gl_depth_format=immersive_native_gl_depth_format,
                         )
@@ -34482,6 +34619,7 @@ class InvPhyTrainerWarp:
                             cuda_device_index=int(torch.cuda.current_device()),
                             native_gl_texture_mode=immersive_native_gl_texture_mode,
                             native_gl_anisotropy=immersive_native_gl_anisotropy,
+                            native_gl_mipmap_lod_bias=immersive_native_gl_mipmap_lod_bias,
                             native_gl_msaa_samples=immersive_native_gl_msaa_samples,
                             native_gl_depth_format=immersive_native_gl_depth_format,
                         )
@@ -34588,6 +34726,7 @@ class InvPhyTrainerWarp:
                         cuda_device_index=int(torch.cuda.current_device()),
                         native_gl_texture_mode=immersive_native_gl_texture_mode,
                         native_gl_anisotropy=immersive_native_gl_anisotropy,
+                        native_gl_mipmap_lod_bias=immersive_native_gl_mipmap_lod_bias,
                         native_gl_msaa_samples=immersive_native_gl_msaa_samples,
                         native_gl_depth_format=immersive_native_gl_depth_format,
                     )
@@ -40475,7 +40614,6 @@ class InvPhyTrainerWarp:
                 viewer_upload_thread_mode = None
                 viewer_upload_thread_fallback_reason = None
                 viewer_upload_ring_slots = None
-                viewer_upload_late_wait_us = None
                 viewer_upload_busy_backoff_us = None
                 viewer_projection_pose_mode = None
                 viewer_source_pose_metadata_valid_count = None
@@ -40500,9 +40638,6 @@ class InvPhyTrainerWarp:
                 viewer_texture_upload_busy_backoff_avg_ms = None
                 viewer_render_without_upload_count = None
                 viewer_texture_upload_no_new_frame_count = None
-                viewer_texture_upload_late_wait_hit_count = None
-                viewer_texture_upload_late_wait_miss_count = None
-                viewer_texture_upload_late_wait_avg_ms = None
                 viewer_async_upload_count = None
                 viewer_async_ready_slot_count = None
                 viewer_async_poll_no_new_count = None
@@ -40682,9 +40817,6 @@ class InvPhyTrainerWarp:
                     viewer_upload_ring_slots = int(
                         viewer_render_stats.get("viewer_upload_ring_slots", 0)
                     )
-                    viewer_upload_late_wait_us = int(
-                        viewer_render_stats.get("viewer_upload_late_wait_us", 0)
-                    )
                     viewer_upload_busy_backoff_us = int(
                         viewer_render_stats.get("viewer_upload_busy_backoff_us", 0)
                     )
@@ -40802,15 +40934,6 @@ class InvPhyTrainerWarp:
                     )
                     viewer_texture_upload_no_new_frame_count = int(
                         viewer_render_stats.get("texture_upload_no_new_frame_count", 0)
-                    )
-                    viewer_texture_upload_late_wait_hit_count = int(
-                        viewer_render_stats.get("texture_upload_late_wait_hit_count", 0)
-                    )
-                    viewer_texture_upload_late_wait_miss_count = int(
-                        viewer_render_stats.get("texture_upload_late_wait_miss_count", 0)
-                    )
-                    viewer_texture_upload_late_wait_avg_ms = float(
-                        viewer_render_stats.get("texture_upload_late_wait_avg_ms", 0.0)
                     )
                     viewer_async_upload_count = int(
                         viewer_render_stats.get("viewer_async_upload_count", 0)
@@ -40949,6 +41072,9 @@ class InvPhyTrainerWarp:
                     requested_native_gl_anisotropy=timing_summary_requested_flags[
                         "immersive_native_gl_anisotropy"
                     ],
+                    requested_native_gl_mipmap_lod_bias=timing_summary_requested_flags[
+                        "immersive_native_gl_mipmap_lod_bias"
+                    ],
                     requested_native_gl_msaa_samples=timing_summary_requested_flags[
                         "immersive_native_gl_msaa_samples"
                     ],
@@ -41036,11 +41162,6 @@ class InvPhyTrainerWarp:
                     viewer_upload_lines.append(
                         "viewer_upload_ring_slots: "
                         f"{int(viewer_upload_ring_slots)}"
-                    )
-                if viewer_upload_late_wait_us is not None:
-                    viewer_upload_lines.append(
-                        "viewer_upload_late_wait_us: "
-                        f"{int(viewer_upload_late_wait_us)}"
                     )
                 if viewer_upload_busy_backoff_us is not None:
                     viewer_upload_lines.append(
@@ -41182,21 +41303,6 @@ class InvPhyTrainerWarp:
                     viewer_upload_lines.append(
                         "viewer_upload_no_new_frame_count: "
                         f"{int(viewer_texture_upload_no_new_frame_count)}"
-                    )
-                if viewer_texture_upload_late_wait_hit_count is not None:
-                    viewer_upload_lines.append(
-                        "viewer_upload_late_wait_hit_count: "
-                        f"{int(viewer_texture_upload_late_wait_hit_count)}"
-                    )
-                if viewer_texture_upload_late_wait_miss_count is not None:
-                    viewer_upload_lines.append(
-                        "viewer_upload_late_wait_miss_count: "
-                        f"{int(viewer_texture_upload_late_wait_miss_count)}"
-                    )
-                if viewer_texture_upload_late_wait_avg_ms is not None:
-                    viewer_upload_lines.append(
-                        "viewer_upload_late_wait_avg_ms: "
-                        f"{viewer_texture_upload_late_wait_avg_ms:.2f}"
                     )
                 if viewer_async_upload_count is not None:
                     viewer_upload_lines.append(
@@ -42324,6 +42430,7 @@ class InvPhyTrainerWarp:
         immersive_static_scene_mode=None,
         immersive_native_gl_texture_mode="stable_mipmap",
         immersive_native_gl_anisotropy=8,
+        immersive_native_gl_mipmap_lod_bias=0.0,
         immersive_native_gl_msaa_samples=4,
         immersive_native_gl_depth_format="depth32f",
         immersive_gaussian_source_validation="off",
@@ -42355,6 +42462,7 @@ class InvPhyTrainerWarp:
             immersive_static_scene_mode=immersive_static_scene_mode,
             immersive_native_gl_texture_mode=immersive_native_gl_texture_mode,
             immersive_native_gl_anisotropy=immersive_native_gl_anisotropy,
+            immersive_native_gl_mipmap_lod_bias=immersive_native_gl_mipmap_lod_bias,
             immersive_native_gl_msaa_samples=immersive_native_gl_msaa_samples,
             immersive_native_gl_depth_format=immersive_native_gl_depth_format,
             immersive_gaussian_source_validation=(

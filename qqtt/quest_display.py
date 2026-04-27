@@ -1296,7 +1296,6 @@ class OpenXRFramePanelMirror:
             self._viewer_upload_thread_mode = "unknown"
             self._viewer_upload_thread_fallback_reason = "none"
             self._viewer_upload_ring_slots = 0
-            self._viewer_upload_late_wait_us = 0
             self._viewer_upload_busy_backoff_us = 0
             self._viewer_projection_pose_mode = "unknown"
             self._viewer_source_pose_metadata_valid_count = 0
@@ -1313,9 +1312,6 @@ class OpenXRFramePanelMirror:
             self._viewer_texture_upload_busy_backoff_avg_ms = 0.0
             self._viewer_render_without_upload_count = 0
             self._viewer_texture_upload_no_new_frame_count = 0
-            self._viewer_texture_upload_late_wait_hit_count = 0
-            self._viewer_texture_upload_late_wait_miss_count = 0
-            self._viewer_texture_upload_late_wait_avg_ms = 0.0
             self._viewer_async_upload_count = 0
             self._viewer_async_ready_slot_count = 0
             self._viewer_async_poll_no_new_count = 0
@@ -1387,8 +1383,6 @@ class OpenXRFramePanelMirror:
             self._steady_state_viewer_texture_upload_busy_backoff_baseline_count = 0
             self._steady_state_viewer_render_without_upload_baseline_count = 0
             self._steady_state_viewer_texture_upload_no_new_frame_baseline_count = 0
-            self._steady_state_viewer_texture_upload_late_wait_hit_baseline_count = 0
-            self._steady_state_viewer_texture_upload_late_wait_miss_baseline_count = 0
             self._steady_state_viewer_async_upload_baseline_count = 0
             self._steady_state_viewer_async_ready_slot_baseline_count = 0
             self._steady_state_viewer_async_poll_no_new_baseline_count = 0
@@ -1548,12 +1542,6 @@ class OpenXRFramePanelMirror:
             )
             self._steady_state_viewer_texture_upload_no_new_frame_baseline_count = int(
                 self._viewer_texture_upload_no_new_frame_count
-            )
-            self._steady_state_viewer_texture_upload_late_wait_hit_baseline_count = int(
-                self._viewer_texture_upload_late_wait_hit_count
-            )
-            self._steady_state_viewer_texture_upload_late_wait_miss_baseline_count = int(
-                self._viewer_texture_upload_late_wait_miss_count
             )
             self._steady_state_viewer_async_upload_baseline_count = int(
                 self._viewer_async_upload_count
@@ -2218,7 +2206,6 @@ class OpenXRFramePanelMirror:
                 f"viewer_upload_thread_mode={viewer_render_stats.get('viewer_upload_thread_mode', 'unknown')} "
                 f"viewer_upload_thread_fallback_reason={viewer_render_stats.get('viewer_upload_thread_fallback_reason', 'none')} "
                 f"viewer_upload_ring_slots={viewer_render_stats.get('viewer_upload_ring_slots', 0)} "
-                f"viewer_upload_late_wait_us={viewer_render_stats.get('viewer_upload_late_wait_us', 0)} "
                 f"viewer_upload_busy_backoff_us={viewer_render_stats.get('viewer_upload_busy_backoff_us', 0)} "
                 f"texture_upload_mmap_copy_avg_ms={viewer_render_stats.get('texture_upload_mmap_copy_avg_ms', 0.0):.2f} "
                 f"texture_upload_gl_avg_ms={viewer_render_stats.get('texture_upload_gl_avg_ms', 0.0):.2f} "
@@ -2228,9 +2215,6 @@ class OpenXRFramePanelMirror:
                 f"texture_upload_busy_backoff_avg_ms={viewer_render_stats.get('texture_upload_busy_backoff_avg_ms', 0.0):.2f} "
                 f"render_without_upload_count={viewer_render_stats.get('render_without_upload_count', 0)} "
                 f"texture_upload_no_new_frame_count={viewer_render_stats.get('texture_upload_no_new_frame_count', 0)} "
-                f"texture_upload_late_wait_hit_count={viewer_render_stats.get('texture_upload_late_wait_hit_count', 0)} "
-                f"texture_upload_late_wait_miss_count={viewer_render_stats.get('texture_upload_late_wait_miss_count', 0)} "
-                f"texture_upload_late_wait_avg_ms={viewer_render_stats.get('texture_upload_late_wait_avg_ms', 0.0):.2f} "
                 f"viewer_async_upload_count={viewer_render_stats.get('viewer_async_upload_count', 0)} "
                 f"viewer_async_ready_slot_count={viewer_render_stats.get('viewer_async_ready_slot_count', 0)} "
                 f"viewer_async_poll_no_new_count={viewer_render_stats.get('viewer_async_poll_no_new_count', 0)} "
@@ -2571,12 +2555,6 @@ class OpenXRFramePanelMirror:
                         self._viewer_upload_ring_slots,
                     )
                 )
-                self._viewer_upload_late_wait_us = int(
-                    parsed.get(
-                        "viewer_upload_late_wait_us",
-                        self._viewer_upload_late_wait_us,
-                    )
-                )
                 self._viewer_upload_busy_backoff_us = int(
                     parsed.get(
                         "viewer_upload_busy_backoff_us",
@@ -2719,24 +2697,6 @@ class OpenXRFramePanelMirror:
                     parsed.get(
                         "texture_upload_no_new_frame_count",
                         self._viewer_texture_upload_no_new_frame_count,
-                    )
-                )
-                self._viewer_texture_upload_late_wait_hit_count = int(
-                    parsed.get(
-                        "texture_upload_late_wait_hit_count",
-                        self._viewer_texture_upload_late_wait_hit_count,
-                    )
-                )
-                self._viewer_texture_upload_late_wait_miss_count = int(
-                    parsed.get(
-                        "texture_upload_late_wait_miss_count",
-                        self._viewer_texture_upload_late_wait_miss_count,
-                    )
-                )
-                self._viewer_texture_upload_late_wait_avg_ms = float(
-                    parsed.get(
-                        "texture_upload_late_wait_avg_ms",
-                        self._viewer_texture_upload_late_wait_avg_ms,
                     )
                 )
                 self._viewer_async_upload_count = int(
@@ -2967,20 +2927,6 @@ class OpenXRFramePanelMirror:
                         self._steady_state_viewer_texture_upload_no_new_frame_baseline_count
                     ),
                 )
-                texture_upload_late_wait_hit_count = max(
-                    0,
-                    int(self._viewer_texture_upload_late_wait_hit_count)
-                    - int(
-                        self._steady_state_viewer_texture_upload_late_wait_hit_baseline_count
-                    ),
-                )
-                texture_upload_late_wait_miss_count = max(
-                    0,
-                    int(self._viewer_texture_upload_late_wait_miss_count)
-                    - int(
-                        self._steady_state_viewer_texture_upload_late_wait_miss_baseline_count
-                    ),
-                )
                 async_upload_count = max(
                     0,
                     int(self._viewer_async_upload_count)
@@ -3089,12 +3035,6 @@ class OpenXRFramePanelMirror:
                 texture_upload_no_new_frame_count = int(
                     self._viewer_texture_upload_no_new_frame_count
                 )
-                texture_upload_late_wait_hit_count = int(
-                    self._viewer_texture_upload_late_wait_hit_count
-                )
-                texture_upload_late_wait_miss_count = int(
-                    self._viewer_texture_upload_late_wait_miss_count
-                )
                 async_upload_count = int(self._viewer_async_upload_count)
                 async_ready_slot_count = int(self._viewer_async_ready_slot_count)
                 async_poll_no_new_count = int(self._viewer_async_poll_no_new_count)
@@ -3150,7 +3090,6 @@ class OpenXRFramePanelMirror:
                 self._viewer_upload_thread_fallback_reason
             ),
             "viewer_upload_ring_slots": int(self._viewer_upload_ring_slots),
-            "viewer_upload_late_wait_us": int(self._viewer_upload_late_wait_us),
             "viewer_upload_busy_backoff_us": int(
                 self._viewer_upload_busy_backoff_us
             ),
@@ -3173,11 +3112,6 @@ class OpenXRFramePanelMirror:
             ),
             "render_without_upload_count": render_without_upload_count,
             "texture_upload_no_new_frame_count": texture_upload_no_new_frame_count,
-            "texture_upload_late_wait_hit_count": texture_upload_late_wait_hit_count,
-            "texture_upload_late_wait_miss_count": texture_upload_late_wait_miss_count,
-            "texture_upload_late_wait_avg_ms": float(
-                self._viewer_texture_upload_late_wait_avg_ms
-            ),
             "viewer_async_upload_count": async_upload_count,
             "viewer_async_ready_slot_count": async_ready_slot_count,
             "viewer_async_poll_no_new_count": async_poll_no_new_count,

@@ -409,11 +409,8 @@ def prioritize_conda_runtime_libs():
 def configure_immersive_viewer_upload_runtime(args) -> None:
     upload_mode = str(args.immersive_viewer_upload_mode).strip().lower()
     upload_thread = str(args.immersive_viewer_upload_thread).strip().lower()
-    late_wait_us = int(args.immersive_viewer_upload_late_wait_us)
     ring_slots = int(args.immersive_viewer_upload_ring_slots)
     busy_backoff_us = int(args.immersive_viewer_upload_busy_backoff_us)
-    if late_wait_us < 0:
-        raise ValueError("--immersive_viewer_upload_late_wait_us must be >= 0.")
     if ring_slots < 3 or ring_slots > 8:
         raise ValueError("--immersive_viewer_upload_ring_slots must be between 3 and 8.")
     if busy_backoff_us < 0:
@@ -424,7 +421,6 @@ def configure_immersive_viewer_upload_runtime(args) -> None:
     # and not affected by stale shell exports.
     os.environ["BOBA_IMMERSIVE_VIEWER_UPLOAD_MODE"] = upload_mode
     os.environ["BOBA_IMMERSIVE_VIEWER_UPLOAD_THREAD"] = upload_thread
-    os.environ["BOBA_IMMERSIVE_VIEWER_UPLOAD_LATE_WAIT_US"] = str(late_wait_us)
     os.environ["BOBA_IMMERSIVE_VIEWER_UPLOAD_RING_SLOTS"] = str(ring_slots)
     os.environ["BOBA_IMMERSIVE_VIEWER_UPLOAD_BUSY_BACKOFF_US"] = str(busy_backoff_us)
 
@@ -544,6 +540,16 @@ def build_parser() -> ArgumentParser:
             "requested native GL anisotropic texture filtering level for "
             "--immersive_native_gl_texture_mode stable_mipmap. "
             "Ignored by stable and legacy modes"
+        ),
+    )
+    parser.add_argument(
+        "--immersive_native_gl_mipmap_lod_bias",
+        type=float,
+        default=0.0,
+        help=(
+            "native GL mipmap LOD bias for --immersive_native_gl_texture_mode "
+            "stable_mipmap. Positive values sample blurrier mip levels sooner; "
+            "use 0.50 as a small far-distance anti-shimmer diagnostic"
         ),
     )
     parser.add_argument(
@@ -682,15 +688,6 @@ def build_parser() -> ArgumentParser:
         ),
     )
     parser.add_argument(
-        "--immersive_viewer_upload_late_wait_us",
-        type=int,
-        default=0,
-        help=(
-            "bounded render-thread late-poll wait in microseconds. "
-            "0 disables waiting; async upload should normally keep this at 0"
-        ),
-    )
-    parser.add_argument(
         "--immersive_viewer_upload_ring_slots",
         type=int,
         default=5,
@@ -810,6 +807,7 @@ def main(argv: list[str] | None = None):
             "[quest_display] immersive_native_gl_options="
             f"texture_mode={args.immersive_native_gl_texture_mode} "
             f"anisotropy={int(args.immersive_native_gl_anisotropy)} "
+            f"mipmap_lod_bias={float(args.immersive_native_gl_mipmap_lod_bias):.3f} "
             f"msaa_samples={int(args.immersive_native_gl_msaa_samples)} "
             f"depth_format={args.immersive_native_gl_depth_format}",
             flush=True,
@@ -842,7 +840,6 @@ def main(argv: list[str] | None = None):
         "[quest_display] immersive_viewer_upload="
         f"mode={args.immersive_viewer_upload_mode} "
         f"thread={args.immersive_viewer_upload_thread} "
-        f"late_wait_us={int(args.immersive_viewer_upload_late_wait_us)} "
         f"ring_slots={int(args.immersive_viewer_upload_ring_slots)} "
         f"busy_backoff_us={int(args.immersive_viewer_upload_busy_backoff_us)}",
         flush=True,
@@ -977,6 +974,9 @@ def main(argv: list[str] | None = None):
             immersive_static_scene_mode=args.immersive_static_scene_mode,
             immersive_native_gl_texture_mode=args.immersive_native_gl_texture_mode,
             immersive_native_gl_anisotropy=args.immersive_native_gl_anisotropy,
+            immersive_native_gl_mipmap_lod_bias=(
+                args.immersive_native_gl_mipmap_lod_bias
+            ),
             immersive_native_gl_msaa_samples=args.immersive_native_gl_msaa_samples,
             immersive_native_gl_depth_format=args.immersive_native_gl_depth_format,
             immersive_gaussian_source_validation=(

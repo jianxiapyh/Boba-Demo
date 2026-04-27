@@ -530,7 +530,6 @@ ImmersiveViewerUploadThreadRequest ReadImmersiveViewerUploadThreadRequest() {
 constexpr uint64_t kDefaultImmersiveUploadSlotCount = 5;
 constexpr uint64_t kMinImmersiveUploadSlotCount = 3;
 constexpr uint64_t kMaxImmersiveUploadSlotCount = 8;
-constexpr uint64_t kDefaultImmersiveViewerUploadLateWaitUs = 0;
 constexpr uint64_t kDefaultImmersiveViewerUploadBusyBackoffUs = 100;
 
 struct ImmersiveUploadSlot {
@@ -3107,9 +3106,6 @@ int main(int argc, char** argv) {
     ImmersiveViewerUploadThreadMode viewer_upload_thread_mode =
         ImmersiveViewerUploadThreadMode::Render;
     std::string viewer_upload_thread_fallback_reason = "none";
-    const uint64_t viewer_upload_late_wait_us = ReadUnsignedEnvOrDefault(
-        "BOBA_IMMERSIVE_VIEWER_UPLOAD_LATE_WAIT_US",
-        kDefaultImmersiveViewerUploadLateWaitUs);
     const uint64_t viewer_upload_ring_slots = ReadUnsignedEnvClamped(
         "BOBA_IMMERSIVE_VIEWER_UPLOAD_RING_SLOTS",
         kDefaultImmersiveUploadSlotCount,
@@ -3200,7 +3196,6 @@ int main(int argc, char** argv) {
     }
     std::cerr << "Immersive bridge viewer upload mode: "
               << ImmersiveViewerUploadModeLabel(viewer_upload_mode)
-              << " late_wait_us=" << viewer_upload_late_wait_us
               << " ring_slots=" << viewer_upload_ring_slots
               << " busy_backoff_us=" << viewer_upload_busy_backoff_us << "\n";
 #endif
@@ -3382,12 +3377,6 @@ int main(int argc, char** argv) {
     uint64_t logged_render_without_upload_count = 0;
     uint64_t texture_upload_no_new_frame_count = 0;
     uint64_t logged_texture_upload_no_new_frame_count = 0;
-    uint64_t texture_upload_late_wait_hit_count = 0;
-    uint64_t logged_texture_upload_late_wait_hit_count = 0;
-    uint64_t texture_upload_late_wait_miss_count = 0;
-    uint64_t logged_texture_upload_late_wait_miss_count = 0;
-    double texture_upload_late_wait_ms_sum = 0.0;
-    double logged_texture_upload_late_wait_ms_sum = 0.0;
 #ifdef BOBA_IMMERSIVE_BRIDGE
     std::string viewer_projection_pose_mode = "current_view_fallback";
     uint64_t viewer_source_pose_metadata_valid_count = 0;
@@ -3520,28 +3509,6 @@ int main(int argc, char** argv) {
         };
 
         bool stereo_source_updated = poll_stereo_source();
-        if (!stereo_source_updated && viewer_upload_late_wait_us > 0) {
-            const auto late_wait_start = std::chrono::steady_clock::now();
-            const auto late_wait_deadline =
-                late_wait_start +
-                std::chrono::microseconds(viewer_upload_late_wait_us);
-            while (std::chrono::steady_clock::now() < late_wait_deadline) {
-                std::this_thread::yield();
-                stereo_source_updated = poll_stereo_source();
-                if (stereo_source_updated) {
-                    break;
-                }
-            }
-            const auto late_wait_end = std::chrono::steady_clock::now();
-            texture_upload_late_wait_ms_sum +=
-                std::chrono::duration<double, std::milli>(
-                    late_wait_end - late_wait_start).count();
-            if (stereo_source_updated) {
-                ++texture_upload_late_wait_hit_count;
-            } else {
-                ++texture_upload_late_wait_miss_count;
-            }
-        }
         if (!stereo_source_updated) {
             ++texture_upload_no_new_frame_count;
             return false;
@@ -4326,15 +4293,6 @@ int main(int argc, char** argv) {
                 const uint64_t texture_upload_no_new_since_last_log =
                     texture_upload_no_new_frame_count -
                     logged_texture_upload_no_new_frame_count;
-                const uint64_t texture_upload_late_wait_hits_since_last_log =
-                    texture_upload_late_wait_hit_count -
-                    logged_texture_upload_late_wait_hit_count;
-                const uint64_t texture_upload_late_wait_misses_since_last_log =
-                    texture_upload_late_wait_miss_count -
-                    logged_texture_upload_late_wait_miss_count;
-                const uint64_t texture_upload_late_waits_since_last_log =
-                    texture_upload_late_wait_hits_since_last_log +
-                    texture_upload_late_wait_misses_since_last_log;
                 const double texture_upload_ms_since_last_log =
                     texture_upload_ms_sum - logged_texture_upload_ms_sum;
                 const double texture_upload_mmap_copy_ms_since_last_log =
@@ -4348,9 +4306,6 @@ int main(int argc, char** argv) {
                 const double texture_upload_gl_right_ms_since_last_log =
                     texture_upload_gl_right_ms_sum -
                     logged_texture_upload_gl_right_ms_sum;
-                const double texture_upload_late_wait_ms_since_last_log =
-                    texture_upload_late_wait_ms_sum -
-                    logged_texture_upload_late_wait_ms_sum;
                 const double texture_upload_busy_backoff_ms_since_last_log =
                     texture_upload_busy_backoff_ms_sum -
                     logged_texture_upload_busy_backoff_ms_sum;
@@ -4388,11 +4343,6 @@ int main(int argc, char** argv) {
                         ? (texture_upload_gl_right_ms_since_last_log /
                            static_cast<double>(texture_uploads_since_last_log))
                         : 0.0;
-                const double texture_upload_late_wait_avg_ms =
-                    (texture_upload_late_waits_since_last_log > 0)
-                        ? (texture_upload_late_wait_ms_since_last_log /
-                           static_cast<double>(texture_upload_late_waits_since_last_log))
-                        : 0.0;
                 const double texture_upload_busy_backoff_avg_ms =
                     (texture_upload_busy_backoffs_since_last_log > 0)
                         ? (texture_upload_busy_backoff_ms_since_last_log /
@@ -4417,8 +4367,6 @@ int main(int argc, char** argv) {
                           << viewer_upload_thread_fallback_reason << " "
                           << "viewer_upload_ring_slots="
                           << viewer_upload_ring_slots << " "
-                          << "viewer_upload_late_wait_us="
-                          << viewer_upload_late_wait_us << " "
                           << "viewer_upload_busy_backoff_us="
                           << viewer_upload_busy_backoff_us << " "
 #else
@@ -4426,7 +4374,6 @@ int main(int argc, char** argv) {
                           << "viewer_upload_thread_mode=render "
                           << "viewer_upload_thread_fallback_reason=none "
                           << "viewer_upload_ring_slots=0 "
-                          << "viewer_upload_late_wait_us=0 "
                           << "viewer_upload_busy_backoff_us=0 "
 #endif
                           << "texture_upload_mmap_copy_avg_ms="
@@ -4462,16 +4409,6 @@ int main(int argc, char** argv) {
                           << texture_upload_no_new_frame_count << " "
                           << "texture_upload_no_new_frame_recent_count="
                           << texture_upload_no_new_since_last_log << " "
-                          << "texture_upload_late_wait_hit_count="
-                          << texture_upload_late_wait_hit_count << " "
-                          << "texture_upload_late_wait_hit_recent_count="
-                          << texture_upload_late_wait_hits_since_last_log << " "
-                          << "texture_upload_late_wait_miss_count="
-                          << texture_upload_late_wait_miss_count << " "
-                          << "texture_upload_late_wait_miss_recent_count="
-                          << texture_upload_late_wait_misses_since_last_log << " "
-                          << "texture_upload_late_wait_avg_ms="
-                          << texture_upload_late_wait_avg_ms << " "
 #ifdef BOBA_IMMERSIVE_BRIDGE
                           << "viewer_async_upload_count="
                           << viewer_async_upload_count << " "
@@ -4539,12 +4476,6 @@ int main(int argc, char** argv) {
                 logged_render_without_upload_count = render_without_upload_count;
                 logged_texture_upload_no_new_frame_count =
                     texture_upload_no_new_frame_count;
-                logged_texture_upload_late_wait_hit_count =
-                    texture_upload_late_wait_hit_count;
-                logged_texture_upload_late_wait_miss_count =
-                    texture_upload_late_wait_miss_count;
-                logged_texture_upload_late_wait_ms_sum =
-                    texture_upload_late_wait_ms_sum;
             }
 #ifdef BOBA_IMMERSIVE_BRIDGE
             previous_presentation_mode = current_presentation_mode;

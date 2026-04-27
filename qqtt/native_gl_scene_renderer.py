@@ -9,7 +9,7 @@ import pickle
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 import torch
@@ -235,15 +235,18 @@ class NativeGlSceneRenderer:
         zfar: float = 100.0,
         texture_mode: str = "stable_mipmap",
         anisotropy: int = 8,
+        mipmap_lod_bias: float = 0.0,
         msaa_samples: int = 4,
         depth_format: str = "depth32f",
         device: torch.device | str | None = None,
         output_ring_size: int = 4,
+        progress_callback: Callable[[dict[str, Any]], None] | None = None,
     ) -> None:
         self.scene_root = _resolve_scene_root(scene_assets_root)
         self.width = int(width)
         self.height = int(height)
         self.render_background = bool(render_background)
+        self._progress_callback = progress_callback
         self.znear = float(znear)
         self.zfar = float(zfar)
         self.texture_mode = str(texture_mode).strip().lower()
@@ -256,6 +259,11 @@ class NativeGlSceneRenderer:
             raise ValueError("anisotropy must be one of {1, 2, 4, 8, 16}")
         self.effective_anisotropy = 1.0
         self.anisotropy_reason = "disabled_for_texture_mode"
+        self.requested_mipmap_lod_bias = float(mipmap_lod_bias)
+        if not np.isfinite(self.requested_mipmap_lod_bias):
+            raise ValueError("mipmap_lod_bias must be finite")
+        self.effective_mipmap_lod_bias = 0.0
+        self.mipmap_lod_bias_reason = "disabled_for_texture_mode"
         self.msaa_samples = int(msaa_samples)
         if self.msaa_samples not in {1, 2, 4}:
             raise ValueError("msaa_samples must be one of {1, 2, 4}")
@@ -275,6 +283,7 @@ class NativeGlSceneRenderer:
         self._materials = _parse_mtl(
             self.scene_root / str(self.manifest["scene_material"])
         )
+        self._publish_progress("parse_scene_mesh", "Loading scene mesh")
         self._asset_groups = self._parse_obj_groups()
 
         self._platform = None
@@ -296,8 +305,24 @@ class NativeGlSceneRenderer:
         self._output_ring_index = 0
         self._last_render_debug: dict[str, Any] | None = None
 
+        self._publish_progress("init_native_gl", "Initializing native GL")
         self._init_context()
         self._init_gl_state()
+
+    def _publish_progress(self, phase: str, label: str, **extra: Any) -> None:
+        callback = self._progress_callback
+        if callback is None:
+            return
+        payload = {
+            "phase": str(phase),
+            "phase_label": str(label),
+            "time_s": float(time.perf_counter()),
+        }
+        payload.update(extra)
+        try:
+            callback(payload)
+        except Exception:
+            pass
 
     def _background_table_face_exclusions(self) -> dict[str, set[int]]:
         if not self.render_background or self._cache_payload is None:
@@ -462,6 +487,7 @@ class NativeGlSceneRenderer:
             "u_color_factor",
         )
         self._resolve_texture_anisotropy()
+        self._resolve_texture_lod_bias()
         self._white_texture = self._create_solid_texture((255, 255, 255, 255))
         self._create_fbo_targets()
 
@@ -586,6 +612,64 @@ class NativeGlSceneRenderer:
             self.effective_anisotropy = 1.0
             self.anisotropy_reason = f"set_failed:{type(exc).__name__}"
 
+    def _resolve_texture_lod_bias(self) -> None:
+        if self.texture_mode != "stable_mipmap":
+            self.effective_mipmap_lod_bias = 0.0
+            self.mipmap_lod_bias_reason = "disabled_for_texture_mode"
+            return
+        requested = float(self.requested_mipmap_lod_bias)
+        if abs(requested) <= 1.0e-9:
+            self.effective_mipmap_lod_bias = 0.0
+            self.mipmap_lod_bias_reason = "requested_0"
+            return
+        gl = self._gl
+        assert gl is not None
+        max_param = getattr(gl, "GL_MAX_TEXTURE_LOD_BIAS", None)
+        if max_param is None:
+            self.effective_mipmap_lod_bias = requested
+            self.mipmap_lod_bias_reason = "enabled_no_max_query"
+            return
+        try:
+            raw_max = gl.glGetFloatv(int(max_param))
+            max_supported = float(np.asarray(raw_max, dtype=np.float32).reshape(-1)[0])
+        except Exception as exc:
+            self.effective_mipmap_lod_bias = requested
+            self.mipmap_lod_bias_reason = f"max_query_failed:{type(exc).__name__}"
+            return
+        if max_supported <= 0.0:
+            self.effective_mipmap_lod_bias = 0.0
+            self.mipmap_lod_bias_reason = f"unsupported:max={max_supported:.3g}"
+            return
+        clamped = min(max(requested, -max_supported), max_supported)
+        self.effective_mipmap_lod_bias = float(clamped)
+        if clamped != requested:
+            self.mipmap_lod_bias_reason = f"clamped_to_+/-{max_supported:.3g}"
+        else:
+            self.mipmap_lod_bias_reason = "enabled"
+
+    def _apply_texture_lod_bias(self) -> None:
+        if (
+            self.texture_mode != "stable_mipmap"
+            or abs(float(self.effective_mipmap_lod_bias)) <= 1.0e-9
+        ):
+            return
+        gl = self._gl
+        assert gl is not None
+        lod_bias_param = getattr(gl, "GL_TEXTURE_LOD_BIAS", None)
+        if lod_bias_param is None:
+            self.effective_mipmap_lod_bias = 0.0
+            self.mipmap_lod_bias_reason = "texture_lod_bias_param_missing"
+            return
+        try:
+            gl.glTexParameterf(
+                gl.GL_TEXTURE_2D,
+                int(lod_bias_param),
+                float(self.effective_mipmap_lod_bias),
+            )
+        except Exception as exc:
+            self.effective_mipmap_lod_bias = 0.0
+            self.mipmap_lod_bias_reason = f"set_failed:{type(exc).__name__}"
+
     def _texture_wrap_mode(self) -> int:
         gl = self._gl
         assert gl is not None
@@ -663,6 +747,7 @@ class NativeGlSceneRenderer:
         gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_WRAP_S, wrap_mode)
         gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_WRAP_T, wrap_mode)
         self._apply_texture_anisotropy()
+        self._apply_texture_lod_bias()
         gl.glBindTexture(gl.GL_TEXTURE_2D, 0)
         self._texture_cache[texture_name] = texture_id
         return texture_id
@@ -848,6 +933,7 @@ class NativeGlSceneRenderer:
 
     def set_layout(self, layout: Any) -> None:
         self._platform.make_current()
+        self._publish_progress("upload_scene_mesh", "Uploading scene mesh")
         self._world_transform = self._compute_world_transform(layout)
         self._delete_meshes()
         self._upload_meshes()
@@ -1161,6 +1247,13 @@ class NativeGlSceneRenderer:
             "native_gl_requested_anisotropy": int(self.requested_anisotropy),
             "native_gl_effective_anisotropy": float(self.effective_anisotropy),
             "native_gl_anisotropy_reason": str(self.anisotropy_reason),
+            "native_gl_requested_mipmap_lod_bias": float(
+                self.requested_mipmap_lod_bias
+            ),
+            "native_gl_effective_mipmap_lod_bias": float(
+                self.effective_mipmap_lod_bias
+            ),
+            "native_gl_mipmap_lod_bias_reason": str(self.mipmap_lod_bias_reason),
             "native_gl_msaa_samples": int(self.msaa_samples),
             "native_gl_depth_format": self.depth_format,
             "native_gl_color_dtype": "uint8",
@@ -1222,6 +1315,13 @@ class NativeGlSceneRenderer:
             "native_gl_requested_anisotropy": int(self.requested_anisotropy),
             "native_gl_effective_anisotropy": float(self.effective_anisotropy),
             "native_gl_anisotropy_reason": str(self.anisotropy_reason),
+            "native_gl_requested_mipmap_lod_bias": float(
+                self.requested_mipmap_lod_bias
+            ),
+            "native_gl_effective_mipmap_lod_bias": float(
+                self.effective_mipmap_lod_bias
+            ),
+            "native_gl_mipmap_lod_bias_reason": str(self.mipmap_lod_bias_reason),
             "msaa_samples": int(self.msaa_samples),
             "depth_format": self.depth_format,
             "native_gl_color_dtype": "uint8",

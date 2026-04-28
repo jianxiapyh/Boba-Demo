@@ -46,6 +46,29 @@ COLLIDER_SUPPORT_PATCH_MIN_SPAN = 0.10
 COLLIDER_BLOCKER_BAND_GAP_Y = 0.18
 COLLIDER_BLOCKER_AREA_MIN = 0.02
 COLLIDER_BLOCKER_SPAN_MIN = 0.05
+LOWER_TABLE_SUPPORT_FLOOR_CLEARANCE_M = 0.02
+SOFA_SEAT_SUPPORT_AREA_MIN = 0.75
+SOFA_SEAT_SUPPORT_MIN_SPAN = 0.75
+SOFA_HANDLE_SUPPORT_AREA_MIN = 0.05
+SOFA_HANDLE_SUPPORT_AREA_MAX = 0.25
+SOFA_HANDLE_MAX_THICKNESS = 0.16
+SOFA_HANDLE_MIN_LENGTH_RATIO = 0.70
+SOFA_HANDLE_SIDE_GAP_MAX = 0.08
+SOFA_HANDLE_MIN_TOP_ABOVE_SEAT = 0.08
+SOFA_HANDLE_MAX_TOP_ABOVE_SEAT = 0.35
+SOFA_HANDLE_TOP_SLAB_THICKNESS_M = 0.006
+SOFA_HANDLE_BAR_MIN_THICKNESS_M = 0.006
+SOFA_HANDLE_TOP_SEGMENT_COUNT = 8
+SOFA_HANDLE_TOP_SEGMENT_MIN_AREA = 0.002
+SOFA_ARMREST_LEG_MIN_AREA = 0.010
+SOFA_ARMREST_LEG_MAX_AREA = 0.060
+SOFA_ARMREST_LEG_MIN_HEIGHT = 0.40
+SOFA_ARMREST_LEG_MIN_LATERAL_THICKNESS = 0.03
+SOFA_ARMREST_LEG_MAX_LATERAL_SPAN = 0.18
+SOFA_ARMREST_LEG_HANDLE_PAD = 0.08
+SOFA_ARMREST_LEG_END_BAND = 0.18
+SOFA_ARMREST_LEG_TOP_MARGIN = 0.02
+SOFA_ARMREST_LEG_UNDERSIDE_REACH = 0.04
 FOCUS_RENDER_CHUNK_EDGE_MIN = 0.8
 FOCUS_RENDER_CHUNK_FACE_MIN = 5000
 FOCUS_RENDER_PLANAR_TILE_SIZE = 0.75
@@ -539,9 +562,16 @@ def _expand_bounds_min_thickness(
 def _support_patch_is_collision_usable(
     patch: dict[str, Any],
     floor_y: float,
+    *,
+    allow_low_support: bool = False,
+    floor_clearance: float = LOWER_TABLE_SUPPORT_FLOOR_CLEARANCE_M,
 ) -> bool:
-    if float(patch["y"]) <= float(floor_y + TABLE_SUPPORT_HEIGHT_MIN):
-        return False
+    patch_y = float(patch["y"])
+    if patch_y <= float(floor_y + TABLE_SUPPORT_HEIGHT_MIN):
+        if not bool(allow_low_support):
+            return False
+        if patch_y <= float(floor_y + max(float(floor_clearance), 0.0)):
+            return False
     if float(patch["area"]) < float(TABLE_SUPPORT_AREA_MIN):
         return False
     extents = np.asarray(patch["bounds_max"] - patch["bounds_min"], dtype=np.float32)
@@ -2691,6 +2721,454 @@ class SimpleLabSceneRenderer:
                 retained.append(record)
         return retained
 
+    def _select_sofa_handle_collider_specs(self) -> list[dict[str, Any]]:
+        table_component_id_set = {int(v) for v in self._table_component_ids}
+        lateral_axes = (0, 2)
+        sofa_supports: list[dict[str, Any]] = []
+        for record in self._collision_component_records:
+            component_id = int(record["id"])
+            if component_id in table_component_id_set:
+                continue
+            for patch in record.get("support_patches", []):
+                if not _support_patch_is_collision_usable(
+                    patch,
+                    self._asset_floor_y,
+                ):
+                    continue
+                if float(patch["area"]) < SOFA_SEAT_SUPPORT_AREA_MIN:
+                    continue
+                patch_min = np.asarray(patch["bounds_min"], dtype=np.float32)
+                patch_max = np.asarray(patch["bounds_max"], dtype=np.float32)
+                patch_extents = np.maximum(patch_max - patch_min, 0.0)
+                if (
+                    min(float(patch_extents[0]), float(patch_extents[2]))
+                    < SOFA_SEAT_SUPPORT_MIN_SPAN
+                ):
+                    continue
+                sofa_supports.append(
+                    {
+                        "component_id": component_id,
+                        "bounds_min": patch_min,
+                        "bounds_max": patch_max,
+                        "extents": patch_extents,
+                        "center": (0.5 * (patch_min + patch_max)).astype(np.float32),
+                        "y": float(patch["y"]),
+                    }
+                )
+
+        if not sofa_supports:
+            return []
+
+        mesh = self._furniture_asset_mesh
+        face_centroids = np.asarray(mesh.triangles_center, dtype=np.float32)
+        face_areas = np.asarray(mesh.area_faces, dtype=np.float32)
+        mesh_faces = np.asarray(mesh.faces, dtype=np.int64)
+        mesh_vertices = np.asarray(mesh.vertices, dtype=np.float32)
+        specs: list[dict[str, Any]] = []
+        used_component_ids: set[int] = set()
+        used_leg_component_ids: set[int] = set()
+        seen_keys: set[tuple[int, tuple[float, ...], tuple[float, ...]]] = set()
+        for support in sorted(sofa_supports, key=lambda entry: int(entry["component_id"])):
+            seat_min = np.asarray(support["bounds_min"], dtype=np.float32)
+            seat_max = np.asarray(support["bounds_max"], dtype=np.float32)
+            seat_extents = np.asarray(support["extents"], dtype=np.float32)
+            seat_center = np.asarray(support["center"], dtype=np.float32)
+            seat_y = float(support["y"])
+            seat_lateral_extents = [float(seat_extents[axis]) for axis in lateral_axes]
+            long_lateral_index = int(np.argmax(seat_lateral_extents))
+            seat_long_axis = int(lateral_axes[long_lateral_index])
+            seat_depth_axis = int(lateral_axes[1 - long_lateral_index])
+            min_depth_overlap = (
+                float(seat_extents[seat_depth_axis]) * SOFA_HANDLE_MIN_LENGTH_RATIO
+            )
+            side_candidates: dict[int, list[tuple[tuple[float, ...], dict[str, Any]]]] = {
+                -1: [],
+                1: [],
+            }
+
+            for record in self._furniture_component_records:
+                component_id = int(record["id"])
+                if (
+                    component_id in table_component_id_set
+                    or component_id == int(support["component_id"])
+                    or component_id in used_component_ids
+                ):
+                    continue
+                support_patches = list(record.get("support_patches", []))
+                if not support_patches:
+                    continue
+                top_patch = max(
+                    support_patches,
+                    key=lambda patch: (float(patch["y"]), float(patch["area"])),
+                )
+                top_area = float(top_patch["area"])
+                if (
+                    top_area < SOFA_HANDLE_SUPPORT_AREA_MIN
+                    or top_area > SOFA_HANDLE_SUPPORT_AREA_MAX
+                ):
+                    continue
+
+                top_patch_min = np.asarray(top_patch["bounds_min"], dtype=np.float32)
+                top_patch_max = np.asarray(top_patch["bounds_max"], dtype=np.float32)
+                bounds_min = np.asarray(record["bounds_min"], dtype=np.float32)
+                bounds_max = np.asarray(record["bounds_max"], dtype=np.float32)
+                extents = np.maximum(bounds_max - bounds_min, 0.0)
+                lateral_extents = [float(extents[axis]) for axis in lateral_axes]
+                thin_axis = int(lateral_axes[int(np.argmin(lateral_extents))])
+                if thin_axis != seat_long_axis:
+                    continue
+                if float(extents[thin_axis]) > SOFA_HANDLE_MAX_THICKNESS:
+                    continue
+                if float(extents[seat_depth_axis]) < min_depth_overlap:
+                    continue
+
+                depth_overlap = max(
+                    0.0,
+                    min(float(bounds_max[seat_depth_axis]), float(seat_max[seat_depth_axis]))
+                    - max(float(bounds_min[seat_depth_axis]), float(seat_min[seat_depth_axis])),
+                )
+                if depth_overlap < min_depth_overlap:
+                    continue
+
+                lower_gap = abs(
+                    float(bounds_max[seat_long_axis]) - float(seat_min[seat_long_axis])
+                )
+                upper_gap = abs(
+                    float(bounds_min[seat_long_axis]) - float(seat_max[seat_long_axis])
+                )
+                side_sign = -1 if lower_gap <= upper_gap else 1
+                side_gap = lower_gap if side_sign < 0 else upper_gap
+                if side_gap > SOFA_HANDLE_SIDE_GAP_MAX:
+                    continue
+                handle_center = 0.5 * (bounds_min + bounds_max)
+                if side_sign < 0 and float(handle_center[seat_long_axis]) >= float(
+                    seat_center[seat_long_axis]
+                ):
+                    continue
+                if side_sign > 0 and float(handle_center[seat_long_axis]) <= float(
+                    seat_center[seat_long_axis]
+                ):
+                    continue
+
+                support_patch_y = float(top_patch["y"])
+                top_face_indices = np.asarray(
+                    top_patch.get("face_indices", []),
+                    dtype=np.int64,
+                )
+                top_slab_specs: list[dict[str, Any]] = []
+                if top_face_indices.size > 0:
+                    patch_centroids = face_centroids[top_face_indices]
+                    patch_areas = face_areas[top_face_indices]
+                    long_values = patch_centroids[:, seat_depth_axis]
+                    long_min = float(np.min(long_values))
+                    long_max = float(np.max(long_values))
+                    segment_count = max(1, int(SOFA_HANDLE_TOP_SEGMENT_COUNT))
+                    if long_max <= long_min + 1.0e-6:
+                        segment_edges = np.asarray([long_min, long_max], dtype=np.float32)
+                    else:
+                        segment_edges = np.linspace(
+                            long_min,
+                            long_max,
+                            segment_count + 1,
+                            dtype=np.float32,
+                        )
+                    for segment_idx in range(max(1, segment_edges.shape[0] - 1)):
+                        left = float(segment_edges[segment_idx])
+                        right = float(segment_edges[segment_idx + 1])
+                        if segment_idx == segment_edges.shape[0] - 2:
+                            segment_mask = (long_values >= left) & (long_values <= right)
+                        else:
+                            segment_mask = (long_values >= left) & (long_values < right)
+                        if not np.any(segment_mask):
+                            continue
+                        segment_face_indices = top_face_indices[segment_mask]
+                        segment_areas = patch_areas[segment_mask]
+                        segment_area = float(np.sum(segment_areas))
+                        if segment_area < float(SOFA_HANDLE_TOP_SEGMENT_MIN_AREA):
+                            continue
+                        segment_centroids = face_centroids[segment_face_indices]
+                        segment_top_y = float(
+                            np.average(segment_centroids[:, 1], weights=segment_areas)
+                        )
+                        segment_vertices = mesh_vertices[
+                            mesh_faces[segment_face_indices].reshape(-1)
+                        ]
+                        segment_bounds_min = np.min(segment_vertices, axis=0).astype(
+                            np.float32
+                        )
+                        segment_bounds_max = np.max(segment_vertices, axis=0).astype(
+                            np.float32
+                        )
+                        segment_box_min = segment_bounds_min.copy()
+                        segment_box_max = segment_bounds_max.copy()
+                        segment_box_min[1] = segment_top_y
+                        segment_box_max[1] = segment_top_y
+                        if (
+                            np.isfinite(segment_box_min).all()
+                            and np.isfinite(segment_box_max).all()
+                            and not np.any(segment_box_max < segment_box_min)
+                        ):
+                            top_slab_specs.append(
+                                {
+                                    "segment_index": int(segment_idx),
+                                    "bounds_min": segment_box_min.astype(np.float32),
+                                    "bounds_max": segment_box_max.astype(np.float32),
+                                    "top_y": float(segment_top_y),
+                                    "area": float(segment_area),
+                                    "aabb_top_error_y": float(
+                                        max(0.0, float(bounds_max[1]) - segment_top_y)
+                                    ),
+                                    "top_raise_y": float(segment_top_y - support_patch_y),
+                                }
+                            )
+
+                if not top_slab_specs:
+                    top_box_min = top_patch_min.copy()
+                    top_box_max = top_patch_max.copy()
+                    top_box_min[1] = support_patch_y
+                    top_box_max[1] = support_patch_y
+                    top_slab_specs.append(
+                        {
+                            "segment_index": 0,
+                            "bounds_min": top_box_min.astype(np.float32),
+                            "bounds_max": top_box_max.astype(np.float32),
+                            "top_y": float(support_patch_y),
+                            "area": float(top_area),
+                            "aabb_top_error_y": float(
+                                max(0.0, float(bounds_max[1]) - support_patch_y)
+                            ),
+                            "top_raise_y": 0.0,
+                        }
+                    )
+
+                total_top_area = float(
+                    sum(float(slab.get("area", 0.0)) for slab in top_slab_specs)
+                )
+                handle_top_y = (
+                    float(
+                        sum(
+                            float(slab["top_y"]) * float(slab.get("area", 0.0))
+                            for slab in top_slab_specs
+                        )
+                        / total_top_area
+                    )
+                    if total_top_area > 1.0e-8
+                    else support_patch_y
+                )
+                handle_clearance_top_y = float(
+                    max(float(slab["top_y"]) for slab in top_slab_specs)
+                )
+                if handle_top_y <= seat_y + SOFA_HANDLE_MIN_TOP_ABOVE_SEAT:
+                    continue
+                if handle_top_y >= seat_y + SOFA_HANDLE_MAX_TOP_ABOVE_SEAT:
+                    continue
+
+                armrest_leg_specs: list[dict[str, Any]] = []
+                handle_pad = float(SOFA_ARMREST_LEG_HANDLE_PAD)
+                handle_depth_min = float(bounds_min[seat_depth_axis])
+                handle_depth_max = float(bounds_max[seat_depth_axis])
+                for leg_record in self._furniture_component_records:
+                    leg_component_id = int(leg_record["id"])
+                    if (
+                        leg_component_id in table_component_id_set
+                        or leg_component_id == component_id
+                        or leg_component_id == int(support["component_id"])
+                        or leg_component_id in used_component_ids
+                        or leg_component_id in used_leg_component_ids
+                    ):
+                        continue
+                    if leg_record.get("support_patches"):
+                        continue
+                    leg_bounds_min = np.asarray(
+                        leg_record["bounds_min"], dtype=np.float32
+                    )
+                    leg_bounds_max = np.asarray(
+                        leg_record["bounds_max"], dtype=np.float32
+                    )
+                    leg_extents = np.maximum(leg_bounds_max - leg_bounds_min, 0.0)
+                    leg_lateral_extents = [
+                        float(leg_extents[axis]) for axis in lateral_axes
+                    ]
+                    leg_area = float(leg_record.get("area", 0.0))
+                    if (
+                        leg_area < SOFA_ARMREST_LEG_MIN_AREA
+                        or leg_area > SOFA_ARMREST_LEG_MAX_AREA
+                    ):
+                        continue
+                    if float(leg_extents[1]) < SOFA_ARMREST_LEG_MIN_HEIGHT:
+                        continue
+                    if (
+                        min(leg_lateral_extents)
+                        < SOFA_ARMREST_LEG_MIN_LATERAL_THICKNESS
+                        or max(leg_lateral_extents)
+                        > SOFA_ARMREST_LEG_MAX_LATERAL_SPAN
+                    ):
+                        continue
+                    if (
+                        float(leg_bounds_max[0]) < float(bounds_min[0]) - handle_pad
+                        or float(leg_bounds_min[0])
+                        > float(bounds_max[0]) + handle_pad
+                        or float(leg_bounds_max[2])
+                        < float(bounds_min[2]) - handle_pad
+                        or float(leg_bounds_min[2])
+                        > float(bounds_max[2]) + handle_pad
+                    ):
+                        continue
+                    leg_center = 0.5 * (leg_bounds_min + leg_bounds_max)
+                    near_handle_end = (
+                        float(leg_center[seat_depth_axis])
+                        <= handle_depth_min + SOFA_ARMREST_LEG_END_BAND
+                        or float(leg_center[seat_depth_axis])
+                        >= handle_depth_max - SOFA_ARMREST_LEG_END_BAND
+                    )
+                    if not near_handle_end:
+                        continue
+                    if (
+                        float(leg_bounds_max[1])
+                        > handle_clearance_top_y + SOFA_ARMREST_LEG_TOP_MARGIN
+                    ):
+                        continue
+                    if (
+                        float(leg_bounds_max[1])
+                        < float(bounds_min[1]) - SOFA_ARMREST_LEG_UNDERSIDE_REACH
+                    ):
+                        continue
+                    if (
+                        float(leg_bounds_min[1])
+                        > float(bounds_min[1]) + SOFA_ARMREST_LEG_TOP_MARGIN
+                    ):
+                        continue
+                    armrest_leg_specs.append(
+                        {
+                            "component_id": int(leg_component_id),
+                            "parent_component_id": int(component_id),
+                            "support_component_id": int(support["component_id"]),
+                            "bounds_min": leg_bounds_min.astype(np.float32),
+                            "bounds_max": leg_bounds_max.astype(np.float32),
+                        }
+                    )
+
+                for slab_spec in top_slab_specs:
+                    segment_min = np.asarray(
+                        slab_spec["bounds_min"], dtype=np.float32
+                    ).copy()
+                    segment_max = np.asarray(
+                        slab_spec["bounds_max"], dtype=np.float32
+                    ).copy()
+                    segment_top_y = float(slab_spec["top_y"])
+                    overlapping_leg_tops: list[float] = []
+                    for leg_spec in armrest_leg_specs:
+                        leg_min = np.asarray(
+                            leg_spec["bounds_min"], dtype=np.float32
+                        )
+                        leg_max = np.asarray(
+                            leg_spec["bounds_max"], dtype=np.float32
+                        )
+                        overlaps_segment = True
+                        for axis in lateral_axes:
+                            if (
+                                float(leg_max[axis])
+                                < float(segment_min[axis])
+                                - float(SOFA_ARMREST_LEG_HANDLE_PAD)
+                                or float(leg_min[axis])
+                                > float(segment_max[axis])
+                                + float(SOFA_ARMREST_LEG_HANDLE_PAD)
+                            ):
+                                overlaps_segment = False
+                                break
+                        if overlaps_segment:
+                            overlapping_leg_tops.append(float(leg_max[1]))
+                    if overlapping_leg_tops:
+                        segment_bottom_y = float(max(overlapping_leg_tops))
+                        bottom_source = "leg_top"
+                    else:
+                        segment_bottom_y = float(bounds_min[1])
+                        bottom_source = "handle_aabb_bottom"
+                    segment_bottom_y = min(segment_bottom_y, segment_top_y)
+                    segment_min[1] = segment_bottom_y
+                    segment_max[1] = segment_top_y
+                    slab_spec["bounds_min"] = segment_min.astype(np.float32)
+                    slab_spec["bounds_max"] = segment_max.astype(np.float32)
+                    slab_spec["bottom_y"] = float(segment_bottom_y)
+                    slab_spec["bottom_source"] = bottom_source
+
+                top_bounds_min = np.min(
+                    np.stack(
+                        [
+                            np.asarray(slab["bounds_min"], dtype=np.float32)
+                            for slab in top_slab_specs
+                        ],
+                        axis=0,
+                    ),
+                    axis=0,
+                ).astype(np.float32)
+                top_bounds_max = np.max(
+                    np.stack(
+                        [
+                            np.asarray(slab["bounds_max"], dtype=np.float32)
+                            for slab in top_slab_specs
+                        ],
+                        axis=0,
+                    ),
+                    axis=0,
+                ).astype(np.float32)
+                spec = {
+                    "component_id": component_id,
+                    "support_component_id": int(support["component_id"]),
+                    "top_bounds_min": top_bounds_min,
+                    "top_bounds_max": top_bounds_max,
+                    "bar_segment_specs": sorted(
+                        top_slab_specs,
+                        key=lambda entry: int(entry["segment_index"]),
+                    ),
+                    "handle_top_y": float(handle_top_y),
+                    "aabb_top_error_y": float(
+                        max(
+                            float(slab["aabb_top_error_y"])
+                            for slab in top_slab_specs
+                        )
+                    ),
+                    "top_raise_y": float(
+                        max(float(slab["top_raise_y"]) for slab in top_slab_specs)
+                    ),
+                    "side_sign": int(side_sign),
+                    "side_gap": float(side_gap),
+                    "depth_overlap": float(depth_overlap),
+                    "armrest_leg_specs": sorted(
+                        armrest_leg_specs,
+                        key=lambda entry: int(entry["component_id"]),
+                    ),
+                }
+                score = (
+                    float(side_gap),
+                    -float(depth_overlap),
+                    abs(handle_top_y - (seat_y + 0.20)),
+                    float(component_id),
+                )
+                side_candidates[side_sign].append((score, spec))
+
+            for side_sign in (-1, 1):
+                candidates = side_candidates[side_sign]
+                if not candidates:
+                    continue
+                _, spec = sorted(candidates, key=lambda item: item[0])[0]
+                component_id = int(spec["component_id"])
+                key = (
+                    component_id,
+                    tuple(np.round(np.asarray(spec["top_bounds_min"], dtype=np.float32), 4)),
+                    tuple(np.round(np.asarray(spec["top_bounds_max"], dtype=np.float32), 4)),
+                )
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                used_component_ids.add(component_id)
+                for leg_spec in spec.get("armrest_leg_specs", []):
+                    used_leg_component_ids.add(int(leg_spec["component_id"]))
+                specs.append(spec)
+
+        specs.sort(key=lambda spec: int(spec["component_id"]))
+        return specs
+
     def _append_focus_render_catalog_entries(
         self,
         catalog_entries: list[dict[str, Any]],
@@ -3173,12 +3651,10 @@ class SimpleLabSceneRenderer:
         floor_bounds_max = self._floor_mesh_world.bounds[1].astype(np.float32).copy()
         floor_bounds_min[2] = floor_z
         floor_bounds_max[2] = floor_z
-        floor_bounds_min, floor_bounds_max = _expand_bounds_min_thickness(
-            floor_bounds_min,
-            floor_bounds_max,
-            min_thickness=FLOOR_COLLIDER_THICKNESS,
-            support_axis=2,
-        )
+        if float(self.layout.scene_up[2]) < 0.0:
+            floor_bounds_max[2] = floor_z + FLOOR_COLLIDER_THICKNESS
+        else:
+            floor_bounds_min[2] = floor_z - FLOOR_COLLIDER_THICKNESS
         collider_entries.append(
             {
                 "category": "floor_slab",
@@ -3231,7 +3707,11 @@ class SimpleLabSceneRenderer:
             component_id = int(record["id"])
             is_active_table_component = component_id in active_table_component_id_set
             for patch in record.get("support_patches", []):
-                if not _support_patch_is_collision_usable(patch, self._asset_floor_y):
+                if not _support_patch_is_collision_usable(
+                    patch,
+                    self._asset_floor_y,
+                    allow_low_support=bool(is_active_table_component),
+                ):
                     continue
                 bounds_min, bounds_max = _expand_bounds_min_thickness(
                     np.asarray(patch["bounds_min"], dtype=np.float32),
@@ -3265,6 +3745,80 @@ class SimpleLabSceneRenderer:
                     }
                 )
 
+        for handle_spec in self._select_sofa_handle_collider_specs():
+            component_id = int(handle_spec["component_id"])
+            bar_min_local_thickness = float(SOFA_HANDLE_BAR_MIN_THICKNESS_M) / max(
+                float(scene_scale),
+                1.0e-6,
+            )
+            for slab_spec in handle_spec.get("bar_segment_specs", []):
+                aabb_top_error_m = float(
+                    slab_spec.get("aabb_top_error_y", 0.0)
+                ) * float(scene_scale)
+                top_raise_m = float(slab_spec.get("top_raise_y", 0.0)) * float(
+                    scene_scale
+                )
+                top_bounds_min, top_bounds_max = _expand_bounds_min_thickness(
+                    np.asarray(slab_spec["bounds_min"], dtype=np.float32),
+                    np.asarray(slab_spec["bounds_max"], dtype=np.float32),
+                    min_thickness=bar_min_local_thickness,
+                    support_axis=1,
+                )
+                bar_thickness_m = float(
+                    max(0.0, float(top_bounds_max[1] - top_bounds_min[1]))
+                    * float(scene_scale)
+                )
+                world_min, world_max = _transform_bounds(
+                    top_bounds_min,
+                    top_bounds_max,
+                    world_transform,
+                )
+                collider_entries.append(
+                    {
+                        "category": "sofa_handle_bar_segment_box",
+                        "component_id": component_id,
+                        "support_component_id": int(
+                            handle_spec["support_component_id"]
+                        ),
+                        "top_segment_index": int(slab_spec.get("segment_index", 0)),
+                        "is_active_table": False,
+                        "aabb_top_error_m": float(aabb_top_error_m),
+                        "top_raise_m": float(top_raise_m),
+                        "bar_min_thickness_m": float(SOFA_HANDLE_BAR_MIN_THICKNESS_M),
+                        "bar_thickness_m": float(bar_thickness_m),
+                        "box": np.stack([world_min, world_max], axis=0).astype(
+                            np.float32
+                        ),
+                    }
+                )
+
+            for leg_spec in handle_spec.get("armrest_leg_specs", []):
+                leg_bounds_min, leg_bounds_max = _expand_bounds_min_thickness(
+                    np.asarray(leg_spec["bounds_min"], dtype=np.float32),
+                    np.asarray(leg_spec["bounds_max"], dtype=np.float32),
+                    min_thickness=COLLIDER_MIN_THICKNESS,
+                    support_axis=None,
+                )
+                world_min, world_max = _transform_bounds(
+                    leg_bounds_min,
+                    leg_bounds_max,
+                    world_transform,
+                )
+                collider_entries.append(
+                    {
+                        "category": "sofa_armrest_leg_box",
+                        "component_id": int(leg_spec["component_id"]),
+                        "parent_component_id": component_id,
+                        "support_component_id": int(
+                            leg_spec["support_component_id"]
+                        ),
+                        "is_active_table": False,
+                        "box": np.stack([world_min, world_max], axis=0).astype(
+                            np.float32
+                        ),
+                    }
+                )
+
         self._scene_collider_boxes = np.stack(
             [np.asarray(entry["box"], dtype=np.float32) for entry in collider_entries],
             axis=0,
@@ -3272,7 +3826,8 @@ class SimpleLabSceneRenderer:
         support_surface_entries = [
             entry
             for entry in collider_entries
-            if entry["category"] in {"floor_slab", "support_slab"}
+            if entry["category"]
+            in {"floor_slab", "support_slab", "sofa_handle_top_slab", "sofa_handle_bar_segment_box"}
         ]
         if support_surface_entries:
             self.layout.support_surface_boxes = np.stack(
@@ -3294,6 +3849,46 @@ class SimpleLabSceneRenderer:
                     else int(entry.get("component_id"))
                 ),
                 "is_active_table": bool(entry.get("is_active_table", False)),
+                "support_component_id": (
+                    None
+                    if entry.get("support_component_id") is None
+                    else int(entry.get("support_component_id"))
+                ),
+                "parent_component_id": (
+                    None
+                    if entry.get("parent_component_id") is None
+                    else int(entry.get("parent_component_id"))
+                ),
+                "top_segment_index": (
+                    None
+                    if entry.get("top_segment_index") is None
+                    else int(entry.get("top_segment_index"))
+                ),
+                "aabb_top_error_m": (
+                    None
+                    if entry.get("aabb_top_error_m") is None
+                    else float(entry.get("aabb_top_error_m"))
+                ),
+                "top_raise_m": (
+                    None
+                    if entry.get("top_raise_m") is None
+                    else float(entry.get("top_raise_m"))
+                ),
+                "top_slab_thickness_m": (
+                    None
+                    if entry.get("top_slab_thickness_m") is None
+                    else float(entry.get("top_slab_thickness_m"))
+                ),
+                "bar_min_thickness_m": (
+                    None
+                    if entry.get("bar_min_thickness_m") is None
+                    else float(entry.get("bar_min_thickness_m"))
+                ),
+                "bar_thickness_m": (
+                    None
+                    if entry.get("bar_thickness_m") is None
+                    else float(entry.get("bar_thickness_m"))
+                ),
             }
             for entry in collider_entries
         ]
@@ -3303,6 +3898,80 @@ class SimpleLabSceneRenderer:
         blocker_box_count = int(
             sum(1 for entry in collider_entries if entry["category"] == "blocker_box")
         )
+        sofa_handle_top_entries = [
+            entry
+            for entry in collider_entries
+            if entry["category"] == "sofa_handle_top_slab"
+        ]
+        sofa_handle_bar_entries = [
+            entry
+            for entry in collider_entries
+            if entry["category"] == "sofa_handle_bar_segment_box"
+        ]
+        sofa_handle_bend_entries = [
+            entry
+            for entry in collider_entries
+            if entry["category"] == "sofa_handle_bend_wall"
+        ]
+        sofa_armrest_leg_entries = [
+            entry
+            for entry in collider_entries
+            if entry["category"] == "sofa_armrest_leg_box"
+        ]
+        sofa_handle_component_ids = sorted(
+            {
+                int(entry["component_id"])
+                for entry in (
+                    sofa_handle_top_entries
+                    + sofa_handle_bar_entries
+                    + sofa_handle_bend_entries
+                )
+                if entry.get("component_id") is not None
+            }
+        )
+        sofa_armrest_leg_component_ids = sorted(
+            {
+                int(entry["component_id"])
+                for entry in sofa_armrest_leg_entries
+                if entry.get("component_id") is not None
+            }
+        )
+        sofa_handle_support_component_ids = sorted(
+            {
+                int(entry["support_component_id"])
+                for entry in (
+                    sofa_handle_top_entries
+                    + sofa_handle_bar_entries
+                    + sofa_handle_bend_entries
+                    + sofa_armrest_leg_entries
+                )
+                if entry.get("support_component_id") is not None
+            }
+        )
+        sofa_handle_aabb_top_errors = [
+            float(entry.get("aabb_top_error_m", 0.0))
+            for entry in sofa_handle_top_entries + sofa_handle_bar_entries
+            if entry.get("aabb_top_error_m") is not None
+            and np.isfinite(float(entry.get("aabb_top_error_m", 0.0)))
+        ]
+        sofa_handle_top_slab_thicknesses = [
+            float(entry.get("top_slab_thickness_m", 0.0))
+            for entry in sofa_handle_top_entries
+            if entry.get("top_slab_thickness_m") is not None
+            and np.isfinite(float(entry.get("top_slab_thickness_m", 0.0)))
+        ]
+        sofa_armrest_top_raises = [
+            float(entry.get("top_raise_m", 0.0))
+            for entry in sofa_handle_top_entries + sofa_handle_bar_entries
+            if entry.get("top_raise_m") is not None
+            and np.isfinite(float(entry.get("top_raise_m", 0.0)))
+        ]
+        sofa_handle_bar_thicknesses = [
+            float(entry.get("bar_thickness_m", 0.0))
+            for entry in sofa_handle_bar_entries
+            if entry.get("bar_thickness_m") is not None
+            and np.isfinite(float(entry.get("bar_thickness_m", 0.0)))
+        ]
         boundary_box_count = int(
             sum(
                 1
@@ -3333,6 +4002,78 @@ class SimpleLabSceneRenderer:
         world_surface_center = startup_surface_center_world.copy()
         world_surface_plane = float(np.dot(world_surface_center, scene_up))
         world_surface_normal = np.array([0.0, 0.0, -1.0], dtype=np.float32)
+
+        def _format_collider_top_face_levels(entries: list[dict[str, Any]]) -> str:
+            if not entries:
+                return "[]"
+            boxes_subset = np.stack(
+                [np.asarray(entry["box"], dtype=np.float32) for entry in entries],
+                axis=0,
+            )
+            vertical_axis = int(np.argmax(np.abs(scene_up)))
+            top_uses_min = bool(float(scene_up[vertical_axis]) < 0.0)
+            subset_top_faces = (
+                boxes_subset[:, 0, vertical_axis]
+                if top_uses_min
+                else boxes_subset[:, 1, vertical_axis]
+            )
+            finite_top_faces = subset_top_faces[np.isfinite(subset_top_faces)]
+            if finite_top_faces.size == 0:
+                return "[]"
+            rounded_tops = np.round(finite_top_faces.astype(np.float64), 4)
+            unique_tops, counts = np.unique(rounded_tops, return_counts=True)
+            return (
+                "["
+                + ",".join(
+                    f"{float(level):.4f}x{int(count)}"
+                    for level, count in zip(unique_tops, counts)
+                )
+                + "]"
+            )
+
+        def _format_collider_bottom_face_levels(entries: list[dict[str, Any]]) -> str:
+            if not entries:
+                return "[]"
+            boxes_subset = np.stack(
+                [np.asarray(entry["box"], dtype=np.float32) for entry in entries],
+                axis=0,
+            )
+            vertical_axis = int(np.argmax(np.abs(scene_up)))
+            top_uses_min = bool(float(scene_up[vertical_axis]) < 0.0)
+            subset_bottom_faces = (
+                boxes_subset[:, 1, vertical_axis]
+                if top_uses_min
+                else boxes_subset[:, 0, vertical_axis]
+            )
+            finite_bottom_faces = subset_bottom_faces[
+                np.isfinite(subset_bottom_faces)
+            ]
+            if finite_bottom_faces.size == 0:
+                return "[]"
+            rounded_bottoms = np.round(finite_bottom_faces.astype(np.float64), 4)
+            unique_bottoms, counts = np.unique(rounded_bottoms, return_counts=True)
+            return (
+                "["
+                + ",".join(
+                    f"{float(level):.4f}x{int(count)}"
+                    for level, count in zip(unique_bottoms, counts)
+                )
+                + "]"
+            )
+
+        def _format_min_mean_max(values: list[float]) -> str:
+            finite_values = np.asarray(
+                [float(value) for value in values if np.isfinite(float(value))],
+                dtype=np.float32,
+            )
+            if finite_values.size == 0:
+                return "nan,nan,nan"
+            return (
+                f"{float(np.min(finite_values)):.4f},"
+                f"{float(np.mean(finite_values)):.4f},"
+                f"{float(np.max(finite_values)):.4f}"
+            )
+
         self._table_alignment_debug = {
             "scene_preset": ILLIXR_SCENE_NAME,
             "asset_transform": {
@@ -3369,6 +4110,49 @@ class SimpleLabSceneRenderer:
             "collider_box_count": int(self._scene_collider_boxes.shape[0]),
             "support_slab_count": support_slab_count,
             "blocker_box_count": blocker_box_count,
+            "sofa_handle_collider_count": int(
+                len(sofa_handle_top_entries)
+                + len(sofa_handle_bar_entries)
+                + len(sofa_handle_bend_entries)
+                + len(sofa_armrest_leg_entries)
+            ),
+            "sofa_handle_top_support_box_count": int(len(sofa_handle_top_entries)),
+            "sofa_handle_bar_segment_box_count": int(len(sofa_handle_bar_entries)),
+            "sofa_handle_bend_wall_box_count": int(len(sofa_handle_bend_entries)),
+            "sofa_armrest_leg_collider_count": int(len(sofa_armrest_leg_entries)),
+            "sofa_handle_component_ids": sofa_handle_component_ids,
+            "sofa_armrest_leg_component_ids": sofa_armrest_leg_component_ids,
+            "sofa_handle_support_component_ids": sofa_handle_support_component_ids,
+            "sofa_handle_support_top_levels": _format_collider_top_face_levels(
+                sofa_handle_top_entries + sofa_handle_bar_entries
+            ),
+            "sofa_handle_bar_bottom_levels": _format_collider_bottom_face_levels(
+                sofa_handle_bar_entries
+            ),
+            "sofa_handle_aabb_top_error_m": (
+                float(max(sofa_handle_aabb_top_errors))
+                if sofa_handle_aabb_top_errors
+                else float("nan")
+            ),
+            "sofa_handle_aabb_top_error_min_mean_max": _format_min_mean_max(
+                sofa_handle_aabb_top_errors
+            ),
+            "sofa_handle_top_slab_thickness_m": (
+                float(max(sofa_handle_top_slab_thicknesses))
+                if sofa_handle_top_slab_thicknesses
+                else float("nan")
+            ),
+            "sofa_armrest_top_raise_m": (
+                float(max(sofa_armrest_top_raises))
+                if sofa_armrest_top_raises
+                else float("nan")
+            ),
+            "sofa_armrest_top_raise_min_mean_max": _format_min_mean_max(
+                sofa_armrest_top_raises
+            ),
+            "sofa_handle_bar_thickness_min_mean_max": _format_min_mean_max(
+                sofa_handle_bar_thicknesses
+            ),
             "boundary_box_count": boundary_box_count,
             "decomposed_component_count": decomposed_component_count,
             "table_render_component_ids": [int(v) for v in self._table_component_ids],

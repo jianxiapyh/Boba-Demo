@@ -6543,15 +6543,21 @@ class InvPhyTrainerWarp:
     IMMERSIVE_SCENE_REST_SETTLE_STEPS = 90
     IMMERSIVE_SCENE_REST_VELOCITY_EPS = 0.035
     IMMERSIVE_SCENE_REST_POSITION_EPS = 0.015
-    IMMERSIVE_IDLE_LOCK_STABLE_FRAMES = 12
-    IMMERSIVE_IDLE_LOCK_MAX_SPEED = 0.025
-    IMMERSIVE_IDLE_LOCK_MAX_MEAN_FRAME_DELTA = 0.002
+    IMMERSIVE_IDLE_LOCK_STABLE_FRAMES = 6
+    IMMERSIVE_IDLE_LOCK_MAX_SPEED = 0.075
+    IMMERSIVE_IDLE_LOCK_MAX_MEAN_FRAME_DELTA = 0.006
     IMMERSIVE_IDLE_LOCK_SUPPORT_XY_MARGIN = 0.01
     IMMERSIVE_IDLE_LOCK_SUPPORT_Z_TOL = 0.015
     IMMERSIVE_IDLE_LOCK_CASE_MIN_SUPPORT_FRACTION = {
         "sloth": 0.18,
         "rope": 0.55,
     }
+    IMMERSIVE_IDLE_LOCK_SPLIT_SUPPORT_MIN_FRACTION = 0.45
+    IMMERSIVE_IDLE_LOCK_SPLIT_SUPPORT_MIN_LEVEL_FRACTION = 0.10
+    IMMERSIVE_POST_RELEASE_LANDING_LOCK_WINDOW_FRAMES = 240
+    IMMERSIVE_POST_RELEASE_LANDING_LOCK_MIN_DELAY_FRAMES = 6
+    IMMERSIVE_POST_RELEASE_CONTACT_HEIGHT_MARGIN_M = 0.010
+    IMMERSIVE_POST_RELEASE_CONTACT_MIN_FRACTION = 0.75
     IMMERSIVE_STARTUP_PLANE_EPS = 0.03
     IMMERSIVE_STARTUP_CENTER_EPS = 0.08
     IMMERSIVE_STARTUP_ALPHA_EPS = 0.02
@@ -7262,8 +7268,10 @@ class InvPhyTrainerWarp:
             case_name = self._interaction_anchor_case_name()
         case_name = str(case_name).strip().lower()
         support_case_name = "rope" if self._is_rope_family_case(case_name) else case_name
+        split_support_enabled = support_case_name == "rope"
         return {
             "case_name": case_name,
+            "support_case_name": support_case_name,
             "stable_frames_required": int(self.IMMERSIVE_IDLE_LOCK_STABLE_FRAMES),
             "max_speed": float(self.IMMERSIVE_IDLE_LOCK_MAX_SPEED),
             "max_mean_frame_delta": float(
@@ -7275,6 +7283,13 @@ class InvPhyTrainerWarp:
                     self.IMMERSIVE_IDLE_LOCK_CASE_MIN_SUPPORT_FRACTION["sloth"],
                 )
             ),
+            "split_support_enabled": bool(split_support_enabled),
+            "split_support_min_fraction": float(
+                self.IMMERSIVE_IDLE_LOCK_SPLIT_SUPPORT_MIN_FRACTION
+            ),
+            "split_support_min_level_fraction": float(
+                self.IMMERSIVE_IDLE_LOCK_SPLIT_SUPPORT_MIN_LEVEL_FRACTION
+            ),
         }
 
     def _make_idle_lock_state(self):
@@ -7285,6 +7300,7 @@ class InvPhyTrainerWarp:
             "last_object_points": None,
             "last_object_points_prev": None,
             "support_fraction": 0.0,
+            "diagnostic_frame_count": 0,
         }
 
     def _build_idle_locked_sim_state(self, sim_state):
@@ -7389,6 +7405,448 @@ class InvPhyTrainerWarp:
             return 0.0
         return float(supported_points.to(dtype=torch.float32).mean().item())
 
+    def _scene_support_level_metrics(
+        self,
+        object_points,
+        support_surface_boxes,
+        scene_up,
+        *,
+        xy_margin=None,
+        z_tolerance=None,
+        level_round_m=0.001,
+    ):
+        empty_result = {
+            "support_fraction": 0.0,
+            "level_fractions": [],
+            "qualifying_level_count": 0,
+        }
+        if object_points is None or int(object_points.numel()) == 0:
+            return dict(empty_result)
+        point_count = int(object_points.shape[0])
+        if support_surface_boxes is None:
+            return dict(empty_result)
+        if xy_margin is None:
+            xy_margin = float(self.IMMERSIVE_IDLE_LOCK_SUPPORT_XY_MARGIN)
+        if z_tolerance is None:
+            z_tolerance = float(self.IMMERSIVE_IDLE_LOCK_SUPPORT_Z_TOL)
+        if not torch.is_tensor(support_surface_boxes):
+            support_surface_boxes = torch.as_tensor(
+                support_surface_boxes,
+                dtype=object_points.dtype,
+                device=object_points.device,
+            )
+        else:
+            support_surface_boxes = support_surface_boxes.to(
+                device=object_points.device,
+                dtype=object_points.dtype,
+            )
+        if support_surface_boxes.ndim != 3 or support_surface_boxes.shape[1:] != (2, 3):
+            return dict(empty_result)
+        if int(support_surface_boxes.shape[0]) == 0:
+            return dict(empty_result)
+
+        scene_up_np = np.asarray(scene_up, dtype=np.float32).reshape(-1)
+        if scene_up_np.shape[0] != 3 or not np.isfinite(scene_up_np).all():
+            scene_up_np = np.array([0.0, 0.0, -1.0], dtype=np.float32)
+        vertical_axis = int(np.argmax(np.abs(scene_up_np)))
+        top_uses_min = bool(float(scene_up_np[vertical_axis]) < 0.0)
+        lateral_axes = [axis for axis in range(3) if axis != vertical_axis]
+
+        box_mins = support_surface_boxes[:, 0, :]
+        box_maxs = support_surface_boxes[:, 1, :]
+        box_count = int(support_surface_boxes.shape[0])
+        support_mask = torch.ones(
+            (point_count, box_count),
+            dtype=torch.bool,
+            device=object_points.device,
+        )
+        for axis in lateral_axes:
+            coords = object_points[:, axis].unsqueeze(1)
+            support_mask &= coords >= (box_mins[:, axis].unsqueeze(0) - xy_margin)
+            support_mask &= coords <= (box_maxs[:, axis].unsqueeze(0) + xy_margin)
+        top_face = (
+            box_mins[:, vertical_axis]
+            if top_uses_min
+            else box_maxs[:, vertical_axis]
+        )
+        support_mask &= (
+            torch.abs(
+                object_points[:, vertical_axis].unsqueeze(1) - top_face.unsqueeze(0)
+            )
+            <= z_tolerance
+        )
+        supported_points = support_mask.any(dim=1)
+        support_fraction = float(supported_points.to(dtype=torch.float32).mean().item())
+        if support_fraction <= 0.0:
+            return {
+                "support_fraction": 0.0,
+                "level_fractions": [],
+                "qualifying_level_count": 0,
+            }
+
+        level_round_m = float(level_round_m)
+        if not np.isfinite(level_round_m) or level_round_m <= 0.0:
+            level_round_m = 0.001
+        level_keys = torch.round(top_face / level_round_m).to(dtype=torch.int64)
+        level_entries = []
+        for level_key in torch.unique(level_keys).detach().cpu().tolist():
+            level_box_mask = level_keys == int(level_key)
+            if not bool(level_box_mask.any().item()):
+                continue
+            level_point_mask = support_mask[:, level_box_mask].any(dim=1)
+            level_fraction = float(
+                level_point_mask.to(dtype=torch.float32).mean().item()
+            )
+            if level_fraction <= 0.0:
+                continue
+            level_top = float(top_face[level_box_mask].mean().item())
+            level_entries.append((level_top, level_fraction))
+        level_entries.sort(key=lambda item: item[0])
+        return {
+            "support_fraction": support_fraction,
+            "level_fractions": level_entries,
+            "qualifying_level_count": 0,
+        }
+
+    def _format_support_by_level(self, support_level_metrics):
+        level_fractions = list(support_level_metrics.get("level_fractions", []))
+        if not level_fractions:
+            return "[]"
+        return (
+            "["
+            + ",".join(
+                f"{float(level):.4f}:{float(fraction):.3f}"
+                for level, fraction in level_fractions
+            )
+            + "]"
+        )
+
+    def _split_support_idle_lock_ok(
+        self,
+        idle_lock_case_profile,
+        support_fraction,
+        support_level_metrics,
+    ):
+        if not bool(idle_lock_case_profile.get("split_support_enabled", False)):
+            return False
+        if support_fraction < float(
+            idle_lock_case_profile.get("split_support_min_fraction", 1.0)
+        ):
+            return False
+        min_level_fraction = float(
+            idle_lock_case_profile.get("split_support_min_level_fraction", 1.0)
+        )
+        qualifying_level_count = sum(
+            1
+            for _, level_fraction in support_level_metrics.get("level_fractions", [])
+            if float(level_fraction) >= min_level_fraction
+        )
+        support_level_metrics["qualifying_level_count"] = int(qualifying_level_count)
+        return qualifying_level_count >= 2
+
+    def _scene_top_support_height_metrics(
+        self,
+        object_points,
+        support_surface_boxes,
+        scene_up,
+        *,
+        xy_margin=None,
+        max_height=None,
+    ):
+        if object_points is None or int(object_points.numel()) == 0:
+            return {
+                "point_count": 0,
+                "near_fraction": 0.0,
+                "max_height": float("inf"),
+                "mean_height": float("inf"),
+            }
+        point_count = int(object_points.shape[0])
+        if support_surface_boxes is None:
+            return {
+                "point_count": point_count,
+                "near_fraction": 0.0,
+                "max_height": float("inf"),
+                "mean_height": float("inf"),
+            }
+        if xy_margin is None:
+            xy_margin = float(self.IMMERSIVE_IDLE_LOCK_SUPPORT_XY_MARGIN)
+        if max_height is None:
+            max_height = float(getattr(cfg, "object_radius", 0.0)) + float(
+                self.IMMERSIVE_POST_RELEASE_CONTACT_HEIGHT_MARGIN_M
+            )
+        if not torch.is_tensor(support_surface_boxes):
+            support_surface_boxes = torch.as_tensor(
+                support_surface_boxes,
+                dtype=object_points.dtype,
+                device=object_points.device,
+            )
+        else:
+            support_surface_boxes = support_surface_boxes.to(
+                device=object_points.device,
+                dtype=object_points.dtype,
+            )
+        if support_surface_boxes.ndim != 3 or support_surface_boxes.shape[1:] != (2, 3):
+            return {
+                "point_count": point_count,
+                "near_fraction": 0.0,
+                "max_height": float("inf"),
+                "mean_height": float("inf"),
+            }
+        if int(support_surface_boxes.shape[0]) == 0:
+            return {
+                "point_count": point_count,
+                "near_fraction": 0.0,
+                "max_height": float("inf"),
+                "mean_height": float("inf"),
+            }
+
+        scene_up_np = np.asarray(scene_up, dtype=np.float32).reshape(-1)
+        if scene_up_np.shape[0] != 3 or not np.isfinite(scene_up_np).all():
+            scene_up_np = np.array([0.0, 0.0, -1.0], dtype=np.float32)
+        vertical_axis = int(np.argmax(np.abs(scene_up_np)))
+        scene_up_sign = 1.0 if float(scene_up_np[vertical_axis]) >= 0.0 else -1.0
+        top_uses_min = scene_up_sign < 0.0
+        lateral_axes = [axis for axis in range(3) if axis != vertical_axis]
+
+        box_mins = support_surface_boxes[:, 0, :]
+        box_maxs = support_surface_boxes[:, 1, :]
+        top_face = (
+            box_mins[:, vertical_axis]
+            if top_uses_min
+            else box_maxs[:, vertical_axis]
+        )
+        support_mask = torch.ones(
+            (point_count, int(support_surface_boxes.shape[0])),
+            dtype=torch.bool,
+            device=object_points.device,
+        )
+        for axis in lateral_axes:
+            coords = object_points[:, axis].unsqueeze(1)
+            support_mask &= coords >= (box_mins[:, axis].unsqueeze(0) - xy_margin)
+            support_mask &= coords <= (box_maxs[:, axis].unsqueeze(0) + xy_margin)
+        heights = (
+            object_points[:, vertical_axis].unsqueeze(1) - top_face.unsqueeze(0)
+        ) * float(scene_up_sign)
+        support_mask &= heights >= -float(self.IMMERSIVE_IDLE_LOCK_SUPPORT_Z_TOL)
+        candidate_heights = torch.where(
+            support_mask,
+            heights.clamp_min(0.0),
+            torch.full_like(heights, float("inf")),
+        )
+        nearest_height, _ = candidate_heights.min(dim=1)
+        finite_mask = torch.isfinite(nearest_height)
+        if not bool(finite_mask.any().item()):
+            return {
+                "point_count": point_count,
+                "near_fraction": 0.0,
+                "max_height": float("inf"),
+                "mean_height": float("inf"),
+            }
+        valid_heights = nearest_height[finite_mask]
+        near_mask = nearest_height <= float(max_height)
+        return {
+            "point_count": point_count,
+            "near_fraction": float(near_mask.to(dtype=torch.float32).mean().item()),
+            "max_height": (
+                float(valid_heights.max().item())
+                if bool(finite_mask.all().item())
+                else float("inf")
+            ),
+            "mean_height": float(valid_heights.mean().item()),
+        }
+
+    @torch.no_grad()
+    def _apply_visual_contact_sink_to_positions(
+        self,
+        visual_points,
+        contact_boxes,
+        scene_up,
+        *,
+        sink_m,
+        band_m,
+        floor_sink_m=0.0,
+        floor_z=None,
+        contact_clearance_m=0.0,
+        object_radius,
+        collect_stats=False,
+    ):
+        sink_m = float(sink_m)
+        band_m = float(band_m)
+        floor_sink_m = float(floor_sink_m)
+        if not np.isfinite(floor_sink_m) or floor_sink_m < 0.0:
+            floor_sink_m = 0.0
+        contact_clearance_m = float(contact_clearance_m)
+        if not np.isfinite(contact_clearance_m) or contact_clearance_m < 0.0:
+            contact_clearance_m = 0.0
+        object_radius = max(float(object_radius), 0.0)
+        if (
+            visual_points is None
+            or int(visual_points.numel()) == 0
+            or contact_boxes is None
+            or (sink_m <= 0.0 and floor_sink_m <= 0.0)
+            or band_m <= 0.0
+        ):
+            return visual_points, None
+        if not torch.is_tensor(contact_boxes):
+            contact_boxes = torch.as_tensor(
+                contact_boxes,
+                dtype=visual_points.dtype,
+                device=visual_points.device,
+            )
+        else:
+            contact_boxes = contact_boxes.to(
+                device=visual_points.device,
+                dtype=visual_points.dtype,
+            )
+        if contact_boxes.ndim != 3 or contact_boxes.shape[1:] != (2, 3):
+            return visual_points, None
+        if int(contact_boxes.shape[0]) == 0:
+            return visual_points, None
+
+        scene_up_np = np.asarray(scene_up, dtype=np.float32).reshape(-1)
+        if scene_up_np.shape[0] != 3 or not np.isfinite(scene_up_np).all():
+            scene_up_np = np.array([0.0, 0.0, -1.0], dtype=np.float32)
+        vertical_axis = int(np.argmax(np.abs(scene_up_np)))
+        scene_up_sign = 1.0 if float(scene_up_np[vertical_axis]) >= 0.0 else -1.0
+        top_uses_min = scene_up_sign < 0.0
+        lateral_axes = [axis for axis in range(3) if axis != vertical_axis]
+
+        points = visual_points.to(dtype=torch.float32)
+        boxes = contact_boxes.to(dtype=torch.float32)
+        box_mins = torch.minimum(boxes[:, 0, :], boxes[:, 1, :])
+        box_maxs = torch.maximum(boxes[:, 0, :], boxes[:, 1, :])
+        box_count = int(boxes.shape[0])
+        point_count = int(points.shape[0])
+        if box_count == 0 or point_count == 0:
+            return visual_points, None
+
+        max_contact_distance = float(object_radius + band_m)
+        edge_guard_m = max(float(sink_m), 0.5 * float(object_radius), 0.005)
+
+        def _falloff(distance):
+            if object_radius > 0.0:
+                return torch.where(
+                    distance <= object_radius,
+                    torch.ones_like(distance),
+                    (
+                        1.0
+                        - (distance - object_radius) / max(float(band_m), 1e-6)
+                    ).clamp(0.0, 1.0),
+                )
+            return (1.0 - distance / max(float(band_m), 1e-6)).clamp(0.0, 1.0)
+
+        top_face = (
+            box_mins[:, vertical_axis]
+            if top_uses_min
+            else box_maxs[:, vertical_axis]
+        )
+        floor_face_mask = torch.zeros_like(top_face, dtype=torch.bool)
+        per_box_sink = torch.full_like(top_face, float(sink_m))
+        if floor_z is not None and np.isfinite(float(floor_z)):
+            floor_z_t = torch.as_tensor(
+                float(floor_z),
+                dtype=top_face.dtype,
+                device=top_face.device,
+            )
+            floor_face_mask = torch.abs(top_face - floor_z_t) <= 1e-4
+            if floor_sink_m > 0.0:
+                per_box_sink = torch.where(
+                    floor_face_mask,
+                    torch.full_like(per_box_sink, float(floor_sink_m)),
+                    per_box_sink,
+                )
+        height_above_top = (
+            points[:, vertical_axis].unsqueeze(1) - top_face.unsqueeze(0)
+        ) * float(scene_up_sign)
+        top_valid = (
+            (height_above_top >= 0.0)
+            & (height_above_top <= max_contact_distance)
+        )
+        edge_distance = None
+        for axis in lateral_axes:
+            coord = points[:, axis].unsqueeze(1)
+            min_edge_distance = coord - box_mins[:, axis].unsqueeze(0)
+            max_edge_distance = box_maxs[:, axis].unsqueeze(0) - coord
+            top_valid &= min_edge_distance >= 0.0
+            top_valid &= max_edge_distance >= 0.0
+            axis_edge_distance = torch.minimum(min_edge_distance, max_edge_distance)
+            edge_distance = (
+                axis_edge_distance
+                if edge_distance is None
+                else torch.minimum(edge_distance, axis_edge_distance)
+            )
+        if edge_distance is None:
+            edge_distance = torch.zeros_like(height_above_top)
+        edge_weight = (edge_distance / max(float(edge_guard_m), 1e-6)).clamp(
+            0.0,
+            1.0,
+        )
+        top_weight = _falloff(height_above_top) * edge_weight
+        available_sink = (
+            height_above_top - float(contact_clearance_m)
+        ).clamp_min(0.0)
+        top_shift = torch.minimum(
+            per_box_sink.unsqueeze(0) * top_weight,
+            available_sink,
+        )
+        top_shift = torch.where(top_valid, top_shift, torch.zeros_like(top_shift))
+        best_shift_amount, best_shift_box_idx = top_shift.max(dim=1)
+        best_shift = torch.zeros_like(points)
+        best_shift[:, vertical_axis] = best_shift_amount * -float(scene_up_sign)
+
+        shifted_points = (points + best_shift).to(dtype=visual_points.dtype)
+        stats = None
+        if bool(collect_stats):
+            shift_norm = torch.linalg.norm(best_shift, dim=1)
+            adjusted_count = int((shift_norm > 1e-7).sum().item())
+            adjusted_height_min = float("nan")
+            adjusted_height_mean = float("nan")
+            adjusted_height_max = float("nan")
+            adjusted_support_top_min = float("nan")
+            adjusted_support_top_mean = float("nan")
+            adjusted_support_top_max = float("nan")
+            floor_adjusted_count = 0
+            if adjusted_count > 0:
+                adjusted_mask = shift_norm > 1e-7
+                point_indices = torch.arange(point_count, device=points.device)
+                adjusted_heights = height_above_top[
+                    point_indices,
+                    best_shift_box_idx,
+                ][adjusted_mask]
+                adjusted_support_tops = top_face[best_shift_box_idx][adjusted_mask]
+                adjusted_height_min = float(adjusted_heights.min().item())
+                adjusted_height_mean = float(adjusted_heights.mean().item())
+                adjusted_height_max = float(adjusted_heights.max().item())
+                adjusted_support_top_min = float(adjusted_support_tops.min().item())
+                adjusted_support_top_mean = float(adjusted_support_tops.mean().item())
+                adjusted_support_top_max = float(adjusted_support_tops.max().item())
+                adjusted_floor_mask = floor_face_mask[best_shift_box_idx][
+                    adjusted_mask
+                ]
+                floor_adjusted_count = int(adjusted_floor_mask.sum().item())
+            stats = {
+                "adjusted_count": adjusted_count,
+                "point_count": point_count,
+                "shifted": adjusted_count > 0,
+                "floor_adjusted_count": floor_adjusted_count,
+                "nonfloor_adjusted_count": adjusted_count - floor_adjusted_count,
+                "adjusted_fraction": (
+                    float(adjusted_count) / float(point_count)
+                    if point_count > 0
+                    else 0.0
+                ),
+                "max_shift_m": (
+                    float(shift_norm.max().item()) if point_count > 0 else 0.0
+                ),
+                "height_above_support_min_m": adjusted_height_min,
+                "height_above_support_mean_m": adjusted_height_mean,
+                "height_above_support_max_m": adjusted_height_max,
+                "support_top_min": adjusted_support_top_min,
+                "support_top_mean": adjusted_support_top_mean,
+                "support_top_max": adjusted_support_top_max,
+            }
+        return shifted_points, stats
+
     def _set_idle_lock_state(
         self,
         idle_lock_state,
@@ -7406,6 +7864,7 @@ class InvPhyTrainerWarp:
         idle_lock_state["last_object_points"] = object_points.detach().clone()
         idle_lock_state["last_object_points_prev"] = object_points.detach().clone()
         idle_lock_state["support_fraction"] = float(support_fraction)
+        idle_lock_state["diagnostic_frame_count"] = 0
         self._restore_sim_state(locked_state)
         support_center = (
             self._object_support_patch_center(object_points)
@@ -7423,7 +7882,49 @@ class InvPhyTrainerWarp:
         )
         return locked_state
 
-    def _release_idle_lock_state(self, idle_lock_state, *, reason):
+    def _idle_lock_active_interaction_sources(self, controller_interaction_state):
+        if controller_interaction_state is None:
+            return []
+        return [
+            source
+            for source in ("left", "right")
+            if controller_interaction_state.get(source) is not None
+        ]
+
+    def _format_idle_lock_interaction_details(
+        self,
+        controller_interaction_state,
+        controller_world_by_source=None,
+    ):
+        sources = self._idle_lock_active_interaction_sources(controller_interaction_state)
+        if not sources:
+            return "sources=[]"
+        parts = ["sources=" + ",".join(sources)]
+        controller_world_by_source = controller_world_by_source or {}
+        for source in sources:
+            controller_world = controller_world_by_source.get(source)
+            if not isinstance(controller_world, dict):
+                parts.append(f"{source}_select=n/a")
+                continue
+            parts.append(
+                f"{source}_select_value="
+                f"{float(controller_world.get('select_value', 0.0)):.3f}"
+            )
+            parts.append(
+                f"{source}_select_pressed="
+                f"{int(bool(controller_world.get('select_pressed', False)))}"
+            )
+            parts.append(
+                f"{source}_select_hold="
+                f"{int(bool(controller_world.get('select_hold_active', False)))}"
+            )
+            parts.append(
+                f"{source}_select_start_edge="
+                f"{int(bool(controller_world.get('select_start_edge', False)))}"
+            )
+        return " ".join(parts)
+
+    def _release_idle_lock_state(self, idle_lock_state, *, reason, details=None):
         if not bool(idle_lock_state.get("active", False)):
             return False
         idle_lock_state["active"] = False
@@ -7432,9 +7933,11 @@ class InvPhyTrainerWarp:
         idle_lock_state["last_object_points"] = None
         idle_lock_state["last_object_points_prev"] = None
         idle_lock_state["support_fraction"] = 0.0
+        detail_suffix = "" if details is None else f" {details}"
         print(
             "[quest_display] idle_lock=released "
-            f"reason={reason}",
+            f"reason={reason}"
+            f"{detail_suffix}",
             flush=True,
         )
         return True
@@ -7449,14 +7952,28 @@ class InvPhyTrainerWarp:
         idle_lock_case_profile,
         support_surface_boxes,
         scene_up,
+        *,
+        suppress_interaction_release=False,
+        controller_world_by_source=None,
     ):
         if (
             controller_interaction_state.get("left") is not None
             or controller_interaction_state.get("right") is not None
         ):
+            if suppress_interaction_release:
+                idle_lock_state["last_object_points"] = object_points.detach().clone()
+                if bool(idle_lock_state.get("active", False)):
+                    idle_lock_state["last_object_points_prev"] = (
+                        object_points.detach().clone()
+                    )
+                return
             self._release_idle_lock_state(
                 idle_lock_state,
                 reason="interaction_started",
+                details=self._format_idle_lock_interaction_details(
+                    controller_interaction_state,
+                    controller_world_by_source=controller_world_by_source,
+                ),
             )
             return
 
@@ -7465,11 +7982,12 @@ class InvPhyTrainerWarp:
             idle_lock_state["last_object_points_prev"] = object_points.detach().clone()
             return
 
-        support_fraction = self._scene_support_fraction(
+        support_level_metrics = self._scene_support_level_metrics(
             object_points,
             support_surface_boxes,
             scene_up,
         )
+        support_fraction = float(support_level_metrics["support_fraction"])
         previous_object_points = idle_lock_state.get("last_object_points_prev")
         if previous_object_points is None or previous_object_points.shape != object_points.shape:
             mean_frame_delta = float("inf")
@@ -7481,13 +7999,20 @@ class InvPhyTrainerWarp:
                 ).mean().item()
             )
         max_speed = float(torch.linalg.norm(object_velocities, dim=1).max().item())
+        split_support_ok = self._split_support_idle_lock_ok(
+            idle_lock_case_profile,
+            support_fraction,
+            support_level_metrics,
+        )
+        support_fraction_ok = support_fraction >= float(
+            idle_lock_case_profile["min_support_fraction"]
+        )
 
         stable = (
             max_speed <= float(idle_lock_case_profile["max_speed"])
             and mean_frame_delta
             <= float(idle_lock_case_profile["max_mean_frame_delta"])
-            and support_fraction
-            >= float(idle_lock_case_profile["min_support_fraction"])
+            and (support_fraction_ok or split_support_ok)
         )
         if stable:
             idle_lock_state["stable_frame_count"] = int(
@@ -7501,11 +8026,33 @@ class InvPhyTrainerWarp:
                     sim_state,
                     object_points,
                     action="engaged",
-                    reason="stably_idle",
+                    reason=(
+                        "stably_idle"
+                        if support_fraction_ok
+                        else "split_support_idle"
+                    ),
                     support_fraction=support_fraction,
                 )
         else:
             idle_lock_state["stable_frame_count"] = 0
+        diagnostic_frame_count = int(
+            idle_lock_state.get("diagnostic_frame_count", 0)
+        ) + 1
+        idle_lock_state["diagnostic_frame_count"] = diagnostic_frame_count
+        if diagnostic_frame_count % 60 == 0:
+            print(
+                "[quest_display] idle_lock=inactive_no_interaction "
+                f"support_fraction={float(support_fraction):.3f} "
+                f"support_by_level={self._format_support_by_level(support_level_metrics)} "
+                f"split_support_ok={int(bool(split_support_ok))} "
+                "split_qualifying_levels="
+                f"{int(support_level_metrics.get('qualifying_level_count', 0))} "
+                f"max_speed={float(max_speed):.5f} "
+                f"mean_frame_delta={float(mean_frame_delta):.5f} "
+                f"stable_frames={int(idle_lock_state.get('stable_frame_count', 0))} "
+                f"required={int(idle_lock_case_profile['stable_frames_required'])}",
+                flush=True,
+            )
         idle_lock_state["last_object_points_prev"] = object_points.detach().clone()
 
     def _build_anchor_def_from_seed(
@@ -10088,6 +10635,8 @@ class InvPhyTrainerWarp:
         controller_motion_state_cache=None,
         frame_index=0,
         runtime_label="shared",
+        allow_interaction_start=True,
+        interaction_release_callback=None,
     ):
         next_target = controller_runtime_base_target.clone()
         if not controller_reset_triggered:
@@ -10107,6 +10656,8 @@ class InvPhyTrainerWarp:
                 object_points,
                 frame_index=frame_index,
                 allow_implicit_fallback_start=allow_implicit_fallback_start,
+                allow_interaction_start=allow_interaction_start,
+                interaction_release_callback=interaction_release_callback,
                 post_select_translation_only=post_select_translation_only,
             )
             self._log_controller_interaction_transition(
@@ -17675,6 +18226,36 @@ class InvPhyTrainerWarp:
                         f"active_table_patches={table_alignment_debug.get('active_table_support_patch_count', 'n/a')} "
                         f"support_slabs={table_alignment_debug.get('support_slab_count', 'n/a')} "
                         f"blocker_boxes={table_alignment_debug.get('blocker_box_count', 'n/a')} "
+                        "sofa_handle_colliders="
+                        f"{table_alignment_debug.get('sofa_handle_collider_count', 'n/a')} "
+                        "sofa_handle_top_support_boxes="
+                        f"{table_alignment_debug.get('sofa_handle_top_support_box_count', 'n/a')} "
+                        "sofa_handle_bar_segment_boxes="
+                        f"{table_alignment_debug.get('sofa_handle_bar_segment_box_count', 'n/a')} "
+                        "sofa_handle_bend_wall_boxes="
+                        f"{table_alignment_debug.get('sofa_handle_bend_wall_box_count', 'n/a')} "
+                        "sofa_armrest_leg_colliders="
+                        f"{table_alignment_debug.get('sofa_armrest_leg_collider_count', 'n/a')} "
+                        "sofa_handle_component_ids="
+                        f"{table_alignment_debug.get('sofa_handle_component_ids', [])} "
+                        "sofa_armrest_leg_component_ids="
+                        f"{table_alignment_debug.get('sofa_armrest_leg_component_ids', [])} "
+                        "sofa_handle_support_top_levels="
+                        f"{table_alignment_debug.get('sofa_handle_support_top_levels', '[]')} "
+                        "sofa_handle_bar_bottom_levels="
+                        f"{table_alignment_debug.get('sofa_handle_bar_bottom_levels', '[]')} "
+                        "sofa_handle_aabb_top_error_m="
+                        f"{float(table_alignment_debug.get('sofa_handle_aabb_top_error_m', float('nan'))):.4f} "
+                        "sofa_handle_aabb_top_error_min_mean_max="
+                        f"{table_alignment_debug.get('sofa_handle_aabb_top_error_min_mean_max', 'nan,nan,nan')} "
+                        "sofa_handle_top_slab_thickness_m="
+                        f"{float(table_alignment_debug.get('sofa_handle_top_slab_thickness_m', float('nan'))):.4f} "
+                        "sofa_armrest_top_raise_m="
+                        f"{float(table_alignment_debug.get('sofa_armrest_top_raise_m', float('nan'))):.4f} "
+                        "sofa_armrest_top_raise_min_mean_max="
+                        f"{table_alignment_debug.get('sofa_armrest_top_raise_min_mean_max', 'nan,nan,nan')} "
+                        "sofa_handle_bar_thickness_min_mean_max="
+                        f"{table_alignment_debug.get('sofa_handle_bar_thickness_min_mean_max', 'nan,nan,nan')} "
                         f"collider_boxes={table_alignment_debug.get('collider_box_count', 'n/a')}",
                         flush=True,
                     )
@@ -27162,54 +27743,527 @@ class InvPhyTrainerWarp:
                         "runtime_static_collider_mode=scene_replace_active_table_with_smooth_top "
                         "requires one static_collider_box_metadata entry per static collider box."
                     )
-                remove_mask = np.array(
+                scene_up = np.asarray(
+                    getattr(
+                        layout,
+                        "scene_up",
+                        np.array([0.0, 0.0, -1.0], dtype=np.float32),
+                    ),
+                    dtype=np.float32,
+                ).reshape(-1)
+                if scene_up.shape[0] != 3 or not np.isfinite(scene_up).all():
+                    scene_up = np.array([0.0, 0.0, -1.0], dtype=np.float32)
+                vertical_axis = int(np.argmax(np.abs(scene_up)))
+                top_uses_min = bool(float(scene_up[vertical_axis]) < 0.0)
+                lateral_axes = [axis for axis in range(3) if axis != vertical_axis]
+                tabletop_bounds_np = np.asarray(
+                    getattr(layout, "smooth_tabletop_bounds", None),
+                    dtype=np.float32,
+                )
+                if (
+                    tabletop_bounds_np.shape != (2, 3)
+                    or not np.isfinite(tabletop_bounds_np).all()
+                ):
+                    raise RuntimeError(
+                        "runtime_static_collider_mode=scene_replace_active_table_with_smooth_top "
+                        "requires finite layout.smooth_tabletop_bounds with shape (2, 3)."
+                    )
+                tabletop_min = np.minimum(
+                    tabletop_bounds_np[0], tabletop_bounds_np[1]
+                )
+                tabletop_max = np.maximum(
+                    tabletop_bounds_np[0], tabletop_bounds_np[1]
+                )
+                table_top_reference = float(
+                    tabletop_min[vertical_axis]
+                    if top_uses_min
+                    else tabletop_max[vertical_axis]
+                )
+                smooth_table_thickness_m = float(
+                    getattr(cfg, "runtime_smooth_table_top_thickness_m", 0.035)
+                )
+                if (
+                    not np.isfinite(smooth_table_thickness_m)
+                    or smooth_table_thickness_m <= 0.0
+                ):
+                    smooth_table_thickness_m = 0.035
+                top_level_tolerance_m = max(0.06, 2.0 * smooth_table_thickness_m)
+                categories = [str(entry.get("category", "")) for entry in metadata]
+                is_active_table = np.array(
+                    [bool(entry.get("is_active_table", False)) for entry in metadata],
+                    dtype=bool,
+                )
+                box_mins = boxes_np[:, 0, :]
+                box_maxs = boxes_np[:, 1, :]
+                box_top_faces = (
+                    box_mins[:, vertical_axis]
+                    if top_uses_min
+                    else box_maxs[:, vertical_axis]
+                )
+                box_extents = np.maximum(box_maxs - box_mins, 0.0)
+                support_category_mask = np.array(
+                    [category == "support_slab" for category in categories],
+                    dtype=bool,
+                )
+                blocker_category_mask = np.array(
+                    [category == "blocker_box" for category in categories],
+                    dtype=bool,
+                )
+                sofa_handle_top_category_mask = np.array(
+                    [category == "sofa_handle_top_slab" for category in categories],
+                    dtype=bool,
+                )
+                sofa_handle_bar_category_mask = np.array(
                     [
-                        bool(entry.get("is_active_table", False))
-                        and str(entry.get("category", ""))
-                        in {"support_slab", "blocker_box"}
-                        for entry in metadata
+                        category == "sofa_handle_bar_segment_box"
+                        for category in categories
                     ],
                     dtype=bool,
                 )
-                removed_active_support_slabs = int(
-                    sum(
-                        bool(entry.get("is_active_table", False))
-                        and str(entry.get("category", "")) == "support_slab"
-                        for entry in metadata
+                sofa_handle_bend_wall_category_mask = np.array(
+                    [category == "sofa_handle_bend_wall" for category in categories],
+                    dtype=bool,
+                )
+                sofa_armrest_leg_category_mask = np.array(
+                    [category == "sofa_armrest_leg_box" for category in categories],
+                    dtype=bool,
+                )
+                sofa_handle_category_mask = (
+                    sofa_handle_top_category_mask
+                    | sofa_handle_bar_category_mask
+                    | sofa_handle_bend_wall_category_mask
+                    | sofa_armrest_leg_category_mask
+                )
+                active_table_support_mask = (
+                    is_active_table & support_category_mask
+                )
+                active_table_top_reference = table_top_reference
+                top_level_height_mask = (
+                    np.abs(box_top_faces - active_table_top_reference)
+                    <= top_level_tolerance_m
+                )
+                top_level_active_support_mask = (
+                    active_table_support_mask & top_level_height_mask
+                )
+                if (
+                    not bool(np.any(top_level_active_support_mask))
+                    and bool(np.any(active_table_support_mask))
+                ):
+                    active_support_top_faces = box_top_faces[active_table_support_mask]
+                    active_table_top_reference = float(
+                        np.min(active_support_top_faces)
+                        if top_uses_min
+                        else np.max(active_support_top_faces)
                     )
+                    top_level_height_mask = (
+                        np.abs(box_top_faces - active_table_top_reference)
+                        <= top_level_tolerance_m
+                    )
+                    top_level_active_support_mask = (
+                        active_table_support_mask & top_level_height_mask
+                    )
+                lower_active_support_mask = (
+                    active_table_support_mask & ~top_level_active_support_mask
+                )
+                top_level_active_blocker_mask = (
+                    is_active_table & blocker_category_mask & top_level_height_mask
+                )
+                lower_active_blocker_mask = (
+                    is_active_table & blocker_category_mask & ~top_level_height_mask
+                )
+                preserve_table_vertical_colliders = bool(
+                    getattr(cfg, "runtime_preserve_table_vertical_colliders", True)
+                )
+                table_vertical_max_thickness_m = float(
+                    getattr(cfg, "runtime_table_vertical_max_thickness_m", 0.08)
+                )
+                if (
+                    not np.isfinite(table_vertical_max_thickness_m)
+                    or table_vertical_max_thickness_m <= 0.0
+                ):
+                    table_vertical_max_thickness_m = 0.08
+                table_vertical_min_height_m = float(
+                    getattr(cfg, "runtime_table_vertical_min_height_m", 0.10)
+                )
+                if (
+                    not np.isfinite(table_vertical_min_height_m)
+                    or table_vertical_min_height_m < 0.0
+                ):
+                    table_vertical_min_height_m = 0.10
+                table_vertical_min_length_m = float(
+                    getattr(cfg, "runtime_table_vertical_min_length_m", 0.15)
+                )
+                if (
+                    not np.isfinite(table_vertical_min_length_m)
+                    or table_vertical_min_length_m < 0.0
+                ):
+                    table_vertical_min_length_m = 0.15
+                lateral_extents = box_extents[:, lateral_axes]
+                table_vertical_panel_mask = (
+                    is_active_table
+                    & blocker_category_mask
+                    & (box_extents[:, vertical_axis] >= table_vertical_min_height_m)
+                    & (np.min(lateral_extents, axis=1) <= table_vertical_max_thickness_m)
+                    & (np.max(lateral_extents, axis=1) >= table_vertical_min_length_m)
+                )
+                if not preserve_table_vertical_colliders:
+                    table_vertical_panel_mask[:] = False
+                top_level_active_vertical_blocker_mask = (
+                    top_level_active_blocker_mask & table_vertical_panel_mask
+                )
+                top_level_active_broad_blocker_mask = (
+                    top_level_active_blocker_mask
+                    & ~top_level_active_vertical_blocker_mask
+                )
+                remove_mask = (
+                    top_level_active_support_mask
+                    | top_level_active_broad_blocker_mask
+                )
+                kept_box_mask = ~remove_mask
+                removed_active_support_slabs = int(
+                    np.count_nonzero(top_level_active_support_mask)
                 )
                 removed_active_blocker_boxes = int(
-                    sum(
-                        bool(entry.get("is_active_table", False))
-                        and str(entry.get("category", "")) == "blocker_box"
-                        for entry in metadata
-                    )
+                    np.count_nonzero(top_level_active_broad_blocker_mask)
+                )
+                preserved_top_active_vertical_blocker_boxes = int(
+                    np.count_nonzero(top_level_active_vertical_blocker_mask)
+                )
+                preserved_lower_active_support_slabs = int(
+                    np.count_nonzero(lower_active_support_mask)
+                )
+                preserved_lower_active_blocker_boxes = int(
+                    np.count_nonzero(lower_active_blocker_mask)
                 )
                 kept_non_table_boxes = int(
-                    sum(
-                        not bool(entry.get("is_active_table", False))
-                        for entry in metadata
-                    )
+                    np.count_nonzero(~is_active_table)
                 )
+                preserved_table_vertical_mask = (
+                    table_vertical_panel_mask & kept_box_mask
+                )
+                kept_sofa_handle_mask = sofa_handle_category_mask & kept_box_mask
+                kept_sofa_handle_top_mask = (
+                    sofa_handle_top_category_mask & kept_box_mask
+                )
+                kept_sofa_handle_bar_mask = (
+                    sofa_handle_bar_category_mask & kept_box_mask
+                )
+                kept_sofa_handle_bend_wall_mask = (
+                    sofa_handle_bend_wall_category_mask & kept_box_mask
+                )
+                kept_sofa_armrest_leg_mask = (
+                    sofa_armrest_leg_category_mask & kept_box_mask
+                )
+                sofa_handle_component_ids = sorted(
+                    {
+                        int(metadata[int(box_idx)].get("component_id"))
+                        for box_idx in np.nonzero(
+                            kept_sofa_handle_top_mask | kept_sofa_handle_bar_mask
+                        )[0]
+                        if metadata[int(box_idx)].get("component_id") is not None
+                    }
+                )
+                sofa_armrest_leg_component_ids = sorted(
+                    {
+                        int(metadata[int(box_idx)].get("component_id"))
+                        for box_idx in np.nonzero(kept_sofa_armrest_leg_mask)[0]
+                        if metadata[int(box_idx)].get("component_id") is not None
+                    }
+                )
+                sofa_handle_aabb_top_errors = [
+                    float(metadata[int(box_idx)].get("aabb_top_error_m"))
+                    for box_idx in np.nonzero(
+                        kept_sofa_handle_top_mask | kept_sofa_handle_bar_mask
+                    )[0]
+                    if metadata[int(box_idx)].get("aabb_top_error_m") is not None
+                    and np.isfinite(
+                        float(metadata[int(box_idx)].get("aabb_top_error_m"))
+                    )
+                ]
+                sofa_handle_top_slab_thicknesses = [
+                    float(metadata[int(box_idx)].get("top_slab_thickness_m"))
+                    for box_idx in np.nonzero(kept_sofa_handle_top_mask)[0]
+                    if metadata[int(box_idx)].get("top_slab_thickness_m") is not None
+                    and np.isfinite(
+                        float(metadata[int(box_idx)].get("top_slab_thickness_m"))
+                    )
+                ]
+                sofa_armrest_top_raises = [
+                    float(metadata[int(box_idx)].get("top_raise_m"))
+                    for box_idx in np.nonzero(
+                        kept_sofa_handle_top_mask | kept_sofa_handle_bar_mask
+                    )[0]
+                    if metadata[int(box_idx)].get("top_raise_m") is not None
+                    and np.isfinite(
+                        float(metadata[int(box_idx)].get("top_raise_m"))
+                    )
+                ]
+                sofa_handle_bar_thicknesses = [
+                    float(metadata[int(box_idx)].get("bar_thickness_m"))
+                    for box_idx in np.nonzero(kept_sofa_handle_bar_mask)[0]
+                    if metadata[int(box_idx)].get("bar_thickness_m") is not None
+                    and np.isfinite(
+                        float(metadata[int(box_idx)].get("bar_thickness_m"))
+                    )
+                ]
+                table_centers = 0.5 * (box_mins + box_maxs)
+                tabletop_center = 0.5 * (tabletop_min + tabletop_max)
+                divider_center_tolerance_m = max(
+                    0.12,
+                    2.0 * float(table_vertical_max_thickness_m),
+                )
+                preserved_table_divider_colliders = 0
+                preserved_table_side_colliders = 0
+                for box_idx in np.nonzero(preserved_table_vertical_mask)[0]:
+                    thin_lateral_axis = lateral_axes[
+                        int(np.argmin(lateral_extents[int(box_idx)]))
+                    ]
+                    is_divider = (
+                        abs(
+                            float(table_centers[int(box_idx), thin_lateral_axis])
+                            - float(tabletop_center[thin_lateral_axis])
+                        )
+                        <= divider_center_tolerance_m
+                    )
+                    if is_divider:
+                        preserved_table_divider_colliders += 1
+                    else:
+                        preserved_table_side_colliders += 1
                 smooth_table_top = self._build_runtime_smooth_table_top_aabb(layout)
-                kept_boxes_np = boxes_np[~remove_mask]
+                kept_boxes_np = boxes_np[kept_box_mask]
+                sofa_handle_physics_lateral_inflate_m = float(
+                    getattr(cfg, "runtime_sofa_handle_physics_inflate_m", 0.02)
+                )
+                if (
+                    not np.isfinite(sofa_handle_physics_lateral_inflate_m)
+                    or sofa_handle_physics_lateral_inflate_m < 0.0
+                ):
+                    object_radius_m = float(getattr(cfg, "object_radius", 0.02))
+                    sofa_handle_physics_lateral_inflate_m = (
+                        object_radius_m
+                        if np.isfinite(object_radius_m) and object_radius_m >= 0.0
+                        else 0.02
+                    )
+                sofa_handle_physics_top_extra_m = float(
+                    getattr(cfg, "runtime_sofa_handle_physics_top_extra_m", 0.0)
+                )
+                if (
+                    not np.isfinite(sofa_handle_physics_top_extra_m)
+                    or sofa_handle_physics_top_extra_m < 0.0
+                ):
+                    sofa_handle_physics_top_extra_m = 0.0
+                sofa_handle_physics_bottom_extra_m = float(
+                    getattr(cfg, "runtime_sofa_handle_physics_bottom_extra_m", 0.004)
+                )
+                if (
+                    not np.isfinite(sofa_handle_physics_bottom_extra_m)
+                    or sofa_handle_physics_bottom_extra_m < 0.0
+                ):
+                    sofa_handle_physics_bottom_extra_m = 0.004
+                kept_boxes_physics_np = np.array(kept_boxes_np, copy=True)
+                kept_sofa_handle_bar_mask_in_kept = kept_sofa_handle_bar_mask[
+                    kept_box_mask
+                ]
+                sofa_handle_bar_physics_boxes = int(
+                    np.count_nonzero(kept_sofa_handle_bar_mask_in_kept)
+                )
+                if sofa_handle_bar_physics_boxes > 0 and (
+                    sofa_handle_physics_lateral_inflate_m > 0.0
+                    or sofa_handle_physics_top_extra_m > 0.0
+                    or sofa_handle_physics_bottom_extra_m > 0.0
+                ):
+                    sofa_handle_bar_physics_indices = np.nonzero(
+                        kept_sofa_handle_bar_mask_in_kept
+                    )[0]
+                    for axis in lateral_axes:
+                        kept_boxes_physics_np[
+                            sofa_handle_bar_physics_indices, 0, axis
+                        ] -= sofa_handle_physics_lateral_inflate_m
+                        kept_boxes_physics_np[
+                            sofa_handle_bar_physics_indices, 1, axis
+                        ] += sofa_handle_physics_lateral_inflate_m
+                    if top_uses_min:
+                        kept_boxes_physics_np[
+                            sofa_handle_bar_physics_indices, 0, vertical_axis
+                        ] -= sofa_handle_physics_top_extra_m
+                        kept_boxes_physics_np[
+                            sofa_handle_bar_physics_indices, 1, vertical_axis
+                        ] += sofa_handle_physics_bottom_extra_m
+                    else:
+                        kept_boxes_physics_np[
+                            sofa_handle_bar_physics_indices, 1, vertical_axis
+                        ] += sofa_handle_physics_top_extra_m
+                        kept_boxes_physics_np[
+                            sofa_handle_bar_physics_indices, 0, vertical_axis
+                        ] -= sofa_handle_physics_bottom_extra_m
+                support_keep_mask = np.array(
+                    [
+                        category
+                        in {
+                            "floor_slab",
+                            "support_slab",
+                            "sofa_handle_top_slab",
+                            "sofa_handle_bar_segment_box",
+                        }
+                        for category in categories
+                    ],
+                    dtype=bool,
+                ) & ~top_level_active_support_mask
+                lower_table_support_boxes_np = boxes_np[
+                    support_keep_mask & lower_active_support_mask
+                ]
+                sofa_handle_support_boxes_np = boxes_np[
+                    support_keep_mask
+                    & (kept_sofa_handle_top_mask | kept_sofa_handle_bar_mask)
+                ]
+                sofa_handle_bar_boxes_np = boxes_np[kept_sofa_handle_bar_mask]
+                runtime_support_boxes_np = np.concatenate(
+                    [boxes_np[support_keep_mask], smooth_table_top.reshape(1, 2, 3)],
+                    axis=0,
+                ).astype(np.float32)
+                layout.support_surface_boxes = runtime_support_boxes_np
                 kept_active_other_boxes = (
                     int(kept_boxes_np.shape[0]) - kept_non_table_boxes
                 )
                 boxes_np = np.concatenate(
-                    [kept_boxes_np, smooth_table_top.reshape(1, 2, 3)],
+                    [kept_boxes_physics_np, smooth_table_top.reshape(1, 2, 3)],
                     axis=0,
                 ).astype(np.float32)
+
+                def _format_top_face_levels(boxes_subset):
+                    boxes_subset = np.asarray(boxes_subset, dtype=np.float32)
+                    if boxes_subset.size == 0:
+                        return "[]"
+                    subset_mins = boxes_subset[:, 0, :]
+                    subset_maxs = boxes_subset[:, 1, :]
+                    subset_top_faces = (
+                        subset_mins[:, vertical_axis]
+                        if top_uses_min
+                        else subset_maxs[:, vertical_axis]
+                    )
+                    finite_top_faces = subset_top_faces[np.isfinite(subset_top_faces)]
+                    if finite_top_faces.size == 0:
+                        return "[]"
+                    rounded_tops = np.round(finite_top_faces.astype(np.float64), 4)
+                    unique_tops, counts = np.unique(rounded_tops, return_counts=True)
+                    return (
+                        "["
+                        + ",".join(
+                            f"{float(level):.4f}x{int(count)}"
+                            for level, count in zip(unique_tops, counts)
+                        )
+                        + "]"
+                    )
+
+                def _format_bottom_face_levels(boxes_subset):
+                    boxes_subset = np.asarray(boxes_subset, dtype=np.float32)
+                    if boxes_subset.size == 0:
+                        return "[]"
+                    subset_mins = boxes_subset[:, 0, :]
+                    subset_maxs = boxes_subset[:, 1, :]
+                    subset_bottom_faces = (
+                        subset_maxs[:, vertical_axis]
+                        if top_uses_min
+                        else subset_mins[:, vertical_axis]
+                    )
+                    finite_bottom_faces = subset_bottom_faces[
+                        np.isfinite(subset_bottom_faces)
+                    ]
+                    if finite_bottom_faces.size == 0:
+                        return "[]"
+                    rounded_bottoms = np.round(
+                        finite_bottom_faces.astype(np.float64), 4
+                    )
+                    unique_bottoms, counts = np.unique(
+                        rounded_bottoms, return_counts=True
+                    )
+                    return (
+                        "["
+                        + ",".join(
+                            f"{float(level):.4f}x{int(count)}"
+                            for level, count in zip(unique_bottoms, counts)
+                        )
+                        + "]"
+                    )
+
+                def _format_min_mean_max(values):
+                    finite_values = np.asarray(
+                        [float(value) for value in values if np.isfinite(float(value))],
+                        dtype=np.float32,
+                    )
+                    if finite_values.size == 0:
+                        return "nan,nan,nan"
+                    return (
+                        f"{float(np.min(finite_values)):.4f},"
+                        f"{float(np.mean(finite_values)):.4f},"
+                        f"{float(np.max(finite_values)):.4f}"
+                    )
+
                 print(
                     "[quest_display] runtime static colliders: "
                     f"mode={runtime_static_collider_mode} "
                     f"original_boxes={original_box_count} "
-                    f"removed_active_table_support_slabs={removed_active_support_slabs} "
-                    f"removed_active_table_blocker_boxes={removed_active_blocker_boxes} "
+                    f"removed_top_active_table_support_slabs={removed_active_support_slabs} "
+                    f"removed_top_active_table_blocker_boxes={removed_active_blocker_boxes} "
+                    "preserved_top_active_table_vertical_blocker_boxes="
+                    f"{preserved_top_active_vertical_blocker_boxes} "
+                    f"preserved_lower_active_table_support_slabs={preserved_lower_active_support_slabs} "
+                    f"preserved_lower_active_table_blocker_boxes={preserved_lower_active_blocker_boxes} "
+                    "preserved_table_vertical_colliders="
+                    f"{int(np.count_nonzero(preserved_table_vertical_mask))} "
+                    "preserved_table_side_colliders="
+                    f"{int(preserved_table_side_colliders)} "
+                    "preserved_table_divider_colliders="
+                    f"{int(preserved_table_divider_colliders)} "
+                    "sofa_handle_colliders="
+                    f"{int(np.count_nonzero(kept_sofa_handle_mask))} "
+                    "sofa_handle_top_support_boxes="
+                    f"{int(np.count_nonzero(kept_sofa_handle_top_mask))} "
+                    "sofa_handle_bar_segment_boxes="
+                    f"{int(np.count_nonzero(kept_sofa_handle_bar_mask))} "
+                    "sofa_handle_bar_physics_boxes="
+                    f"{sofa_handle_bar_physics_boxes} "
+                    "sofa_handle_bar_physics_lateral_inflate_m="
+                    f"{sofa_handle_physics_lateral_inflate_m:.4f} "
+                    "sofa_handle_bar_physics_top_extra_m="
+                    f"{sofa_handle_physics_top_extra_m:.4f} "
+                    "sofa_handle_bar_physics_bottom_extra_m="
+                    f"{sofa_handle_physics_bottom_extra_m:.4f} "
+                    "sofa_handle_bend_wall_boxes="
+                    f"{int(np.count_nonzero(kept_sofa_handle_bend_wall_mask))} "
+                    "sofa_armrest_leg_colliders="
+                    f"{int(np.count_nonzero(kept_sofa_armrest_leg_mask))} "
+                    "sofa_handle_component_ids="
+                    f"{sofa_handle_component_ids} "
+                    "sofa_armrest_leg_component_ids="
+                    f"{sofa_armrest_leg_component_ids} "
+                    "sofa_handle_support_top_levels="
+                    f"{_format_top_face_levels(sofa_handle_support_boxes_np)} "
+                    "sofa_handle_bar_bottom_levels="
+                    f"{_format_bottom_face_levels(sofa_handle_bar_boxes_np)} "
+                    "sofa_handle_aabb_top_error_m="
+                    f"{float(max(sofa_handle_aabb_top_errors)) if sofa_handle_aabb_top_errors else float('nan'):.4f} "
+                    "sofa_handle_aabb_top_error_min_mean_max="
+                    f"{_format_min_mean_max(sofa_handle_aabb_top_errors)} "
+                    "sofa_handle_top_slab_thickness_m="
+                    f"{float(max(sofa_handle_top_slab_thicknesses)) if sofa_handle_top_slab_thicknesses else float('nan'):.4f} "
+                    "sofa_armrest_top_raise_m="
+                    f"{float(max(sofa_armrest_top_raises)) if sofa_armrest_top_raises else float('nan'):.4f} "
+                    "sofa_armrest_top_raise_min_mean_max="
+                    f"{_format_min_mean_max(sofa_armrest_top_raises)} "
+                    "sofa_handle_bar_thickness_min_mean_max="
+                    f"{_format_min_mean_max(sofa_handle_bar_thicknesses)} "
+                    "lower_table_support_boxes="
+                    f"{int(lower_table_support_boxes_np.shape[0])} "
+                    "lower_table_support_top_levels="
+                    f"{_format_top_face_levels(lower_table_support_boxes_np)} "
                     f"kept_non_table_boxes={kept_non_table_boxes} "
                     f"kept_active_table_other_boxes={kept_active_other_boxes} "
                     f"kept_boxes={int(kept_boxes_np.shape[0])} "
                     f"output_boxes={int(boxes_np.shape[0])} "
+                    f"runtime_support_boxes={int(runtime_support_boxes_np.shape[0])} "
+                    f"top_level_reference={float(active_table_top_reference):.4f} "
+                    f"top_level_tolerance={float(top_level_tolerance_m):.4f} "
                     "smooth_tabletop_patch_count="
                     f"{getattr(layout, 'smooth_tabletop_patch_count', 'n/a')} "
                     f"smooth_table_top_aabb={smooth_table_top.tolist()}",
@@ -27960,6 +29014,8 @@ class InvPhyTrainerWarp:
         object_points,
         frame_index=0,
         allow_implicit_fallback_start=True,
+        allow_interaction_start=True,
+        interaction_release_callback=None,
         post_select_translation_only=False,
     ):
         anchors = {"left": None, "right": None}
@@ -27993,15 +29049,33 @@ class InvPhyTrainerWarp:
                 and (not select_hold_active)
                 and select_release_frames >= self.LIVE_CONTROLLER_SELECT_RELEASE_FRAMES
             ):
-                self._clear_live_controller_interaction(
+                released_interaction_state = self._clear_live_controller_interaction(
                     source,
                     controller_interaction_state,
                     controller_attachment_metadata,
                     reason="released",
                 )
+                if interaction_release_callback is not None:
+                    interaction_release_callback(
+                        source=source,
+                        frame_index=frame_index,
+                        interaction_state=released_interaction_state,
+                        select_release_frames=select_release_frames,
+                    )
                 self._clear_live_controller_active_overlay_hold(source)
                 interaction_state = None
             if interaction_state is None and select_start_edge:
+                if not bool(allow_interaction_start):
+                    print(
+                        "[live_openxr_controller] "
+                        f"{source} interaction_start_suppressed "
+                        "reason=startup_input_gate "
+                        f"select_value={float(controller_world.get('select_value', 0.0)):.3f} "
+                        f"select_pressed={int(bool(controller_world.get('select_pressed', False)))} "
+                        f"release_frames={int(select_release_frames)}",
+                        flush=True,
+                    )
+                    continue
                 overlay = controller_overlay_by_source.get(source)
                 preview_state = controller_anchor_preview_state[source]
                 cycle_locked = bool(preview_state.get("cycle_locked", False))
@@ -34027,6 +35101,36 @@ class InvPhyTrainerWarp:
                     f"active_table_patches={table_alignment_debug.get('active_table_support_patch_count', 'n/a')} "
                     f"support_slabs={table_alignment_debug.get('support_slab_count', 'n/a')} "
                     f"blocker_boxes={table_alignment_debug.get('blocker_box_count', 'n/a')} "
+                    "sofa_handle_colliders="
+                    f"{table_alignment_debug.get('sofa_handle_collider_count', 'n/a')} "
+                    "sofa_handle_top_support_boxes="
+                    f"{table_alignment_debug.get('sofa_handle_top_support_box_count', 'n/a')} "
+                    "sofa_handle_bar_segment_boxes="
+                    f"{table_alignment_debug.get('sofa_handle_bar_segment_box_count', 'n/a')} "
+                    "sofa_handle_bend_wall_boxes="
+                    f"{table_alignment_debug.get('sofa_handle_bend_wall_box_count', 'n/a')} "
+                    "sofa_armrest_leg_colliders="
+                    f"{table_alignment_debug.get('sofa_armrest_leg_collider_count', 'n/a')} "
+                    "sofa_handle_component_ids="
+                    f"{table_alignment_debug.get('sofa_handle_component_ids', [])} "
+                    "sofa_armrest_leg_component_ids="
+                    f"{table_alignment_debug.get('sofa_armrest_leg_component_ids', [])} "
+                    "sofa_handle_support_top_levels="
+                    f"{table_alignment_debug.get('sofa_handle_support_top_levels', '[]')} "
+                    "sofa_handle_bar_bottom_levels="
+                    f"{table_alignment_debug.get('sofa_handle_bar_bottom_levels', '[]')} "
+                    "sofa_handle_aabb_top_error_m="
+                    f"{float(table_alignment_debug.get('sofa_handle_aabb_top_error_m', float('nan'))):.4f} "
+                    "sofa_handle_aabb_top_error_min_mean_max="
+                    f"{table_alignment_debug.get('sofa_handle_aabb_top_error_min_mean_max', 'nan,nan,nan')} "
+                    "sofa_handle_top_slab_thickness_m="
+                    f"{float(table_alignment_debug.get('sofa_handle_top_slab_thickness_m', float('nan'))):.4f} "
+                    "sofa_armrest_top_raise_m="
+                    f"{float(table_alignment_debug.get('sofa_armrest_top_raise_m', float('nan'))):.4f} "
+                    "sofa_armrest_top_raise_min_mean_max="
+                    f"{table_alignment_debug.get('sofa_armrest_top_raise_min_mean_max', 'nan,nan,nan')} "
+                    "sofa_handle_bar_thickness_min_mean_max="
+                    f"{table_alignment_debug.get('sofa_handle_bar_thickness_min_mean_max', 'nan,nan,nan')} "
                     f"collider_boxes={table_alignment_debug.get('collider_box_count', 'n/a')}",
                     flush=True,
                 )
@@ -35202,6 +36306,7 @@ class InvPhyTrainerWarp:
             prev_target = startup_bootstrap_output["prev_target"]
             scene_rest_state = startup_bootstrap_output["scene_rest_state"]
             x = startup_bootstrap_output["x"]
+            current_v = scene_rest_state["v"].detach().clone()
             controller_anchor_templates = startup_bootstrap_output[
                 "controller_anchor_templates"
             ]
@@ -35302,6 +36407,635 @@ class InvPhyTrainerWarp:
                 layout,
                 scene_rest_state,
             )
+            startup_input_gate_state = {
+                "active": True,
+                "opened_logged": False,
+            }
+            post_release_landing_lock_state = {
+                "active": False,
+                "source": None,
+                "sources": [],
+                "release_frame_index": -1,
+                "expires_frame_index": -1,
+                "anchor_name": None,
+                "contact_object_indices": None,
+                "latest_support_fraction": 0.0,
+                "latest_released_contact_fraction": 0.0,
+                "latest_released_contact_max_height": float("inf"),
+                "last_block_log_frame": -1000000,
+            }
+            visual_contact_sink_m = float(
+                getattr(cfg, "runtime_visual_contact_sink_m", 0.0)
+            )
+            visual_contact_sink_band_m = float(
+                getattr(cfg, "runtime_visual_contact_sink_band_m", 0.0)
+            )
+            visual_floor_contact_sink_m = float(
+                getattr(cfg, "runtime_visual_floor_contact_sink_m", 0.0)
+            )
+            visual_contact_clearance_m = float(
+                getattr(cfg, "runtime_visual_contact_clearance_m", 0.0)
+            )
+            if (
+                not np.isfinite(visual_contact_sink_m)
+                or visual_contact_sink_m < 0.0
+            ):
+                visual_contact_sink_m = 0.0
+            if (
+                not np.isfinite(visual_contact_sink_band_m)
+                or visual_contact_sink_band_m < 0.0
+            ):
+                visual_contact_sink_band_m = 0.0
+            if (
+                not np.isfinite(visual_floor_contact_sink_m)
+                or visual_floor_contact_sink_m < 0.0
+            ):
+                visual_floor_contact_sink_m = 0.0
+            if (
+                not np.isfinite(visual_contact_clearance_m)
+                or visual_contact_clearance_m < 0.0
+            ):
+                visual_contact_clearance_m = 0.0
+            visual_contact_sink_enabled = bool(
+                (visual_contact_sink_m > 0.0 or visual_floor_contact_sink_m > 0.0)
+                and visual_contact_sink_band_m > 0.0
+                and support_surface_boxes_t is not None
+                and int(support_surface_boxes_t.numel()) > 0
+            )
+            visual_contact_sink_diagnostic_state = {"last_log_frame": -1000000}
+
+            def _format_visual_contact_support_top_diagnostics():
+                if (
+                    support_surface_boxes_t is None
+                    or int(support_surface_boxes_t.numel()) == 0
+                ):
+                    return "support_top_levels=[]"
+                scene_up_np = np.asarray(layout.scene_up, dtype=np.float32).reshape(-1)
+                if scene_up_np.shape[0] != 3 or not np.isfinite(scene_up_np).all():
+                    scene_up_np = np.array([0.0, 0.0, -1.0], dtype=np.float32)
+                vertical_axis = int(np.argmax(np.abs(scene_up_np)))
+                scene_up_sign = (
+                    1.0 if float(scene_up_np[vertical_axis]) >= 0.0 else -1.0
+                )
+                top_uses_min = scene_up_sign < 0.0
+                boxes_np = support_surface_boxes_t.detach().cpu().numpy()
+                box_mins = np.minimum(boxes_np[:, 0, :], boxes_np[:, 1, :])
+                box_maxs = np.maximum(boxes_np[:, 0, :], boxes_np[:, 1, :])
+                top_faces = (
+                    box_mins[:, vertical_axis]
+                    if top_uses_min
+                    else box_maxs[:, vertical_axis]
+                )
+                finite_tops = top_faces[np.isfinite(top_faces)]
+                if finite_tops.size == 0:
+                    return "support_top_levels=[]"
+                rounded_tops = np.round(finite_tops.astype(np.float64), 4)
+                unique_tops, counts = np.unique(rounded_tops, return_counts=True)
+                level_parts = [
+                    f"{float(level):.4f}x{int(count)}"
+                    for level, count in zip(unique_tops, counts)
+                ]
+                floor_top = float("nan")
+                if np.isfinite(float(layout.floor_z)):
+                    floor_idx = int(np.argmin(np.abs(finite_tops - float(layout.floor_z))))
+                    floor_top = float(finite_tops[floor_idx])
+
+                smooth_top = float("nan")
+                lower_table_top = float("nan")
+                tabletop_bounds = getattr(layout, "smooth_tabletop_bounds", None)
+                if tabletop_bounds is not None:
+                    tabletop_bounds_np = np.asarray(tabletop_bounds, dtype=np.float32)
+                    if (
+                        tabletop_bounds_np.shape == (2, 3)
+                        and np.isfinite(tabletop_bounds_np).all()
+                    ):
+                        table_mins = np.minimum(
+                            tabletop_bounds_np[0],
+                            tabletop_bounds_np[1],
+                        )
+                        table_maxs = np.maximum(
+                            tabletop_bounds_np[0],
+                            tabletop_bounds_np[1],
+                        )
+                        smooth_top = float(
+                            table_mins[vertical_axis]
+                            if top_uses_min
+                            else table_maxs[vertical_axis]
+                        )
+                        table_overlap = np.ones((int(boxes_np.shape[0]),), dtype=bool)
+                        for axis in range(3):
+                            if axis == vertical_axis:
+                                continue
+                            table_overlap &= box_maxs[:, axis] >= table_mins[axis]
+                            table_overlap &= box_mins[:, axis] <= table_maxs[axis]
+                        lower_mask = table_overlap & (np.abs(top_faces - smooth_top) > 1e-4)
+                        if np.isfinite(float(layout.floor_z)):
+                            lower_mask &= np.abs(top_faces - float(layout.floor_z)) > 1e-4
+                        lower_candidates = top_faces[lower_mask & np.isfinite(top_faces)]
+                        if lower_candidates.size > 0:
+                            level_delta = (lower_candidates - smooth_top) * scene_up_sign
+                            below_top_mask = level_delta < -1e-4
+                            below_top_candidates = lower_candidates[below_top_mask]
+                            if below_top_candidates.size > 0:
+                                lower_table_top = float(
+                                    below_top_candidates[
+                                        int(
+                                            np.argmin(
+                                                np.abs(
+                                                    below_top_candidates - smooth_top
+                                                )
+                                            )
+                                        )
+                                    ]
+                                )
+                return (
+                    "support_top_levels=["
+                    + ",".join(level_parts)
+                    + "] "
+                    f"floor_support_top={floor_top:.4f} "
+                    f"smooth_table_top={smooth_top:.4f} "
+                    f"lower_table_support_top={lower_table_top:.4f}"
+                )
+
+            print(
+                "[quest_display] visual_contact_sink "
+                f"enabled={int(visual_contact_sink_enabled)} "
+                f"sink_m={float(visual_contact_sink_m):.4f} "
+                f"floor_sink_m={float(visual_floor_contact_sink_m):.4f} "
+                f"band_m={float(visual_contact_sink_band_m):.4f} "
+                f"clearance_m={float(visual_contact_clearance_m):.4f} "
+                f"floor_z={float(layout.floor_z):.4f} "
+                f"object_radius={float(getattr(cfg, 'object_radius', 0.0)):.4f} "
+                f"surface_boxes={int(support_surface_boxes_t.shape[0])} "
+                f"{_format_visual_contact_support_top_diagnostics()}",
+                flush=True,
+            )
+
+            def _startup_input_gate_source_released(source):
+                state = controller_select_hold_state.get(source, {})
+                if not state:
+                    return False
+                if not bool(state.get("available", False)):
+                    return True
+                if bool(state.get("hold_active", False)):
+                    return False
+                return (
+                    int(state.get("release_frames", 0))
+                    >= int(self.LIVE_CONTROLLER_SELECT_RELEASE_FRAMES)
+                )
+
+            def _startup_input_gate_details():
+                details = []
+                for source in ("left", "right"):
+                    state = controller_select_hold_state.get(source, {})
+                    details.append(
+                        f"{source}_available={int(bool(state.get('available', False)))}"
+                    )
+                    details.append(
+                        f"{source}_hold={int(bool(state.get('hold_active', False)))}"
+                    )
+                    details.append(
+                        f"{source}_release_frames={int(state.get('release_frames', 0))}"
+                    )
+                    details.append(
+                        f"{source}_value={float(state.get('value', 0.0)):.3f}"
+                    )
+                return " ".join(details)
+
+            def _update_startup_input_gate():
+                if not bool(startup_input_gate_state.get("active", False)):
+                    return False
+                if not all(
+                    _startup_input_gate_source_released(source)
+                    for source in ("left", "right")
+                ):
+                    return True
+                startup_input_gate_state["active"] = False
+                if not bool(startup_input_gate_state.get("opened_logged", False)):
+                    startup_input_gate_state["opened_logged"] = True
+                    print(
+                        "[quest_display] startup_input_gate=opened "
+                        f"frame={int(frame_count)} "
+                        + _startup_input_gate_details(),
+                        flush=True,
+                    )
+                return False
+
+            def _clear_startup_input_gate_interactions():
+                cleared_sources = []
+                for source in ("left", "right"):
+                    if controller_interaction_state.get(source) is None:
+                        continue
+                    self._clear_live_controller_interaction(
+                        source,
+                        controller_interaction_state,
+                        controller_attachment_metadata,
+                        reason="startup_input_gate",
+                    )
+                    self._reset_controller_anchor_preview_state(
+                        controller_anchor_preview_state,
+                        source,
+                    )
+                    cleared_sources.append(source)
+                if cleared_sources:
+                    print(
+                        "[quest_display] startup_input_gate=cleared_interactions "
+                        f"sources={','.join(cleared_sources)} "
+                        + _startup_input_gate_details(),
+                        flush=True,
+                    )
+
+            def _arm_post_release_landing_lock(
+                *,
+                source,
+                frame_index,
+                interaction_state,
+                select_release_frames,
+            ):
+                release_frame_index = int(frame_index)
+                window_frames = int(
+                    self.IMMERSIVE_POST_RELEASE_LANDING_LOCK_WINDOW_FRAMES
+                )
+                sources = list(post_release_landing_lock_state.get("sources", []))
+                if str(source) not in sources:
+                    sources.append(str(source))
+                anchor_name = (
+                    None
+                    if interaction_state is None
+                    else interaction_state.get("anchor_name")
+                )
+                released_contact_indices = None
+                if interaction_state is not None:
+                    contact_indices = interaction_state.get("contact_object_indices")
+                    if contact_indices is not None:
+                        contact_indices = torch.as_tensor(
+                            contact_indices,
+                            dtype=torch.long,
+                            device=cfg.device,
+                        )
+                        contact_indices = contact_indices[
+                            (contact_indices >= 0)
+                            & (contact_indices < int(self.num_all_points))
+                        ]
+                        if int(contact_indices.numel()) > 0:
+                            released_contact_indices = torch.unique(
+                                contact_indices
+                            ).detach().clone()
+                previous_contact_indices = post_release_landing_lock_state.get(
+                    "contact_object_indices"
+                )
+                if (
+                    previous_contact_indices is not None
+                    and released_contact_indices is not None
+                    and int(torch.as_tensor(previous_contact_indices).numel()) > 0
+                ):
+                    released_contact_indices = torch.unique(
+                        torch.cat(
+                            [
+                                torch.as_tensor(
+                                    previous_contact_indices,
+                                    dtype=torch.long,
+                                    device=cfg.device,
+                                ),
+                                released_contact_indices,
+                            ],
+                            dim=0,
+                        )
+                    )
+                elif released_contact_indices is None:
+                    released_contact_indices = previous_contact_indices
+                released_contact_count = (
+                    0
+                    if released_contact_indices is None
+                    else int(torch.as_tensor(released_contact_indices).numel())
+                )
+                post_release_landing_lock_state.update(
+                    {
+                        "active": True,
+                        "source": str(source),
+                        "sources": sources,
+                        "release_frame_index": release_frame_index,
+                        "expires_frame_index": release_frame_index + window_frames,
+                        "anchor_name": anchor_name,
+                        "contact_object_indices": released_contact_indices,
+                        "latest_support_fraction": 0.0,
+                        "latest_released_contact_fraction": 0.0,
+                        "latest_released_contact_max_height": float("inf"),
+                        "last_block_log_frame": -1000000,
+                    }
+                )
+                print(
+                    "[quest_display] post_release_landing_lock=armed "
+                    f"source={source} "
+                    f"sources={','.join(sources)} "
+                    f"frame={release_frame_index} "
+                    f"expires_frame={release_frame_index + window_frames} "
+                    f"anchor={anchor_name} "
+                    f"released_contact_count={released_contact_count} "
+                    f"select_release_frames={int(select_release_frames)}",
+                    flush=True,
+                )
+
+            def _clear_post_release_landing_lock(reason):
+                if not bool(post_release_landing_lock_state.get("active", False)):
+                    return
+                latest_support_fraction = float(
+                    post_release_landing_lock_state.get(
+                        "latest_support_fraction", 0.0
+                    )
+                )
+                print(
+                    "[quest_display] post_release_landing_lock=cleared "
+                    f"reason={reason} "
+                    f"sources={','.join(post_release_landing_lock_state.get('sources', []))} "
+                    f"latest_support_fraction={latest_support_fraction:.3f} "
+                    "latest_released_contact_fraction="
+                    f"{float(post_release_landing_lock_state.get('latest_released_contact_fraction', 0.0)):.3f} "
+                    "latest_released_contact_max_height="
+                    f"{float(post_release_landing_lock_state.get('latest_released_contact_max_height', float('inf'))):.4f}",
+                    flush=True,
+                )
+                post_release_landing_lock_state["active"] = False
+                post_release_landing_lock_state["sources"] = []
+                post_release_landing_lock_state["contact_object_indices"] = None
+
+            def _maybe_apply_post_release_landing_lock(object_points, sim_state):
+                if not bool(post_release_landing_lock_state.get("active", False)):
+                    return False
+                if bool(idle_lock_state.get("active", False)):
+                    post_release_landing_lock_state["active"] = False
+                    post_release_landing_lock_state["sources"] = []
+                    post_release_landing_lock_state["contact_object_indices"] = None
+                    return False
+                if (
+                    controller_interaction_state.get("left") is not None
+                    or controller_interaction_state.get("right") is not None
+                ):
+                    _clear_post_release_landing_lock("new_interaction")
+                    return False
+                release_frame_index = int(
+                    post_release_landing_lock_state.get("release_frame_index", -1)
+                )
+                if release_frame_index < 0:
+                    _clear_post_release_landing_lock("invalid_release_frame")
+                    return False
+                frame_distance = int(frame_count) - release_frame_index
+                min_delay_frames = int(
+                    self.IMMERSIVE_POST_RELEASE_LANDING_LOCK_MIN_DELAY_FRAMES
+                )
+                if frame_distance < min_delay_frames:
+                    return False
+                support_level_metrics = self._scene_support_level_metrics(
+                    object_points,
+                    support_surface_boxes_t,
+                    layout.scene_up,
+                )
+                support_fraction = float(support_level_metrics["support_fraction"])
+                split_support_ok = self._split_support_idle_lock_ok(
+                    idle_lock_case_profile,
+                    support_fraction,
+                    support_level_metrics,
+                )
+                support_fraction_ok = support_fraction >= float(
+                    idle_lock_case_profile["min_support_fraction"]
+                )
+                post_release_landing_lock_state["latest_support_fraction"] = float(
+                    support_fraction
+                )
+                if support_fraction_ok or split_support_ok:
+                    contact_indices = post_release_landing_lock_state.get(
+                        "contact_object_indices"
+                    )
+                    contact_count = (
+                        0
+                        if contact_indices is None
+                        else int(torch.as_tensor(contact_indices).numel())
+                    )
+                    released_contact_fraction = 1.0
+                    released_contact_max_height = 0.0
+                    if contact_count > 0:
+                        contact_indices_t = torch.as_tensor(
+                            contact_indices,
+                            dtype=torch.long,
+                            device=object_points.device,
+                        )
+                        contact_indices_t = contact_indices_t[
+                            (contact_indices_t >= 0)
+                            & (contact_indices_t < int(object_points.shape[0]))
+                        ]
+                        contact_count = int(contact_indices_t.numel())
+                    if contact_count > 0:
+                        contact_points = object_points[contact_indices_t]
+                        contact_height_limit = float(
+                            getattr(cfg, "object_radius", 0.0)
+                        ) + float(
+                            self.IMMERSIVE_POST_RELEASE_CONTACT_HEIGHT_MARGIN_M
+                        )
+                        contact_metrics = self._scene_top_support_height_metrics(
+                            contact_points,
+                            support_surface_boxes_t,
+                            layout.scene_up,
+                            max_height=contact_height_limit,
+                        )
+                        released_contact_fraction = float(
+                            contact_metrics["near_fraction"]
+                        )
+                        released_contact_max_height = float(
+                            contact_metrics["max_height"]
+                        )
+                        post_release_landing_lock_state[
+                            "latest_released_contact_fraction"
+                        ] = released_contact_fraction
+                        post_release_landing_lock_state[
+                            "latest_released_contact_max_height"
+                        ] = released_contact_max_height
+                        if released_contact_fraction < float(
+                            self.IMMERSIVE_POST_RELEASE_CONTACT_MIN_FRACTION
+                        ):
+                            if int(frame_count) > int(
+                                post_release_landing_lock_state.get(
+                                    "expires_frame_index", -1
+                                )
+                            ):
+                                print(
+                                    "[quest_display] post_release_landing_lock=expired "
+                                    f"sources={','.join(post_release_landing_lock_state.get('sources', []))} "
+                                    "reason=released_contact_lifted "
+                                    f"frame_distance={int(frame_distance)} "
+                                    f"latest_support_fraction={float(support_fraction):.3f} "
+                                    "support_by_level="
+                                    f"{self._format_support_by_level(support_level_metrics)} "
+                                    f"split_support_ok={int(bool(split_support_ok))} "
+                                    "latest_released_contact_fraction="
+                                    f"{released_contact_fraction:.3f} "
+                                    "latest_released_contact_max_height="
+                                    f"{released_contact_max_height:.4f} "
+                                    "required_support_fraction="
+                                    f"{float(idle_lock_case_profile['min_support_fraction']):.3f}",
+                                    flush=True,
+                                )
+                                post_release_landing_lock_state["active"] = False
+                                post_release_landing_lock_state["sources"] = []
+                                post_release_landing_lock_state[
+                                    "contact_object_indices"
+                                ] = None
+                                return False
+                            last_block_log_frame = int(
+                                post_release_landing_lock_state.get(
+                                    "last_block_log_frame", -1000000
+                                )
+                            )
+                            if int(frame_count) - last_block_log_frame >= 15:
+                                post_release_landing_lock_state[
+                                    "last_block_log_frame"
+                                ] = int(frame_count)
+                                print(
+                                    "[quest_display] post_release_landing_lock=blocked "
+                                    "reason=released_contact_lifted "
+                                    f"frame_distance={int(frame_distance)} "
+                                    f"support_fraction={float(support_fraction):.3f} "
+                                    f"released_contact_count={int(contact_count)} "
+                                    "released_contact_fraction="
+                                    f"{released_contact_fraction:.3f} "
+                                    "released_contact_max_height="
+                                    f"{released_contact_max_height:.4f} "
+                                    "required_released_contact_fraction="
+                                    f"{float(self.IMMERSIVE_POST_RELEASE_CONTACT_MIN_FRACTION):.3f}",
+                                    flush=True,
+                                )
+                            return False
+                    self._set_idle_lock_state(
+                        idle_lock_state,
+                        sim_state,
+                        object_points,
+                        action="engaged",
+                        reason=(
+                            "post_release_landed"
+                            if support_fraction_ok
+                            else "post_release_split_support_landed"
+                        ),
+                        support_fraction=support_fraction,
+                    )
+                    print(
+                        "[quest_display] post_release_landing_lock=locked "
+                        f"sources={','.join(post_release_landing_lock_state.get('sources', []))} "
+                        f"frame_distance={int(frame_distance)} "
+                        f"support_fraction={float(support_fraction):.3f} "
+                        "support_by_level="
+                        f"{self._format_support_by_level(support_level_metrics)} "
+                        f"split_support_ok={int(bool(split_support_ok))} "
+                        f"released_contact_count={int(contact_count)} "
+                        f"released_contact_fraction={released_contact_fraction:.3f} "
+                        f"released_contact_max_height={released_contact_max_height:.4f}",
+                        flush=True,
+                    )
+                    post_release_landing_lock_state["active"] = False
+                    post_release_landing_lock_state["sources"] = []
+                    post_release_landing_lock_state["contact_object_indices"] = None
+                    return True
+                if int(frame_count) > int(
+                    post_release_landing_lock_state.get("expires_frame_index", -1)
+                ):
+                    print(
+                        "[quest_display] post_release_landing_lock=expired "
+                        f"sources={','.join(post_release_landing_lock_state.get('sources', []))} "
+                        f"frame_distance={int(frame_distance)} "
+                        f"latest_support_fraction={float(support_fraction):.3f} "
+                        "support_by_level="
+                        f"{self._format_support_by_level(support_level_metrics)} "
+                        f"split_support_ok={int(bool(split_support_ok))} "
+                        "latest_released_contact_fraction="
+                        f"{float(post_release_landing_lock_state.get('latest_released_contact_fraction', 0.0)):.3f} "
+                        "latest_released_contact_max_height="
+                        f"{float(post_release_landing_lock_state.get('latest_released_contact_max_height', float('inf'))):.4f} "
+                        "required_support_fraction="
+                        f"{float(idle_lock_case_profile['min_support_fraction']):.3f}",
+                        flush=True,
+                    )
+                    post_release_landing_lock_state["active"] = False
+                    post_release_landing_lock_state["sources"] = []
+                    post_release_landing_lock_state["contact_object_indices"] = None
+                    return False
+                return False
+
+            def _render_immersive_stereo_gaussians_with_visual_contact_sink(
+                left_eye_render_state_arg,
+                right_eye_render_state_arg,
+                gaussians_arg,
+                render_pipe_arg,
+                background_black_arg,
+                background_white_arg,
+                *,
+                mode,
+                render_profile_frame_arg=None,
+            ):
+                restore_xyz = None
+                if visual_contact_sink_enabled:
+                    original_xyz = gaussians_arg._xyz
+                    collect_stats = (
+                        int(frame_count)
+                        - int(
+                            visual_contact_sink_diagnostic_state.get(
+                                "last_log_frame", -1000000
+                            )
+                        )
+                    ) >= 60
+                    adjusted_xyz, sink_stats = (
+                        self._apply_visual_contact_sink_to_positions(
+                            original_xyz,
+                            support_surface_boxes_t,
+                            layout.scene_up,
+                            sink_m=visual_contact_sink_m,
+                            band_m=visual_contact_sink_band_m,
+                            floor_sink_m=visual_floor_contact_sink_m,
+                            floor_z=float(layout.floor_z),
+                            contact_clearance_m=visual_contact_clearance_m,
+                            object_radius=float(getattr(cfg, "object_radius", 0.0)),
+                            collect_stats=collect_stats,
+                        )
+                    )
+                    if adjusted_xyz is not original_xyz:
+                        gaussians_arg._xyz = adjusted_xyz
+                        restore_xyz = original_xyz
+                    if sink_stats is not None:
+                        visual_contact_sink_diagnostic_state[
+                            "last_log_frame"
+                        ] = int(frame_count)
+                        print(
+                            "[quest_display] visual_contact_sink_frame "
+                            f"frame={int(frame_count)} "
+                            f"shifted={int(bool(sink_stats['shifted']))} "
+                            f"adjusted_fraction={float(sink_stats['adjusted_fraction']):.3f} "
+                            f"adjusted_points={int(sink_stats['adjusted_count'])}/"
+                            f"{int(sink_stats['point_count'])} "
+                            f"floor_adjusted_points={int(sink_stats['floor_adjusted_count'])} "
+                            "nonfloor_adjusted_points="
+                            f"{int(sink_stats['nonfloor_adjusted_count'])} "
+                            f"max_shift_m={float(sink_stats['max_shift_m']):.5f} "
+                            "height_above_support_min_mean_max="
+                            f"{float(sink_stats['height_above_support_min_m']):.5f},"
+                            f"{float(sink_stats['height_above_support_mean_m']):.5f},"
+                            f"{float(sink_stats['height_above_support_max_m']):.5f} "
+                            "support_top_min_mean_max="
+                            f"{float(sink_stats['support_top_min']):.4f},"
+                            f"{float(sink_stats['support_top_mean']):.4f},"
+                            f"{float(sink_stats['support_top_max']):.4f}",
+                            flush=True,
+                        )
+                try:
+                    return self._render_immersive_stereo_gaussians(
+                        left_eye_render_state_arg,
+                        right_eye_render_state_arg,
+                        gaussians_arg,
+                        render_pipe_arg,
+                        background_black_arg,
+                        background_white_arg,
+                        render_profile_frame=render_profile_frame_arg,
+                        mode=mode,
+                    )
+                finally:
+                    if restore_xyz is not None:
+                        gaussians_arg._xyz = restore_xyz
 
             glfw.make_context_current(window)
             if preview_display_active and preview_uploader is None:
@@ -36469,6 +38203,9 @@ class InvPhyTrainerWarp:
                     _arm_immersive_steady_state_metrics_epoch()
                 controller_reset_triggered = False
                 controller_overlay_by_source = {}
+                startup_input_gate_active = bool(
+                    startup_input_gate_state.get("active", False)
+                )
 
                 latest_sample = immersive_bridge.get_latest_sample()
                 if latest_sample is not None:
@@ -36587,6 +38324,7 @@ class InvPhyTrainerWarp:
                             reason="reset",
                             support_fraction=reset_support_fraction,
                         )
+                        _clear_post_release_landing_lock("reset")
                         _update_balanced_scene_input_cache_from_points(
                             reset_object_points
                         )
@@ -36600,6 +38338,14 @@ class InvPhyTrainerWarp:
                 else:
                     current_live_left_controller = None
                     current_live_right_controller = None
+
+                startup_input_gate_active = _update_startup_input_gate()
+                if startup_input_gate_active:
+                    _clear_startup_input_gate_interactions()
+                controller_world_by_source = {
+                    "left": current_live_left_controller,
+                    "right": current_live_right_controller,
+                }
 
                 render_profile_frame = self._render_profile_new_frame(profile_enabled)
                 if render_profile_frame is not None:
@@ -37006,7 +38752,9 @@ class InvPhyTrainerWarp:
                             immersive_framegen_mode = "off"
                             balanced_scene_render_plan = None
 
-                if (
+                if startup_input_gate_active:
+                    _clear_startup_input_gate_interactions()
+                elif (
                     idle_lock_state.get("active", False)
                     and (
                         controller_interaction_state.get("left") is not None
@@ -37016,6 +38764,15 @@ class InvPhyTrainerWarp:
                     self._release_idle_lock_state(
                         idle_lock_state,
                         reason="interaction_started",
+                        details=self._format_idle_lock_interaction_details(
+                            controller_interaction_state,
+                            controller_world_by_source=controller_world_by_source,
+                        ),
+                    )
+                elif not startup_input_gate_active:
+                    _maybe_apply_post_release_landing_lock(
+                        x[: self.num_all_points],
+                        {"x": x, "v": current_v},
                     )
 
                 sim_timer.start()
@@ -37103,6 +38860,8 @@ class InvPhyTrainerWarp:
                     idle_lock_case_profile,
                     support_surface_boxes_t,
                     layout.scene_up,
+                    suppress_interaction_release=startup_input_gate_active,
+                    controller_world_by_source=controller_world_by_source,
                 )
                 (
                     object_bounds_min,
@@ -37593,7 +39352,7 @@ class InvPhyTrainerWarp:
                                 right_gaussian_rgba,
                                 right_gaussian_depth,
                                 gaussian_render_wall_s,
-                            ) = self._render_immersive_stereo_gaussians(
+                            ) = _render_immersive_stereo_gaussians_with_visual_contact_sink(
                                 left_eye_render_state,
                                 right_eye_render_state,
                                 gaussians,
@@ -37601,7 +39360,7 @@ class InvPhyTrainerWarp:
                                 background_black,
                                 background_white,
                                 mode=gaussian_render_mode_for_frame,
-                                render_profile_frame=render_profile_frame,
+                                render_profile_frame_arg=render_profile_frame,
                             )
                             break
                         except Exception as exc:
@@ -38091,7 +39850,7 @@ class InvPhyTrainerWarp:
                                 right_gaussian_rgba,
                                 right_gaussian_depth,
                                 gaussian_render_wall_s,
-                            ) = self._render_immersive_stereo_gaussians(
+                            ) = _render_immersive_stereo_gaussians_with_visual_contact_sink(
                                 left_eye_render_state,
                                 right_eye_render_state,
                                 gaussians,
@@ -38099,7 +39858,7 @@ class InvPhyTrainerWarp:
                                 background_black,
                                 background_white,
                                 mode=gaussian_render_mode_for_frame,
-                                render_profile_frame=render_profile_frame,
+                                render_profile_frame_arg=render_profile_frame,
                             )
                             break
                         except Exception as exc:
@@ -40174,6 +41933,8 @@ class InvPhyTrainerWarp:
                     controller_motion_state_cache=controller_motion_state_cache,
                     frame_index=frame_count,
                     runtime_label="immersive",
+                    allow_interaction_start=not startup_input_gate_active,
+                    interaction_release_callback=_arm_post_release_landing_lock,
                 )
                 frame_count += 1
                 prev_target = next_prev_target

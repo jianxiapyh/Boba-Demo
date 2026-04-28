@@ -27418,6 +27418,21 @@ class InvPhyTrainerWarp:
             if interaction_state is None
             else interaction_state.get("validation_path")
         )
+        grab_spring_scale = (
+            None
+            if interaction_state is None
+            else interaction_state.get("grab_spring_scale")
+        )
+        grab_spring_mean = (
+            None
+            if interaction_state is None
+            else interaction_state.get("grab_spring_mean")
+        )
+        grab_spring_max = (
+            None
+            if interaction_state is None
+            else interaction_state.get("grab_spring_max")
+        )
         self._log_live_openxr_controller_info(
             "[live_openxr_controller] "
             f"{source} interaction_{action}=1 "
@@ -27429,6 +27444,9 @@ class InvPhyTrainerWarp:
             f"ray_gate={None if projected_anchor_distance_passed is None else int(bool(projected_anchor_distance_passed))} "
             f"anchor={anchor_name} "
             f"seed={seed_index} patch={patch_size} "
+            f"grab_spring_scale={None if grab_spring_scale is None else round(float(grab_spring_scale), 3)} "
+            f"spring_mean={None if grab_spring_mean is None else round(float(grab_spring_mean), 4)} "
+            f"spring_max={None if grab_spring_max is None else round(float(grab_spring_max), 4)} "
             f"hit_to_anchor={None if hit_distance is None else round(float(hit_distance), 4)} "
             f"projected_anchor={None if projected_anchor_distance is None else round(float(projected_anchor_distance), 4)} "
             f"target_delta={None if target_delta is None else round(float(target_delta), 4)} "
@@ -28697,6 +28715,17 @@ class InvPhyTrainerWarp:
             "selected_object_reference_positions": kinematic_reference_positions,
         }
 
+    def _runtime_rope_controller_grab_spring_scale(self):
+        if not self._is_rope_family_case():
+            return 1.0
+        try:
+            scale = float(getattr(cfg, "runtime_rope_controller_grab_spring_scale", 1.0))
+        except (TypeError, ValueError):
+            return 1.0
+        if not np.isfinite(scale) or scale <= 0.0:
+            return 1.0
+        return scale
+
     def _apply_controller_attachment_remap(
         self,
         source,
@@ -28711,6 +28740,12 @@ class InvPhyTrainerWarp:
         )
         spring_y = remap_candidate.get("spring_y")
         if spring_y is not None:
+            spring_scale = self._runtime_rope_controller_grab_spring_scale()
+            if spring_scale != 1.0:
+                spring_y = spring_y * spring_scale
+            remap_candidate["grab_spring_scale"] = float(spring_scale)
+            remap_candidate["grab_spring_mean"] = float(spring_y.mean().item())
+            remap_candidate["grab_spring_max"] = float(spring_y.max().item())
             self.simulator.update_local_spring_stiffness_subset(
                 source_meta["spring_indices"],
                 spring_y,
@@ -29269,6 +29304,9 @@ class InvPhyTrainerWarp:
                         "target_point_indices": remap_candidate.get("target_point_indices"),
                         "multi_points_debug": remap_candidate.get("multi_points_debug"),
                         "hit_to_anchor_distance": remap_candidate.get("hit_to_anchor_distance"),
+                        "grab_spring_scale": remap_candidate.get("grab_spring_scale", 1.0),
+                        "grab_spring_mean": remap_candidate.get("grab_spring_mean"),
+                        "grab_spring_max": remap_candidate.get("grab_spring_max"),
                         "explicit_preview_selected": explicit_preview_selected,
                         "grab_start_mode": grab_start_mode,
                         "preview_anchor_visible": preview_anchor_visible,
@@ -30777,6 +30815,7 @@ class InvPhyTrainerWarp:
             source,
             controller_attachment_metadata,
         )
+        grab_spring_scale = float(interaction_state.get("grab_spring_scale", 1.0))
         sample_id = controller_world.get("sample_id")
 
         previous_cache = state_cache.get(source) or {}
@@ -30809,6 +30848,7 @@ class InvPhyTrainerWarp:
             round(target_frame_delta, 5),
             round(target_rest_delta, 4),
             int(spring_stats["spring_active"]),
+            round(grab_spring_scale, 4),
             round(spring_stats["spring_max"], 4),
         )
         last_state = previous_cache.get("state")
@@ -30838,6 +30878,7 @@ class InvPhyTrainerWarp:
                 f"target_frame_delta={target_frame_delta:.5f} "
                 f"target_rest_delta={target_rest_delta:.4f} "
                 f"spring_active={int(spring_stats['spring_active'])} "
+                f"grab_spring_scale={grab_spring_scale:.3f} "
                 f"spring_mean={spring_stats['spring_mean']:.4f} "
                 f"spring_max={spring_stats['spring_max']:.4f}",
             )

@@ -33,6 +33,7 @@ class Config:
         self.runtime_sofa_handle_physics_inflate_m = 0.02
         self.runtime_sofa_handle_physics_top_extra_m = 0.0
         self.runtime_sofa_handle_physics_bottom_extra_m = 0.004
+        self.runtime_rope_controller_grab_spring_scale = 1.5
         self.collide_object_elas = 0.7
         self.collide_object_fric = 0.3
 

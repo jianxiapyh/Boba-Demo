@@ -1,154 +1,84 @@
-# Boba Demo
+# Boba Quest Rope Game
 
-This repo contains the shipped Quest immersive Boba demo path: live OpenXR controller input on Linux, immersive desktop compositing, and Quest immersive display.
+This repository runs the `rope_game` case: a Quest/OpenXR rope pick-and-place demo with live controller input in the `ILLIXR_lab` scene.
 
-The public packaged demo cases in this branch are:
-- `sloth`
-- `rope`
-- `hq_rope`
-- `rope_game`
-- `hq_rope_game`
-- `hybrid_rope_game`
-- `hybrid_rope_game_1`
+## Requirements
 
-Compatibility alias:
-- `hq_rope_0 -> hq_rope`
+- Ubuntu 22.04 with an X11 desktop/OpenGL session. Hidden-window mode still requires a working display session.
+- An NVIDIA CUDA workstation. The provided setup is tuned for RTX 6000 Blackwell with CUDA under `/usr/local/cuda`.
+- A working Quest with ALVR/SteamVR configured as the OpenXR runtime.
+- The `boba` Conda environment from the main Boba checkout.
+- The vendored `gsplat` source from the main Boba checkout. Its default location is:
 
-Each case has a manifest under `assets/<case>/`, and the shipped room assets live under `assets/scenes/ILLIXR_lab/`.
+```text
+../Boba/gaussian_splatting/submodules/gsplat/
+```
 
-## Runtime assets
+If that checkout is elsewhere, set `BOBA_GSPLAT_SOURCE_ROOT` to its `gsplat` directory before setup or launch.
 
-The immersive demo no longer depends on runtime assets from:
-- `data/`
-- `experiments/`
-- `experiments_optimization/`
-- `gaussian_output/`
+## Setup
 
-The packaged runtime bundles live under:
-- `assets/sloth/`
-- `assets/rope/`
-- `assets/hq_rope/`
-- `assets/rope_game/`
-- `assets/hq_rope_game/`
-- `assets/hybrid_rope_game/`
-- `assets/hybrid_rope_game_1/`
+Install the native OpenXR bridge dependencies on Ubuntu 22.04:
 
-For the shipped runtime Gaussian PLYs:
-- `assets/sloth/sloth.ply` is copied from `Boba/gaussian_output/double_stretch_sloth/.../iteration_10000/point_cloud.ply`
-- `assets/rope/rope.ply` is copied from `Boba/gaussian_output/single_lift_rope/.../iteration_10000/point_cloud.ply`
-- `assets/hq_rope/hq_rope.ply` is rebaked from `feng_rope/data/different_types/feng_rope_v8_0000/shape/object.ply`
-- `assets/hq_rope_game/phystwin_rope.ply` is extracted from `shashuo0104/gs-scans` at `rope/rope.ply`.
+```bash
+sudo apt install g++ pkg-config libglfw3-dev libgl1-mesa-dev libx11-dev libopenxr-dev
+```
 
-`hq_rope_game` uses the same game logic, tutorial, and course as `rope_game`, but its object assets come from the original PhysTwin rope release (`shashuo0104/phystwin-rope`, `1495` object spring-mass nodes), not the retrained `assets/hq_rope` package. Target zone sizing is resolved from the original rope span at startup.
-
-`hybrid_rope_game` uses the stable `assets/rope` spring-mass model and rope-game behavior, but renders the higher-quality PhysTwin Gaussian from `assets/hq_rope_game/phystwin_rope.ply` after a startup principal-axis visual retarget onto the rope simulation rest shape.
-
-`hybrid_rope_game_1` uses the same hybrid rope assets and runtime behavior with a table-first, front-sofa-finish course.
-
-The packaged runtime no longer requires `multi_ctrls.pkl`; controller traces come from `final_data.pkl` for every shipped case.
-
-No alignment, annotation, filler-training, or candidate-generation workflow is kept in this branch anymore. This repo is now a runtime-only demo package.
-
-## Environment
-
-The intended environment on RTX6000 Blackwell is the existing `boba` Conda environment from the main `Boba` checkout. ALVR/SteamVR/OpenXR runtime setup is assumed to already be installed on the machine.
-
-Run the RTX6000 environment preflight/install from an activated `boba` shell:
+Activate the runtime environment and run the repository setup once:
 
 ```bash
 conda activate boba
 bash env_install/RTX6000_env_install.sh
 ```
 
-The RTX6000 installer installs/uses `git-lfs`, hydrates manifest-referenced demo assets that are still checked out as LFS pointers, rebuilds the local CUDA extensions with `TORCH_CUDA_ARCH_LIST=12.0`, and rebuilds `pycuda` with CUDA/OpenGL interop enabled.
-
-If you only need to recheck or hydrate packaged assets:
+Validate the assets used by `rope_game`:
 
 ```bash
-python tools/fetch_demo_case_assets.py --all
-python tools/fetch_demo_case_assets.py --case sloth
+python tools/fetch_demo_case_assets.py --case rope_game --check-only
 ```
 
-This demo resolves `gsplat` from the sibling `Boba` checkout instead of a stock pip wheel. The default expected source tree is:
+The case uses:
 
-```text
-../Boba/gaussian_splatting/submodules/gsplat/
-```
+- `assets/rope_game/manifest.json` for the course and tutorial.
+- `assets/rope/` for the model, calibration, simulation data, metadata, parameters, and Gaussian PLY.
+- `configs/real.yaml` for the rope simulation configuration.
+- `assets/scenes/ILLIXR_lab/` for the immersive room.
 
-If your `Boba` checkout lives elsewhere, set `BOBA_GSPLAT_SOURCE_ROOT` to that vendored `gsplat` source root before launching.
+## Run
 
-The launcher expects:
-- `PYTHONNOUSERSITE=1`
-- `CUDA_HOME=/usr/local/cuda`
-- `LD_LIBRARY_PATH` beginning with `$CONDA_PREFIX/lib:$CUDA_HOME/lib64`
-
-Direct `python boba_quest_immersive.py ...` launches self-reexec once with that runtime contract when started from an activated `boba` environment.
-
-## Main run commands
-
-Canonical RTX6000 Quest immersive run:
+Run from an activated `boba` environment:
 
 ```bash
-conda activate boba
 python boba_quest_immersive.py \
   --case_name rope_game \
   --n_dup 0 \
-  --interactive_window_mode hidden
-```
-
-Alternate packaged cases:
-
-```bash
-python boba_quest_immersive.py \
-  --case_name sloth \
-  --n_dup 0 \
-  --interactive_window_mode hidden
-
-python boba_quest_immersive.py \
-  --case_name rope \
-  --n_dup 0 \
-  --interactive_window_mode hidden
-
-python boba_quest_immersive.py \
-  --case_name hq_rope \
-  --n_dup 0 \
-  --interactive_window_mode hidden
-
-python boba_quest_immersive.py \
-  --case_name hq_rope_game \
-  --n_dup 0 \
-  --interactive_window_mode hidden
-
-python boba_quest_immersive.py \
-  --case_name hybrid_rope_game \
-  --n_dup 0 \
-  --interactive_window_mode hidden
-
-python boba_quest_immersive.py \
-  --case_name hybrid_rope_game_1 \
-  --n_dup 0 \
-  --interactive_window_mode hidden
-```
-
-Quest immersive run with render profiling:
-
-```bash
-python boba_quest_immersive.py \
-  --case_name sloth \
-  --n_dup 0 \
   --interactive_window_mode hidden \
-  --profile \
-  --profile_freq 30
+  --immersive_static_scene_backend native_gl \
+  --immersive_static_scene_overlap on \
+  --immersive_present_pipeline off \
+  --immersive_static_scene_reuse off \
+  --immersive_gaussian_render stereo_batched \
+  --immersive_native_gl_texture_mode stable_mipmap \
+  --immersive_native_gl_anisotropy 8 \
+  --immersive_native_gl_mipmap_lod_bias 0.50 \
+  --immersive_native_gl_msaa_samples 4 \
+  --immersive_native_gl_depth_format depth32f \
+  --immersive_eye_resolution 1344 \
+  --immersive_controller_translation_scale 0.25 \
+  --immersive_viewer_upload_mode pbo \
+  --immersive_viewer_upload_thread auto
 ```
 
-If the native bridge dependency preflight reports missing packages on Ubuntu 22.04:
+Native-GL overlap requires the present pipeline to remain off and currently forces static-scene reuse off. The launcher configures its CUDA and Conda runtime library paths automatically when started from the activated environment.
+
+## Troubleshooting
+
+If asset validation reports missing files or Git LFS pointers, hydrate only this case:
 
 ```bash
-sudo apt install pkg-config libglfw3-dev libgl1-mesa-dev libx11-dev libopenxr-dev
+python tools/fetch_demo_case_assets.py --case rope_game
 ```
 
-The launcher is intentionally fixed to:
-- `input_source=live_openxr_controller`
-- `quest_display_mode=immersive`
-- `scene_preset=ILLIXR_lab`
-- `immersive_render_preset=balanced`
+If the native bridge preflight fails, rerun the Ubuntu dependency command from the setup section.
+
+If OpenXR cannot find the headset, confirm that SteamVR and ALVR are running and the Quest is connected. For a non-default SteamVR installation, set `XR_RUNTIME_JSON` to its OpenXR runtime JSON.

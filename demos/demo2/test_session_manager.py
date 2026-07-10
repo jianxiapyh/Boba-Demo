@@ -70,15 +70,30 @@ class SessionManagerTest(unittest.TestCase):
 
 
 class Demo2ControlTest(unittest.TestCase):
-    def test_button_vector_mapping_matches_keyboard_axes(self):
+    def test_phone_horizontal_axes_are_mirrored_to_world_space(self):
         step = 0.005
         self.assertEqual(
             control_vector_to_step(1.0, 0.0, 0.0, step),
+            (-step, 0.0, 0.0),
+        )
+        self.assertEqual(
+            control_vector_to_step(-1.0, 0.0, 0.0, step),
             (step, 0.0, 0.0),
         )
         self.assertEqual(
             control_vector_to_step(0.0, -1.0, 0.0, step),
+            (0.0, step, 0.0),
+        )
+        self.assertEqual(
+            control_vector_to_step(0.0, 1.0, 0.0, step),
             (0.0, -step, 0.0),
+        )
+
+    def test_phone_vertical_axis_keeps_world_sign(self):
+        step = 0.005
+        self.assertEqual(
+            control_vector_to_step(0.0, 0.0, -1.0, step),
+            (0.0, 0.0, -step),
         )
         self.assertEqual(
             control_vector_to_step(0.0, 0.0, 1.0, step),
@@ -88,11 +103,11 @@ class Demo2ControlTest(unittest.TestCase):
     def test_button_vector_mapping_combines_and_clamps(self):
         self.assertEqual(
             control_vector_to_step(1.0, -1.0, 1.0, 0.1),
-            (0.1, -0.1, 0.1),
+            (-0.1, 0.1, 0.1),
         )
         self.assertEqual(
             control_vector_to_step(3.0, -4.0, 5.0, 0.1),
-            (0.1, -0.1, 0.1),
+            (-0.1, 0.1, 0.1),
         )
         self.assertEqual(
             add_vectors_clamped((1, 0.5, 0), (1, -1, 2)),

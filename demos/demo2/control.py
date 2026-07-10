@@ -14,12 +14,18 @@ def clamp_vector3(vector):
     return tuple(clamp_unit(value) for value in values)
 
 
+# The phone controls are expressed from the viewer's perspective. For the
+# packaged rope scene, its world X/Y directions are mirrored relative to that
+# view, while world Z already agrees with the visible up/down direction.
+PHONE_TO_WORLD_AXIS_SIGNS = (-1.0, -1.0, 1.0)
+
+
 def control_vector_to_step(x, y, z, step_size):
     step_size = float(step_size)
     return (
-        clamp_unit(x) * step_size,
-        clamp_unit(y) * step_size,
-        clamp_unit(z) * step_size,
+        clamp_unit(x) * step_size * PHONE_TO_WORLD_AXIS_SIGNS[0],
+        clamp_unit(y) * step_size * PHONE_TO_WORLD_AXIS_SIGNS[1],
+        clamp_unit(z) * step_size * PHONE_TO_WORLD_AXIS_SIGNS[2],
     )
 
 
@@ -34,7 +40,12 @@ def add_vectors_clamped(*vectors):
 
 
 def joystick_to_interactive_2d_step(dx, dy, step_size):
-    return control_vector_to_step(dy, dx, 0.0, step_size)
+    step_size = float(step_size)
+    return (
+        clamp_unit(dy) * step_size,
+        clamp_unit(dx) * step_size,
+        0.0,
+    )
 
 
 def legacy_joystick_to_control_vector(dx, dy):

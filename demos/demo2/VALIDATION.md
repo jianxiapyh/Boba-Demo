@@ -35,7 +35,7 @@ Phone additions present during validation: Flask 3.1.3, qrcode 8.2, Pillow 12.2.
 
 - Full preflight: NVIDIA/CUDA, PyTorch CUDA allocation, `pycuda.gl`, custom Boba-Batched `gsplat.rasterization_shared_template`, hidden GLFW/OpenGL context, additions, and packaged assets.
 - Post-extras Boba-Batched smoke: standard headless `single_push_rope_4`, batch 1, all 81 measured frames.
-- Phone/API/session suite: 27 tests, including claim conflict, authenticated controls, heartbeat, release, timeout, invalid IDs, stream authorization, and port-bind failure.
+- Phone/API/session suite: 28 tests, including six-direction phone calibration, claim conflict, authenticated controls, heartbeat, release, timeout, invalid IDs, stream authorization, and port-bind failure.
 - Asset-validator suite: 4 tests.
 - Packaged assets: 9 manifest entries, 100 controller trajectories, 34,983 Gaussian vertices, and 8 matching provenance hashes.
 - Final bounded Demo 2 runtime: batch 1 and batch 100 with packaged assets and the shared `phystwin` environment.

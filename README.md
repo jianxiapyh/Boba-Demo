@@ -9,6 +9,7 @@ The public packaged demo cases in this branch are:
 - `rope_game`
 - `hq_rope_game`
 - `hybrid_rope_game`
+- `hybrid_rope_game_1`
 
 Compatibility alias:
 - `hq_rope_0 -> hq_rope`
@@ -30,6 +31,7 @@ The packaged runtime bundles live under:
 - `assets/rope_game/`
 - `assets/hq_rope_game/`
 - `assets/hybrid_rope_game/`
+- `assets/hybrid_rope_game_1/`
 
 For the shipped runtime Gaussian PLYs:
 - `assets/sloth/sloth.ply` is copied from `Boba/gaussian_output/double_stretch_sloth/.../iteration_10000/point_cloud.ply`
@@ -40,6 +42,8 @@ For the shipped runtime Gaussian PLYs:
 `hq_rope_game` uses the same game logic, tutorial, and course as `rope_game`, but its object assets come from the original PhysTwin rope release (`shashuo0104/phystwin-rope`, `1495` object spring-mass nodes), not the retrained `assets/hq_rope` package. Target zone sizing is resolved from the original rope span at startup.
 
 `hybrid_rope_game` uses the stable `assets/rope` spring-mass model and rope-game behavior, but renders the higher-quality PhysTwin Gaussian from `assets/hq_rope_game/phystwin_rope.ply` after a startup principal-axis visual retarget onto the rope simulation rest shape.
+
+`hybrid_rope_game_1` uses the same hybrid rope assets and runtime behavior with a table-first, front-sofa-finish course.
 
 The packaged runtime no longer requires `multi_ctrls.pkl`; controller traces come from `final_data.pkl` for every shipped case.
 
@@ -117,6 +121,11 @@ python boba_quest_immersive.py \
 
 python boba_quest_immersive.py \
   --case_name hybrid_rope_game \
+  --n_dup 0 \
+  --interactive_window_mode hidden
+
+python boba_quest_immersive.py \
+  --case_name hybrid_rope_game_1 \
   --n_dup 0 \
   --interactive_window_mode hidden
 ```

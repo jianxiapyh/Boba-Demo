@@ -7226,6 +7226,7 @@ class InvPhyTrainerWarp:
             "rope_game",
             "hq_rope_game",
             "hybrid_rope_game",
+            "hybrid_rope_game_1",
         }
 
     def _live_controller_case_profile(self, case_name=None):
@@ -15535,7 +15536,11 @@ class InvPhyTrainerWarp:
         return bool(torch.isfinite(torch.as_tensor(tensor)).all().item())
 
     def _sanitize_hq_rope_game_gaussians(self, gaussians, case_name):
-        if case_name not in {"hq_rope_game", "hybrid_rope_game"}:
+        if case_name not in {
+            "hq_rope_game",
+            "hybrid_rope_game",
+            "hybrid_rope_game_1",
+        }:
             return {}
         tensor_fields = {
             "xyz": gaussians._xyz,
@@ -33587,6 +33592,7 @@ class InvPhyTrainerWarp:
             "hq_rope",
             "hq_rope_game",
             "hybrid_rope_game",
+            "hybrid_rope_game_1",
         }
         kept_gaussian_count = raw_gaussian_count
         if not disable_opacity_pruning:
@@ -33599,7 +33605,12 @@ class InvPhyTrainerWarp:
             mode=getattr(cfg, "visual_gaussian_retarget", ""),
             gs_path=gs_path,
         )
-        if case_name in {"hq_rope", "hq_rope_game", "hybrid_rope_game"}:
+        if case_name in {
+            "hq_rope",
+            "hq_rope_game",
+            "hybrid_rope_game",
+            "hybrid_rope_game_1",
+        }:
             gaussian_bounds_min = (
                 gaussians._xyz.min(dim=0).values.detach().cpu().numpy().tolist()
             )

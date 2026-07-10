@@ -1,0 +1,17 @@
+{
+  "best_model": "../rope/best_model.pth",
+  "calibrate": "../rope/calibrate.pkl",
+  "config": "configs/hybrid_rope_game.yaml",
+  "final_data": "../rope/final_data.pkl",
+  "gaussian_ply": "../hq_rope_game/phystwin_rope.ply",
+  "metadata": "../rope/metadata.json",
+  "optimal_params": "../rope/optimal_params.pkl",
+  "game_mode": "rope_pick_place_v1",
+  "game_course": "course_v1.json",
+  "tutorial_extra_slides": [
+    "../rope_game/tutorial_rope_game_goal.png"
+  ],
+  "visual_gaussian_retarget": "principal_axis_to_sim_rest",
+  "visual_gaussian_driver_case": "rope",
+  "visual_gaussian_source_case": "hq_rope_game"
+}

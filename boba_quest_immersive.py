@@ -26,6 +26,7 @@ PUBLIC_DEMO_CASES = (
     "rope_game",
     "hq_rope_game",
     "hybrid_rope_game",
+    "hybrid_rope_game_1",
 )
 COMPAT_DEMO_CASE_ALIASES = {
     "hq_rope_0": "hq_rope",
@@ -500,7 +501,8 @@ def build_parser() -> ArgumentParser:
             "real-frame static-scene reuse mode for immersive Quest output: "
             "'off' always renders a fresh static scene, "
             "'static' reuses cached static-scene outputs up to a fixed age limit, "
-            "'adaptive' adds motion/head-reset guardrails before reuse"
+            "'adaptive' adds motion/head-reset guardrails before reuse. "
+            "Native GL full-scene overlap currently forces this setting to 'off'"
         ),
     )
     parser.add_argument(
@@ -516,7 +518,9 @@ def build_parser() -> ArgumentParser:
             "(v1 supports balanced_support_focus only, with --immersive_timewarp off "
             "and --immersive_framegen off), "
             "'native_gl' renders the full room with the native OpenGL path and "
-            "CUDA readback (v1 requires true-stereo serial mode with overlap/timewarp/framegen off)"
+            "CUDA readback (supports serial or stereo-batched Gaussian rendering "
+            "with overlap on or off; requires timewarp, framegen, and the present "
+            "pipeline off)"
         ),
     )
     parser.add_argument(

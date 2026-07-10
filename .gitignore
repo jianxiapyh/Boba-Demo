@@ -24,6 +24,12 @@ test_output/
 *.png
 !assets/
 !assets/system_designs.png
+!assets/**/
+!assets/**/*.json
+!assets/**/*.pkl
+!assets/**/*.ply
+!assets/**/*.pth
+!assets/**/*.png
 test_output*
 test_superglue*
 test_enhance*

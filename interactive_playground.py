@@ -27,11 +27,22 @@ def set_all_seeds(seed):
     torch.backends.cudnn.benchmark = False
 
 
-def create_gl_window(width, height):
+def create_gl_window(width, height, use_screen_resolution=False):
     import glfw
     from OpenGL import GL as gl
 
     assert glfw.init(), "GLFW init failed"
+    if use_screen_resolution:
+        primary_monitor = glfw.get_primary_monitor()
+        video_mode = glfw.get_video_mode(primary_monitor) if primary_monitor else None
+        if video_mode is not None:
+            mode_size = getattr(video_mode, "size", None)
+            if mode_size is not None:
+                width, height = int(mode_size.width), int(mode_size.height)
+            else:
+                width = int(getattr(video_mode, "width", width))
+                height = int(getattr(video_mode, "height", height))
+
     glfw.window_hint(glfw.CLIENT_API, glfw.OPENGL_API)
     glfw.window_hint(glfw.CONTEXT_VERSION_MAJOR, 4)
     glfw.window_hint(glfw.CONTEXT_VERSION_MINOR, 6)
@@ -39,6 +50,8 @@ def create_gl_window(width, height):
 
     window = glfw.create_window(width, height, "Boba_Batched Playground", None, None)
     assert window, "create_window failed (need X11 desktop GL)"
+    if use_screen_resolution:
+        glfw.set_window_pos(window, 0, 0)
 
     glfw.make_context_current(window)
     _ = gl.glGetString(gl.GL_VERSION)

@@ -1,0 +1,719 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#050607">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="Boba Demo 2">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="apple-touch-icon" href="/assets/Picture1.png">
+  <title>Boba Demo 2</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: #101418;
+      color: #f5f7f8;
+      --demo2-view-width: 100vw;
+      --demo2-view-height: 100vh;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background: #101418;
+    }
+    body.controller-mode {
+      min-height: var(--demo2-view-height);
+      overflow: hidden;
+    }
+    body.controller-mode header,
+    body.controller-mode #sessionPanel {
+      display: none;
+    }
+    body.controller-mode main {
+      width: var(--demo2-view-width);
+      height: var(--demo2-view-height);
+      padding: 0;
+      display: block;
+    }
+    header {
+      position: sticky;
+      top: 0;
+      z-index: 5;
+      padding: 14px 16px 10px;
+      background: rgba(16, 20, 24, 0.94);
+      border-bottom: 1px solid rgba(255,255,255,0.1);
+    }
+    h1 {
+      margin: 0;
+      font-size: 20px;
+      font-weight: 720;
+      letter-spacing: 0;
+    }
+    main {
+      padding: 14px 14px 28px;
+      display: grid;
+      gap: 14px;
+    }
+    .status {
+      min-height: 22px;
+      color: #b9c2c9;
+      font-size: 14px;
+    }
+    .sessions {
+      display: grid;
+      grid-template-columns: repeat(5, minmax(0, 1fr));
+      gap: 8px;
+    }
+    button {
+      border: 1px solid rgba(255,255,255,0.16);
+      background: #1b2229;
+      color: #f5f7f8;
+      min-height: 46px;
+      border-radius: 8px;
+      font-size: 16px;
+      font-weight: 650;
+    }
+    button.available { background: #203642; border-color: #5ba6c8; }
+    button.occupied { color: #7f8991; background: #171c21; }
+    button.mine { background: #175071; border-color: #71c8f0; color: #ffffff; }
+    button:disabled { opacity: 0.55; }
+    .viewer {
+      display: none;
+      gap: 12px;
+    }
+    .viewer.active {
+      display: grid;
+    }
+    body.controller-mode .viewer.active {
+      display: block;
+      width: var(--demo2-view-width);
+      height: var(--demo2-view-height);
+    }
+    .demo-console {
+      display: grid;
+      gap: 12px;
+    }
+    body.controller-mode .demo-console {
+      width: 100%;
+      height: 100%;
+      display: block;
+    }
+    .stream-wrap {
+      position: relative;
+      width: 100%;
+      aspect-ratio: 4 / 3;
+      background: #050607;
+      border: 1px solid rgba(255,255,255,0.12);
+      border-radius: 8px;
+      overflow: hidden;
+    }
+    body.controller-mode .stream-wrap {
+      width: var(--demo2-view-width);
+      height: var(--demo2-view-height);
+      aspect-ratio: auto;
+      border: 0;
+      border-radius: 0;
+      display: grid;
+      grid-template-rows: minmax(0, 1fr) auto;
+    }
+    #stream {
+      width: 100%;
+      height: 100%;
+      display: block;
+      object-fit: contain;
+    }
+    body.controller-mode #stream {
+      min-height: 0;
+      background: #050607;
+    }
+    .hands {
+      position: absolute;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-end;
+      gap: 10px;
+      padding: 10px;
+      pointer-events: none;
+    }
+    body.controller-mode .hands {
+      position: static;
+      left: auto;
+      right: auto;
+      bottom: auto;
+      padding:
+        8px
+        max(12px, env(safe-area-inset-right))
+        max(10px, env(safe-area-inset-bottom))
+        max(12px, env(safe-area-inset-left));
+      background: rgba(244, 246, 248, 0.96);
+      box-shadow: 0 -2px 18px rgba(0,0,0,0.28);
+    }
+    .hand-panel {
+      display: grid;
+      gap: 5px;
+      width: min(44%, 220px);
+      min-width: 150px;
+      padding: 0;
+      color: #f8fbff;
+      pointer-events: auto;
+    }
+    .hand-title {
+      text-align: left;
+      font-size: 18px;
+      font-weight: 760;
+      line-height: 1;
+      color: #ffffff;
+      text-shadow:
+        0 2px 6px rgba(0,0,0,0.75),
+        0 0 2px rgba(0,0,0,0.9);
+    }
+    .hand-panel.right .hand-title {
+      text-align: right;
+    }
+    body.controller-mode .hand-title {
+      color: #101418;
+      text-shadow: none;
+    }
+    .control-pad {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      grid-template-rows: repeat(2, minmax(0, 1fr));
+      gap: 2px;
+      touch-action: none;
+      user-select: none;
+      -webkit-user-select: none;
+      -webkit-touch-callout: none;
+    }
+    .hand-panel.left .control-pad {
+      grid-template-areas:
+        ". xneg . zneg"
+        "ypos xpos yneg zpos";
+    }
+    .hand-panel.right .control-pad {
+      grid-template-areas:
+        "zneg . xneg ."
+        "zpos ypos xpos yneg";
+    }
+    .control-button {
+      min-height: 48px;
+      aspect-ratio: 1;
+      display: grid;
+      place-items: center;
+      padding: 0;
+      border-color: transparent;
+      background: transparent;
+      color: rgba(8, 12, 15, 0.78);
+      touch-action: none;
+      user-select: none;
+      -webkit-user-select: none;
+      -webkit-touch-callout: none;
+    }
+    .control-button .wide-arrow {
+      width: clamp(36px, 9vw, 62px);
+      height: clamp(30px, 7vw, 52px);
+      display: block;
+      background-image: url("/assets/arrow_empty.png");
+      background-position: center;
+      background-repeat: no-repeat;
+      background-size: contain;
+      filter: drop-shadow(0 3px 5px rgba(0,0,0,0.55));
+    }
+    .wide-arrow.dir-down {
+      transform: rotate(180deg);
+    }
+    .wide-arrow.dir-left {
+      transform: rotate(-90deg);
+    }
+    .wide-arrow.dir-right {
+      transform: rotate(90deg);
+    }
+    .control-button[data-control="xneg"] { grid-area: xneg; }
+    .control-button[data-control="xpos"] { grid-area: xpos; }
+    .control-button[data-control="ypos"] { grid-area: ypos; }
+    .control-button[data-control="yneg"] { grid-area: yneg; }
+    .control-button[data-control="zneg"] { grid-area: zneg; }
+    .control-button[data-control="zpos"] { grid-area: zpos; }
+    .control-button.active {
+      background: transparent;
+      border-color: transparent;
+      transform: translateY(1px);
+    }
+    .hand-panel.left .control-button.active .wide-arrow {
+      background-image: url("/assets/arrow_1.png");
+    }
+    .hand-panel.right .control-button.active .wide-arrow {
+      background-image: url("/assets/arrow_2.png");
+    }
+    .sr-only {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      padding: 0;
+      margin: -1px;
+      overflow: hidden;
+      clip: rect(0, 0, 0, 0);
+      white-space: nowrap;
+      border: 0;
+    }
+    .actions {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 10px;
+    }
+    .release {
+      background: #3a2020;
+      border-color: #9d4b4b;
+    }
+    body.controller-mode .actions {
+      position: static;
+      z-index: 4;
+      width: 0;
+      height: 0;
+    }
+    body.controller-mode .release {
+      position: fixed;
+      top: max(10px, env(safe-area-inset-top));
+      right: max(10px, env(safe-area-inset-right));
+      z-index: 4;
+      min-height: 34px;
+      padding: 6px 10px;
+      border-radius: 999px;
+      font-size: 13px;
+      backdrop-filter: blur(8px);
+      background: rgba(58, 32, 32, 0.78);
+    }
+    @media (min-width: 720px) {
+      main { max-width: 760px; margin: 0 auto; }
+      .sessions { grid-template-columns: repeat(10, minmax(0, 1fr)); }
+    }
+    @media (max-width: 500px) {
+      main { padding-left: 8px; padding-right: 8px; }
+      .hands { padding: 6px; gap: 6px; }
+      .hand-panel { width: calc(50% - 3px); min-width: 0; }
+      .hand-title { font-size: 13px; }
+      .control-button { min-height: 40px; }
+      .control-button .wide-arrow { width: 32px; height: 28px; }
+    }
+    @media (orientation: landscape) {
+      body.controller-mode .stream-wrap {
+        display: block;
+      }
+      body.controller-mode #stream {
+        position: absolute;
+        inset: 0;
+        width: var(--demo2-view-width);
+        height: var(--demo2-view-height);
+        object-fit: cover;
+      }
+      body.controller-mode .hands {
+        position: absolute;
+        left: 0;
+        right: 0;
+        top: 0;
+        bottom: 0;
+        align-items: flex-end;
+        padding:
+          max(12px, env(safe-area-inset-top))
+          max(14px, env(safe-area-inset-right))
+          max(14px, env(safe-area-inset-bottom))
+          max(14px, env(safe-area-inset-left));
+        background: linear-gradient(
+          to top,
+          rgba(0,0,0,0.42),
+          rgba(0,0,0,0.12) 48%,
+          transparent
+        );
+      }
+      body.controller-mode .hand-title {
+        color: #ffffff;
+        text-shadow:
+          0 2px 6px rgba(0,0,0,0.75),
+          0 0 2px rgba(0,0,0,0.9);
+      }
+      body.controller-mode .hand-panel {
+        width: min(36vw, 230px);
+        min-width: 0;
+      }
+      body.controller-mode .control-button {
+        min-height: clamp(44px, 13dvh, 66px);
+      }
+      body.controller-mode .control-button .wide-arrow {
+        width: clamp(42px, 8vw, 68px);
+        height: clamp(38px, 10dvh, 62px);
+      }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Boba Demo 2</h1>
+    <div id="status" class="status">Loading sessions...</div>
+  </header>
+  <main>
+    <section id="sessionPanel">
+      <div id="sessions" class="sessions"></div>
+    </section>
+    <section id="viewer" class="viewer">
+      <div class="demo-console">
+        <div class="stream-wrap">
+          <img id="stream" alt="Selected Boba session stream">
+          <div class="hands">
+            <div class="hand-panel left">
+              <div class="hand-title">Left Hand</div>
+              <div class="control-pad" aria-label="Left hand controls">
+                <button type="button" class="control-button" data-hand="left" data-key="w" data-axis="x" data-dir="1" data-control="xneg" aria-label="Left hand forward">
+                  <span class="wide-arrow dir-up" aria-hidden="true"></span><span class="sr-only">W</span>
+                </button>
+                <button type="button" class="control-button" data-hand="left" data-key="s" data-axis="x" data-dir="-1" data-control="xpos" aria-label="Left hand backward">
+                  <span class="wide-arrow dir-down" aria-hidden="true"></span><span class="sr-only">S</span>
+                </button>
+                <button type="button" class="control-button" data-hand="left" data-key="a" data-axis="y" data-dir="-1" data-control="ypos" aria-label="Left hand left">
+                  <span class="wide-arrow dir-left" aria-hidden="true"></span><span class="sr-only">A</span>
+                </button>
+                <button type="button" class="control-button" data-hand="left" data-key="d" data-axis="y" data-dir="1" data-control="yneg" aria-label="Left hand right">
+                  <span class="wide-arrow dir-right" aria-hidden="true"></span><span class="sr-only">D</span>
+                </button>
+                <button type="button" class="control-button" data-hand="left" data-key="q" data-axis="z" data-dir="-1" data-control="zneg" aria-label="Left hand up">
+                  <span class="wide-arrow dir-up" aria-hidden="true"></span><span class="sr-only">Q</span>
+                </button>
+                <button type="button" class="control-button" data-hand="left" data-key="e" data-axis="z" data-dir="1" data-control="zpos" aria-label="Left hand down">
+                  <span class="wide-arrow dir-down" aria-hidden="true"></span><span class="sr-only">E</span>
+                </button>
+              </div>
+            </div>
+            <div class="hand-panel right">
+              <div class="hand-title">Right Hand</div>
+              <div class="control-pad" aria-label="Right hand controls">
+                <button type="button" class="control-button" data-hand="right" data-key="i" data-axis="x" data-dir="1" data-control="xneg" aria-label="Right hand forward">
+                  <span class="wide-arrow dir-up" aria-hidden="true"></span><span class="sr-only">I</span>
+                </button>
+                <button type="button" class="control-button" data-hand="right" data-key="k" data-axis="x" data-dir="-1" data-control="xpos" aria-label="Right hand backward">
+                  <span class="wide-arrow dir-down" aria-hidden="true"></span><span class="sr-only">K</span>
+                </button>
+                <button type="button" class="control-button" data-hand="right" data-key="j" data-axis="y" data-dir="-1" data-control="ypos" aria-label="Right hand left">
+                  <span class="wide-arrow dir-left" aria-hidden="true"></span><span class="sr-only">J</span>
+                </button>
+                <button type="button" class="control-button" data-hand="right" data-key="l" data-axis="y" data-dir="1" data-control="yneg" aria-label="Right hand right">
+                  <span class="wide-arrow dir-right" aria-hidden="true"></span><span class="sr-only">L</span>
+                </button>
+                <button type="button" class="control-button" data-hand="right" data-key="u" data-axis="z" data-dir="-1" data-control="zneg" aria-label="Right hand up">
+                  <span class="wide-arrow dir-up" aria-hidden="true"></span><span class="sr-only">U</span>
+                </button>
+                <button type="button" class="control-button" data-hand="right" data-key="o" data-axis="z" data-dir="1" data-control="zpos" aria-label="Right hand down">
+                  <span class="wide-arrow dir-down" aria-hidden="true"></span><span class="sr-only">O</span>
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="actions">
+        <button id="release" class="release" type="button">Release</button>
+      </div>
+    </section>
+  </main>
+  <script>
+    const statusEl = document.getElementById("status");
+    const sessionsEl = document.getElementById("sessions");
+    const viewerEl = document.getElementById("viewer");
+    const streamEl = document.getElementById("stream");
+    const controlButtons = Array.from(document.querySelectorAll(".control-button"));
+    const releaseEl = document.getElementById("release");
+
+    let currentSession = Number(localStorage.getItem("bobaDemo2Session"));
+    let token = localStorage.getItem("bobaDemo2Token") || "";
+    if (!Number.isFinite(currentSession)) currentSession = null;
+    let input = {
+      left: { x: 0, y: 0, z: 0 },
+      right: { x: 0, y: 0, z: 0 }
+    };
+    const heldControls = new Map();
+    const pointerButtons = new Map();
+
+    function setStatus(text) {
+      statusEl.textContent = text;
+    }
+
+    async function api(path, options = {}) {
+      const response = await fetch(path, {
+        ...options,
+        headers: {
+          "Content-Type": "application/json",
+          ...(options.headers || {})
+        }
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(data.error || `HTTP ${response.status}`);
+      }
+      return data;
+    }
+
+    function updateOrientationClass() {
+      const isPortrait = window.matchMedia("(orientation: portrait)").matches;
+      document.body.classList.toggle(
+        "portrait-controller",
+        currentSession !== null && isPortrait
+      );
+    }
+
+    function updateViewportVars() {
+      const viewport = window.visualViewport;
+      const width = viewport ? viewport.width : window.innerWidth;
+      const height = viewport ? viewport.height : window.innerHeight;
+      if (Number.isFinite(width) && width > 0) {
+        document.documentElement.style.setProperty("--demo2-view-width", `${Math.round(width)}px`);
+      }
+      if (Number.isFinite(height) && height > 0) {
+        document.documentElement.style.setProperty("--demo2-view-height", `${Math.round(height)}px`);
+      }
+      updateOrientationClass();
+    }
+
+    function enterControllerMode() {
+      document.body.classList.add("controller-mode");
+      viewerEl.classList.add("active");
+      updateViewportVars();
+    }
+
+    function exitControllerMode() {
+      document.body.classList.remove("controller-mode", "portrait-controller");
+    }
+
+    function setClaim(sessionId, newToken) {
+      currentSession = sessionId;
+      token = newToken;
+      localStorage.setItem("bobaDemo2Session", String(sessionId));
+      localStorage.setItem("bobaDemo2Token", newToken);
+      streamEl.src = `/stream/${sessionId}.mjpg?token=${encodeURIComponent(newToken)}&t=${Date.now()}`;
+      enterControllerMode();
+    }
+
+    function clearClaim() {
+      currentSession = null;
+      token = "";
+      localStorage.removeItem("bobaDemo2Session");
+      localStorage.removeItem("bobaDemo2Token");
+      streamEl.removeAttribute("src");
+      viewerEl.classList.remove("active");
+      clearHeldControls();
+      exitControllerMode();
+    }
+
+    async function refreshSessions() {
+      try {
+        const query = token ? `?token=${encodeURIComponent(token)}` : "";
+        const data = await api(`/api/sessions${query}`);
+        sessionsEl.innerHTML = "";
+        data.sessions.forEach((session) => {
+          const button = document.createElement("button");
+          button.textContent = session.id;
+          button.disabled = session.occupied && !session.you;
+          button.className = session.you ? "mine" : (session.available ? "available" : "occupied");
+          button.addEventListener("click", () => claim(session.id));
+          sessionsEl.appendChild(button);
+        });
+        if (currentSession !== null && token) {
+          setStatus(`Controlling session ${currentSession}`);
+          enterControllerMode();
+        } else {
+          setStatus("Choose an available session");
+        }
+      } catch (error) {
+        setStatus(error.message);
+      }
+    }
+
+    async function claim(sessionId) {
+      try {
+        const data = await api(`/api/sessions/${sessionId}/claim`, { method: "POST" });
+        setClaim(sessionId, data.token);
+        await refreshSessions();
+      } catch (error) {
+        setStatus(error.message);
+        await refreshSessions();
+      }
+    }
+
+    async function release() {
+      if (currentSession === null || !token) return;
+      try {
+        await api(`/api/sessions/${currentSession}/release`, {
+          method: "POST",
+          body: JSON.stringify({ token })
+        });
+      } catch (error) {
+        setStatus(error.message);
+      }
+      clearClaim();
+      await refreshSessions();
+    }
+
+    async function heartbeat() {
+      if (currentSession === null || !token) return;
+      try {
+        await api(`/api/sessions/${currentSession}/heartbeat`, {
+          method: "POST",
+          body: JSON.stringify({ token })
+        });
+      } catch (error) {
+        clearClaim();
+        setStatus(error.message);
+        await refreshSessions();
+      }
+    }
+
+    function buttonControl(button) {
+      return {
+        hand: button.dataset.hand,
+        axis: button.dataset.axis,
+        dir: Number(button.dataset.dir || "0")
+      };
+    }
+
+    function refreshInputFromHeld() {
+      const next = {
+        left: { x: 0, y: 0, z: 0 },
+        right: { x: 0, y: 0, z: 0 }
+      };
+      heldControls.forEach((control) => {
+        if (control.hand in next && control.axis in next[control.hand]) {
+          next[control.hand][control.axis] += control.dir;
+        }
+      });
+      input = {
+        left: {
+          x: Math.max(-1, Math.min(1, next.left.x)),
+          y: Math.max(-1, Math.min(1, next.left.y)),
+          z: Math.max(-1, Math.min(1, next.left.z))
+        },
+        right: {
+          x: Math.max(-1, Math.min(1, next.right.x)),
+          y: Math.max(-1, Math.min(1, next.right.y)),
+          z: Math.max(-1, Math.min(1, next.right.z))
+        }
+      };
+      controlButtons.forEach((button) => {
+        button.classList.toggle(
+          "active",
+          heldControls.has(`${button.dataset.hand}:${button.dataset.key}`)
+        );
+      });
+    }
+
+    function pressButton(button) {
+      heldControls.set(`${button.dataset.hand}:${button.dataset.key}`, buttonControl(button));
+      refreshInputFromHeld();
+    }
+
+    function releaseButton(button) {
+      heldControls.delete(`${button.dataset.hand}:${button.dataset.key}`);
+      refreshInputFromHeld();
+    }
+
+    function clearHeldControls() {
+      heldControls.clear();
+      pointerButtons.clear();
+      refreshInputFromHeld();
+    }
+
+    function buttonFromTouch(touch) {
+      const element = document.elementFromPoint(touch.clientX, touch.clientY);
+      return element ? element.closest(".control-button") : null;
+    }
+
+    if (window.PointerEvent) {
+      controlButtons.forEach((button) => {
+        button.addEventListener("pointerdown", (event) => {
+          event.preventDefault();
+          button.setPointerCapture(event.pointerId);
+          pointerButtons.set(event.pointerId, button);
+          pressButton(button);
+        });
+        button.addEventListener("pointerup", (event) => {
+          event.preventDefault();
+          releaseButton(pointerButtons.get(event.pointerId) || button);
+          pointerButtons.delete(event.pointerId);
+        });
+        button.addEventListener("pointercancel", (event) => {
+          event.preventDefault();
+          releaseButton(pointerButtons.get(event.pointerId) || button);
+          pointerButtons.delete(event.pointerId);
+        });
+        button.addEventListener("contextmenu", (event) => event.preventDefault());
+      });
+    } else {
+      document.addEventListener("touchstart", (event) => {
+        event.preventDefault();
+        for (const touch of event.changedTouches) {
+          const button = buttonFromTouch(touch);
+          if (!button) continue;
+          pointerButtons.set(touch.identifier, button);
+          pressButton(button);
+        }
+      }, { passive: false });
+      document.addEventListener("touchend", (event) => {
+        event.preventDefault();
+        for (const touch of event.changedTouches) {
+          const button = pointerButtons.get(touch.identifier);
+          if (button) releaseButton(button);
+          pointerButtons.delete(touch.identifier);
+        }
+      }, { passive: false });
+      document.addEventListener("touchcancel", (event) => {
+        event.preventDefault();
+        for (const touch of event.changedTouches) {
+          const button = pointerButtons.get(touch.identifier);
+          if (button) releaseButton(button);
+          pointerButtons.delete(touch.identifier);
+        }
+      }, { passive: false });
+    }
+
+    async function sendInput() {
+      if (currentSession === null || !token) return;
+      try {
+        await fetch(`/api/sessions/${currentSession}/input`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ token, left: input.left, right: input.right })
+        });
+      } catch (_) {
+        // Keep the control loop quiet; heartbeat handles stale sessions visibly.
+      }
+    }
+
+    releaseEl.addEventListener("click", release);
+    window.addEventListener("resize", updateViewportVars);
+    window.addEventListener("orientationchange", updateViewportVars);
+    if (window.visualViewport) {
+      window.visualViewport.addEventListener("resize", updateViewportVars);
+      window.visualViewport.addEventListener("scroll", updateViewportVars);
+    }
+    window.addEventListener("beforeunload", () => {
+      if (currentSession !== null && token) {
+        navigator.sendBeacon(
+          `/api/sessions/${currentSession}/release`,
+          new Blob([JSON.stringify({ token })], { type: "application/json" })
+        );
+      }
+    });
+
+    setInterval(refreshSessions, 2000);
+    setInterval(heartbeat, 3000);
+    setInterval(sendInput, 33);
+    updateViewportVars();
+    refreshSessions();
+    if (currentSession !== null && token) {
+      setClaim(currentSession, token);
+    }
+  </script>
+</body>
+</html>

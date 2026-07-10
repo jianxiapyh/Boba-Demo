@@ -16,6 +16,7 @@ import warp as wp
 
 import open3d as o3d
 
+from demos.demo2.control import add_vectors_clamped, control_vector_to_step
 from gaussian_splatting.scene.cameras import Camera
 from gaussian_splatting.scene.gaussian_model import GaussianModel
 from gaussian_splatting.dynamic_utils import (
@@ -44,6 +45,23 @@ SIM_FORCE_MODES = (
     SIM_FORCE_MODE_GATHER,
     SIM_FORCE_MODE_TEMPLATE_STATE_BATCHED_ATOMIC,
 )
+
+
+class BatchedReplayCheckError(RuntimeError):
+    def __init__(
+        self,
+        message,
+        *,
+        frame_idx=None,
+        batch_element=None,
+        hinted_instance=None,
+        original_error=None,
+    ):
+        super().__init__(message)
+        self.frame_idx = frame_idx
+        self.batch_element = batch_element
+        self.hinted_instance = hinted_instance
+        self.original_error = original_error
 
 #pyh moving timer class outside 
 class Timer:
@@ -810,6 +828,7 @@ class InvPhyTrainerWarp:
         gs_path,
         n_dup=0,
         instance_offsets=None,
+        controller_points_group_override=None,
         gaussian_render_mode="shared_template",
         force_shared_batched_gaussians=False,
         sim_force_mode=SIM_FORCE_MODE_GATHER,
@@ -843,15 +862,37 @@ class InvPhyTrainerWarp:
         frame_len = int(self.dataset.frame_len)
         controller_points_group = None
         batch_size = n_dup + 1
-        if n_dup > 0:
-            controller_points_group = self._ensure_controller_points_group_loaded()
+        use_controller_group = controller_points_group_override is not None or n_dup > 0
+        if use_controller_group:
+            if controller_points_group_override is None:
+                controller_points_group = self._ensure_controller_points_group_loaded()
+            else:
+                controller_points_group = controller_points_group_override.to(
+                    device=cfg.device,
+                    dtype=self.controller_points.dtype,
+                ).contiguous()
+                if controller_points_group.ndim != 4 or controller_points_group.shape[-1] != 3:
+                    raise ValueError(
+                        "controller_points_group_override must have shape (N,T,C,3), "
+                        f"got {tuple(controller_points_group.shape)}"
+                    )
+                if controller_points_group.shape[2] != self.controller_points.shape[1]:
+                    raise ValueError(
+                        "controller_points_group_override controller count does not match "
+                        f"the case data: {controller_points_group.shape[2]} vs "
+                        f"{self.controller_points.shape[1]}"
+                    )
             required_instances = batch_size
-            if self.num_input_trajectories < required_instances:
+            available_instances = int(controller_points_group.shape[0])
+            if available_instances < required_instances:
                 raise ValueError(
-                    "multi_ctrls.pkl does not contain enough trajectories for the requested "
-                    f"batch size {required_instances}. Found {self.num_input_trajectories}."
+                    "Controller trajectory bank does not contain enough trajectories "
+                    f"for the requested batch size {required_instances}. "
+                    f"Found {available_instances}."
                 )
             frame_len = self.multi_frame_len
+            if controller_points_group_override is not None:
+                frame_len = int(controller_points_group.shape[1])
 
         if instance_offsets is None:
             resolved_instance_offsets = self._default_diagonal_instance_offsets(
@@ -888,7 +929,7 @@ class InvPhyTrainerWarp:
         for dup_i in range(batch_size):
             shift = resolved_instance_offsets[dup_i]
             ctrl_v = ctrl_init_vertices + shift
-            if n_dup > 0:
+            if use_controller_group:
                 new_controller_points = controller_points_group[dup_i] + shift
             else:
                 new_controller_points = self.controller_points
@@ -1177,6 +1218,661 @@ class InvPhyTrainerWarp:
             ] = batch_frames[batch_idx]
         return grid
 
+    def _parse_linalg_batch_element(self, exc):
+        import re
+
+        match = re.search(r"Batch element (\d+)", str(exc))
+        if not match:
+            return None
+        return int(match.group(1))
+
+    def _demo2_replay_end(self, runtime, replay_start, replay_end):
+        replay_start = int(replay_start)
+        if replay_start < 0 or replay_start >= int(runtime.frame_len):
+            raise ValueError(
+                f"replay_start must be in [0, {int(runtime.frame_len) - 1}], "
+                f"got {replay_start}"
+            )
+        if replay_end is None:
+            replay_end = int(runtime.frame_len)
+        replay_end = int(replay_end)
+        if replay_end <= replay_start or replay_end > int(runtime.frame_len):
+            raise ValueError(
+                f"replay_end must be in ({replay_start}, {int(runtime.frame_len)}], "
+                f"got {replay_end}"
+            )
+        return replay_end
+
+    def _snapshot_demo2_reset_state(self, runtime):
+        cache = runtime.rotation_cache
+        cache_state = {
+            "R_cache": cache["R_cache"].detach().clone(),
+            "F_prev": cache["F_prev"].detach().clone(),
+            "rotation_computed": cache["rotation_computed"].detach().clone(),
+            "Q_cache_bm": cache["Q_cache_bm"].detach().clone(),
+            "motions_bm_fp32": torch.zeros_like(cache["motions_bm_fp32"]),
+        }
+        return SimpleNamespace(
+            gaussian_xyz=runtime.gaussians._xyz.detach().clone(),
+            gaussian_rotation=runtime.gaussians._rotation.detach().clone(),
+            object_x=runtime.prev_x.detach().clone(),
+            object_v=wp.to_torch(
+                self.simulator.wp_init_velocities, requires_grad=False
+            ).detach().clone(),
+            prev_x=runtime.prev_x.detach().clone(),
+            cache_state=cache_state,
+        )
+
+    def _restore_demo2_reset_state(self, runtime, reset_state):
+        self.simulator.set_init_state(
+            self.simulator.wp_init_vertices,
+            self.simulator.wp_init_velocities,
+        )
+        runtime.gaussians._xyz = reset_state.gaussian_xyz.clone()
+        runtime.gaussians._rotation = reset_state.gaussian_rotation.clone()
+        runtime.prev_x = reset_state.prev_x.clone()
+
+        cache = runtime.rotation_cache
+        for key, value in reset_state.cache_state.items():
+            cache[key].copy_(value)
+
+    def _restore_demo2_instance_reset_state(
+        self,
+        runtime,
+        reset_state,
+        session_ids,
+        x_tensor=None,
+    ):
+        session_ids = sorted(
+            {
+                int(session_id)
+                for session_id in session_ids
+                if 0 <= int(session_id) < int(runtime.batch_size)
+            }
+        )
+        if not session_ids:
+            return
+
+        state_x = wp.to_torch(self.simulator.wp_states[0].wp_x, requires_grad=False)
+        state_v = wp.to_torch(self.simulator.wp_states[0].wp_v, requires_grad=False)
+        cache = runtime.rotation_cache
+        obj_nodes = int(runtime.object_nodes_per_instance)
+        gs_nodes = int(runtime.gaussians_per_instance)
+
+        for session_id in session_ids:
+            obj_start = session_id * obj_nodes
+            obj_end = obj_start + obj_nodes
+            gs_start = session_id * gs_nodes
+            gs_end = gs_start + gs_nodes
+
+            state_x[obj_start:obj_end].copy_(reset_state.object_x[obj_start:obj_end])
+            state_v[obj_start:obj_end].copy_(reset_state.object_v[obj_start:obj_end])
+            runtime.prev_x[obj_start:obj_end].copy_(reset_state.object_x[obj_start:obj_end])
+            if x_tensor is not None:
+                x_tensor[obj_start:obj_end].copy_(reset_state.object_x[obj_start:obj_end])
+
+            runtime.gaussians._xyz[gs_start:gs_end].copy_(
+                reset_state.gaussian_xyz[gs_start:gs_end]
+            )
+            runtime.gaussians._rotation[gs_start:gs_end].copy_(
+                reset_state.gaussian_rotation[gs_start:gs_end]
+            )
+
+            cache["R_cache"][obj_start:obj_end].copy_(
+                reset_state.cache_state["R_cache"][obj_start:obj_end]
+            )
+            cache["F_prev"][obj_start:obj_end].copy_(
+                reset_state.cache_state["F_prev"][obj_start:obj_end]
+            )
+            cache["rotation_computed"][obj_start:obj_end].copy_(
+                reset_state.cache_state["rotation_computed"][obj_start:obj_end]
+            )
+            cache["Q_cache_bm"][:, session_id, :].copy_(
+                reset_state.cache_state["Q_cache_bm"][:, session_id, :]
+            )
+            cache["motions_bm_fp32"][:, session_id, :].copy_(
+                reset_state.cache_state["motions_bm_fp32"][:, session_id, :]
+            )
+
+    def _resolve_demo2_control_masks(self, demo2_control_parts, w2c, intrinsic):
+        controller_points = self.controller_points[0].detach()
+        num_controller_points = int(controller_points.shape[0])
+        all_indices = torch.arange(
+            num_controller_points,
+            device=controller_points.device,
+            dtype=torch.long,
+        )
+        if int(demo2_control_parts) == 1:
+            return [all_indices]
+        if num_controller_points < 2:
+            return [all_indices, all_indices]
+
+        try:
+            from sklearn.cluster import KMeans
+        except Exception as exc:
+            raise RuntimeError(
+                "Demo 2 two-hand control requires scikit-learn for controller "
+                "point splitting."
+            ) from exc
+
+        points_np = controller_points.detach().cpu().numpy()
+        labels = KMeans(n_clusters=2, random_state=0, n_init=10).fit_predict(points_np)
+        masks = [labels == 0, labels == 1]
+        if not masks[0].any() or not masks[1].any():
+            return [all_indices, all_indices]
+
+        centers = [points_np[mask].mean(axis=0) for mask in masks]
+        proj_mat = np.asarray(intrinsic, dtype=np.float32) @ np.asarray(
+            w2c[:3, :], dtype=np.float32
+        )
+        projected_x = []
+        for center in centers:
+            center_h = np.concatenate([center, [1.0]], axis=0)
+            projected = proj_mat @ center_h
+            projected = projected / projected[-1]
+            projected_x.append(float(projected[0]))
+        if projected_x[0] > projected_x[1]:
+            masks = [masks[1], masks[0]]
+
+        return [
+            torch.from_numpy(mask)
+            .to(device=controller_points.device, dtype=torch.bool)
+            .nonzero(as_tuple=False)
+            .squeeze(1)
+            for mask in masks
+        ]
+
+    def _update_demo2_control_offsets(
+        self,
+        control_offsets,
+        session_snapshot,
+        control_step,
+        control_max_offset,
+        control_parts,
+    ):
+        occupied_set = {
+            int(session_id)
+            for session_id in session_snapshot.keys()
+            if 0 <= int(session_id) < int(control_offsets.shape[0])
+        }
+        for session_id in range(int(control_offsets.shape[0])):
+            if session_id not in occupied_set:
+                control_offsets[session_id].zero_()
+
+        for session_id, claim in session_snapshot.items():
+            session_id = int(session_id)
+            if session_id not in occupied_set:
+                continue
+            left = claim.get("left", (0.0, 0.0, 0.0))
+            right = claim.get("right", (0.0, 0.0, 0.0))
+            if int(control_parts) == 1:
+                vectors = [add_vectors_clamped(left, right)]
+            else:
+                vectors = [left, right]
+            for part_idx, control_vector in enumerate(vectors[: int(control_parts)]):
+                step = control_vector_to_step(
+                    control_vector[0],
+                    control_vector[1],
+                    control_vector[2],
+                    control_step,
+                )
+                step_tensor = torch.tensor(
+                    step,
+                    device=control_offsets.device,
+                    dtype=control_offsets.dtype,
+                )
+                control_offsets[session_id, part_idx] += step_tensor
+
+        control_max_offset = abs(float(control_max_offset))
+        if control_max_offset > 0.0:
+            norms = torch.linalg.vector_norm(control_offsets, dim=2, keepdim=True)
+            scales = torch.clamp(
+                control_max_offset / torch.clamp(norms, min=1e-8),
+                max=1.0,
+            )
+            control_offsets.mul_(scales)
+        return control_offsets
+
+    def _apply_demo2_control_offsets(
+        self,
+        target,
+        runtime,
+        control_offsets,
+        occupied_sessions,
+        control_masks,
+    ):
+        if not occupied_sessions:
+            return target
+
+        target = target.clone()
+        controller_nodes = int(runtime.controller_nodes_per_instance)
+        for session_id in occupied_sessions:
+            session_id = int(session_id)
+            if session_id < 0 or session_id >= int(runtime.batch_size):
+                continue
+            start = session_id * controller_nodes
+            for part_idx, indices in enumerate(control_masks):
+                if indices.numel() == 0:
+                    continue
+                world_offset = control_offsets[session_id, part_idx]
+                target[start + indices] = target[start + indices] + world_offset.view(1, 3)
+        return target
+
+    def _resolve_demo2_hand_anchor_points(self, control_masks):
+        base_controller_points = self.controller_points[0].to(device=cfg.device)
+        anchors = []
+        for indices in control_masks:
+            if indices.numel() == 0:
+                anchors.append(base_controller_points.mean(dim=0))
+                continue
+            target_points = base_controller_points[indices]
+            anchors.append(self._find_closest_point(target_points).squeeze(0))
+        return torch.stack(anchors, dim=0).to(
+            device=cfg.device,
+            dtype=base_controller_points.dtype,
+        )
+
+    def _load_demo2_hand_icons(self, render_backend, dtype, device):
+        asset_dir = Path(__file__).resolve().parents[2] / "assets"
+        icons = []
+        for filename in ("Picture2.png", "Picture1.png"):
+            path = asset_dir / filename
+            image = render_backend.cv2.imread(
+                str(path),
+                render_backend.cv2.IMREAD_UNCHANGED,
+            )
+            if image is None:
+                raise FileNotFoundError(f"Missing Demo 2 hand icon asset: {path}")
+            if image.ndim != 3 or image.shape[2] != 4:
+                raise ValueError(f"Expected RGBA hand icon asset: {path}")
+            image = np.ascontiguousarray(image[:, :, [2, 1, 0, 3]])
+            icons.append(torch.tensor(image, device=device, dtype=dtype))
+        return icons
+
+    def _project_demo2_point_to_tile(
+        self,
+        point,
+        w2c_T,
+        intrinsic_T,
+        tile_width,
+        tile_height,
+    ):
+        point = point.to(device=w2c_T.device, dtype=w2c_T.dtype)
+        point_h = torch.cat((point, point.new_ones(1)), dim=0)
+        pix3 = point_h @ (w2c_T[:, :3] @ intrinsic_T)
+        if not bool(torch.isfinite(pix3).all().item()):
+            return None
+        depth = float(pix3[2].detach().item())
+        if abs(depth) < 1e-6:
+            return None
+        xy = pix3[:2] / pix3[2]
+        x = int(round(float(xy[0].detach().item())))
+        y = int(round(float(xy[1].detach().item())))
+        margin = max(12, min(int(tile_width), int(tile_height)) // 20)
+        if x < -margin or x >= int(tile_width) + margin:
+            return None
+        if y < -margin or y >= int(tile_height) + margin:
+            return None
+        return x, y
+
+    def _demo2_projected_icon_size(
+        self,
+        point,
+        camera_x_axis,
+        hand_size,
+        w2c_T,
+        intrinsic_T,
+        tile_width,
+        tile_height,
+    ):
+        pixel_1 = self._project_demo2_point_to_tile(
+            point + hand_size * camera_x_axis,
+            w2c_T=w2c_T,
+            intrinsic_T=intrinsic_T,
+            tile_width=tile_width,
+            tile_height=tile_height,
+        )
+        pixel_2 = self._project_demo2_point_to_tile(
+            point - hand_size * camera_x_axis,
+            w2c_T=w2c_T,
+            intrinsic_T=intrinsic_T,
+            tile_width=tile_width,
+            tile_height=tile_height,
+        )
+        if pixel_1 is None or pixel_2 is None:
+            return 36
+        size = int(
+            round(
+                math.sqrt(
+                    float((pixel_1[0] - pixel_2[0]) ** 2)
+                    + float((pixel_1[1] - pixel_2[1]) ** 2)
+                )
+                / 2.0
+            )
+        )
+        return max(1, min(size, 100))
+
+    def _overlay_demo2_hand_icon(self, frame, x, y, icon, icon_size):
+        icon_size = int(icon_size)
+        if icon_size < 1:
+            return
+        resized = F.interpolate(
+            icon.permute(2, 0, 1).unsqueeze(0),
+            size=(icon_size, icon_size),
+            mode="bilinear",
+            align_corners=False,
+        ).squeeze(0).permute(1, 2, 0)
+        icon_h, icon_w = int(resized.shape[0]), int(resized.shape[1])
+        frame_h, frame_w = int(frame.shape[0]), int(frame.shape[1])
+        left = int(round(x)) - icon_w // 2
+        top = int(round(y)) - icon_h // 2
+        roi_x0 = max(0, left)
+        roi_y0 = max(0, top)
+        roi_x1 = min(frame_w, left + icon_w)
+        roi_y1 = min(frame_h, top + icon_h)
+        if roi_x1 <= roi_x0 or roi_y1 <= roi_y0:
+            return
+        icon_x0 = roi_x0 - left
+        icon_y0 = roi_y0 - top
+        icon_roi = resized[
+            icon_y0 : icon_y0 + (roi_y1 - roi_y0),
+            icon_x0 : icon_x0 + (roi_x1 - roi_x0),
+        ]
+        alpha = (icon_roi[:, :, 3:4] / 255.0).clamp(0.0, 1.0)
+        roi = frame[roi_y0:roi_y1, roi_x0:roi_x1, :]
+        roi.mul_(1.0 - alpha).add_(icon_roi[:, :, :3] * alpha)
+
+    def _overlay_demo2_interaction_points(
+        self,
+        batch_frames,
+        *,
+        runtime,
+        control_offsets,
+        occupied_sessions,
+        control_masks,
+        hand_anchor_points,
+        hand_icons,
+        camera_x_axis,
+        w2c_T,
+        intrinsic_T,
+    ):
+        if not occupied_sessions:
+            return batch_frames
+
+        tile_height, tile_width = int(batch_frames.shape[1]), int(batch_frames.shape[2])
+        hand_size = 0.1
+        for session_id in sorted(int(value) for value in occupied_sessions):
+            if session_id < 0 or session_id >= int(runtime.batch_size):
+                continue
+            for part_idx, indices in enumerate(control_masks):
+                if indices.numel() == 0:
+                    continue
+                local_point = hand_anchor_points[part_idx] + control_offsets[
+                    session_id,
+                    part_idx,
+                ]
+                pixel = self._project_demo2_point_to_tile(
+                    local_point,
+                    w2c_T=w2c_T,
+                    intrinsic_T=intrinsic_T,
+                    tile_width=tile_width,
+                    tile_height=tile_height,
+                )
+                if pixel is None:
+                    continue
+                icon_size = self._demo2_projected_icon_size(
+                    local_point,
+                    camera_x_axis,
+                    hand_size,
+                    w2c_T,
+                    intrinsic_T,
+                    tile_width,
+                    tile_height,
+                )
+                self._overlay_demo2_hand_icon(
+                    batch_frames[session_id],
+                    pixel[0],
+                    pixel[1],
+                    hand_icons[min(part_idx, len(hand_icons) - 1)],
+                    icon_size,
+                )
+        return batch_frames
+
+    def _draw_demo2_rect(self, frame, x0, y0, x1, y1, color):
+        height, width = int(frame.shape[0]), int(frame.shape[1])
+        x0 = max(0, min(width, int(x0)))
+        x1 = max(0, min(width, int(x1)))
+        y0 = max(0, min(height, int(y0)))
+        y1 = max(0, min(height, int(y1)))
+        if x1 <= x0 or y1 <= y0:
+            return
+        frame[y0:y1, x0:x1, :] = color
+
+    def _draw_demo2_number(self, frame, value, x, y, scale, color):
+        segments = {
+            "0": "abcfed",
+            "1": "bc",
+            "2": "abged",
+            "3": "abgcd",
+            "4": "fgbc",
+            "5": "afgcd",
+            "6": "afgecd",
+            "7": "abc",
+            "8": "abcdefg",
+            "9": "abfgcd",
+        }
+        segment_boxes = {
+            "a": (1, 0, 4, 1),
+            "b": (4, 1, 5, 4),
+            "c": (4, 4, 5, 7),
+            "d": (1, 7, 4, 8),
+            "e": (0, 4, 1, 7),
+            "f": (0, 1, 1, 4),
+            "g": (1, 3, 4, 4),
+        }
+        cursor = int(x)
+        for digit in str(int(value)):
+            for segment in segments.get(digit, ""):
+                sx0, sy0, sx1, sy1 = segment_boxes[segment]
+                self._draw_demo2_rect(
+                    frame,
+                    cursor + sx0 * scale,
+                    y + sy0 * scale,
+                    cursor + sx1 * scale,
+                    y + sy1 * scale,
+                    color,
+                )
+            cursor += 6 * scale
+
+    def _overlay_demo2_public_display(
+        self,
+        frame,
+        *,
+        batch_size,
+        batch_grid_cols,
+        occupied_sessions,
+        qr_overlay=None,
+    ):
+        display_height, display_width = int(frame.shape[0]), int(frame.shape[1])
+        cols = (
+            int(batch_grid_cols)
+            if batch_grid_cols is not None
+            else int(math.ceil(math.sqrt(batch_size)))
+        )
+        rows = int(math.ceil(batch_size / float(cols)))
+        label_bg = torch.tensor([0.0, 0.0, 0.0], device=frame.device, dtype=frame.dtype)
+        label_fg = torch.tensor([255.0, 255.0, 255.0], device=frame.device, dtype=frame.dtype)
+
+        for session_id in sorted(int(value) for value in occupied_sessions):
+            if session_id < 0 or session_id >= int(batch_size):
+                continue
+            row = session_id // cols
+            col = session_id % cols
+            x0 = int(round(col * display_width / cols))
+            x1 = int(round((col + 1) * display_width / cols))
+            y0 = int(round(row * display_height / rows))
+            y1 = int(round((row + 1) * display_height / rows))
+
+            label_scale = max(2, min((x1 - x0) // 48, (y1 - y0) // 32))
+            label_width = (len(str(session_id)) * 6 + 1) * label_scale
+            label_height = 9 * label_scale
+            lx0 = x0 + label_scale
+            ly0 = y0 + label_scale
+            self._draw_demo2_rect(
+                frame,
+                lx0,
+                ly0,
+                lx0 + label_width,
+                ly0 + label_height,
+                label_bg,
+            )
+            self._draw_demo2_number(
+                frame,
+                session_id,
+                lx0 + label_scale,
+                ly0 + label_scale,
+                label_scale,
+                label_fg,
+            )
+
+        if qr_overlay is not None:
+            qr_height, qr_width = int(qr_overlay.shape[0]), int(qr_overlay.shape[1])
+            margin = max(12, min(display_width, display_height) // 80)
+            x0 = max(0, display_width - qr_width - margin)
+            y0 = margin
+            x1 = min(display_width, x0 + qr_width)
+            y1 = min(display_height, y0 + qr_height)
+            frame[y0:y1, x0:x1, :] = qr_overlay[: y1 - y0, : x1 - x0, :]
+
+    def _update_demo2_motion_debug(
+        self,
+        motion_debug,
+        *,
+        runtime,
+        current_target,
+        batch_frames,
+        frame_counter,
+        replay_len,
+    ):
+        if motion_debug is None or int(runtime.batch_size) < 1:
+            return
+        if int(frame_counter) >= int(replay_len):
+            return
+
+        batch_size = int(runtime.batch_size)
+        controller_nodes = int(runtime.controller_nodes_per_instance)
+        last_session_id = int(motion_debug.last_session_id)
+        start = last_session_id * controller_nodes
+        end = start + controller_nodes
+
+        if motion_debug.reference_target is None:
+            motion_debug.reference_target = current_target.detach().clone()
+            motion_debug.reference_tile = batch_frames[last_session_id].detach().clone()
+            if motion_debug.enabled:
+                motion_debug.target_delta_max_by_session = torch.zeros(
+                    batch_size,
+                    device=current_target.device,
+                    dtype=current_target.dtype,
+                )
+            return
+
+        target_delta = torch.linalg.vector_norm(
+            current_target[start:end] - motion_debug.reference_target[start:end],
+            dim=1,
+        ).mean()
+        pixel_delta = torch.mean(
+            torch.abs(batch_frames[last_session_id] - motion_debug.reference_tile)
+        )
+        target_delta_value = float(target_delta.detach().item())
+        pixel_delta_value = float(pixel_delta.detach().item())
+        motion_debug.max_target_delta = max(
+            motion_debug.max_target_delta,
+            target_delta_value,
+        )
+        motion_debug.max_pixel_delta = max(
+            motion_debug.max_pixel_delta,
+            pixel_delta_value,
+        )
+
+        if motion_debug.enabled:
+            reshaped_delta = torch.linalg.vector_norm(
+                (
+                    current_target.detach()
+                    - motion_debug.reference_target
+                ).view(batch_size, controller_nodes, 3),
+                dim=2,
+            ).mean(dim=1)
+            motion_debug.target_delta_max_by_session = torch.maximum(
+                motion_debug.target_delta_max_by_session,
+                reshaped_delta,
+            )
+            if frame_counter % 10 == 0 or frame_counter + 1 >= replay_len:
+                motion_debug.records.append(
+                    {
+                        "frame": int(frame_counter),
+                        "last_session_target_delta": target_delta_value,
+                        "last_session_pixel_delta": pixel_delta_value,
+                    }
+                )
+
+        if frame_counter + 1 < replay_len or motion_debug.first_cycle_checked:
+            return
+
+        motion_debug.first_cycle_checked = True
+        if motion_debug.max_target_delta > 1e-4 and motion_debug.max_pixel_delta < 0.5:
+            motion_debug.warning = (
+                "Last Demo 2 session target moved during the first replay cycle, "
+                "but its rendered tile stayed nearly static."
+            )
+            print(
+                "[Demo2][WARN] "
+                f"{motion_debug.warning} session={last_session_id}, "
+                f"target_delta={motion_debug.max_target_delta:.6f}, "
+                f"pixel_delta={motion_debug.max_pixel_delta:.6f}"
+            )
+        elif motion_debug.enabled:
+            print(
+                "[Demo2][motion-debug] "
+                f"last_session={last_session_id}, "
+                f"target_delta={motion_debug.max_target_delta:.6f}, "
+                f"pixel_delta={motion_debug.max_pixel_delta:.6f}"
+            )
+
+        if motion_debug.enabled and motion_debug.target_delta_max_by_session is not None:
+            deltas = motion_debug.target_delta_max_by_session.detach().cpu()
+            last_value = float(deltas[last_session_id].item())
+            print(
+                "[Demo2][motion-debug] "
+                f"per-session target delta: min={float(deltas.min().item()):.6f}, "
+                f"max={float(deltas.max().item()):.6f}, "
+                f"last={last_value:.6f}"
+            )
+
+    def _write_demo2_motion_debug(self, motion_debug):
+        if (
+            motion_debug is None
+            or not motion_debug.path
+            or not motion_debug.enabled
+        ):
+            return
+        target_delta_max_by_session = None
+        if motion_debug.target_delta_max_by_session is not None:
+            target_delta_max_by_session = (
+                motion_debug.target_delta_max_by_session.detach().cpu().tolist()
+            )
+        payload = {
+            "last_session_id": int(motion_debug.last_session_id),
+            "max_target_delta": float(motion_debug.max_target_delta),
+            "max_pixel_delta": float(motion_debug.max_pixel_delta),
+            "warning": motion_debug.warning,
+            "records": motion_debug.records,
+            "target_delta_max_by_session": target_delta_max_by_session,
+        }
+        os.makedirs(os.path.dirname(os.path.abspath(motion_debug.path)), exist_ok=True)
+        with open(motion_debug.path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2)
+        print(f"[Demo2][motion-debug] Wrote {motion_debug.path}")
+
     def _write_headless_summary(self, output_dir, batch_size, component_times):
         frames_used_for_stats = len(component_times["total"])
         if frames_used_for_stats == 0:
@@ -1238,6 +1934,90 @@ class InvPhyTrainerWarp:
             * 1000.0
             if component_times["full_motion_interpolation"]
             else None,
+        }
+
+    def check_batched_replay_lbs(
+        self,
+        model_path,
+        gs_path,
+        controller_points_group,
+        replay_start=0,
+        replay_end=None,
+        gaussian_render_mode="shared_template",
+        sim_force_mode=SIM_FORCE_MODE_GATHER,
+    ):
+        batch_size = int(controller_points_group.shape[0])
+        runtime = self._build_runtime_core(
+            model_path=model_path,
+            gs_path=gs_path,
+            n_dup=batch_size - 1,
+            controller_points_group_override=controller_points_group,
+            gaussian_render_mode=gaussian_render_mode,
+            force_shared_batched_gaussians=True,
+            sim_force_mode=sim_force_mode,
+        )
+        replay_end = self._demo2_replay_end(runtime, replay_start, replay_end)
+
+        gaussians = runtime.gaussians
+        frame_idx = int(replay_start)
+        prev_target = self.batch_controller_points[frame_idx]
+        current_target = prev_target
+        checked_frames = 0
+
+        try:
+            while frame_idx < replay_end:
+                if checked_frames > 0:
+                    current_target = self.batch_controller_points[frame_idx]
+
+                self.simulator.set_controller_interactive(prev_target, current_target)
+                if self.simulator.object_collision_flag:
+                    self.simulator.update_collision_graph()
+                wp.capture_launch(self.simulator.forward_graph)
+                wp.synchronize()
+
+                x = wp.to_torch(self.simulator.wp_states[-1].wp_x, requires_grad=False)
+                self.simulator.set_init_state(
+                    self.simulator.wp_states[-1].wp_x,
+                    self.simulator.wp_states[-1].wp_v,
+                )
+
+                if frame_idx + 1 < replay_end:
+                    try:
+                        current_pos, current_rot = lbs_with_rotation_reuse(
+                            current_mass_nodes=x,
+                            cache=runtime.rotation_cache,
+                        )
+                    except torch._C._LinAlgError as exc:
+                        batch_element = self._parse_linalg_batch_element(exc)
+                        hinted_instance = None
+                        if batch_element is not None:
+                            hinted_instance = int(batch_element) // int(
+                                runtime.object_nodes_per_instance
+                            )
+                            if hinted_instance < 0 or hinted_instance >= batch_size:
+                                hinted_instance = None
+                        raise BatchedReplayCheckError(
+                            "Batched replay LBS failed with torch.linalg.eigh "
+                            f"at replay frame {frame_idx}.",
+                            frame_idx=frame_idx,
+                            batch_element=batch_element,
+                            hinted_instance=hinted_instance,
+                            original_error=exc,
+                        ) from exc
+                    gaussians._xyz = current_pos
+                    gaussians._rotation = current_rot
+
+                prev_target = current_target
+                frame_idx += 1
+                checked_frames += 1
+        finally:
+            torch.cuda.empty_cache()
+
+        return {
+            "batch_size": batch_size,
+            "frames_checked": checked_frames,
+            "replay_start": int(replay_start),
+            "replay_end": int(replay_end),
         }
 
     def _write_headless_ncu_profile_metrics(self, output_dir, metrics):
@@ -1563,6 +2343,604 @@ class InvPhyTrainerWarp:
                 )
         return summary
 
+    def run_batched_demo2_runtime(
+        self,
+        model_path,
+        gs_path,
+        window,
+        cuda_ctx,
+        controller_points_group,
+        batch_size=100,
+        gaussian_render_mode="shared_template",
+        batch_image_resolution="640x480",
+        batch_grid_cols=10,
+        replay_start=0,
+        replay_end=None,
+        sim_force_mode=SIM_FORCE_MODE_GATHER,
+        session_snapshot_fn=None,
+        input_snapshot_fn=None,
+        occupied_sessions_fn=None,
+        publish_frame_fn=None,
+        qr_overlay_rgb=None,
+        phone_stream_size=(640, 480),
+        phone_stream_fps=10.0,
+        phone_control_step=0.005,
+        phone_control_max_offset=0.0,
+        demo2_control_parts=1,
+        demo2_debug_motion=False,
+        demo2_debug_motion_path=None,
+        max_frames=None,
+    ):
+        gaussian_render_mode = normalize_gaussian_render_mode(gaussian_render_mode)
+        if sim_force_mode not in SIM_FORCE_MODES:
+            raise ValueError(
+                f"sim_force_mode must be one of {SIM_FORCE_MODES}. "
+                f"Received: {sim_force_mode}"
+            )
+        batch_size = int(batch_size)
+        if batch_size < 1:
+            raise ValueError(f"batch_size must be positive, got {batch_size}")
+        if batch_image_resolution not in ("native", "640x480"):
+            raise ValueError(
+                "batch_image_resolution must be 'native' or '640x480'. "
+                f"Received: {batch_image_resolution}"
+            )
+        if batch_grid_cols is not None and int(batch_grid_cols) < 1:
+            raise ValueError("batch_grid_cols must be a positive integer.")
+        if phone_stream_fps <= 0:
+            raise ValueError("phone_stream_fps must be positive.")
+        if phone_control_step < 0:
+            raise ValueError("phone_control_step must be non-negative.")
+        if phone_control_max_offset < 0:
+            raise ValueError("phone_control_max_offset must be non-negative.")
+        demo2_control_parts = int(demo2_control_parts)
+        if demo2_control_parts not in (1, 2):
+            raise ValueError("demo2_control_parts must be 1 or 2.")
+
+        runtime = self._build_runtime_core(
+            model_path=model_path,
+            gs_path=gs_path,
+            n_dup=batch_size - 1,
+            controller_points_group_override=controller_points_group[:batch_size],
+            gaussian_render_mode=gaussian_render_mode,
+            force_shared_batched_gaussians=True,
+            sim_force_mode=sim_force_mode,
+        )
+        replay_end = self._demo2_replay_end(runtime, replay_start, replay_end)
+        replay_start = int(replay_start)
+        replay_len = int(replay_end - replay_start)
+        print(
+            "[Demo2] Runtime ready: "
+            f"batch_size={runtime.batch_size}, replay={replay_start}:{replay_end}, "
+            f"gaussian_render_mode={gaussian_render_mode}, sim_force_mode={sim_force_mode}, "
+            f"control_parts={demo2_control_parts}"
+        )
+        reset_state = self._snapshot_demo2_reset_state(runtime)
+
+        render_backend = self._load_render_backend()
+        render_backend.glfw.make_context_current(window)
+
+        native_width, native_height = [int(value) for value in cfg.WH]
+        width, height = self._resolve_batch_image_render_size(
+            batch_image_resolution=batch_image_resolution,
+            native_width=native_width,
+            native_height=native_height,
+        )
+        display_width, display_height = render_backend.glfw.get_framebuffer_size(window)
+        display_width = int(display_width) if display_width > 0 else width
+        display_height = int(display_height) if display_height > 0 else height
+
+        background = torch.tensor([1, 1, 1], dtype=torch.float32, device=cfg.device)
+        intrinsic = self._scale_intrinsic_for_render_size(
+            cfg.intrinsics[0],
+            native_width=native_width,
+            native_height=native_height,
+            render_width=width,
+            render_height=height,
+        )
+        w2c = cfg.w2cs[0]
+        view, K_cuda = self._create_gs_view(w2c, intrinsic, height, width)
+        w2c_cuda = torch.tensor(w2c, dtype=torch.float32, device=cfg.device)
+        w2c_T = w2c_cuda.T.contiguous()
+        intrinsic_T = K_cuda.T.contiguous()
+        control_masks = self._resolve_demo2_control_masks(
+            demo2_control_parts,
+            w2c=w2c,
+            intrinsic=intrinsic,
+        )
+        hand_anchor_points = self._resolve_demo2_hand_anchor_points(control_masks)
+        c2w = np.linalg.inv(np.asarray(w2c, dtype=np.float32))
+        camera_x_axis = torch.tensor(
+            c2w[:3, 0],
+            dtype=hand_anchor_points.dtype,
+            device=cfg.device,
+        )
+
+        overlay = render_backend.cv2.imread(cfg.bg_img_path)
+        overlay = render_backend.cv2.cvtColor(
+            overlay, render_backend.cv2.COLOR_BGR2RGB
+        )
+        if overlay.shape[1] != width or overlay.shape[0] != height:
+            overlay = render_backend.cv2.resize(
+                overlay,
+                (width, height),
+                interpolation=render_backend.cv2.INTER_LINEAR,
+            )
+        overlay = torch.tensor(overlay, dtype=torch.float32, device=cfg.device)
+        hand_icons = self._load_demo2_hand_icons(
+            render_backend,
+            dtype=overlay.dtype,
+            device=cfg.device,
+        )
+
+        render_gaussians = build_batch_images_render_view(
+            runtime.gaussians,
+            gaussian_render_mode=gaussian_render_mode,
+        )
+
+        bytes_per_pixel = 4
+        pbo_size = display_width * display_height * bytes_per_pixel
+        row_pitch = display_width * bytes_per_pixel
+
+        tex = None
+        pbo = None
+        reg = None
+        prog = None
+        vao = None
+        try:
+            tex = render_backend.gl.glGenTextures(1)
+            render_backend.gl.glBindTexture(render_backend.gl.GL_TEXTURE_2D, tex)
+            render_backend.gl.glTexParameteri(
+                render_backend.gl.GL_TEXTURE_2D,
+                render_backend.gl.GL_TEXTURE_MIN_FILTER,
+                render_backend.gl.GL_NEAREST,
+            )
+            render_backend.gl.glTexParameteri(
+                render_backend.gl.GL_TEXTURE_2D,
+                render_backend.gl.GL_TEXTURE_MAG_FILTER,
+                render_backend.gl.GL_NEAREST,
+            )
+            render_backend.gl.glTexImage2D(
+                render_backend.gl.GL_TEXTURE_2D,
+                0,
+                render_backend.gl.GL_RGBA8,
+                display_width,
+                display_height,
+                0,
+                render_backend.gl.GL_RGBA,
+                render_backend.gl.GL_UNSIGNED_BYTE,
+                None,
+            )
+            render_backend.gl.glBindTexture(render_backend.gl.GL_TEXTURE_2D, 0)
+
+            pbo = render_backend.gl.glGenBuffers(1)
+            render_backend.gl.glBindBuffer(
+                render_backend.gl.GL_PIXEL_UNPACK_BUFFER, pbo
+            )
+            render_backend.gl.glBufferData(
+                render_backend.gl.GL_PIXEL_UNPACK_BUFFER,
+                pbo_size,
+                None,
+                render_backend.gl.GL_STREAM_DRAW,
+            )
+            render_backend.gl.glBindBuffer(
+                render_backend.gl.GL_PIXEL_UNPACK_BUFFER, 0
+            )
+            reg = render_backend.RegisteredBuffer(
+                int(pbo), render_backend.graphics_map_flags.WRITE_DISCARD
+            )
+
+            vertex_shader_source = """
+            #version 330 core
+            out vec2 uv; const vec2 V[4]=vec2[4](vec2(-1,-1),vec2(1,-1),vec2(-1,1),vec2(1,1));
+            const vec2 T[4]=vec2[4](vec2(0,0),vec2(1,0),vec2(0,1),vec2(1,1));
+            void main(){ gl_Position=vec4(V[gl_VertexID],0,1); uv=T[gl_VertexID]; }
+            """
+            fragment_shader_source = """
+            #version 330 core
+            in vec2 uv; out vec4 frag; uniform sampler2D uTex;
+            void main(){ frag = texture(uTex, vec2(uv.x,1.0 - uv.y)); }
+            """
+
+            def _compile(kind, src):
+                shader_id = render_backend.gl.glCreateShader(kind)
+                render_backend.gl.glShaderSource(shader_id, src)
+                render_backend.gl.glCompileShader(shader_id)
+                if not render_backend.gl.glGetShaderiv(
+                    shader_id, render_backend.gl.GL_COMPILE_STATUS
+                ):
+                    raise RuntimeError(
+                        render_backend.gl.glGetShaderInfoLog(shader_id).decode()
+                    )
+                return shader_id
+
+            prog = render_backend.gl.glCreateProgram()
+            render_backend.gl.glAttachShader(
+                prog,
+                _compile(render_backend.gl.GL_VERTEX_SHADER, vertex_shader_source),
+            )
+            render_backend.gl.glAttachShader(
+                prog,
+                _compile(render_backend.gl.GL_FRAGMENT_SHADER, fragment_shader_source),
+            )
+            render_backend.gl.glLinkProgram(prog)
+            if not render_backend.gl.glGetProgramiv(
+                prog, render_backend.gl.GL_LINK_STATUS
+            ):
+                raise RuntimeError(
+                    render_backend.gl.glGetProgramInfoLog(prog).decode()
+                )
+            render_backend.gl.glUseProgram(prog)
+            render_backend.gl.glUniform1i(
+                render_backend.gl.glGetUniformLocation(prog, "uTex"), 0
+            )
+            render_backend.gl.glUseProgram(0)
+            vao = render_backend.gl.glGenVertexArrays(1)
+            render_backend.gl.glBindVertexArray(vao)
+
+            pbo_stream = render_backend.cuda_driver.Stream()
+            cpy2d = render_backend.cuda_driver.Memcpy2D()
+            cpy2d.src_pitch = row_pitch
+            cpy2d.dst_pitch = row_pitch
+            cpy2d.width_in_bytes = row_pitch
+            cpy2d.height = display_height
+
+            frame_rgba = torch.empty(
+                (display_height, display_width, 4),
+                dtype=torch.uint8,
+                device=cfg.device,
+            )
+            frame = torch.empty(
+                (display_height, display_width, 3),
+                dtype=overlay.dtype,
+                device=cfg.device,
+            )
+            qr_overlay = None
+            if qr_overlay_rgb is not None:
+                qr_overlay = torch.tensor(
+                    qr_overlay_rgb,
+                    device=cfg.device,
+                    dtype=frame.dtype,
+                )
+
+            input_snapshot_fn = input_snapshot_fn or (lambda: {})
+            occupied_sessions_fn = occupied_sessions_fn or (lambda: [])
+
+            def legacy_session_snapshot():
+                occupied = set(int(value) for value in occupied_sessions_fn())
+                inputs = input_snapshot_fn()
+                return {
+                    session_id: {
+                        "claim_id": 1,
+                        "left": inputs.get(session_id, (0.0, 0.0, 0.0)),
+                        "right": (0.0, 0.0, 0.0),
+                    }
+                    for session_id in occupied
+                }
+
+            session_snapshot_fn = session_snapshot_fn or legacy_session_snapshot
+            stream_width, stream_height = [int(value) for value in phone_stream_size]
+            stream_interval = 1.0 / float(phone_stream_fps)
+            next_stream_publish = 0.0
+            control_offsets = torch.zeros(
+                (int(runtime.batch_size), demo2_control_parts, 3),
+                device=cfg.device,
+                dtype=self.batch_controller_points.dtype,
+            )
+            motion_debug = SimpleNamespace(
+                enabled=bool(demo2_debug_motion),
+                path=demo2_debug_motion_path,
+                last_session_id=int(runtime.batch_size) - 1,
+                reference_target=None,
+                reference_tile=None,
+                target_delta_max_by_session=None,
+                max_target_delta=0.0,
+                max_pixel_delta=0.0,
+                warning=None,
+                first_cycle_checked=False,
+                records=[],
+            )
+            replay_cursors = [int(replay_start) for _ in range(int(runtime.batch_size))]
+            active_claim_ids = [None for _ in range(int(runtime.batch_size))]
+
+            frame_counter = 0
+            prev_target = self.batch_controller_points[replay_start].clone()
+            while not render_backend.glfw.window_should_close(window):
+                if max_frames is not None and frame_counter >= int(max_frames):
+                    break
+
+                raw_snapshot = session_snapshot_fn()
+                session_snapshot = {
+                    int(session_id): claim
+                    for session_id, claim in raw_snapshot.items()
+                    if 0 <= int(session_id) < int(runtime.batch_size)
+                }
+                occupied_sessions = sorted(session_snapshot.keys())
+                current_claim_ids = {
+                    session_id: int(claim.get("claim_id", 1))
+                    for session_id, claim in session_snapshot.items()
+                }
+                previously_claimed = {
+                    session_id
+                    for session_id, claim_id in enumerate(active_claim_ids)
+                    if claim_id is not None
+                }
+                newly_claimed = [
+                    session_id
+                    for session_id, claim_id in current_claim_ids.items()
+                    if active_claim_ids[session_id] != claim_id
+                ]
+                released_sessions = sorted(
+                    previously_claimed - set(current_claim_ids.keys())
+                )
+                reset_sessions = sorted(set(newly_claimed + released_sessions))
+
+                if reset_sessions:
+                    self._restore_demo2_instance_reset_state(
+                        runtime,
+                        reset_state,
+                        reset_sessions,
+                    )
+                    control_offsets[reset_sessions].zero_()
+                    for session_id in reset_sessions:
+                        replay_cursors[session_id] = replay_start
+
+                for session_id in released_sessions:
+                    active_claim_ids[session_id] = None
+                for session_id in newly_claimed:
+                    active_claim_ids[session_id] = current_claim_ids[session_id]
+
+                self._update_demo2_control_offsets(
+                    control_offsets,
+                    session_snapshot,
+                    float(phone_control_step),
+                    float(phone_control_max_offset),
+                    demo2_control_parts,
+                )
+
+                current_target = self.batch_controller_points[replay_start].clone()
+                controller_nodes = int(runtime.controller_nodes_per_instance)
+                for session_id in range(int(runtime.batch_size)):
+                    start = session_id * controller_nodes
+                    end = start + controller_nodes
+                    if active_claim_ids[session_id] is None:
+                        frame_idx = replay_cursors[session_id]
+                    else:
+                        frame_idx = replay_start
+                    current_target[start:end].copy_(
+                        self.batch_controller_points[frame_idx, start:end]
+                    )
+                current_target = self._apply_demo2_control_offsets(
+                    current_target,
+                    runtime,
+                    control_offsets,
+                    occupied_sessions,
+                    control_masks,
+                )
+                if reset_sessions:
+                    for session_id in reset_sessions:
+                        start = session_id * controller_nodes
+                        end = start + controller_nodes
+                        prev_target[start:end].copy_(current_target[start:end])
+
+                self.simulator.set_controller_interactive(prev_target, current_target)
+                if self.simulator.object_collision_flag:
+                    self.simulator.update_collision_graph()
+                wp.capture_launch(self.simulator.forward_graph)
+                wp.synchronize()
+
+                x = wp.to_torch(self.simulator.wp_states[-1].wp_x, requires_grad=False)
+                self.simulator.set_init_state(
+                    self.simulator.wp_states[-1].wp_x,
+                    self.simulator.wp_states[-1].wp_v,
+                )
+
+                results = render_backend.render_gaussian(
+                    view,
+                    render_gaussians,
+                    None,
+                    background,
+                )
+                batch_frames, _ = self._composite_batch_images_without_shadows(
+                    results["render"],
+                    overlay,
+                )
+                if int(batch_frames.shape[0]) != int(runtime.batch_size):
+                    raise RuntimeError(
+                        "Demo 2 batch image renderer returned an unexpected batch "
+                        f"count: {int(batch_frames.shape[0])} vs {int(runtime.batch_size)}"
+                    )
+                self._update_demo2_motion_debug(
+                    motion_debug,
+                    runtime=runtime,
+                    current_target=current_target,
+                    batch_frames=batch_frames,
+                    frame_counter=frame_counter,
+                    replay_len=replay_len,
+                )
+                self._overlay_demo2_interaction_points(
+                    batch_frames,
+                    runtime=runtime,
+                    control_offsets=control_offsets,
+                    occupied_sessions=occupied_sessions,
+                    control_masks=control_masks,
+                    hand_anchor_points=hand_anchor_points,
+                    hand_icons=hand_icons,
+                    camera_x_axis=camera_x_axis,
+                    w2c_T=w2c_T,
+                    intrinsic_T=intrinsic_T,
+                )
+
+                batch_grid = self._make_batch_image_grid(
+                    batch_frames,
+                    batch_grid_cols=batch_grid_cols,
+                )
+                display_grid = batch_grid
+                if (
+                    display_grid.shape[0] != display_height
+                    or display_grid.shape[1] != display_width
+                ):
+                    display_grid = F.interpolate(
+                        display_grid.permute(2, 0, 1).unsqueeze(0),
+                        size=(display_height, display_width),
+                        mode="bilinear",
+                        align_corners=False,
+                    ).squeeze(0).permute(1, 2, 0)
+                frame.copy_(display_grid)
+
+                self._overlay_demo2_public_display(
+                    frame,
+                    batch_size=runtime.batch_size,
+                    batch_grid_cols=batch_grid_cols,
+                    occupied_sessions=occupied_sessions,
+                    qr_overlay=qr_overlay,
+                )
+
+                now = time.time()
+                if (
+                    publish_frame_fn is not None
+                    and occupied_sessions
+                    and now >= next_stream_publish
+                ):
+                    occupied_ids = torch.tensor(
+                        occupied_sessions,
+                        device=batch_frames.device,
+                        dtype=torch.long,
+                    )
+                    stream_tiles = F.interpolate(
+                        batch_frames[occupied_ids].permute(0, 3, 1, 2),
+                        size=(stream_height, stream_width),
+                        mode="bilinear",
+                        align_corners=False,
+                    ).permute(0, 2, 3, 1)
+                    stream_rgbs = (
+                        stream_tiles.clamp(0, 255)
+                        .to(torch.uint8)
+                        .detach()
+                        .cpu()
+                        .numpy()
+                    )
+                    for idx, session_id in enumerate(occupied_sessions):
+                        rgb = stream_rgbs[idx]
+                        publish_frame_fn(session_id, rgb)
+                    next_stream_publish = now + stream_interval
+
+                frame_u8 = frame.clamp(0, 255).to(torch.uint8)
+                frame_rgba[:, :, :3] = frame_u8
+                frame_rgba[:, :, 3] = 255
+                torch.cuda.current_stream().synchronize()
+
+                mapping = reg.map()
+                try:
+                    ptr, _ = mapping.device_ptr_and_size()
+                    cpy2d.set_src_device(frame_rgba.data_ptr())
+                    cpy2d.set_dst_device(ptr)
+                    cpy2d(pbo_stream)
+                    pbo_stream.synchronize()
+                finally:
+                    mapping.unmap()
+
+                render_backend.gl.glBindTexture(render_backend.gl.GL_TEXTURE_2D, tex)
+                render_backend.gl.glBindBuffer(
+                    render_backend.gl.GL_PIXEL_UNPACK_BUFFER, pbo
+                )
+                render_backend.gl.glTexSubImage2D(
+                    render_backend.gl.GL_TEXTURE_2D,
+                    0,
+                    0,
+                    0,
+                    display_width,
+                    display_height,
+                    render_backend.gl.GL_RGBA,
+                    render_backend.gl.GL_UNSIGNED_BYTE,
+                    None,
+                )
+                render_backend.gl.glBindBuffer(
+                    render_backend.gl.GL_PIXEL_UNPACK_BUFFER, 0
+                )
+
+                render_backend.gl.glViewport(0, 0, display_width, display_height)
+                render_backend.gl.glDisable(render_backend.gl.GL_DEPTH_TEST)
+                render_backend.gl.glClear(render_backend.gl.GL_COLOR_BUFFER_BIT)
+                render_backend.gl.glUseProgram(prog)
+                render_backend.gl.glActiveTexture(render_backend.gl.GL_TEXTURE0)
+                render_backend.gl.glBindTexture(render_backend.gl.GL_TEXTURE_2D, tex)
+                render_backend.gl.glDrawArrays(
+                    render_backend.gl.GL_TRIANGLE_STRIP, 0, 4
+                )
+                render_backend.gl.glBindTexture(render_backend.gl.GL_TEXTURE_2D, 0)
+                render_backend.gl.glUseProgram(0)
+
+                render_backend.glfw.swap_buffers(window)
+                render_backend.glfw.poll_events()
+
+                end_of_replay_sessions = []
+                for session_id in range(int(runtime.batch_size)):
+                    if active_claim_ids[session_id] is not None:
+                        continue
+                    if replay_cursors[session_id] + 1 < replay_end:
+                        replay_cursors[session_id] += 1
+                    else:
+                        replay_cursors[session_id] = replay_start
+                        end_of_replay_sessions.append(session_id)
+
+                next_prev_target = current_target.clone()
+                if end_of_replay_sessions:
+                    self._restore_demo2_instance_reset_state(
+                        runtime,
+                        reset_state,
+                        end_of_replay_sessions,
+                        x_tensor=x,
+                    )
+                    for session_id in end_of_replay_sessions:
+                        start = session_id * controller_nodes
+                        end = start + controller_nodes
+                        next_prev_target[start:end].copy_(
+                            self.batch_controller_points[replay_start, start:end]
+                        )
+
+                try:
+                    current_pos, current_rot = lbs_with_rotation_reuse(
+                        current_mass_nodes=x,
+                        cache=runtime.rotation_cache,
+                    )
+                except torch._C._LinAlgError as exc:
+                    batch_element = self._parse_linalg_batch_element(exc)
+                    hinted_instance = None
+                    if batch_element is not None:
+                        hinted_instance = int(batch_element) // int(
+                            runtime.object_nodes_per_instance
+                        )
+                        if hinted_instance < 0 or hinted_instance >= runtime.batch_size:
+                            hinted_instance = None
+                    raise BatchedReplayCheckError(
+                        "Demo 2 LBS failed with torch.linalg.eigh "
+                        f"at runtime frame {frame_counter}. "
+                        "Regenerate the filtered trajectory bank with this replay range.",
+                        frame_idx=frame_counter,
+                        batch_element=batch_element,
+                        hinted_instance=hinted_instance,
+                        original_error=exc,
+                    ) from exc
+                runtime.gaussians._xyz = current_pos
+                runtime.gaussians._rotation = current_rot
+
+                prev_target = next_prev_target
+                frame_counter += 1
+        finally:
+            self._write_demo2_motion_debug(motion_debug if "motion_debug" in locals() else None)
+            if reg is not None:
+                reg.unregister()
+            if prog is not None:
+                render_backend.gl.glDeleteProgram(prog)
+            if tex is not None:
+                render_backend.gl.glDeleteTextures([tex])
+            if pbo is not None:
+                render_backend.gl.glDeleteBuffers(1, [pbo])
+            if vao is not None:
+                render_backend.gl.glDeleteVertexArrays(1, [vao])
+            cuda_ctx.pop()
+
     def run_batched_full_runtime(
         self,
         model_path,
@@ -1578,6 +2956,7 @@ class InvPhyTrainerWarp:
         save_video=False,
         save_batch_images=False,
         save_batch_grid=False,
+        display_batch_grid=False,
         batch_image_resolution="native",
         batch_grid_cols=None,
         profile_render_components=False,
@@ -1617,10 +2996,10 @@ class InvPhyTrainerWarp:
                 "batch_image_resolution='640x480' can only be used with "
                 "render_mode='batch_images'."
             )
-        elif save_batch_images or save_batch_grid:
+        elif save_batch_images or save_batch_grid or display_batch_grid:
             raise ValueError(
-                "--save_batch_images and --save_batch_grid can only be used with "
-                "render_mode='batch_images'."
+                "--save_batch_images, --save_batch_grid, and --display_batch_grid "
+                "can only be used with render_mode='batch_images'."
             )
 
         print(f"[BatchedRender] gaussian_render_mode={gaussian_render_mode}")
@@ -1660,6 +3039,15 @@ class InvPhyTrainerWarp:
             native_width=native_width,
             native_height=native_height,
         )
+        display_width = width
+        display_height = height
+        if display_batch_grid:
+            framebuffer_width, framebuffer_height = render_backend.glfw.get_framebuffer_size(
+                window
+            )
+            if framebuffer_width > 0 and framebuffer_height > 0:
+                display_width = int(framebuffer_width)
+                display_height = int(framebuffer_height)
         available_views = min(len(cfg.intrinsics), len(cfg.w2cs))
         if num_views < 1 or num_views > available_views:
             raise ValueError(
@@ -1719,8 +3107,8 @@ class InvPhyTrainerWarp:
         intrinsic_T = K_cuda.T.contiguous()
         inv_Lz = 1.0 / lights[:, 2]
         bytes_per_pixel = 4
-        pbo_size = width * height * bytes_per_pixel
-        row_pitch = width * bytes_per_pixel
+        pbo_size = display_width * display_height * bytes_per_pixel
+        row_pitch = display_width * bytes_per_pixel
 
         tex = None
         pbo = None
@@ -1747,8 +3135,8 @@ class InvPhyTrainerWarp:
                 render_backend.gl.GL_TEXTURE_2D,
                 0,
                 render_backend.gl.GL_RGBA8,
-                width,
-                height,
+                display_width,
+                display_height,
                 0,
                 render_backend.gl.GL_RGBA,
                 render_backend.gl.GL_UNSIGNED_BYTE,
@@ -1840,13 +3228,19 @@ class InvPhyTrainerWarp:
             cpy2d.src_pitch = row_pitch
             cpy2d.dst_pitch = row_pitch
             cpy2d.width_in_bytes = row_pitch
-            cpy2d.height = height
+            cpy2d.height = display_height
             print("[BatchedRender] GL interop setup complete")
 
             frame_rgba = torch.empty(
-                (height, width, 4), dtype=torch.uint8, device=cfg.device
+                (display_height, display_width, 4),
+                dtype=torch.uint8,
+                device=cfg.device,
             )
-            frame = torch.empty_like(overlay)
+            frame = torch.empty(
+                (display_height, display_width, 3),
+                dtype=overlay.dtype,
+                device=cfg.device,
+            )
             rgb_temp = torch.empty(
                 (height, width, 3), dtype=overlay.dtype, device=cfg.device
             )
@@ -1998,7 +3392,26 @@ class InvPhyTrainerWarp:
                         rendering,
                         overlay,
                     )
-                    frame.copy_(batch_frames[0])
+                    batch_grid = None
+                    if display_batch_grid:
+                        batch_grid = self._make_batch_image_grid(
+                            batch_frames,
+                            batch_grid_cols=batch_grid_cols,
+                        )
+                        display_grid = batch_grid
+                        if (
+                            display_grid.shape[0] != display_height
+                            or display_grid.shape[1] != display_width
+                        ):
+                            display_grid = F.interpolate(
+                                display_grid.permute(2, 0, 1).unsqueeze(0),
+                                size=(display_height, display_width),
+                                mode="bilinear",
+                                align_corners=False,
+                            ).squeeze(0).permute(1, 2, 0)
+                        frame.copy_(display_grid)
+                    else:
+                        frame.copy_(batch_frames[0])
                 else:
                     frame.copy_(overlay)
 
@@ -2065,8 +3478,8 @@ class InvPhyTrainerWarp:
                     0,
                     0,
                     0,
-                    width,
-                    height,
+                    display_width,
+                    display_height,
                     render_backend.gl.GL_RGBA,
                     render_backend.gl.GL_UNSIGNED_BYTE,
                     None,
@@ -2075,7 +3488,7 @@ class InvPhyTrainerWarp:
                     render_backend.gl.GL_PIXEL_UNPACK_BUFFER, 0
                 )
 
-                render_backend.gl.glViewport(0, 0, width, height)
+                render_backend.gl.glViewport(0, 0, display_width, display_height)
                 render_backend.gl.glDisable(render_backend.gl.GL_DEPTH_TEST)
                 render_backend.gl.glClear(render_backend.gl.GL_COLOR_BUFFER_BIT)
                 render_backend.gl.glUseProgram(prog)
@@ -2094,7 +3507,8 @@ class InvPhyTrainerWarp:
                 if frame_count > 1:
                     component_times["frame_compositing"].append(frame_comp_time)
 
-                if prev_x is not None:
+                should_prepare_next_frame = frame_count + 1 < runtime.frame_len
+                if prev_x is not None and should_prepare_next_frame:
                     with torch.no_grad():
                         interp_timer.start()
                         current_pos, current_rot = lbs_with_rotation_reuse(
@@ -2135,10 +3549,11 @@ class InvPhyTrainerWarp:
                                     ),
                                 )
                         if save_batch_grid:
-                            batch_grid = self._make_batch_image_grid(
-                                batch_frames,
-                                batch_grid_cols=batch_grid_cols,
-                            )
+                            if batch_grid is None:
+                                batch_grid = self._make_batch_image_grid(
+                                    batch_frames,
+                                    batch_grid_cols=batch_grid_cols,
+                                )
                             torchvision.utils.save_image(
                                 batch_grid.permute(2, 0, 1).float() / 255.0,
                                 os.path.join(

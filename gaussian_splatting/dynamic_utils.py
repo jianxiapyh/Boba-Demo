@@ -5,6 +5,7 @@ import torch
 
 
 VALID_DEVICE_CHOICES = {"auto", "orin", "desktop"}
+VALID_LINALG_BACKEND_CHOICES = {"auto", "default", "magma", "cusolver"}
 
 
 def _read_device_override():
@@ -55,9 +56,57 @@ def _select_variant(override, device_name):
     return "desktop"
 
 
+def _read_linalg_backend_override():
+    value = os.environ.get("BOBA_LINALG_BACKEND", "auto").strip().lower()
+    if not value:
+        value = "auto"
+
+    if value not in VALID_LINALG_BACKEND_CHOICES:
+        allowed = ", ".join(sorted(VALID_LINALG_BACKEND_CHOICES))
+        raise RuntimeError(
+            f"Invalid BOBA_LINALG_BACKEND value {value!r}. Expected one of: {allowed}."
+        )
+
+    return value
+
+
+def _default_linalg_backend_for_device(variant, device_name):
+    if variant != "desktop":
+        return "default"
+
+    lowered = device_name.lower()
+    if "rtx pro 6000" in lowered and "blackwell" in lowered:
+        return "magma"
+
+    return "default"
+
+
+def _configure_linalg_backend(variant, device_name):
+    requested_backend = _read_linalg_backend_override()
+    selected_backend = (
+        _default_linalg_backend_for_device(variant, device_name)
+        if requested_backend == "auto"
+        else requested_backend
+    )
+
+    try:
+        torch.backends.cuda.preferred_linalg_library(selected_backend)
+    except AttributeError as exc:
+        raise RuntimeError(
+            "The active PyTorch build does not expose "
+            "torch.backends.cuda.preferred_linalg_library()."
+        ) from exc
+
+    return selected_backend
+
+
 BOBA_DEVICE = _read_device_override()
 DETECTED_DEVICE_NAME = _detect_device_name()
 SELECTED_DYNAMIC_UTIL_VARIANT = _select_variant(BOBA_DEVICE, DETECTED_DEVICE_NAME)
+SELECTED_LINALG_BACKEND = _configure_linalg_backend(
+    SELECTED_DYNAMIC_UTIL_VARIANT,
+    DETECTED_DEVICE_NAME,
+)
 SELECTED_DYNAMIC_UTIL_MODULE = (
     "gaussian_splatting.dynamic_utils_fp16_no_profiling_orin"
     if SELECTED_DYNAMIC_UTIL_VARIANT == "orin"
@@ -80,8 +129,10 @@ __all__ = sorted(
             "BOBA_DEVICE",
             "DETECTED_DEVICE_NAME",
             "SELECTED_DYNAMIC_UTIL_VARIANT",
+            "SELECTED_LINALG_BACKEND",
             "SELECTED_DYNAMIC_UTIL_MODULE",
             "VALID_DEVICE_CHOICES",
+            "VALID_LINALG_BACKEND_CHOICES",
         ]
     )
 )

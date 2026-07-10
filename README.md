@@ -1,225 +1,107 @@
-# Boba: Batched Simulation for Physics-Based Gaussian Digital Twins
+# Boba Phone Demo
 
-> This repository contains the source code for Boba, and this branch currently includes `Boba-Local` and `Boba-Batched`.
-> For `Boba-Distributed`, switch to the future `Boba-Distributed` branch and follow the README there.
+This branch packages Boba Demo 2: a 100-session batched replay on the workstation display with QR-based phone claiming, phone controls, and a per-session MJPEG stream.
 
-Boba is based on PhysTwin. In this branch, the main public paths are `Boba-Local` and `Boba-Batched`, corresponding to the system designs shown below.
+## Prerequisite: working Boba-Batched
 
-This branch contains the spring-mass simulation and skinning pipeline described in the paper, together with the rendering optimizations used for the visualization path. `Boba-Distributed` and its transmission optimizations will be documented in the future `Boba-Distributed` branch.
+This branch deliberately reuses the environment prepared for Boba-Batched. Before setting up the phone demo, the following must already work:
 
-## System Designs
+- `Boba_Batched` is checked out at `/home/yihan/Research/Boba_Latest`.
+- Its `phystwin` Conda environment can run a CUDA/rendering Boba-Batched workload.
+- NVIDIA CUDA, X11/OpenGL, PyCUDA OpenGL interoperability, and the custom Boba-Batched `gsplat` runtime are operational.
 
-![Boba system designs](./assets/system_designs.png)
+The runtime snapshot in this branch was imported from `Boba_Batched@99e50055a60a4bc7e5022abba1a938bf386b273d`. The preflight also verifies the expected interfaces in the active `Boba_Batched` checkout so a later compatible revision can be reused.
 
-- `Boba-Local`: single-instance spring-mass simulation, skinning, and visualization.
-- `Boba-Batched`: batched spring-mass simulation and skinning, with headless and rendered benchmark paths.
-- `Boba-Distributed`: planned as a separate public branch.
-- In this branch, `batch_size=1` / `instance=1` follows the `Boba-Local` equivalent path.
-
-## Setup
-
-### Prerequisites
-
-- Linux on an NVIDIA GPU
-- CUDA-compatible driver and toolkit
-- Linux build tools for compiled extensions
-- Desktop OpenGL / X11 for interactive windowed runs
-- A valid `DISPLAY` when launching rendering paths
-
-On a minimal Ubuntu/NVIDIA machine, install system packages such as `build-essential`, `libglfw3`, `libglfw3-dev`, and the usual desktop OpenGL / X11 runtime libraries before continuing.
-
-The install script below is written around a CUDA 12.1 desktop setup. We have also tested Boba successfully on CUDA 11.8 and CUDA 12.2.
-
-TODO: add Jetson AGX Orin-specific install commands and RTX 5090-specific install commands.
+If the Boba-Batched checkout is elsewhere, export its location before setup and launch:
 
 ```bash
-export PATH={YOUR_DIR}/cuda/cuda-12.1/bin:$PATH
-export LD_LIBRARY_PATH={YOUR_DIR}/cuda/cuda-12.1/lib64:$LD_LIBRARY_PATH
-
-conda create -y -n phystwin python=3.10
-
-bash ./env_install/env_install.sh
+export BOBA_BATCHED_ROOT=/path/to/Boba_Latest
 ```
 
-`env_install/env_install.sh` installs the Python packages required by the public Boba scripts in this branch:
+The phone-demo setup does not install or upgrade PyTorch, CUDA, Warp, PyCUDA, NumPy, Open3D, or `gsplat`.
 
-- core runtime and evaluation packages
-- PyTorch 2.4.0 with CUDA 12.1
-- Warp, Open3D, OpenGL / GLFW / PyCUDA, vendored `gsplat`, and kornia
-- `gsplat` pinned to upstream `v1.5.3` and installed only into the `phystwin` conda environment
-- `gsplat` installed in editable mode from `gaussian_splatting/submodules/gsplat`, with CUDA compiled on first use
-- compiled KNN extension
-
-All Boba rendering commands should be run from the `phystwin` environment, or via:
+## One-time phone-demo setup
 
 ```bash
-conda run -n phystwin env PYTHONNOUSERSITE=1 python ...
+conda activate phystwin
+mkdir -p /home/yihan/Research
+git clone --single-branch --branch Boba-Phone-Demo \
+  https://github.com/jianxiapyh/Boba-Demo.git \
+  /home/yihan/Research/Boba-Phone-Demo
+cd /home/yihan/Research/Boba-Phone-Demo
+
+bash env_install/install_demo2_extras.sh
+bash scripts/demo2_preflight.sh
+python tools/validate_demo2_assets.py --case single_push_rope_4
+python -m unittest discover -s demos/demo2 -p 'test_*.py' -v
 ```
 
-Boba validates that runtime imports resolve to the vendored `gsplat` copy. A system-level or user-level `gsplat` install is not a supported configuration.
+`install_demo2_extras.sh` installs only missing phone-web dependencies and verifies that core Boba package versions do not change.
 
-## Required Assets
+Normal users do not need to filter trajectories. The packaged case already contains the validated 100-trajectory controller bank.
 
-Replace the placeholders below with the public download links before release, then place the downloaded folders at the repository root.
+## Run
 
-- [data](https://example.com/boba/data)
-- [gaussian_output](https://example.com/boba/gaussian_output)
-- [experiments](https://example.com/boba/experiments)
-- [experiments_optimization](https://example.com/boba/experiments_optimization)
-
-Expected layout:
-
-```text
-data/
-experiments/
-experiments_optimization/
-gaussian_output/
-```
-
-## Run Boba-Local
-
-Performance mode:
+Run a bounded one-session smoke test first:
 
 ```bash
-conda run -n phystwin env PYTHONNOUSERSITE=1 python interactive_playground.py --mode perf --case_name double_lift_cloth_3
+bash scripts/run_demo2.sh \
+  --case_name single_push_rope_4 \
+  --batch_size 1 \
+  --batch_grid_cols 1 \
+  --max_frames 3
 ```
 
-Quality mode:
+Start the full demo:
 
 ```bash
-conda run -n phystwin env PYTHONNOUSERSITE=1 python interactive_playground.py --mode quality --case_name double_lift_cloth_3
+bash scripts/run_demo2.sh \
+  --case_name single_push_rope_4 \
+  --batch_size 100 \
+  --batch_grid_cols 10 \
+  --batch_image_resolution 640x480 \
+  --host 0.0.0.0 \
+  --port 7860
 ```
 
-`quality` mode is the single-instance evaluation path with calibrated multi-view rendering.
-It writes `inference.pkl` and rendered frames under `results/quality/<case>/`.
-For quality comparison against the original PhysTwin paper numbers, use one camera view.
-The quality script defaults to PhysTwin-style render aggregation:
+Batch 100 is the target configuration and has been exercised on RTX PRO 6000 Blackwell. Use a smaller explicit `--batch_size` on GPUs that cannot fit the full workload.
+
+## Connect a phone
+
+The workstation display shows a QR code. Open it from iPhone Safari or Android Chrome while the phone and workstation are on the same LAN. The phone lists available sessions; claiming one resets that instance and switches the browser to its controller and video stream.
+
+Only TCP port `7860` is used. If UFW is active, permit that port only from the trusted LAN. Replace the interface and subnet in this example:
 
 ```bash
-conda run -n phystwin env PYTHONNOUSERSITE=1 bash benchmarks/Boba_Local_single_inst_quality.sh --num_views 1
+sudo ufw allow in on <lan-interface> from <lan-subnet> to any port 7860 proto tcp
 ```
 
-Render evaluation supports two `OVERALL` aggregation modes:
-- `phystwin`: PhysTwin-compatible mode. `OVERALL` is averaged over every evaluated frame/view sample directly, so longer sequences contribute more samples.
-- `scene_mean`: Equal-scene summary mode. This is often the fairer Boba summary because each scene/case sequence gets equal weight in the final `OVERALL` row.
-
-Here, `scene` means one data sequence/case such as `double_lift_cloth_1`, and `view` means one calibrated camera view. `--num_views 2` and `--num_views 3` are Boba multi-view extensions; use `--num_views 1` for one-to-one comparison with original PhysTwin paper numbers.
-
-## Run Boba-Batched
-
-Headless spring-mass + LBS batch scaling:
+If a VPN or multiple network adapters cause the QR code to advertise the wrong address, pass the workstation LAN address explicitly:
 
 ```bash
-conda run -n phystwin env PYTHONNOUSERSITE=1 bash benchmarks/run_sim_lbs_batch_scaling.sh --batch_sizes 1 2 4 8
+bash scripts/run_demo2.sh \
+  --case_name single_push_rope_4 \
+  --batch_size 100 \
+  --public_url http://192.168.1.50:7860
 ```
 
-Headless spring-mass + LBS best-throughput search for one case:
+`--public_url` changes the advertised URL; it does not create an HTTPS tunnel. Some iPhones warn about local HTTP pages. For a public deployment, provide an access-controlled HTTPS tunnel separately and pass its URL through `--public_url`. Anyone who can reach this server can claim an available session, so do not expose it without access controls.
 
-```bash
-conda run -n phystwin env PYTHONNOUSERSITE=1 bash benchmarks/run_sim_lbs_best_throughput.sh single_lift_rope
-```
+Before presenting the demo, verify from the physical phone that it can scan the QR code, claim and control a session, release it, and reclaim a session after the heartbeat timeout. Automated tests cover the same API state transitions, but they cannot validate a particular phone, Wi-Fi network, or iOS local-HTTP policy.
 
-This autotune benchmark searches batch sizes automatically instead of requiring a fixed `--batch_sizes` list.
-It reports the best measured instance count, batch FPS, and throughput under `results/batch_autotune/`.
+See [`demos/demo2/VALIDATION.md`](demos/demo2/VALIDATION.md) for the recorded environment versions and completed validation matrix.
 
-```bash
-NUM_RUNS=1 MAX_BATCH_SIZE=256 REFINE_SAMPLES=9 REFINE_ROUNDS=2 FINAL_DENSE_WINDOW=8 \
-  conda run -n phystwin env PYTHONNOUSERSITE=1 bash benchmarks/run_sim_lbs_best_throughput.sh single_lift_rope
-```
+## Packaged assets
 
-Batched full runtime for one case:
+The runtime payload is under `assets/single_push_rope_4/` and is resolved through its manifest. It contains only the checkpoint, calibration, metadata, optimized parameters, final data, Gaussian PLY, background, and filtered controller bank required at runtime.
 
-```bash
-conda run -n phystwin env PYTHONNOUSERSITE=1 python benchmarks/run_batched_full_runtime_case.py \
-  --case_name double_lift_cloth_3 \
-  --batch_size 4 \
-  --batched_render_variant batch_optimized
+The raw trajectory bank and original training dataset are intentionally excluded. `demos/filter_demo_trajectories.py` remains a developer tool for users who separately possess those inputs.
 
-conda run -n phystwin env PYTHONNOUSERSITE=1 python benchmarks/run_batched_full_runtime_case.py \
-  --case_name double_lift_cloth_3 \
-  --batch_size 4 \
-  --render_mode instance \
-  --instance_id 2 \
-  --save_video
-```
+## Troubleshooting
 
-Batched full runtime across cases:
-
-```bash
-conda run -n phystwin env PYTHONNOUSERSITE=1 bash benchmarks/run_batched_full_runtime.sh --batch_size 4 --batched_render_variant batch_optimized
-conda run -n phystwin env PYTHONNOUSERSITE=1 bash benchmarks/run_batched_full_runtime.sh --batch_size 4 --render_mode instance --instance_id 2 --save_video
-```
-
-## Boba-Distributed
-
-`Boba-Distributed` will be documented in the future `Boba-Distributed` branch. Use the README in that branch for the setup and execution commands for the distributed design.
-
-## Benchmark Scripts
-
-For the full benchmark entrypoint reference, including every script option,
-environment override, and output layout, see
-[`benchmarks/README.md`](benchmarks/README.md).
-
-Full-runtime performance benchmark:
-
-```bash
-conda run -n phystwin env PYTHONNOUSERSITE=1 bash benchmarks/Boba_Local_single_inst_perf.sh
-```
-
-Full-runtime quality benchmark:
-
-```bash
-conda run -n phystwin env PYTHONNOUSERSITE=1 bash benchmarks/Boba_Local_single_inst_quality.sh
-```
-
-PhysTwin-compatible render reporting for paper-number comparison:
-
-```bash
-conda run -n phystwin env PYTHONNOUSERSITE=1 bash benchmarks/Boba_Local_single_inst_quality.sh --num_views 1
-```
-
-Headless sim+LBS batch-scaling benchmark:
-
-```bash
-conda run -n phystwin env PYTHONNOUSERSITE=1 bash benchmarks/run_sim_lbs_batch_scaling.sh --batch_sizes 1 2 4 8
-```
-
-Headless sim+LBS best-throughput autotune benchmark:
-
-```bash
-conda run -n phystwin env PYTHONNOUSERSITE=1 bash benchmarks/run_sim_lbs_best_throughput.sh single_lift_rope
-```
-
-Batched full-runtime benchmark:
-
-```bash
-conda run -n phystwin env PYTHONNOUSERSITE=1 bash benchmarks/run_batched_full_runtime.sh --batch_size 4 --batched_render_variant batch_optimized
-```
-
-Batched full-runtime scaling benchmark:
-
-```bash
-DISPLAY=:1 conda run -n phystwin env PYTHONNOUSERSITE=1 bash benchmarks/run_batched_full_runtime_batch_scaling.sh --batch_sizes 1 2 4 8 16 32 64
-```
-
-Defaults when unspecified:
-- `render_mode=batch_images`
-- `num_views=1`
-- `overall_mode=phystwin`
-- `save_video=false`
-- `NUM_RUNS=3`
-- best-throughput autotune: `NUM_RUNS=1`, `MAX_BATCH_SIZE=256`, `REFINE_SAMPLES=9`, `REFINE_ROUNDS=2`, `FINAL_DENSE_WINDOW=8`
-
-This path still requires an X11/OpenGL display because the full-runtime renderer creates a GLFW window.
-
-## Outputs
-
-- `results/perf`: full-runtime performance summaries and logs
-- `results/quality`: rendered outputs, evaluation artifacts, and metrics
-- `results/batch_scaling`: headless sim+LBS batch-scaling outputs
-- `results/batch_autotune`: best-throughput search outputs, including `best_throughput_table.csv` and `candidate_table.csv`
-- `results/batched_render`: batched full-runtime render and benchmark outputs
-
-## Citation
-
-Citation information will be added with the public Boba release.
+- **Wrong environment:** activate `phystwin`; the scripts reject other environments.
+- **Missing Boba-Batched checkout:** set `BOBA_BATCHED_ROOT` to the working checkout.
+- **OpenGL/display failure:** confirm `DISPLAY` is set and that a Boba-Batched rendering command works in the same shell.
+- **`libstdc++` import errors:** launch through `scripts/run_demo2.sh`, which places `$CONDA_PREFIX/lib` before system libraries.
+- **Phone cannot connect:** confirm both devices are on the same non-isolated LAN, allow TCP `7860`, and use an explicit `--public_url`.
+- **CUDA out of memory:** retry with a smaller explicit `--batch_size` and matching `--batch_grid_cols`.

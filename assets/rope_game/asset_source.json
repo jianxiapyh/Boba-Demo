@@ -1,0 +1,52 @@
+{
+  "description": "Self-contained runtime payload for the sole rope_game demo, preserving the stable rope simulation payload, high-quality visual Gaussian, and standard three-sofa course.",
+  "simulation_payload": {
+    "provenance": "Retained byte-for-byte from the Boba-Demo runtime baseline in commit aa15ab9.",
+    "license": "Boba-Demo repository MIT license",
+    "files": {
+      "best_model.pth": {
+        "size_bytes": 120818,
+        "sha256": "e48fc6e5170e370579bc7511d39f5d56a355fe9b2a9c2bca63891a3182241b72"
+      },
+      "calibrate.pkl": {
+        "size_bytes": 601,
+        "sha256": "160962e646f60bdfd70a71793e11c8152a0d05543762999213d489ef50849f1d"
+      },
+      "final_data.pkl": {
+        "size_bytes": 1084852,
+        "sha256": "35167df19341465d567de0b94cdab95317fe547fd21dc45640c05b0e4e9a3794"
+      },
+      "metadata.json": {
+        "size_bytes": 499,
+        "sha256": "f95c83b25929e401ae98438bcba648e72b037d9cc4892f057b6e92a1b3bd8989"
+      },
+      "optimal_params.pkl": {
+        "size_bytes": 551,
+        "sha256": "38d2d93801d1daae1a48aba83b39638a9658528d9a0a69a37a6e02b04739e505"
+      }
+    }
+  },
+  "visual_gaussian": {
+    "file": "phystwin_rope.ply",
+    "source_repo": "https://huggingface.co/shashuo0104/gs-scans",
+    "source_revision": "cf85a25d8ed72cafeb290ef67cae8c44fcd90782",
+    "source_archive_path": "gs_scans.zip",
+    "source_archive_size_bytes": 152329584,
+    "source_archive_sha256": "3a31ab5d2c15aacd6ad1fafd39e3df486cb1d2f917a1ecf18e53a32e27d8def8",
+    "source_path": "rope/rope.ply",
+    "size_bytes": 8650282,
+    "sha256": "c552a93bd4a4fe14a940a4ab0be0602f81af2513da3d2cf78265dd28dc79527c",
+    "license": "MIT"
+  },
+  "gameplay_assets": {
+    "course_v1.json": {
+      "description": "Standard three-sofa rope course.",
+      "size_bytes": 787,
+      "sha256": "eac7a03b8392231edfcba99c2eebfa9eefd455f0a3a1736c7c741bd64516da01"
+    },
+    "tutorial_rope_game_goal.png": {
+      "size_bytes": 71960,
+      "sha256": "8447810d581b9401e97514ebee7db44fb41aa086d3c53c0f0e8702d062f7fb42"
+    }
+  }
+}

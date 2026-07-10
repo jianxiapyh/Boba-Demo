@@ -2,10 +2,13 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
+import ctypes.util
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
+import sysconfig
 import threading
 import time
 from typing import Optional
@@ -27,26 +30,72 @@ def _prepend_env_path(env: dict[str, str], key: str, value: str) -> None:
 
 
 def _ensure_jsoncpp_compat_dir(repo_root: Path) -> Optional[str]:
-    compat_dir = repo_root / "linux_pose_probe" / ".compat_libs"
+    del repo_root  # Kept in the signature for compatibility with existing callers.
+    cache_root = Path(
+        os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")
+    ).expanduser()
+    compat_dir = cache_root / "boba-demo" / "native-compat"
     compat_link = compat_dir / "libjsoncpp.so.1"
-    if compat_link.exists():
-        return str(compat_dir)
 
-    candidates = (
-        Path("/usr/lib/x86_64-linux-gnu/libjsoncpp.so.1.9.5"),
-        Path("/lib/x86_64-linux-gnu/libjsoncpp.so.1.9.5"),
-        Path("/usr/lib/x86_64-linux-gnu/libjsoncpp.so.25"),
-        Path("/lib/x86_64-linux-gnu/libjsoncpp.so.25"),
+    candidates: list[Path] = []
+    multiarch = sysconfig.get_config_var("MULTIARCH")
+    library_roots = [Path("/usr/lib"), Path("/lib"), Path("/usr/local/lib")]
+    if multiarch:
+        library_roots = [
+            Path("/usr/lib") / str(multiarch),
+            Path("/lib") / str(multiarch),
+            *library_roots,
+        ]
+    for library_root in library_roots:
+        candidates.extend(sorted(library_root.glob("libjsoncpp.so.1*")))
+
+    discovered_name = ctypes.util.find_library("jsoncpp")
+    if discovered_name:
+        discovered_path = Path(discovered_name)
+        if discovered_path.is_absolute():
+            candidates.append(discovered_path)
+
+    try:
+        ldconfig_result = subprocess.run(
+            ["ldconfig", "-p"],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+    except OSError:
+        ldconfig_result = None
+    if ldconfig_result is not None and ldconfig_result.returncode == 0:
+        for line in ldconfig_result.stdout.splitlines():
+            match = re.search(r"\blibjsoncpp\.so(?:\.\d+)*\b.*=>\s+(\S+)$", line)
+            if match:
+                candidates.append(Path(match.group(1)))
+
+    for library_root in library_roots:
+        candidates.extend(sorted(library_root.glob("libjsoncpp.so.*")))
+
+    target = next(
+        (
+            candidate.resolve()
+            for candidate in candidates
+            if candidate.exists() and candidate.resolve().is_file()
+        ),
+        None,
     )
-    target = next((candidate for candidate in candidates if candidate.exists()), None)
     if target is None:
         return None
 
     compat_dir.mkdir(parents=True, exist_ok=True)
+    if compat_link.is_symlink() or compat_link.exists():
+        try:
+            if compat_link.resolve(strict=True) == target:
+                return str(compat_dir)
+        except OSError:
+            pass
+        compat_link.unlink()
     try:
         compat_link.symlink_to(target)
-    except FileExistsError:
-        pass
+    except OSError:
+        return None
     return str(compat_dir)
 
 

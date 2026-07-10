@@ -18,14 +18,8 @@ import json
 from ..utils.system_utils import mkdir_p
 from plyfile import PlyData, PlyElement
 from ..utils.sh_utils import RGB2SH
-from simple_knn._C import distCUDA2
 from ..utils.graphics_utils import BasicPointCloud
 from ..utils.general_utils import strip_symmetric, build_scaling_rotation, get_minimum_axis, flip_align_view
-
-try:
-    from diff_gaussian_rasterization import SparseGaussianAdam
-except:
-    pass
 
 class GaussianModel:
 
@@ -164,6 +158,14 @@ class GaussianModel:
             self.active_sh_degree += 1
 
     def create_from_pcd(self, pcd : BasicPointCloud, cam_infos : int, spatial_lr_scale : float):
+        try:
+            from simple_knn._C import distCUDA2
+        except ImportError as exc:
+            raise RuntimeError(
+                "Creating a Gaussian model from a point cloud requires simple_knn. "
+                "Loading the packaged rope_game model does not require it."
+            ) from exc
+
         self.spatial_lr_scale = spatial_lr_scale
         fused_point_cloud = torch.tensor(np.asarray(pcd.points)).float().cuda()
         fused_color = RGB2SH(torch.tensor(np.asarray(pcd.colors)).float().cuda())
@@ -213,8 +215,10 @@ class GaussianModel:
             self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
         elif self.optimizer_type == "sparse_adam":
             try:
+                from diff_gaussian_rasterization import SparseGaussianAdam
+
                 self.optimizer = SparseGaussianAdam(l, lr=0.0, eps=1e-15)
-            except:
+            except (ImportError, RuntimeError):
                 # A special version of the rasterizer is required to enable sparse adam
                 self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
 

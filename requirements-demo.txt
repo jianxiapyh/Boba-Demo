@@ -1,0 +1,8 @@
+# Add-ons for the Quest demo. The Boba-Batched phystwin environment supplies
+# Torch/CUDA, NumPy, Warp, Open3D, PyCUDA, GLFW, PyOpenGL, and gsplat build deps.
+einops==0.8.2
+pyglet==1.5.31
+pyrender==0.1.45
+rtree==1.4.1
+scikit-learn==1.7.2
+trimesh==4.11.5

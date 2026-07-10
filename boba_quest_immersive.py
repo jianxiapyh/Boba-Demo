@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import glob
 import json
 import os
 import pickle
@@ -19,36 +18,13 @@ np = None
 torch = None
 REPO_ROOT = Path(__file__).resolve().parent
 DEFAULT_SCENE_ASSETS_ROOT = REPO_ROOT / "assets" / "scenes"
-PUBLIC_DEMO_CASES = (
-    "sloth",
-    "rope",
-    "hq_rope",
-    "rope_game",
-    "hq_rope_game",
-    "hybrid_rope_game",
-    "hybrid_rope_game_1",
-)
-COMPAT_DEMO_CASE_ALIASES = {
-    "hq_rope_0": "hq_rope",
-}
-SUPPORTED_DEMO_CASE_ARGUMENTS = PUBLIC_DEMO_CASES + tuple(COMPAT_DEMO_CASE_ALIASES.keys())
+PUBLIC_DEMO_CASES = ("rope_game",)
 SHARED_TUTORIAL_SLIDES = (
     "controls_overview.png",
     "interaction_tips.png",
 )
-DEMO_CASE_WORLD_SCALE = {
-    "hq_rope": 0.3932700391790796,
-}
-DEMO_CASE_LENGTH_LIKE_CFG_KEYS = (
-    "object_radius",
-    "controller_radius",
-    "collision_dist",
-)
 RUNTIME_ENV_READY_SENTINEL = "BOBA_IMMERSIVE_RUNTIME_READY"
 DEFAULT_CUDA_HOME = "/usr/local/cuda"
-DEFAULT_GSPLAT_SOURCE_ROOT = (
-    REPO_ROOT.parent / "Boba" / "gaussian_splatting" / "submodules" / "gsplat"
-)
 BRIDGE_DEPS_CHECK_SCRIPT = (
     REPO_ROOT / "linux_pose_probe" / "check_boba_immersive_bridge_deps.sh"
 )
@@ -99,12 +75,10 @@ def ensure_direct_launch_runtime_env(argv: list[str] | None = None) -> None:
         ld_library_leading_entries,
     )
 
-    launch_env.setdefault("BOBA_GSPLAT_SOURCE_ROOT", str(DEFAULT_GSPLAT_SOURCE_ROOT))
-
     reexec_keys = ("PYTHONNOUSERSITE", "LD_LIBRARY_PATH")
     needs_reexec = any(current_env.get(key) != launch_env.get(key) for key in reexec_keys)
     if not needs_reexec:
-        for key in ("CUDA_HOME", "PATH", "BOBA_GSPLAT_SOURCE_ROOT"):
+        for key in ("CUDA_HOME", "PATH"):
             os.environ[key] = launch_env[key]
         return
 
@@ -179,12 +153,15 @@ def print_cuda_startup_debug_banner(torch_module) -> None:
 
 
 def canonical_demo_case_name(case_name: str) -> str:
-    case_key = str(case_name).strip().lower()
-    return str(COMPAT_DEMO_CASE_ALIASES.get(case_key, case_key))
+    return str(case_name).strip().lower()
 
 
 def resolve_demo_case_manifest(case_name: str) -> tuple[str, Path, dict]:
     canonical_case = canonical_demo_case_name(case_name)
+    if canonical_case not in PUBLIC_DEMO_CASES:
+        raise ValueError(
+            f"Unsupported demo case '{case_name}'. This branch contains only 'rope_game'."
+        )
     manifest_path = REPO_ROOT / "assets" / canonical_case / "manifest.json"
     if not manifest_path.exists():
         raise FileNotFoundError(
@@ -205,7 +182,9 @@ def manifest_file_path(manifest_dir: Path, manifest: dict, key: str) -> str:
 
 
 def manifest_config_path(manifest: dict) -> str:
-    relative_path = manifest.get("config", "configs/real.yaml")
+    relative_path = manifest.get("config")
+    if relative_path is None:
+        raise KeyError("Manifest is missing required key: config")
     config_path = Path(str(relative_path))
     if not config_path.is_absolute():
         config_path = REPO_ROOT / config_path
@@ -232,23 +211,6 @@ def resolve_demo_case_tutorial_slides(manifest_dir: Path, manifest: dict, case_n
             f"case '{case_name}': " + ", ".join(missing_paths)
         )
     return [str(Path(path).resolve()) for path in slide_paths]
-
-
-def demo_case_world_scale(case_name: str) -> float:
-    case_key = canonical_demo_case_name(case_name)
-    return float(DEMO_CASE_WORLD_SCALE.get(case_key, 1.0))
-
-
-def apply_demo_case_world_scale_to_cfg(cfg, case_name: str) -> float:
-    scale = demo_case_world_scale(case_name)
-    cfg.demo_case_world_scale = scale
-    if abs(scale - 1.0) <= 1e-8:
-        return scale
-    for attr_name in DEMO_CASE_LENGTH_LIKE_CFG_KEYS:
-        if not hasattr(cfg, attr_name):
-            continue
-        setattr(cfg, attr_name, float(getattr(cfg, attr_name)) * scale)
-    return scale
 
 
 def set_all_seeds(seed: int):
@@ -279,43 +241,6 @@ def create_gl_window(width: int, height: int, visible: bool = True):
     _ = gl.glGetString(gl.GL_VERSION)
     glfw.swap_interval(0)
     return window
-
-
-def configure_local_python_paths():
-    repo_root = os.path.dirname(os.path.abspath(__file__))
-    submodule_roots = (
-        (
-            os.path.join(repo_root, "gaussian_splatting", "submodules", "simple-knn"),
-            ("simple_knn/_C*.so",),
-        ),
-        (
-            os.path.join(
-                repo_root,
-                "gaussian_splatting",
-                "submodules",
-                "diff-gaussian-rasterization",
-            ),
-            ("diff_gaussian_rasterization/_C*.so",),
-        ),
-        (
-            os.path.join(repo_root, "gaussian_splatting", "submodules", "fused-ssim"),
-            ("fused_ssim_cuda*.so",),
-        ),
-    )
-    for path, required_globs in reversed(submodule_roots):
-        if not os.path.isdir(path):
-            continue
-
-        has_native_build = any(glob.glob(os.path.join(path, pattern)) for pattern in required_globs)
-        if not has_native_build:
-            print(
-                f"[python_path] skipping local submodule without built extension: {path}",
-                flush=True,
-            )
-            continue
-
-        if path not in sys.path:
-            sys.path.insert(0, path)
 
 
 def prefer_system_ninja_binary():
@@ -439,9 +364,9 @@ def build_parser() -> ArgumentParser:
     parser.add_argument(
         "--case_name",
         type=str,
-        choices=SUPPORTED_DEMO_CASE_ARGUMENTS,
-        default="sloth",
-        help="public packaged demo case",
+        choices=PUBLIC_DEMO_CASES,
+        default="rope_game",
+        help="packaged demo case (this branch supports only rope_game)",
     )
     parser.add_argument("--n_dup", type=int, default=0, help="must remain 0 for the shipped Quest demo")
     parser.add_argument(
@@ -581,7 +506,7 @@ def build_parser() -> ArgumentParser:
         choices=("off", "on"),
         default="off",
         help=(
-            "expensive Gaussian source corruption validator for rope-family "
+            "expensive Gaussian source corruption validator for rope_game "
             "immersive runs. Keep off for normal native-GL gameplay; use on for "
             "debugging source-coverage rollback behavior"
         ),
@@ -752,12 +677,6 @@ def main(argv: list[str] | None = None):
     case_name = args.case_name
     canonical_case_name, manifest_dir, case_manifest = resolve_demo_case_manifest(case_name)
     validate_demo_case_assets(REPO_ROOT, canonical_case_name, manifest_dir, case_manifest)
-    if canonical_case_name != case_name:
-        print(
-            "[quest_display] demo case alias resolved: "
-            f"requested={case_name} canonical={canonical_case_name}",
-            flush=True,
-        )
     ensure_immersive_bridge_system_deps()
 
     global np, torch
@@ -874,7 +793,6 @@ def main(argv: list[str] | None = None):
     prioritize_conda_bin()
     prioritize_conda_runtime_libs()
     prefer_system_ninja_binary()
-    configure_local_python_paths()
     from qqtt import InvPhyTrainerWarp
     from qqtt.utils import logger, cfg
 
@@ -908,16 +826,7 @@ def main(argv: list[str] | None = None):
     with open(optimal_path, "rb") as f:
         optimal_params = pickle.load(f)
     cfg.set_optimal_params(optimal_params)
-    demo_case_scale = apply_demo_case_world_scale_to_cfg(cfg, canonical_case_name)
-    if abs(demo_case_scale - 1.0) > 1e-8:
-        print(
-            "[quest_display] demo case world scale: "
-            f"case={canonical_case_name} scale={demo_case_scale:.8f} "
-            f"object_radius={float(cfg.object_radius):.8f} "
-            f"controller_radius={float(cfg.controller_radius):.8f} "
-            f"collision_dist={float(cfg.collision_dist):.8f}",
-            flush=True,
-        )
+    cfg.demo_case_world_scale = 1.0
     print(
         "[quest_display] demo case config: "
         f"case={canonical_case_name} "

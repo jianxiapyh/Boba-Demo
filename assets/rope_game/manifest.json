@@ -1,14 +1,19 @@
 {
-  "best_model": "../rope/best_model.pth",
-  "calibrate": "../rope/calibrate.pkl",
-  "config": "configs/real.yaml",
-  "final_data": "../rope/final_data.pkl",
-  "gaussian_ply": "../rope/rope.ply",
-  "metadata": "../rope/metadata.json",
-  "optimal_params": "../rope/optimal_params.pkl",
+  "best_model": "best_model.pth",
+  "calibrate": "calibrate.pkl",
+  "config": "configs/rope_game.yaml",
+  "final_data": "final_data.pkl",
+  "gaussian_ply": "phystwin_rope.ply",
+  "metadata": "metadata.json",
+  "optimal_params": "optimal_params.pkl",
   "game_mode": "rope_pick_place_v1",
   "game_course": "course_v1.json",
   "tutorial_extra_slides": [
     "tutorial_rope_game_goal.png"
-  ]
+  ],
+  "visual_gaussian_retarget": "principal_axis_to_sim_rest",
+  "visual_gaussian_driver_case": "rope_game",
+  "visual_gaussian_source_case": "rope_game",
+  "asset_provenance": "asset_source.json",
+  "asset_license": "ASSET_LICENSE.md"
 }

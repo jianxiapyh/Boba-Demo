@@ -31,10 +31,6 @@ from gaussian_splatting.dynamic_utils import (
     knn_weights_sparse,
     get_topk_indices,
 )
-from gs_render import (
-    remove_gaussians_with_low_opacity,
-)
-
 import time
 from types import SimpleNamespace
 
@@ -6456,8 +6452,7 @@ class InvPhyTrainerWarp:
     LIVE_CONTROLLER_ATTACH_ACTIVE_COLOR = [255.0, 64.0, 255.0]
     LIVE_CONTROLLER_TRANSLATION_SCALE_DEFAULT = 1.0
     LIVE_CONTROLLER_CASE_TRANSLATION_SCALE = {
-        "sloth": 2.0,
-        "rope": 4,
+        "rope_game": 4.0,
     }
     IMMERSIVE_LIVE_HEAD_TRANSLATION_SCALE = 1.0
     LIVE_CONTROLLER_HIT_WORLD_RADIUS = 0.03
@@ -6549,8 +6544,7 @@ class InvPhyTrainerWarp:
     IMMERSIVE_IDLE_LOCK_SUPPORT_XY_MARGIN = 0.01
     IMMERSIVE_IDLE_LOCK_SUPPORT_Z_TOL = 0.015
     IMMERSIVE_IDLE_LOCK_CASE_MIN_SUPPORT_FRACTION = {
-        "sloth": 0.18,
-        "rope": 0.55,
+        "rope_game": 0.55,
     }
     IMMERSIVE_IDLE_LOCK_SPLIT_SUPPORT_MIN_FRACTION = 0.45
     IMMERSIVE_IDLE_LOCK_SPLIT_SUPPORT_MIN_LEVEL_FRACTION = 0.10
@@ -7166,33 +7160,8 @@ class InvPhyTrainerWarp:
             ordered[:region_node_count], dtype=torch.long, device=object_points.device
         )
 
-    def _pick_predefined_anchor_seed_index(
-        self,
-        depth_valid,
-        required_mask,
-        score_values,
-        prefer_largest,
-        used_indices,
-    ):
-        used_mask = torch.zeros_like(depth_valid)
-        if used_indices:
-            used_mask[list(used_indices)] = True
-
-        mask = depth_valid & required_mask & (~used_mask)
-        if not bool(mask.any().item()):
-            mask = depth_valid & (~used_mask)
-        if not bool(mask.any().item()):
-            mask = depth_valid
-        candidate_indices = torch.nonzero(mask, as_tuple=False).squeeze(1)
-        if candidate_indices.numel() == 0:
-            return None
-
-        candidate_scores = score_values[candidate_indices]
-        order = torch.argsort(candidate_scores, descending=prefer_largest)
-        return int(candidate_indices[order[0]].item())
-
     def _interaction_anchor_case_name(self):
-        return str(getattr(cfg, "demo_case_name", "sloth")).strip().lower()
+        return str(getattr(cfg, "demo_case_name", "rope_game")).strip().lower()
 
     def _demo_case_world_scale(self, case_name=None):
         if case_name is None:
@@ -7220,26 +7189,15 @@ class InvPhyTrainerWarp:
         if case_name is None:
             case_name = self._interaction_anchor_case_name()
         case_name = str(case_name).strip().lower()
-        return case_name in {
-            "rope",
-            "hq_rope",
-            "rope_game",
-            "hq_rope_game",
-            "hybrid_rope_game",
-            "hybrid_rope_game_1",
-        }
+        return case_name == "rope_game"
 
     def _live_controller_case_profile(self, case_name=None):
         if case_name is None:
             case_name = self._interaction_anchor_case_name()
         case_name = str(case_name).strip().lower()
-        default_anchor_names = {"left": None, "right": None}
-        translation_case_name = case_name
-        if self._is_rope_family_case(case_name):
-            default_anchor_names = {"left": "left_end", "right": "right_end"}
-            translation_case_name = "rope"
+        default_anchor_names = {"left": "left_end", "right": "right_end"}
         default_translation_scale = self.LIVE_CONTROLLER_CASE_TRANSLATION_SCALE.get(
-            translation_case_name,
+            case_name,
             self.LIVE_CONTROLLER_TRANSLATION_SCALE_DEFAULT,
         )
         translation_scale_multiplier = float(
@@ -7268,11 +7226,9 @@ class InvPhyTrainerWarp:
         if case_name is None:
             case_name = self._interaction_anchor_case_name()
         case_name = str(case_name).strip().lower()
-        support_case_name = "rope" if self._is_rope_family_case(case_name) else case_name
-        split_support_enabled = support_case_name == "rope"
         return {
             "case_name": case_name,
-            "support_case_name": support_case_name,
+            "support_case_name": "rope_game",
             "stable_frames_required": int(self.IMMERSIVE_IDLE_LOCK_STABLE_FRAMES),
             "max_speed": float(self.IMMERSIVE_IDLE_LOCK_MAX_SPEED),
             "max_mean_frame_delta": float(
@@ -7280,11 +7236,11 @@ class InvPhyTrainerWarp:
             ),
             "min_support_fraction": float(
                 self.IMMERSIVE_IDLE_LOCK_CASE_MIN_SUPPORT_FRACTION.get(
-                    support_case_name,
-                    self.IMMERSIVE_IDLE_LOCK_CASE_MIN_SUPPORT_FRACTION["sloth"],
+                    case_name,
+                    self.IMMERSIVE_IDLE_LOCK_CASE_MIN_SUPPORT_FRACTION["rope_game"],
                 )
             ),
-            "split_support_enabled": bool(split_support_enabled),
+            "split_support_enabled": True,
             "split_support_min_fraction": float(
                 self.IMMERSIVE_IDLE_LOCK_SPLIT_SUPPORT_MIN_FRACTION
             ),
@@ -8085,62 +8041,6 @@ class InvPhyTrainerWarp:
             "rest_radius": float(radius.item()),
         }
 
-    def _build_sloth_interaction_anchors(self, object_points, intrinsic, w2c):
-        pixels, depth_valid = self._project_points_to_pixels(object_points, intrinsic, w2c)
-        if not bool(depth_valid.any().item()):
-            return []
-
-        valid_pixels = pixels[depth_valid]
-        center_pixel = valid_pixels.mean(dim=0)
-        spread = valid_pixels.max(dim=0).values - valid_pixels.min(dim=0).values
-        spread_x = float(spread[0].item())
-        spread_y = float(spread[1].item())
-        upper_mask = pixels[:, 1] <= center_pixel[1]
-        lower_mask = pixels[:, 1] > center_pixel[1]
-        left_mask = pixels[:, 0] <= center_pixel[0]
-        right_mask = pixels[:, 0] > center_pixel[0]
-        center_score = torch.linalg.norm(pixels - center_pixel.unsqueeze(0), dim=1)
-        torso_half_width = max(spread_x * 0.18, 8.0)
-        torso_half_height = max(spread_y * 0.16, 10.0)
-        torso_center_mask = (
-            (torch.abs(pixels[:, 0] - center_pixel[0]) <= torso_half_width)
-            & (torch.abs(pixels[:, 1] - center_pixel[1]) <= torso_half_height)
-        )
-
-        anchor_specs = [
-            ("left_leg", left_mask & lower_mask, center_score, True),
-            ("right_leg", right_mask & lower_mask, center_score, True),
-            ("left_arm", left_mask & upper_mask, center_score, True),
-            ("right_arm", right_mask & upper_mask, center_score, True),
-            ("torso_center", torso_center_mask, center_score, False),
-        ]
-
-        used_indices = set()
-        anchors = []
-        region_node_count = min(
-            int(object_points.shape[0]), self.LIVE_CONTROLLER_PREDEFINED_ANCHOR_NODE_COUNT
-        )
-        for name, required_mask, score_values, prefer_largest in anchor_specs:
-            seed_idx = self._pick_predefined_anchor_seed_index(
-                depth_valid,
-                required_mask,
-                score_values,
-                prefer_largest,
-                used_indices,
-            )
-            if seed_idx is None:
-                continue
-            used_indices.add(seed_idx)
-            anchor_def = self._build_anchor_def_from_seed(
-                name,
-                seed_idx,
-                object_points,
-                region_node_count,
-            )
-            if anchor_def is not None:
-                anchors.append(anchor_def)
-        return anchors
-
     def _graph_shortest_path_indices(self, start_idx, end_idx, object_points):
         if start_idx is None or end_idx is None:
             return []
@@ -8318,9 +8218,7 @@ class InvPhyTrainerWarp:
         return [resolved_left, *other_defs, resolved_right], debug
 
     def _build_case_interaction_anchors(self, object_points, intrinsic, w2c):
-        if self._is_rope_family_case():
-            return self._build_rope_interaction_anchors(object_points, intrinsic, w2c)
-        return self._build_sloth_interaction_anchors(object_points, intrinsic, w2c)
+        return self._build_rope_interaction_anchors(object_points, intrinsic, w2c)
 
     def _compute_predefined_interaction_anchor_states(self, anchor_defs, object_points):
         states = []
@@ -15476,7 +15374,9 @@ class InvPhyTrainerWarp:
         debug = {
             "case": case_name,
             "mode": mode,
-            "driver_case": str(getattr(cfg, "visual_gaussian_driver_case", "") or "rope"),
+            "driver_case": str(
+                getattr(cfg, "visual_gaussian_driver_case", "") or "rope_game"
+            ),
             "source_case": str(getattr(cfg, "visual_gaussian_source_case", "") or ""),
             "gaussian_source": str(gs_path),
             "gaussian_count": int(gaussians._xyz.shape[0]),
@@ -15502,7 +15402,7 @@ class InvPhyTrainerWarp:
             "gaussian_opacity_total": total_opacity,
         }
         print(
-            "[quest_display] hybrid rope visual retarget: "
+            "[quest_display] rope_game visual retarget: "
             f"case={debug['case']} "
             f"mode={debug['mode']} "
             f"driver_case={debug['driver_case']} "
@@ -15535,13 +15435,7 @@ class InvPhyTrainerWarp:
     def _is_finite_tensor(self, tensor):
         return bool(torch.isfinite(torch.as_tensor(tensor)).all().item())
 
-    def _sanitize_hq_rope_game_gaussians(self, gaussians, case_name):
-        if case_name not in {
-            "hq_rope_game",
-            "hybrid_rope_game",
-            "hybrid_rope_game_1",
-        }:
-            return {}
+    def _sanitize_rope_game_gaussians(self, gaussians):
         tensor_fields = {
             "xyz": gaussians._xyz,
             "features_dc": gaussians._features_dc,
@@ -27684,7 +27578,7 @@ class InvPhyTrainerWarp:
             "[quest_display] immersive rest settle recovered non-finite state: "
             f"case={case_name} "
             f"source={source} "
-            f"hq_rope_game_nonfinite_settle_recovered={int(case_name == 'hq_rope_game')} "
+            f"rope_game_nonfinite_settle_recovered={int(case_name == 'rope_game')} "
             f"step_idx={int(step_idx)} "
             f"x_finite={x_finite}/{x_total} "
             f"v_finite={v_finite}/{v_total}",
@@ -33584,20 +33478,8 @@ class InvPhyTrainerWarp:
         gaussians = GaussianModel(sh_degree=3)
         gaussians.load_ply(gs_path)
         raw_gaussian_count = int(gaussians._xyz.shape[0])
-        gaussian_finite_debug = self._sanitize_hq_rope_game_gaussians(
-            gaussians,
-            case_name,
-        )
-        disable_opacity_pruning = case_name in {
-            "hq_rope",
-            "hq_rope_game",
-            "hybrid_rope_game",
-            "hybrid_rope_game_1",
-        }
+        gaussian_finite_debug = self._sanitize_rope_game_gaussians(gaussians)
         kept_gaussian_count = raw_gaussian_count
-        if not disable_opacity_pruning:
-            gaussians = remove_gaussians_with_low_opacity(gaussians, 0.1)
-            kept_gaussian_count = int(gaussians._xyz.shape[0])
         gaussians.isotropic = True
         visual_retarget_debug = self._apply_visual_gaussian_retarget_to_sim_rest(
             gaussians,
@@ -33605,48 +33487,42 @@ class InvPhyTrainerWarp:
             mode=getattr(cfg, "visual_gaussian_retarget", ""),
             gs_path=gs_path,
         )
-        if case_name in {
-            "hq_rope",
-            "hq_rope_game",
-            "hybrid_rope_game",
-            "hybrid_rope_game_1",
-        }:
-            gaussian_bounds_min = (
-                gaussians._xyz.min(dim=0).values.detach().cpu().numpy().tolist()
-            )
-            gaussian_bounds_max = (
-                gaussians._xyz.max(dim=0).values.detach().cpu().numpy().tolist()
-            )
-            object_bounds_min = (
-                obj_init_vertices.min(dim=0).values.detach().cpu().numpy().tolist()
-            )
-            object_bounds_max = (
-                obj_init_vertices.max(dim=0).values.detach().cpu().numpy().tolist()
-            )
-            scaled_object_span = self._principal_axis_span_torch(obj_init_vertices.detach())
-            print(
-                "[quest_display] hq rope gaussian import: "
-                f"case={case_name} "
-                f"gaussian_source={gs_path} "
-                f"total_gaussians={raw_gaussian_count} "
-                f"kept_gaussians={kept_gaussian_count} "
-                f"object_nodes={int(getattr(self, 'num_original_points', 0))} "
-                f"mass_nodes={int(self.num_all_points)} "
-                "opacity_pruning=disabled "
-                "gaussian_xyz_finite="
-                f"{gaussian_finite_debug.get('xyz_finite', int(gaussians._xyz.numel()))}/"
-                f"{gaussian_finite_debug.get('xyz_total', int(gaussians._xyz.numel()))} "
-                "gaussian_opacity_nonfinite_sanitized="
-                f"{gaussian_finite_debug.get('opacity_nonfinite_sanitized', 0)} "
-                f"gaussian_bounds_min={gaussian_bounds_min} "
-                f"gaussian_bounds_max={gaussian_bounds_max} "
-                f"frame0_object_bounds_min={object_bounds_min} "
-                f"frame0_object_bounds_max={object_bounds_max} "
-                f"frame0_object_span_m={scaled_object_span:.8f} "
-                "visual_retarget="
-                f"{'none' if visual_retarget_debug is None else visual_retarget_debug['mode']}",
-                flush=True,
-            )
+        gaussian_bounds_min = (
+            gaussians._xyz.min(dim=0).values.detach().cpu().numpy().tolist()
+        )
+        gaussian_bounds_max = (
+            gaussians._xyz.max(dim=0).values.detach().cpu().numpy().tolist()
+        )
+        object_bounds_min = (
+            obj_init_vertices.min(dim=0).values.detach().cpu().numpy().tolist()
+        )
+        object_bounds_max = (
+            obj_init_vertices.max(dim=0).values.detach().cpu().numpy().tolist()
+        )
+        scaled_object_span = self._principal_axis_span_torch(obj_init_vertices.detach())
+        print(
+            "[quest_display] rope_game gaussian import: "
+            f"case={case_name} "
+            f"gaussian_source={gs_path} "
+            f"total_gaussians={raw_gaussian_count} "
+            f"kept_gaussians={kept_gaussian_count} "
+            f"object_nodes={int(getattr(self, 'num_original_points', 0))} "
+            f"mass_nodes={int(self.num_all_points)} "
+            "opacity_pruning=disabled "
+            "gaussian_xyz_finite="
+            f"{gaussian_finite_debug.get('xyz_finite', int(gaussians._xyz.numel()))}/"
+            f"{gaussian_finite_debug.get('xyz_total', int(gaussians._xyz.numel()))} "
+            "gaussian_opacity_nonfinite_sanitized="
+            f"{gaussian_finite_debug.get('opacity_nonfinite_sanitized', 0)} "
+            f"gaussian_bounds_min={gaussian_bounds_min} "
+            f"gaussian_bounds_max={gaussian_bounds_max} "
+            f"frame0_object_bounds_min={object_bounds_min} "
+            f"frame0_object_bounds_max={object_bounds_max} "
+            f"frame0_object_span_m={scaled_object_span:.8f} "
+            "visual_retarget="
+            f"{'none' if visual_retarget_debug is None else visual_retarget_debug['mode']}",
+            flush=True,
+        )
 
         startup_yaw_angle = self._resolve_immersive_startup_yaw_angle(obj_init_vertices)
         startup_yaw_debug = self._apply_immersive_startup_yaw(

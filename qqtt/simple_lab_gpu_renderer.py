@@ -10,19 +10,49 @@ import torch.nn.functional as F
 import trimesh
 from PIL import Image
 
-try:
-    from pytorch3d.renderer import MeshRasterizer, RasterizationSettings, TexturesUV
-    from pytorch3d.structures import Meshes
-    from pytorch3d.utils import cameras_from_opencv_projection
-except Exception as exc:  # pragma: no cover - availability is environment-specific
-    MeshRasterizer = None
-    RasterizationSettings = None
-    TexturesUV = None
-    Meshes = None
-    cameras_from_opencv_projection = None
-    _PYTORCH3D_IMPORT_ERROR = exc
-else:
+MeshRasterizer = None
+RasterizationSettings = None
+TexturesUV = None
+Meshes = None
+cameras_from_opencv_projection = None
+_PYTORCH3D_IMPORT_ERROR = None
+_PYTORCH3D_IMPORT_ATTEMPTED = False
+
+
+def _load_pytorch3d() -> bool:
+    """Load the optional legacy GPU scene backend only when it is selected."""
+    global MeshRasterizer
+    global RasterizationSettings
+    global TexturesUV
+    global Meshes
+    global cameras_from_opencv_projection
+    global _PYTORCH3D_IMPORT_ERROR
+    global _PYTORCH3D_IMPORT_ATTEMPTED
+
+    if _PYTORCH3D_IMPORT_ATTEMPTED:
+        return _PYTORCH3D_IMPORT_ERROR is None
+    _PYTORCH3D_IMPORT_ATTEMPTED = True
+    try:
+        from pytorch3d.renderer import (
+            MeshRasterizer as _MeshRasterizer,
+            RasterizationSettings as _RasterizationSettings,
+            TexturesUV as _TexturesUV,
+        )
+        from pytorch3d.structures import Meshes as _Meshes
+        from pytorch3d.utils import (
+            cameras_from_opencv_projection as _cameras_from_opencv_projection,
+        )
+    except Exception as exc:  # pragma: no cover - availability is environment-specific
+        _PYTORCH3D_IMPORT_ERROR = exc
+        return False
+
+    MeshRasterizer = _MeshRasterizer
+    RasterizationSettings = _RasterizationSettings
+    TexturesUV = _TexturesUV
+    Meshes = _Meshes
+    cameras_from_opencv_projection = _cameras_from_opencv_projection
     _PYTORCH3D_IMPORT_ERROR = None
+    return True
 
 
 @dataclass
@@ -113,7 +143,7 @@ class SimpleLabGpuRenderer:
 
     @property
     def table_available(self) -> bool:
-        return self.available and _PYTORCH3D_IMPORT_ERROR is None
+        return self.available and _load_pytorch3d()
 
     def delete(self) -> None:
         self._grid_cache.clear()

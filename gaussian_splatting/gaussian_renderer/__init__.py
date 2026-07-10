@@ -11,7 +11,6 @@
 
 import torch
 import math
-from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
 from ..scene.gaussian_model import GaussianModel
 from ..utils.sh_utils import eval_sh
 from torch.nn import functional as F
@@ -60,6 +59,13 @@ def _camera_intrinsic_matrix(viewpoint_camera, pc : GaussianModel):
             [0, 0, 1],
         ]
     ).to(pc.get_xyz)
+
+
+def _collapse_elliptical_radii(radii: torch.Tensor) -> torch.Tensor:
+    """Convert the custom fork's ``[..., camera, gaussian, xy]`` radii to scalars."""
+    if torch.is_tensor(radii) and radii.ndim >= 3 and radii.shape[-1] == 2:
+        return radii.amax(dim=-1)
+    return radii
 
 
 # This is code is adapted from ChatSim background gaussians model: 
@@ -113,7 +119,7 @@ def render_gsplat(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.T
     # [1, H, W, 1] -> [1, H, W]
     rendered_alphas = render_alphas[0].permute(2, 0, 1)
 
-    radii = info["radii"].squeeze(0) # [N,]
+    radii = _collapse_elliptical_radii(info["radii"]).squeeze(0) # [N,]
     try:
         info["means2d"].retain_grad() # [1, N, 2]
     except:
@@ -278,7 +284,7 @@ def render_gsplat_batch(viewpoint_cameras, pc : GaussianModel, pipe, bg_color : 
         pass
 
     packages = []
-    batched_radii = info["radii"]
+    batched_radii = _collapse_elliptical_radii(info["radii"])
     batched_means2d = info["means2d"]
     for batch_index in range(len(viewpoint_cameras)):
         rendered_image = render_colors[batch_index].permute(2, 0, 1)[:3]
@@ -313,6 +319,17 @@ def render_3dgs(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Ten
     
     Background tensor (bg_color) must be on GPU!
     """
+
+    try:
+        from diff_gaussian_rasterization import (
+            GaussianRasterizationSettings,
+            GaussianRasterizer,
+        )
+    except ImportError as exc:
+        raise RuntimeError(
+            "The legacy 3DGS renderer requires diff_gaussian_rasterization. "
+            "The supported rope_game path uses gsplat and does not require it."
+        ) from exc
  
     # Create zero tensor. We will use it to make pytorch return gradients of the 2D (screen-space) means
     screenspace_points = torch.zeros_like(pc.get_xyz, dtype=pc.get_xyz.dtype, requires_grad=True, device="cuda") + 0

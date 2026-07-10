@@ -3,6 +3,7 @@ __pycache__/
 *.so
 *.log
 *.txt
+!requirements-demo.txt
 *.npy
 *.npz
 *.pkl

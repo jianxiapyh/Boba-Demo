@@ -7,17 +7,23 @@ import argparse
 parser = argparse.ArgumentParser(description='Convert images to video')
 parser.add_argument('--image_folder', type=str, help='Path of image folder')
 parser.add_argument('--video_path', type=str, help='Video filename')
-parser.add_argument('--fps', type=int, default=15, help='Frame per second')
+parser.add_argument('--fps', type=float, default=15.0, help='Frame per second')
 args = parser.parse_args()
 
 image_folder = args.image_folder
 video_path = args.video_path
-fps = int(args.fps)
+fps = float(args.fps)
 
 video_folder = os.path.dirname(video_path)
 os.makedirs(video_folder, exist_ok=True)
 
-images_path = sorted([img for img in os.listdir(image_folder) if img.endswith(".png") or img.endswith(".jpg")])
+images_path = sorted(
+    [
+        img
+        for img in os.listdir(image_folder)
+        if img.lower().endswith((".png", ".jpg", ".jpeg"))
+    ]
+)
 if len(images_path) == 0:
     print("No images found in the folder")
 

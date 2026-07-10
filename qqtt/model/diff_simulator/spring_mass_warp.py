@@ -10,6 +10,14 @@ if not cfg.use_graph:
     wp.config.verify_autograd_array_access = True
 
 
+SIM_FORCE_MODE_GATHER = "gather"
+SIM_FORCE_MODE_TEMPLATE_STATE_BATCHED_ATOMIC = "template_state_batched_atomic"
+SIM_FORCE_MODES = (
+    SIM_FORCE_MODE_GATHER,
+    SIM_FORCE_MODE_TEMPLATE_STATE_BATCHED_ATOMIC,
+)
+
+
 class State:
     def __init__(self, wp_init_vertices, num_control_points):
         self.wp_x = wp.zeros_like(wp_init_vertices, requires_grad=True)
@@ -17,7 +25,6 @@ class State:
         self.wp_v_before_ground = wp.zeros_like(wp_init_vertices, requires_grad=True)
         self.wp_v = wp.zeros_like(self.wp_x, requires_grad=True)
         self.wp_vertice_forces = wp.zeros_like(self.wp_x, requires_grad=True)
-        self.wp_dummy_vertices_forces = wp.zeros_like(self.wp_x, requires_grad=False)
         # No need to compute the gradient for the control points
         self.wp_control_x = wp.zeros(
             (num_control_points), dtype=wp.vec3, requires_grad=False
@@ -26,8 +33,6 @@ class State:
 
     def clear_forces(self):
         self.wp_vertice_forces.zero_()
-        #additional 
-        self.wp_dummy_vertices_forces.zero_()
 
 
     @property
@@ -60,73 +65,172 @@ def set_control_points(
     )
 
 
-#pyh potential additional optimization
-#inv_rest_lengths is precomputed
-#no log and exp for spring_Y, and already clamped for inference
+
 @wp.kernel
-def eval_springs_batched_opt(
-    #batched [all obj][all controller]
-    x: wp.array(dtype=wp.vec3), 
-    v: wp.array(dtype=wp.vec3), 
-    control_x: wp.array(dtype=wp.vec3), 
-    control_v: wp.array(dtype=wp.vec3), 
-    #shared 
+def eval_springs_single_instance_atomic(
+    x: wp.array(dtype=wp.vec3),
+    v: wp.array(dtype=wp.vec3),
+    control_x: wp.array(dtype=wp.vec3),
+    control_v: wp.array(dtype=wp.vec3),
+    num_object_points: int,
     springs: wp.array(dtype=wp.vec2i),
     inv_rest_lengths: wp.array(dtype=float),
     spring_Y_clamped: wp.array(dtype=float),
     dashpot_damping: float,
-    #pyh added variable to help indexing Spring_Y
-    object_spring_single: int,
-    object_spring_total: int,
-    controller_spring_single: int,
-    object_massnode_single: int,
-    controller_massnode_single: int,
-    f: wp.array(dtype=wp.vec3), #these needs to be all instance
+    f: wp.array(dtype=wp.vec3),
 ):
     tid = wp.tid()
-    local_idx = 0
-    inst = 0
-    #pyh if tid is a object-object spring
-    if tid < object_spring_total:
-        inst = tid // object_spring_single
-        local_idx = tid - inst * object_spring_single
+
+    idx1 = springs[tid][0]
+    idx2 = springs[tid][1]
+
+    if idx1 >= num_object_points:
+        x1 = control_x[idx1 - num_object_points]
+        v1 = control_v[idx1 - num_object_points]
     else:
-        #pyh now it is a controller-object spring
-        t = tid - object_spring_total
-        inst = t // controller_spring_single
-        local_idx = object_spring_single + (t - inst * controller_spring_single)
+        x1 = x[idx1]
+        v1 = v[idx1]
 
-    y = spring_Y_clamped[local_idx]
+    if idx2 >= num_object_points:
+        x2 = control_x[idx2 - num_object_points]
+        v2 = control_v[idx2 - num_object_points]
+    else:
+        x2 = x[idx2]
+        v2 = v[idx2]
 
-    #we need to remap to global
-    global_idx1 = 0
-    global_idx2 = 0
+    inv_rest = inv_rest_lengths[tid]
+    y = spring_Y_clamped[tid]
 
-    local_idx1 = springs[local_idx][0] #lets say its (3,5) but in 2 instance it might be (13,15)
+    dis = x2 - x1
+    dis_len = wp.length(dis)
+    d = dis / wp.max(dis_len, 1e-6)
+
+    spring_force = y * (dis_len * inv_rest - 1.0) * d
+    v_rel = wp.dot(v2 - v1, d)
+    dashpot_forces = dashpot_damping * v_rel * d
+    overall_force = spring_force + dashpot_forces
+
+    if idx1 < num_object_points:
+        wp.atomic_add(f, idx1, overall_force)
+    if idx2 < num_object_points:
+        wp.atomic_sub(f, idx2, overall_force)
+
+
+@wp.kernel
+def eval_springs_batched_template_state_atomic(
+    # batched state
+    x: wp.array(dtype=wp.vec3),
+    v: wp.array(dtype=wp.vec3),
+    control_x: wp.array(dtype=wp.vec3),
+    control_v: wp.array(dtype=wp.vec3),
+
+    # BASE template springs (size = n_springs)
+    springs: wp.array(dtype=wp.vec2i),
+    inv_rest_lengths: wp.array(dtype=float),
+    spring_Y_clamped: wp.array(dtype=float),
+    dashpot_damping: float,
+
+    # sizes
+    object_massnode_single: int,
+    controller_massnode_single: int,
+    n_springs: int,
+
+    # output: per-instance object-node forces
+    f: wp.array(dtype=wp.vec3),
+):
+    tid = wp.tid()
+
+    inst = tid // n_springs
+    local_idx = tid - inst * n_springs
+
+    local_idx1 = springs[local_idx][0]
     local_idx2 = springs[local_idx][1]
 
-    idx1_control = False
-    idx2_control = False
-
-    #it is a controller mass node
     if local_idx1 >= object_massnode_single:
-        idx1_control = True
         ctrl1 = inst * controller_massnode_single + (local_idx1 - object_massnode_single)
         x1 = control_x[ctrl1]
         v1 = control_v[ctrl1]
     else:
-        #it is an object mass node
         global_idx1 = inst * object_massnode_single + local_idx1
         x1 = x[global_idx1]
         v1 = v[global_idx1]
-    
+
     if local_idx2 >= object_massnode_single:
-        idx2_control = True
         ctrl2 = inst * controller_massnode_single + (local_idx2 - object_massnode_single)
         x2 = control_x[ctrl2]
         v2 = control_v[ctrl2]
     else:
-        #it is an object mass node
+        global_idx2 = inst * object_massnode_single + local_idx2
+        x2 = x[global_idx2]
+        v2 = v[global_idx2]
+
+    inv_rest = inv_rest_lengths[local_idx]
+    y = spring_Y_clamped[local_idx]
+
+    dis = x2 - x1
+    dis_len = wp.length(dis)
+    d = dis / wp.max(dis_len, 1e-6)
+
+    spring_force = y * (dis_len * inv_rest - 1.0) * d
+    v_rel = wp.dot(v2 - v1, d)
+    dashpot_forces = dashpot_damping * v_rel * d
+    overall_force = spring_force + dashpot_forces
+
+    if local_idx1 < object_massnode_single:
+        wp.atomic_add(f, inst * object_massnode_single + local_idx1, overall_force)
+    if local_idx2 < object_massnode_single:
+        wp.atomic_sub(f, inst * object_massnode_single + local_idx2, overall_force)
+
+
+@wp.kernel
+def eval_springs_batched_compute_all_base(
+    # batched state
+    x: wp.array(dtype=wp.vec3),
+    v: wp.array(dtype=wp.vec3),
+    control_x: wp.array(dtype=wp.vec3),
+    control_v: wp.array(dtype=wp.vec3),
+
+    # BASE template springs (size = n_springs)
+    springs: wp.array(dtype=wp.vec2i),
+    inv_rest_lengths: wp.array(dtype=float),
+    spring_Y_clamped: wp.array(dtype=float),
+    dashpot_damping: float,
+
+    # sizes
+    object_massnode_single: int,
+    controller_massnode_single: int,
+    n_springs: int,
+    number_of_instance: int,
+
+    # output: per-instance per-base-spring force (size = number_of_instance * n_springs)
+    spring_out: wp.array(dtype=wp.vec3),
+):
+    tid = wp.tid()
+
+    inst = tid // n_springs
+    local_idx = tid - inst * n_springs  # BASE spring id in [0, n_springs)
+
+    y = spring_Y_clamped[local_idx]
+
+    local_idx1 = springs[local_idx][0]
+    local_idx2 = springs[local_idx][1]
+
+    # endpoint 1
+    if local_idx1 >= object_massnode_single:
+        ctrl1 = inst * controller_massnode_single + (local_idx1 - object_massnode_single)
+        x1 = control_x[ctrl1]
+        v1 = control_v[ctrl1]
+    else:
+        global_idx1 = inst * object_massnode_single + local_idx1
+        x1 = x[global_idx1]
+        v1 = v[global_idx1]
+
+    # endpoint 2
+    if local_idx2 >= object_massnode_single:
+        ctrl2 = inst * controller_massnode_single + (local_idx2 - object_massnode_single)
+        x2 = control_x[ctrl2]
+        v2 = control_v[ctrl2]
+    else:
         global_idx2 = inst * object_massnode_single + local_idx2
         x2 = x[global_idx2]
         v2 = v[global_idx2]
@@ -135,24 +239,52 @@ def eval_springs_batched_opt(
 
     dis = x2 - x1
     dis_len = wp.length(dis)
-
     d = dis / wp.max(dis_len, 1e-6)
 
-    spring_force = (
-        y
-        * (dis_len * inv_rest - 1.0)
-        * d
-    )
-
+    spring_force = y * (dis_len * inv_rest - 1.0) * d
     v_rel = wp.dot(v2 - v1, d)
     dashpot_forces = dashpot_damping * v_rel * d
 
-    overall_force = spring_force + dashpot_forces
+    #[spring][instance]
+    # out_idx = local_idx * number_of_instance + inst
+    # spring_out[out_idx] = spring_force + dashpot_forces
+    #instance major [inst][spring]
+    spring_out[tid] = spring_force + dashpot_forces
 
-    if not idx1_control:
-        wp.atomic_add(f, global_idx1, overall_force)
-    if not idx2_control:
-        wp.atomic_sub(f, global_idx2, overall_force)
+@wp.kernel
+def reduce_object_force_from_signed_incidence_instance(
+    signed_incidence_map: wp.array(dtype=wp.int32),
+    spring_force_lookup: wp.array(dtype=wp.vec3),
+
+    object_massnode_single: int,
+    max_incident_springs: int,
+    n_springs: int,
+
+    f: wp.array(dtype=wp.vec3),
+):
+    tid = wp.tid()
+
+    # inst-major mapping (inst constant for a chunk of threads)
+    inst = tid // object_massnode_single
+    obj_node = tid - inst * object_massnode_single
+
+    acc = wp.vec3(0.0, 0.0, 0.0)
+    base_row = obj_node * max_incident_springs
+
+    for incident_idx in range(max_incident_springs):
+        sid = signed_incidence_map[base_row + incident_idx]
+        if sid != 0:
+            sign = 1.0
+            if sid < 0:
+                sign = -1.0
+                sid = -sid
+            base_idx = sid - 1
+
+            force = spring_force_lookup[inst * n_springs + base_idx]  # <-- instance-major
+            acc = acc + sign * force
+
+    f[inst * object_massnode_single + obj_node] = acc
+
 
 #updated since masses are shared
 @wp.kernel
@@ -373,29 +505,6 @@ def build_resting_collision_pairs(
             resting_collision_pairs[i][index] = wp.bool(1)
             resting_collision_pairs[index][i] = wp.bool(1)
 
-@wp.func
-def apply_surface_collision_response(
-    velocity: wp.vec3,
-    normal: wp.vec3,
-    clamp_collide_elas: float,
-    clamp_collide_fric: float,
-):
-    v_normal = wp.dot(velocity, normal) * normal
-    v_tangent = velocity - v_normal
-    v_normal_length = wp.length(v_normal)
-    v_tangent_length = wp.max(wp.length(v_tangent), 1e-6)
-    v_normal_new = -clamp_collide_elas * v_normal
-    tangent_scale = wp.max(
-        0.0,
-        1.0
-        - clamp_collide_fric
-        * (1.0 + clamp_collide_elas)
-        * v_normal_length
-        / v_tangent_length,
-    )
-    v_tangent_new = tangent_scale * v_tangent
-    return v_normal_new + v_tangent_new
-
 @wp.kernel
 def integrate_ground_collision(
     x: wp.array(dtype=wp.vec3),
@@ -404,10 +513,6 @@ def integrate_ground_collision(
     collide_fric: wp.array(dtype=float),
     dt: float,
     reverse_factor: float,
-    use_ground_plane: int,
-    static_box_mins: wp.array(dtype=wp.vec3),
-    static_box_maxs: wp.array(dtype=wp.vec3),
-    static_box_count: int,
     x_new: wp.array(dtype=wp.vec3),
     v_new: wp.array(dtype=wp.vec3),
 ):
@@ -416,203 +521,52 @@ def integrate_ground_collision(
     x0 = x[tid]
     v0 = v[tid]
 
-    clamp_collide_elas = wp.clamp(collide_elas[0], low=0.0, high=1.0)
-    clamp_collide_fric = wp.clamp(collide_fric[0], low=0.0, high=2.0)
     normal = wp.vec3(0.0, 0.0, 1.0) * reverse_factor
-    collision_eps = float(1.0e-4)
 
-    x_result = x0 + v0 * dt
-    v_result = v0
+    x_z = x0[2]
+    v_z = v0[2]
+    next_x_z = (x_z + v_z * dt) * reverse_factor
 
-    if use_ground_plane != 0:
-        x_z = x0[2]
-        v_z = v0[2]
-        next_x_z = (x_z + v_z * dt) * reverse_factor
-        if next_x_z < 0.0 and v_z * reverse_factor < -1e-4:
-            v_after = apply_surface_collision_response(
-                v0,
-                normal,
-                clamp_collide_elas,
-                clamp_collide_fric,
-            )
-            toi = -x_z / v_z
-            x_result = x0 + v0 * toi + v_after * (dt - toi)
-            v_result = v_after
+    if next_x_z < 0.0 and v_z * reverse_factor < -1e-4:
+        # Ground Collision
+        v_normal = wp.dot(v0, normal) * normal
+        v_tao = v0 - v_normal
+        v_normal_length = wp.length(v_normal)
+        v_tao_length = wp.max(wp.length(v_tao), 1e-6)
+        clamp_collide_elas = wp.clamp(collide_elas[0], low=0.0, high=1.0)
+        clamp_collide_fric = wp.clamp(collide_fric[0], low=0.0, high=2.0)
 
-    best_hit_t = float(2.0)
-    best_hit_normal = wp.vec3(0.0, 0.0, 0.0)
-    has_sweep_hit = int(0)
-    best_inside_depth = float(1.0e8)
-    best_inside_normal = wp.vec3(0.0, 0.0, 0.0)
-    best_inside_projected = x0
-    has_inside_hit = int(0)
-    displacement = v0 * dt
-
-    for box_index in range(static_box_count):
-        box_min = static_box_mins[box_index]
-        box_max = static_box_maxs[box_index]
-        inside_box = (
-            x0[0] >= box_min[0]
-            and x0[0] <= box_max[0]
-            and x0[1] >= box_min[1]
-            and x0[1] <= box_max[1]
-            and x0[2] >= box_min[2]
-            and x0[2] <= box_max[2]
+        v_normal_new = -clamp_collide_elas * v_normal
+        a = wp.max(
+            0.0,
+            1.0
+            - clamp_collide_fric
+            * (1.0 + clamp_collide_elas)
+            * v_normal_length
+            / v_tao_length,
         )
-        if inside_box:
-            dist_x_min = x0[0] - box_min[0]
-            dist_x_max = box_max[0] - x0[0]
-            dist_y_min = x0[1] - box_min[1]
-            dist_y_max = box_max[1] - x0[1]
-            dist_z_min = x0[2] - box_min[2]
-            dist_z_max = box_max[2] - x0[2]
+        v_tao_new = a * v_tao
 
-            nearest_dist = dist_x_min
-            inside_normal = wp.vec3(-1.0, 0.0, 0.0)
-            inside_projected = wp.vec3(box_min[0] - collision_eps, x0[1], x0[2])
+        v1 = v_normal_new + v_tao_new
+        toi = -x_z / v_z
+    else:
+        v1 = v0
+        toi = 0.0
 
-            if dist_x_max < nearest_dist:
-                nearest_dist = dist_x_max
-                inside_normal = wp.vec3(1.0, 0.0, 0.0)
-                inside_projected = wp.vec3(box_max[0] + collision_eps, x0[1], x0[2])
-            if dist_y_min < nearest_dist:
-                nearest_dist = dist_y_min
-                inside_normal = wp.vec3(0.0, -1.0, 0.0)
-                inside_projected = wp.vec3(x0[0], box_min[1] - collision_eps, x0[2])
-            if dist_y_max < nearest_dist:
-                nearest_dist = dist_y_max
-                inside_normal = wp.vec3(0.0, 1.0, 0.0)
-                inside_projected = wp.vec3(x0[0], box_max[1] + collision_eps, x0[2])
-            if dist_z_min < nearest_dist:
-                nearest_dist = dist_z_min
-                inside_normal = wp.vec3(0.0, 0.0, -1.0)
-                inside_projected = wp.vec3(x0[0], x0[1], box_min[2] - collision_eps)
-            if dist_z_max < nearest_dist:
-                nearest_dist = dist_z_max
-                inside_normal = wp.vec3(0.0, 0.0, 1.0)
-                inside_projected = wp.vec3(x0[0], x0[1], box_max[2] + collision_eps)
-
-            if has_inside_hit == 0 or nearest_dist < best_inside_depth:
-                best_inside_depth = nearest_dist
-                best_inside_normal = inside_normal
-                best_inside_projected = inside_projected
-                has_inside_hit = int(1)
-        else:
-            t_enter = float(0.0)
-            t_exit = float(1.0)
-            candidate_normal = wp.vec3(0.0, 0.0, 0.0)
-            valid_hit = int(1)
-
-            d0 = displacement[0]
-            if wp.abs(d0) < collision_eps:
-                if x0[0] < box_min[0] or x0[0] > box_max[0]:
-                    valid_hit = int(0)
-            else:
-                inv_d0 = 1.0 / d0
-                t0a = (box_min[0] - x0[0]) * inv_d0
-                t0b = (box_max[0] - x0[0]) * inv_d0
-                near_t0 = wp.min(t0a, t0b)
-                far_t0 = wp.max(t0a, t0b)
-                if near_t0 > t_enter:
-                    t_enter = near_t0
-                    if t0a < t0b:
-                        candidate_normal = wp.vec3(-1.0, 0.0, 0.0)
-                    else:
-                        candidate_normal = wp.vec3(1.0, 0.0, 0.0)
-                t_exit = wp.min(t_exit, far_t0)
-                if t_enter > t_exit:
-                    valid_hit = int(0)
-
-            d1 = displacement[1]
-            if valid_hit != 0:
-                if wp.abs(d1) < collision_eps:
-                    if x0[1] < box_min[1] or x0[1] > box_max[1]:
-                        valid_hit = int(0)
-                else:
-                    inv_d1 = 1.0 / d1
-                    t1a = (box_min[1] - x0[1]) * inv_d1
-                    t1b = (box_max[1] - x0[1]) * inv_d1
-                    near_t1 = wp.min(t1a, t1b)
-                    far_t1 = wp.max(t1a, t1b)
-                    if near_t1 > t_enter:
-                        t_enter = near_t1
-                        if t1a < t1b:
-                            candidate_normal = wp.vec3(0.0, -1.0, 0.0)
-                        else:
-                            candidate_normal = wp.vec3(0.0, 1.0, 0.0)
-                    t_exit = wp.min(t_exit, far_t1)
-                    if t_enter > t_exit:
-                        valid_hit = int(0)
-
-            d2 = displacement[2]
-            if valid_hit != 0:
-                if wp.abs(d2) < collision_eps:
-                    if x0[2] < box_min[2] or x0[2] > box_max[2]:
-                        valid_hit = int(0)
-                else:
-                    inv_d2 = 1.0 / d2
-                    t2a = (box_min[2] - x0[2]) * inv_d2
-                    t2b = (box_max[2] - x0[2]) * inv_d2
-                    near_t2 = wp.min(t2a, t2b)
-                    far_t2 = wp.max(t2a, t2b)
-                    if near_t2 > t_enter:
-                        t_enter = near_t2
-                        if t2a < t2b:
-                            candidate_normal = wp.vec3(0.0, 0.0, -1.0)
-                        else:
-                            candidate_normal = wp.vec3(0.0, 0.0, 1.0)
-                    t_exit = wp.min(t_exit, far_t2)
-                    if t_enter > t_exit:
-                        valid_hit = int(0)
-
-            if (
-                valid_hit != 0
-                and t_enter >= 0.0
-                and t_enter <= 1.0
-                and wp.dot(v0, candidate_normal) < -1e-4
-                and t_enter < best_hit_t
-            ):
-                best_hit_t = t_enter
-                best_hit_normal = candidate_normal
-                has_sweep_hit = int(1)
-
-    if has_inside_hit != 0:
-        v_after = v0
-        if wp.dot(v0, best_inside_normal) < -1e-4:
-            v_after = apply_surface_collision_response(
-                v0,
-                best_inside_normal,
-                clamp_collide_elas,
-                clamp_collide_fric,
-            )
-        x_result = best_inside_projected + v_after * dt
-        v_result = v_after
-    elif has_sweep_hit != 0:
-        toi = best_hit_t * dt
-        hit_point = x0 + v0 * toi + best_hit_normal * collision_eps
-        v_after = apply_surface_collision_response(
-            v0,
-            best_hit_normal,
-            clamp_collide_elas,
-            clamp_collide_fric,
-        )
-        x_result = hit_point + v_after * (dt - toi)
-        v_result = v_after
-
-    x_new[tid] = x_result
-    v_new[tid] = v_result
+    x_new[tid] = x0 + v0 * toi + v1 * (dt - toi)
+    v_new[tid] = v1
 
 class SpringMassSystemWarp:
     def __init__(
         self,
-        init_springs, #already in batch format
-        init_rest_lengths, #shared 
-        init_masses, #shared
-        init_masks, #shared if provided
-        # per instance var
-        init_vertices, #already passed in batch format, require num_object_points to be set correctly to all object mass nodes
+        base_springs,
+        base_rest_lengths,
+        init_masses,
+        init_masks,
+        signed_incidence_map,
+        max_incident_springs,
+        init_vertices,
         init_velocities,
-        #no changed needed
         dt, 
         num_substeps, 
         dashpot_damping,  
@@ -628,43 +582,54 @@ class SpringMassSystemWarp:
         collide_object_elas, 
         collide_object_fric, 
         spring_Y,
-        #added
-        object_massnodes_total, #original num_object_points
+        object_massnodes_total,
         object_massnodes_single,
-        object_springs_single, 
-        object_springs_total, 
         controller_massnodes_single, 
-        controller_springs_single, 
-        controller_rest_location, #replaces controller_points 
+        controller_rest_location,
         number_of_instance,
-        use_ground_plane=True,
+        sim_force_mode=SIM_FORCE_MODE_GATHER,
     ):
         logger.info(f"[SIMULATION]: Initialize the Spring-Mass System")
         self.device = cfg.device
+        if sim_force_mode not in SIM_FORCE_MODES:
+            raise ValueError(
+                f"sim_force_mode must be one of {SIM_FORCE_MODES}. "
+                f"Received: {sim_force_mode}"
+            )
 
-        #assigning single copies
-        self.n_springs = object_springs_total + controller_springs_single * number_of_instance
-
-        self.torch_springs = init_springs.contiguous()
-        self.torch_rest_lengths = init_rest_lengths.contiguous()
-        self.torch_inv_rest_lengths = (
-            1.0 / self.torch_rest_lengths.clamp_min(1e-6)
-        ).contiguous()
-
-        self.wp_springs = wp.from_torch(
-            self.torch_springs, dtype=wp.vec2i, requires_grad=False
+        self.sim_force_mode = sim_force_mode
+        self.use_gather_solver = (
+            number_of_instance > 1 and sim_force_mode == SIM_FORCE_MODE_GATHER
         )
-
-        self.wp_rest_lengths = wp.from_torch(
-            self.torch_rest_lengths, dtype=wp.float32, requires_grad=False
+        self.use_template_state_batched_atomic = (
+            sim_force_mode == SIM_FORCE_MODE_TEMPLATE_STATE_BATCHED_ATOMIC
         )
-        self.wp_inv_rest_length = wp.from_torch(
-            self.torch_inv_rest_lengths, dtype=wp.float32, requires_grad=False
+        if self.use_gather_solver and signed_incidence_map is None:
+            raise ValueError("signed_incidence_map is required when number_of_instance > 1")
+
+        self.n_springs_single = int(base_springs.shape[0])
+        self.n_springs_batched = self.n_springs_single * number_of_instance
+
+        self.wp_template_springs = wp.from_torch(
+            base_springs, dtype=wp.vec2i, requires_grad=False
         )
         
-        #for testing eval_spring timing
-        self.wp_spring_tmp = wp.zeros((self.n_springs,), dtype=wp.vec3, requires_grad=False)
+        self.wp_inv_template_rest_length = wp.from_torch(
+            1.0 / base_rest_lengths, dtype=wp.float32, requires_grad=False
+        )
 
+        self.wp_spring_force_lookup = None
+        self.wp_signed_incidence_map = None
+        if self.use_gather_solver:
+            # Temporary per-spring force buffer used by the two-stage gather assembly.
+            self.wp_spring_force_lookup = wp.zeros(
+                (self.n_springs_batched,), dtype=wp.vec3, requires_grad=False
+            )
+            self.wp_signed_incidence_map = wp.from_torch(
+                signed_incidence_map.to(dtype=torch.int32).contiguous(),
+                dtype=wp.int32,
+                requires_grad=False,
+            )
 
         self.wp_masses = wp.from_torch(
             init_masses, dtype=wp.float32, requires_grad=False
@@ -700,7 +665,6 @@ class SpringMassSystemWarp:
         self.reverse_factor = 1.0 if not reverse_z else -1.0
         self.spring_Y_min = spring_Y_min
         self.spring_Y_max = spring_Y_max
-        self.use_ground_plane = int(bool(use_ground_plane))
         # variable for collision detection
         self.object_collision_flag = 0
         self.resting_collision_pairs = None
@@ -708,14 +672,6 @@ class SpringMassSystemWarp:
         self.collision_grid = None
         self.wp_collision_indices = None
         self.wp_collision_number = None
-        self.static_box_count = 0
-        zero_boxes = torch.zeros((1, 3), dtype=torch.float32, device=self.device)
-        self.wp_static_box_mins = wp.from_torch(
-            zero_boxes.clone(), dtype=wp.vec3, requires_grad=False
-        )
-        self.wp_static_box_maxs = wp.from_torch(
-            zero_boxes.clone(), dtype=wp.vec3, requires_grad=False
-        )
         
         if self_collision:
             self.object_collision_flag = 1
@@ -755,32 +711,21 @@ class SpringMassSystemWarp:
             collide_object_fric.to(device=self.device, dtype=torch.float32).detach().reshape(1).contiguous(),
             requires_grad=cfg.collision_learn,
         )
+
         spring_Y_temp = spring_Y.to(device=self.device, dtype=torch.float32).contiguous()
-        self.torch_log_spring_Y = torch.log(spring_Y_temp.clamp_min(1e-12)).contiguous()
-        self.wp_spring_Y = wp.from_torch(
-            self.torch_log_spring_Y,
-            dtype=wp.float32,
-            requires_grad=True,
-        )
+        spring_Y_clamped = spring_Y_temp.clamp(min=self.spring_Y_min, max=self.spring_Y_max)
 
-        self.torch_spring_Y_clamped = spring_Y_temp.clamp(
-            min=self.spring_Y_min, max=self.spring_Y_max
-        ).contiguous()
         self.wp_spring_Y_clamped = wp.from_torch(
-            self.torch_spring_Y_clamped, dtype=wp.float32, requires_grad=False
+            spring_Y_clamped, dtype=wp.float32, requires_grad=False
         )
 
-
-        assert self.torch_spring_Y_clamped.numel() == self.wp_springs.shape[0]
+        assert spring_Y_clamped.numel() == self.n_springs_single
         
         self.object_massnode_single = object_massnodes_single
         self.object_massnode_total = object_massnodes_total
-        self.object_spring_single = object_springs_single
-        self.object_spring_total = object_springs_total
         self.controller_massnode_single = controller_massnodes_single
-        self.controller_spring_single = controller_springs_single
         self.number_of_instance = number_of_instance
-        self.springs_per_instance = object_springs_single + controller_springs_single
+        self.max_incident_springs = int(max_incident_springs)
 
         self.wp_init_velocities = None
         if init_velocities is None:
@@ -810,58 +755,8 @@ class SpringMassSystemWarp:
         for i in range(self.num_substeps + 1):
             state = State(self.wp_init_vertices, self.num_controller_points)
             self.wp_states.append(state)
-        
-        #add early return counters
-        self.wp_early_return_count = wp.zeros((1,), dtype=wp.int32, device = cfg.device, requires_grad=False)
 
-    def set_static_collision_boxes(self, boxes):
-        if boxes is None:
-            self.static_box_count = 0
-            return
-
-        boxes = boxes.to(device=self.device, dtype=torch.float32)
-        if boxes.numel() == 0:
-            self.static_box_count = 0
-            return
-        if boxes.ndim != 3 or boxes.shape[1:] != (2, 3):
-            raise ValueError(f"static boxes shape {tuple(boxes.shape)} != (N,2,3)")
-
-        mins = boxes[:, 0].contiguous()
-        maxs = boxes[:, 1].contiguous()
-        self.wp_static_box_mins = wp.from_torch(mins, dtype=wp.vec3, requires_grad=False)
-        self.wp_static_box_maxs = wp.from_torch(maxs, dtype=wp.vec3, requires_grad=False)
-        self.static_box_count = int(boxes.shape[0])
-
-    def update_local_spring_subset(self, spring_indices, springs, rest_lengths):
-        spring_indices = spring_indices.to(
-            device=self.torch_springs.device, dtype=torch.long
-        )
-        springs = springs.to(
-            device=self.torch_springs.device, dtype=self.torch_springs.dtype
-        )
-        rest_lengths = rest_lengths.to(
-            device=self.torch_rest_lengths.device,
-            dtype=self.torch_rest_lengths.dtype,
-        )
-        inv_rest_lengths = 1.0 / rest_lengths.clamp_min(1e-6)
-        self.torch_springs.index_copy_(0, spring_indices, springs)
-        self.torch_rest_lengths.index_copy_(0, spring_indices, rest_lengths)
-        self.torch_inv_rest_lengths.index_copy_(0, spring_indices, inv_rest_lengths)
-
-    def update_local_spring_stiffness_subset(self, spring_indices, spring_y):
-        spring_indices = spring_indices.to(
-            device=self.torch_spring_Y_clamped.device, dtype=torch.long
-        )
-        clamped = spring_y.to(
-            device=self.torch_spring_Y_clamped.device,
-            dtype=self.torch_spring_Y_clamped.dtype,
-        ).clamp(min=0.0, max=self.spring_Y_max)
-        log_clamped = torch.log(clamped.clamp_min(1e-12))
-        self.torch_spring_Y_clamped.index_copy_(0, spring_indices, clamped)
-        self.torch_log_spring_Y.index_copy_(0, spring_indices, log_clamped)
-
-
-
+    
     #pyh creating cuda graph requires all scalar variable to be set, that's not possible in batched 
     #so we are moving it out
     def create_cuda_graph(self):
@@ -949,6 +844,7 @@ class SpringMassSystemWarp:
           outputs=[self.wp_collision_indices, self.wp_collision_number],
         )
 
+
     def step(self):
         for i in range(self.num_substeps):
             self.wp_states[i].clear_forces()
@@ -965,27 +861,76 @@ class SpringMassSystemWarp:
                 ],
                 outputs=[self.wp_states[i].wp_control_x],
             )
+            
+            if self.use_gather_solver:
+                wp.launch(
+                    kernel=eval_springs_batched_compute_all_base,
+                    dim=self.n_springs_batched,
+                    inputs=[
+                        self.wp_states[i].wp_x,
+                        self.wp_states[i].wp_v,
+                        self.wp_states[i].wp_control_x,
+                        self.wp_states[i].wp_control_v,
+                        self.wp_template_springs,
+                        self.wp_inv_template_rest_length,
+                        self.wp_spring_Y_clamped,
+                        self.dashpot_damping,
+                        self.object_massnode_single,
+                        self.controller_massnode_single,
+                        self.n_springs_single,
+                        self.number_of_instance,
+                    ],
+                    outputs=[self.wp_spring_force_lookup],
+                )
 
-            wp.launch(
-                kernel=eval_springs_batched_opt,
-                 dim=self.n_springs,
-                inputs=[
-                    self.wp_states[i].wp_x,
-                    self.wp_states[i].wp_v,
-                    self.wp_states[i].wp_control_x,
-                    self.wp_states[i].wp_control_v,
-                    self.wp_springs,
-                    self.wp_inv_rest_length,
-                    self.wp_spring_Y_clamped,
-                    self.dashpot_damping,
-                    self.object_spring_single,
-                    self.object_spring_total,
-                    self.controller_spring_single,
-                    self.object_massnode_single,
-                    self.controller_massnode_single,
-                ],
-                outputs=[self.wp_states[i].wp_vertice_forces],
-            )    
+                wp.launch(
+                    kernel=reduce_object_force_from_signed_incidence_instance,
+                    dim=self.number_of_instance * self.object_massnode_single,
+                    inputs=[
+                        self.wp_signed_incidence_map,
+                        self.wp_spring_force_lookup,
+                        self.object_massnode_single,
+                        self.max_incident_springs,
+                        self.n_springs_single,
+                    ],
+                    outputs=[self.wp_states[i].wp_vertice_forces],
+                )
+            elif self.use_template_state_batched_atomic:
+                wp.launch(
+                    kernel=eval_springs_batched_template_state_atomic,
+                    dim=self.n_springs_batched,
+                    inputs=[
+                        self.wp_states[i].wp_x,
+                        self.wp_states[i].wp_v,
+                        self.wp_states[i].wp_control_x,
+                        self.wp_states[i].wp_control_v,
+                        self.wp_template_springs,
+                        self.wp_inv_template_rest_length,
+                        self.wp_spring_Y_clamped,
+                        self.dashpot_damping,
+                        self.object_massnode_single,
+                        self.controller_massnode_single,
+                        self.n_springs_single,
+                    ],
+                    outputs=[self.wp_states[i].wp_vertice_forces],
+                )
+            else:
+                wp.launch(
+                    kernel=eval_springs_single_instance_atomic,
+                    dim=self.n_springs_single,
+                    inputs=[
+                        self.wp_states[i].wp_x,
+                        self.wp_states[i].wp_v,
+                        self.wp_states[i].wp_control_x,
+                        self.wp_states[i].wp_control_v,
+                        self.object_massnode_single,
+                        self.wp_template_springs,
+                        self.wp_inv_template_rest_length,
+                        self.wp_spring_Y_clamped,
+                        self.dashpot_damping,
+                    ],
+                    outputs=[self.wp_states[i].wp_vertice_forces],
+                )
 
             if self.object_collision_flag:
                 output_v = self.wp_states[i].wp_v_before_collision
@@ -1043,10 +988,7 @@ class SpringMassSystemWarp:
                     self.wp_collide_fric,
                     self.dt,
                     self.reverse_factor,
-                    self.use_ground_plane,
-                    self.wp_static_box_mins,
-                    self.wp_static_box_maxs,
-                    self.static_box_count,
                 ],
                 outputs=[self.wp_states[i + 1].wp_x, self.wp_states[i + 1].wp_v],
-            )         
+            )
+        

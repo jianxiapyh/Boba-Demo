@@ -12,23 +12,28 @@
 import os
 import random
 import json
+from typing import TYPE_CHECKING
+
 from ..utils.system_utils import searchForMaxIteration
-from ..scene.dataset_readers import sceneLoadTypeCallbacks
-from ..scene.gaussian_model import GaussianModel
-from ..arguments import ModelParams
-from ..utils.camera_utils import cameraList_from_camInfos, camera_to_JSON
-import open3d as o3d
-import numpy as np
-import torch
+
+if TYPE_CHECKING:
+    from ..arguments import ModelParams
+    from ..scene.gaussian_model import GaussianModel
 
 class Scene:
 
-    gaussians : GaussianModel
+    gaussians : "GaussianModel"
 
-    def __init__(self, args : ModelParams, gaussians : GaussianModel, load_iteration=None, shuffle=True, resolution_scales=[1.0]):
+    def __init__(self, args : "ModelParams", gaussians : "GaussianModel", load_iteration=None, shuffle=True, resolution_scales=[1.0]):
         """b
         :param path: Path to colmap scene main folder.
         """
+        from ..scene.dataset_readers import sceneLoadTypeCallbacks
+        from ..utils.camera_utils import cameraList_from_camInfos, camera_to_JSON
+        import open3d as o3d
+        import numpy as np
+        import torch
+
         self.model_path = args.model_path
         self.loaded_iter = None
         self.gaussians = gaussians

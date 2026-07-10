@@ -1,84 +1,225 @@
-# Boba Quest Rope Game
+# Boba: Batched Simulation for Physics-Based Gaussian Digital Twins
 
-This repository runs the `rope_game` case: a Quest/OpenXR rope pick-and-place demo with live controller input in the `ILLIXR_lab` scene.
+> This repository contains the source code for Boba, and this branch currently includes `Boba-Local` and `Boba-Batched`.
+> For `Boba-Distributed`, switch to the future `Boba-Distributed` branch and follow the README there.
 
-## Requirements
+Boba is based on PhysTwin. In this branch, the main public paths are `Boba-Local` and `Boba-Batched`, corresponding to the system designs shown below.
 
-- Ubuntu 22.04 with an X11 desktop/OpenGL session. Hidden-window mode still requires a working display session.
-- An NVIDIA CUDA workstation. The provided setup is tuned for RTX 6000 Blackwell with CUDA under `/usr/local/cuda`.
-- A working Quest with ALVR/SteamVR configured as the OpenXR runtime.
-- The `boba` Conda environment from the main Boba checkout.
-- The vendored `gsplat` source from the main Boba checkout. Its default location is:
+This branch contains the spring-mass simulation and skinning pipeline described in the paper, together with the rendering optimizations used for the visualization path. `Boba-Distributed` and its transmission optimizations will be documented in the future `Boba-Distributed` branch.
 
-```text
-../Boba/gaussian_splatting/submodules/gsplat/
-```
+## System Designs
 
-If that checkout is elsewhere, set `BOBA_GSPLAT_SOURCE_ROOT` to its `gsplat` directory before setup or launch.
+![Boba system designs](./assets/system_designs.png)
+
+- `Boba-Local`: single-instance spring-mass simulation, skinning, and visualization.
+- `Boba-Batched`: batched spring-mass simulation and skinning, with headless and rendered benchmark paths.
+- `Boba-Distributed`: planned as a separate public branch.
+- In this branch, `batch_size=1` / `instance=1` follows the `Boba-Local` equivalent path.
 
 ## Setup
 
-Install the native OpenXR bridge dependencies on Ubuntu 22.04:
+### Prerequisites
+
+- Linux on an NVIDIA GPU
+- CUDA-compatible driver and toolkit
+- Linux build tools for compiled extensions
+- Desktop OpenGL / X11 for interactive windowed runs
+- A valid `DISPLAY` when launching rendering paths
+
+On a minimal Ubuntu/NVIDIA machine, install system packages such as `build-essential`, `libglfw3`, `libglfw3-dev`, and the usual desktop OpenGL / X11 runtime libraries before continuing.
+
+The install script below is written around a CUDA 12.1 desktop setup. We have also tested Boba successfully on CUDA 11.8 and CUDA 12.2.
+
+TODO: add Jetson AGX Orin-specific install commands and RTX 5090-specific install commands.
 
 ```bash
-sudo apt install g++ pkg-config libglfw3-dev libgl1-mesa-dev libx11-dev libopenxr-dev
+export PATH={YOUR_DIR}/cuda/cuda-12.1/bin:$PATH
+export LD_LIBRARY_PATH={YOUR_DIR}/cuda/cuda-12.1/lib64:$LD_LIBRARY_PATH
+
+conda create -y -n phystwin python=3.10
+
+bash ./env_install/env_install.sh
 ```
 
-Activate the runtime environment and run the repository setup once:
+`env_install/env_install.sh` installs the Python packages required by the public Boba scripts in this branch:
+
+- core runtime and evaluation packages
+- PyTorch 2.4.0 with CUDA 12.1
+- Warp, Open3D, OpenGL / GLFW / PyCUDA, vendored `gsplat`, and kornia
+- `gsplat` pinned to upstream `v1.5.3` and installed only into the `phystwin` conda environment
+- `gsplat` installed in editable mode from `gaussian_splatting/submodules/gsplat`, with CUDA compiled on first use
+- compiled KNN extension
+
+All Boba rendering commands should be run from the `phystwin` environment, or via:
 
 ```bash
-conda activate boba
-bash env_install/RTX6000_env_install.sh
+conda run -n phystwin env PYTHONNOUSERSITE=1 python ...
 ```
 
-Validate the assets used by `rope_game`:
+Boba validates that runtime imports resolve to the vendored `gsplat` copy. A system-level or user-level `gsplat` install is not a supported configuration.
+
+## Required Assets
+
+Replace the placeholders below with the public download links before release, then place the downloaded folders at the repository root.
+
+- [data](https://example.com/boba/data)
+- [gaussian_output](https://example.com/boba/gaussian_output)
+- [experiments](https://example.com/boba/experiments)
+- [experiments_optimization](https://example.com/boba/experiments_optimization)
+
+Expected layout:
+
+```text
+data/
+experiments/
+experiments_optimization/
+gaussian_output/
+```
+
+## Run Boba-Local
+
+Performance mode:
 
 ```bash
-python tools/fetch_demo_case_assets.py --case rope_game --check-only
+conda run -n phystwin env PYTHONNOUSERSITE=1 python interactive_playground.py --mode perf --case_name double_lift_cloth_3
 ```
 
-The case uses:
-
-- `assets/rope_game/manifest.json` for the course and tutorial.
-- `assets/rope/` for the model, calibration, simulation data, metadata, parameters, and Gaussian PLY.
-- `configs/real.yaml` for the rope simulation configuration.
-- `assets/scenes/ILLIXR_lab/` for the immersive room.
-
-## Run
-
-Run from an activated `boba` environment:
+Quality mode:
 
 ```bash
-python boba_quest_immersive.py \
-  --case_name rope_game \
-  --n_dup 0 \
-  --interactive_window_mode hidden \
-  --immersive_static_scene_backend native_gl \
-  --immersive_static_scene_overlap on \
-  --immersive_present_pipeline off \
-  --immersive_static_scene_reuse off \
-  --immersive_gaussian_render stereo_batched \
-  --immersive_native_gl_texture_mode stable_mipmap \
-  --immersive_native_gl_anisotropy 8 \
-  --immersive_native_gl_mipmap_lod_bias 0.50 \
-  --immersive_native_gl_msaa_samples 4 \
-  --immersive_native_gl_depth_format depth32f \
-  --immersive_eye_resolution 1344 \
-  --immersive_controller_translation_scale 0.25 \
-  --immersive_viewer_upload_mode pbo \
-  --immersive_viewer_upload_thread auto
+conda run -n phystwin env PYTHONNOUSERSITE=1 python interactive_playground.py --mode quality --case_name double_lift_cloth_3
 ```
 
-Native-GL overlap requires the present pipeline to remain off and currently forces static-scene reuse off. The launcher configures its CUDA and Conda runtime library paths automatically when started from the activated environment.
-
-## Troubleshooting
-
-If asset validation reports missing files or Git LFS pointers, hydrate only this case:
+`quality` mode is the single-instance evaluation path with calibrated multi-view rendering.
+It writes `inference.pkl` and rendered frames under `results/quality/<case>/`.
+For quality comparison against the original PhysTwin paper numbers, use one camera view.
+The quality script defaults to PhysTwin-style render aggregation:
 
 ```bash
-python tools/fetch_demo_case_assets.py --case rope_game
+conda run -n phystwin env PYTHONNOUSERSITE=1 bash benchmarks/Boba_Local_single_inst_quality.sh --num_views 1
 ```
 
-If the native bridge preflight fails, rerun the Ubuntu dependency command from the setup section.
+Render evaluation supports two `OVERALL` aggregation modes:
+- `phystwin`: PhysTwin-compatible mode. `OVERALL` is averaged over every evaluated frame/view sample directly, so longer sequences contribute more samples.
+- `scene_mean`: Equal-scene summary mode. This is often the fairer Boba summary because each scene/case sequence gets equal weight in the final `OVERALL` row.
 
-If OpenXR cannot find the headset, confirm that SteamVR and ALVR are running and the Quest is connected. For a non-default SteamVR installation, set `XR_RUNTIME_JSON` to its OpenXR runtime JSON.
+Here, `scene` means one data sequence/case such as `double_lift_cloth_1`, and `view` means one calibrated camera view. `--num_views 2` and `--num_views 3` are Boba multi-view extensions; use `--num_views 1` for one-to-one comparison with original PhysTwin paper numbers.
+
+## Run Boba-Batched
+
+Headless spring-mass + LBS batch scaling:
+
+```bash
+conda run -n phystwin env PYTHONNOUSERSITE=1 bash benchmarks/run_sim_lbs_batch_scaling.sh --batch_sizes 1 2 4 8
+```
+
+Headless spring-mass + LBS best-throughput search for one case:
+
+```bash
+conda run -n phystwin env PYTHONNOUSERSITE=1 bash benchmarks/run_sim_lbs_best_throughput.sh single_lift_rope
+```
+
+This autotune benchmark searches batch sizes automatically instead of requiring a fixed `--batch_sizes` list.
+It reports the best measured instance count, batch FPS, and throughput under `results/batch_autotune/`.
+
+```bash
+NUM_RUNS=1 MAX_BATCH_SIZE=256 REFINE_SAMPLES=9 REFINE_ROUNDS=2 FINAL_DENSE_WINDOW=8 \
+  conda run -n phystwin env PYTHONNOUSERSITE=1 bash benchmarks/run_sim_lbs_best_throughput.sh single_lift_rope
+```
+
+Batched full runtime for one case:
+
+```bash
+conda run -n phystwin env PYTHONNOUSERSITE=1 python benchmarks/run_batched_full_runtime_case.py \
+  --case_name double_lift_cloth_3 \
+  --batch_size 4 \
+  --batched_render_variant batch_optimized
+
+conda run -n phystwin env PYTHONNOUSERSITE=1 python benchmarks/run_batched_full_runtime_case.py \
+  --case_name double_lift_cloth_3 \
+  --batch_size 4 \
+  --render_mode instance \
+  --instance_id 2 \
+  --save_video
+```
+
+Batched full runtime across cases:
+
+```bash
+conda run -n phystwin env PYTHONNOUSERSITE=1 bash benchmarks/run_batched_full_runtime.sh --batch_size 4 --batched_render_variant batch_optimized
+conda run -n phystwin env PYTHONNOUSERSITE=1 bash benchmarks/run_batched_full_runtime.sh --batch_size 4 --render_mode instance --instance_id 2 --save_video
+```
+
+## Boba-Distributed
+
+`Boba-Distributed` will be documented in the future `Boba-Distributed` branch. Use the README in that branch for the setup and execution commands for the distributed design.
+
+## Benchmark Scripts
+
+For the full benchmark entrypoint reference, including every script option,
+environment override, and output layout, see
+[`benchmarks/README.md`](benchmarks/README.md).
+
+Full-runtime performance benchmark:
+
+```bash
+conda run -n phystwin env PYTHONNOUSERSITE=1 bash benchmarks/Boba_Local_single_inst_perf.sh
+```
+
+Full-runtime quality benchmark:
+
+```bash
+conda run -n phystwin env PYTHONNOUSERSITE=1 bash benchmarks/Boba_Local_single_inst_quality.sh
+```
+
+PhysTwin-compatible render reporting for paper-number comparison:
+
+```bash
+conda run -n phystwin env PYTHONNOUSERSITE=1 bash benchmarks/Boba_Local_single_inst_quality.sh --num_views 1
+```
+
+Headless sim+LBS batch-scaling benchmark:
+
+```bash
+conda run -n phystwin env PYTHONNOUSERSITE=1 bash benchmarks/run_sim_lbs_batch_scaling.sh --batch_sizes 1 2 4 8
+```
+
+Headless sim+LBS best-throughput autotune benchmark:
+
+```bash
+conda run -n phystwin env PYTHONNOUSERSITE=1 bash benchmarks/run_sim_lbs_best_throughput.sh single_lift_rope
+```
+
+Batched full-runtime benchmark:
+
+```bash
+conda run -n phystwin env PYTHONNOUSERSITE=1 bash benchmarks/run_batched_full_runtime.sh --batch_size 4 --batched_render_variant batch_optimized
+```
+
+Batched full-runtime scaling benchmark:
+
+```bash
+DISPLAY=:1 conda run -n phystwin env PYTHONNOUSERSITE=1 bash benchmarks/run_batched_full_runtime_batch_scaling.sh --batch_sizes 1 2 4 8 16 32 64
+```
+
+Defaults when unspecified:
+- `render_mode=batch_images`
+- `num_views=1`
+- `overall_mode=phystwin`
+- `save_video=false`
+- `NUM_RUNS=3`
+- best-throughput autotune: `NUM_RUNS=1`, `MAX_BATCH_SIZE=256`, `REFINE_SAMPLES=9`, `REFINE_ROUNDS=2`, `FINAL_DENSE_WINDOW=8`
+
+This path still requires an X11/OpenGL display because the full-runtime renderer creates a GLFW window.
+
+## Outputs
+
+- `results/perf`: full-runtime performance summaries and logs
+- `results/quality`: rendered outputs, evaluation artifacts, and metrics
+- `results/batch_scaling`: headless sim+LBS batch-scaling outputs
+- `results/batch_autotune`: best-throughput search outputs, including `best_throughput_table.csv` and `candidate_table.csv`
+- `results/batched_render`: batched full-runtime render and benchmark outputs
+
+## Citation
+
+Citation information will be added with the public Boba release.

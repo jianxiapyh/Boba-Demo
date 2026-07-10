@@ -22,11 +22,6 @@ from simple_knn._C import distCUDA2
 from ..utils.graphics_utils import BasicPointCloud
 from ..utils.general_utils import strip_symmetric, build_scaling_rotation, get_minimum_axis, flip_align_view
 
-try:
-    from diff_gaussian_rasterization import SparseGaussianAdam
-except:
-    pass
-
 class GaussianModel:
 
     def setup_functions(self):
@@ -103,10 +98,7 @@ class GaussianModel:
     @property
     def get_scaling(self):
         if self.isotropic:
-            scaling = self.scaling_activation(self._scaling)
-            if scaling.shape[1] == 1:
-                return scaling.repeat(1, 3)
-            return scaling
+            return self.scaling_activation(self._scaling).repeat(1, 3)
         else:
             return self.scaling_activation(self._scaling)
     
@@ -209,14 +201,13 @@ class GaussianModel:
             {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"}
         ]
 
-        if self.optimizer_type == "default":
-            self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
-        elif self.optimizer_type == "sparse_adam":
-            try:
-                self.optimizer = SparseGaussianAdam(l, lr=0.0, eps=1e-15)
-            except:
-                # A special version of the rasterizer is required to enable sparse adam
-                self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
+        if self.optimizer_type != "default":
+            raise ValueError(
+                "Boba_OpenSource only supports optimizer_type='default' after "
+                "removing the unused legacy rasterizer path."
+            )
+
+        self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
 
         self.exposure_optimizer = torch.optim.Adam([self._exposure])
 
@@ -305,13 +296,8 @@ class GaussianModel:
 
         extra_f_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("f_rest_")]
         extra_f_names = sorted(extra_f_names, key = lambda x: int(x.split('_')[-1]))
-        expected_extra_count = 3 * (self.max_sh_degree + 1) ** 2 - 3
-        if len(extra_f_names) not in {0, expected_extra_count}:
-            raise ValueError(
-                f"Unexpected SH feature count in {path}: "
-                f"found {len(extra_f_names)} f_rest entries, expected 0 or {expected_extra_count}."
-            )
-        features_extra = np.zeros((xyz.shape[0], expected_extra_count), dtype=np.float32)
+        assert len(extra_f_names)==3*(self.max_sh_degree + 1) ** 2 - 3
+        features_extra = np.zeros((xyz.shape[0], len(extra_f_names)))
         for idx, attr_name in enumerate(extra_f_names):
             features_extra[:, idx] = np.asarray(plydata.elements[0][attr_name])
         # Reshape (P,F*SH_coeffs) to (P, F, SH_coeffs except DC)
@@ -511,21 +497,13 @@ class GaussianModel:
     #     self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)
     #     self.denom[update_filter] += 1
 
-    def add_densification_stats(self, viewspace_point_tensor, update_filter, width, height, use_gsplat=True, use_absgrad=False):
-        if use_gsplat:
-            # https://github.com/liruilong940607/gaussian-splatting/commit/258123ab8f8d52038da862c936bd413dc0b32e4d
-            # grad = viewspace_point_tensor.grad.squeeze(0) # [N, 2]
-            if use_absgrad:
-                # grads = info["means2d"].absgrad.clone()
-                grad = viewspace_point_tensor.absgrad.squeeze(0) # [N, 2]
-            else:
-                # grads = info["means2d"].grad.clone()
-                grad = viewspace_point_tensor.grad.squeeze(0) # [N, 2]
-            # Normalize the gradient to [-1, 1] screen size
-            grad[:, 0] *= width * 0.5
-            grad[:, 1] *= height * 0.5
-            self.xyz_gradient_accum[update_filter] += torch.norm(grad[update_filter,:2], dim=-1, keepdim=True)
-            self.denom[update_filter] += 1
+    def add_densification_stats(self, viewspace_point_tensor, update_filter, width, height, use_absgrad=False):
+        # gsplat tracks gradients in normalized screen coordinates, so rescale to pixels.
+        if use_absgrad:
+            grad = viewspace_point_tensor.absgrad.squeeze(0) # [N, 2]
         else:
-            self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)
-            self.denom[update_filter] += 1
+            grad = viewspace_point_tensor.grad.squeeze(0) # [N, 2]
+        grad[:, 0] *= width * 0.5
+        grad[:, 1] *= height * 0.5
+        self.xyz_gradient_accum[update_filter] += torch.norm(grad[update_filter,:2], dim=-1, keepdim=True)
+        self.denom[update_filter] += 1

@@ -1,50 +1,8 @@
 import numpy as np
 import torch
 import pickle
-from qqtt.utils import logger, visualize_pc, cfg
+from qqtt.utils import logger, cfg
 import matplotlib.pyplot as plt
-
-
-def _object_support_patch_center_np(object_points: np.ndarray, reverse_z: bool) -> np.ndarray:
-    object_points = np.asarray(object_points, dtype=np.float64)
-    scene_down = np.array(
-        [0.0, 0.0, 1.0 if reverse_z else -1.0],
-        dtype=np.float64,
-    )
-    support_depth = object_points @ scene_down
-    support_depth_max = float(np.max(support_depth))
-    support_mask = support_depth >= (support_depth_max - 0.012)
-    support_points = object_points[support_mask]
-    if support_points.size == 0:
-        support_points = object_points
-    support_center = support_points.mean(axis=0)
-    support_center = support_center.astype(np.float64, copy=True)
-    support_center[2] = (
-        float(np.max(object_points[:, 2]))
-        if reverse_z
-        else float(np.min(object_points[:, 2]))
-    )
-    return support_center
-
-
-def _scale_points_about_pivot(points: np.ndarray, pivot: np.ndarray, scale: float) -> np.ndarray:
-    points = np.asarray(points, dtype=np.float64)
-    pivot = np.asarray(pivot, dtype=np.float64).reshape(1, 1, 3) if points.ndim == 3 else np.asarray(pivot, dtype=np.float64).reshape(1, 3)
-    return pivot + (points - pivot) * float(scale)
-
-
-def _principal_axis_span_np(points: np.ndarray) -> float:
-    points = np.asarray(points, dtype=np.float64)
-    if points.ndim != 2 or points.shape[0] <= 1:
-        return 0.0
-    centered = points - points.mean(axis=0, keepdims=True)
-    try:
-        _, _, vh = np.linalg.svd(centered, full_matrices=False)
-    except np.linalg.LinAlgError:
-        return float(np.linalg.norm(points.max(axis=0) - points.min(axis=0)))
-    axis = vh[0]
-    proj = centered @ axis
-    return float(np.max(proj) - np.min(proj))
 
 
 class RealData:
@@ -62,51 +20,6 @@ class RealData:
         controller_points = data["controller_points"]
         other_surface_points = data["surface_points"]
         interior_points = data["interior_points"]
-        demo_case_name = str(getattr(cfg, "demo_case_name", "")).strip().lower()
-        demo_case_world_scale = float(getattr(cfg, "demo_case_world_scale", 1.0))
-        self.demo_case_scale_debug = None
-        if abs(demo_case_world_scale - 1.0) > 1e-8:
-            scale_pivot = _object_support_patch_center_np(
-                object_points[0],
-                reverse_z=bool(getattr(cfg, "reverse_z", True)),
-            )
-            object_span_before = _principal_axis_span_np(object_points[0])
-            object_points = _scale_points_about_pivot(
-                object_points,
-                scale_pivot,
-                demo_case_world_scale,
-            )
-            controller_points = _scale_points_about_pivot(
-                controller_points,
-                scale_pivot,
-                demo_case_world_scale,
-            )
-            other_surface_points = _scale_points_about_pivot(
-                other_surface_points,
-                scale_pivot,
-                demo_case_world_scale,
-            )
-            interior_points = _scale_points_about_pivot(
-                interior_points,
-                scale_pivot,
-                demo_case_world_scale,
-            )
-            object_span_after = _principal_axis_span_np(object_points[0])
-            self.demo_case_scale_debug = {
-                "case_name": demo_case_name,
-                "scale": float(demo_case_world_scale),
-                "pivot": scale_pivot.tolist(),
-                "object_span_before": float(object_span_before),
-                "object_span_after": float(object_span_after),
-            }
-            logger.info(
-                "[DATA]: demo case world scale applied "
-                f"case={demo_case_name} "
-                f"scale={demo_case_world_scale:.8f} "
-                f"pivot={scale_pivot.tolist()} "
-                f"frame0_object_span_before={object_span_before:.8f} "
-                f"frame0_object_span_after={object_span_after:.8f}"
-            )
 
         # Get the rainbow color for the object_colors
         y_min, y_max = np.min(object_points[0, :, 1]), np.max(object_points[0, :, 1])
@@ -164,6 +77,11 @@ class RealData:
         self.visualize_data(visualize=visualize, save_gt=save_gt)
 
     def visualize_data(self, visualize=False, save_gt=True):
+        if not visualize and not save_gt:
+            return
+
+        from qqtt.utils.visualize import visualize_pc
+
         if visualize:
             visualize_pc(
                 self.object_points,

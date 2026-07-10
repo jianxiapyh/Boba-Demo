@@ -18,22 +18,6 @@ class Config:
         self.init_spring_Y = 3e3
         self.collide_elas = 0.5
         self.collide_fric = 0.3
-        self.runtime_static_collider_mode = "scene"
-        self.runtime_smooth_table_top_offset_m = 0.002
-        self.runtime_smooth_table_top_thickness_m = 0.035
-        self.runtime_visual_contact_sink_m = 0.0
-        self.runtime_visual_contact_sink_band_m = 0.0
-        self.runtime_visual_floor_contact_sink_m = 0.0
-        self.runtime_visual_contact_clearance_m = 0.0
-        self.runtime_preserve_table_vertical_colliders = True
-        self.runtime_table_vertical_max_thickness_m = 0.08
-        self.runtime_table_vertical_min_height_m = 0.10
-        self.runtime_table_vertical_min_length_m = 0.15
-        self.runtime_lower_table_support_floor_clearance_m = 0.02
-        self.runtime_sofa_handle_physics_inflate_m = 0.02
-        self.runtime_sofa_handle_physics_top_extra_m = 0.0
-        self.runtime_sofa_handle_physics_bottom_extra_m = 0.004
-        self.runtime_rope_controller_grab_spring_scale = 1.5
         self.collide_object_elas = 0.7
         self.collide_object_fric = 0.3
 
@@ -78,9 +62,7 @@ class Config:
         for key, value in config_dict.items():
             if hasattr(self, key):
                 current_value = getattr(self, key)
-                if isinstance(current_value, bool):
-                    value = bool(value)
-                elif isinstance(current_value, int):
+                if isinstance(current_value, int):
                     value = int(value)
                 elif isinstance(current_value, float):
                     value = float(value)

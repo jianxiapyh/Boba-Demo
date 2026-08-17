@@ -42,12 +42,12 @@ constexpr uint32_t kMinExpectedHeaderVersion = 2;
 constexpr uint32_t kMaxExpectedHeaderVersion = 3;
 constexpr const char* kExpectedSharedFrameMagic = "BOBAQIM1";
 constexpr const char* kBinaryUsageName = "boba_immersive_bridge";
-constexpr const char* kApplicationName = "Boba Immersive Demo";
+constexpr const char* kApplicationName = "Demo: Boba Immersive XR Application";
 #else
 constexpr uint32_t kExpectedHeaderVersion = 2;
 constexpr const char* kExpectedSharedFrameMagic = "BOBAQST1";
 constexpr const char* kBinaryUsageName = "boba_immersive_demo";
-constexpr const char* kApplicationName = "Boba Immersive Demo";
+constexpr const char* kApplicationName = "Demo: Boba Immersive XR Application";
 #endif
 constexpr float kPanelDistanceMeters = 1.1f;
 constexpr float kPanelWidthMeters = 1.2f;
@@ -2744,9 +2744,8 @@ int main(int argc, char** argv) {
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 6);
     glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
 
-    GLFWwindow* window =
-        glfwCreateWindow(kPanelWindowWidth, kPanelWindowHeight, "Boba Immersive Demo", nullptr,
-                         nullptr);
+    GLFWwindow* window = glfwCreateWindow(kPanelWindowWidth, kPanelWindowHeight,
+                                          kApplicationName, nullptr, nullptr);
     if (window == nullptr) {
         std::cerr << "glfwCreateWindow failed.\n";
         glfwTerminate();

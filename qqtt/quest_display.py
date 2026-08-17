@@ -29,6 +29,7 @@ from qqtt.live_openxr import (
 
 
 class OpenXRFramePanelMirror:
+    DISPLAY_NAME = "Demo: Boba Immersive XR Application"
     HEADER_STRUCT = struct.Struct("<8sIIIIIIQQII8x")
     HEADER_MAGIC = b"BOBAQST1"
     HEADER_VERSION = 2
@@ -316,7 +317,7 @@ class OpenXRFramePanelMirror:
         self._stdout_thread.start()
         self._stderr_thread.start()
         print(
-            f"[quest_display] started Boba Immersive Demo pid={self.process.pid} "
+            f"[quest_display] started {self.DISPLAY_NAME} pid={self.process.pid} "
             f"shared_frame={self.shared_frame_path}",
             flush=True,
         )
@@ -350,7 +351,7 @@ class OpenXRFramePanelMirror:
         time.sleep(0.5)
         if self.process.poll() is not None:
             raise RuntimeError(
-                "Boba Immersive Demo exited during startup.\n" + self.debug_summary()
+                f"{self.DISPLAY_NAME} exited during startup.\n" + self.debug_summary()
             )
         self._start_stage_commit_thread()
 
@@ -414,7 +415,7 @@ class OpenXRFramePanelMirror:
         }
         publish_start = time.perf_counter()
         if self._shared_mmap is None:
-            raise RuntimeError("Boba Immersive Demo shared buffer is not initialized.")
+            raise RuntimeError(f"{self.DISPLAY_NAME} shared buffer is not initialized.")
         if frame_rgba.shape != (self.height, self.width, self.channels):
             raise ValueError(
                 f"Quest mirror frame shape {tuple(frame_rgba.shape)} != "
@@ -426,7 +427,7 @@ class OpenXRFramePanelMirror:
         if self.process is not None and self.process.poll() is not None:
             if not self._exit_logged:
                 print(
-                    "[quest_display] Boba Immersive Demo exited unexpectedly; "
+                    f"[quest_display] {self.DISPLAY_NAME} exited unexpectedly; "
                     "disabling Quest publishing for this run.\n"
                     + self.debug_summary(),
                     flush=True,
@@ -2066,7 +2067,7 @@ class OpenXRFramePanelMirror:
                     return sample
                 if self.process is not None and self.process.poll() is not None:
                     raise RuntimeError(
-                        "Boba Immersive Demo exited before producing controller data.\n"
+                        f"{self.DISPLAY_NAME} exited before producing controller data.\n"
                         + self.debug_summary()
                     )
                 remaining = deadline - time.monotonic()
@@ -2092,7 +2093,7 @@ class OpenXRFramePanelMirror:
                     return sample
                 if self.process is not None and self.process.poll() is not None:
                     raise RuntimeError(
-                        "Boba Immersive Demo exited while waiting for a newer sample.\n"
+                        f"{self.DISPLAY_NAME} exited while waiting for a newer sample.\n"
                         + self.debug_summary()
                     )
                 remaining = deadline - time.monotonic()

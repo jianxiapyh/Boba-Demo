@@ -178,7 +178,16 @@ def draw_page_surface(draw: ImageDraw.ImageDraw):
 
 
 def draw_title(draw: ImageDraw.ImageDraw, text: str):
-    draw.text((OUTER_MARGIN + TITLE_OFFSET_X, OUTER_MARGIN + TITLE_OFFSET_Y), text, font=TITLE_FONT, fill=TITLE_COLOR)
+    title_x = OUTER_MARGIN + TITLE_OFFSET_X
+    max_width = SLIDE_WIDTH - title_x - OUTER_MARGIN
+    title_font = TITLE_FONT
+    if text_size(draw, text, title_font)[0] > max_width:
+        for size in range(72, 47, -2):
+            candidate_font = load_font(size, bold=True)
+            if text_size(draw, text, candidate_font)[0] <= max_width:
+                title_font = candidate_font
+                break
+    draw.text((title_x, OUTER_MARGIN + TITLE_OFFSET_Y), text, font=title_font, fill=TITLE_COLOR)
 
 
 def draw_footer(draw: ImageDraw.ImageDraw, text: str):
@@ -706,7 +715,7 @@ def make_slide() -> tuple[Image.Image, ImageDraw.ImageDraw]:
 
 def slide_one() -> Image.Image:
     image, draw = make_slide()
-    draw_title(draw, "Boba Immersive Demo Tutorial")
+    draw_title(draw, "Demo: Boba Immersive XR Application Tutorial")
 
     left_rect = (OUTER_MARGIN + 28, CONTENT_TOP, 900, CONTENT_TOP + CONTENT_HEIGHT)
     right_rect = (934, CONTENT_TOP, SLIDE_WIDTH - OUTER_MARGIN - 28, CONTENT_TOP + CONTENT_HEIGHT)

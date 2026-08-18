@@ -1,5 +1,5 @@
 {
-  "description": "Self-contained runtime payload for the sole rope_game demo, preserving the stable rope simulation payload, high-quality visual Gaussian, and standard three-sofa course.",
+  "description": "Self-contained runtime payload for the Rope game mode, preserving the stable rope simulation payload, high-quality visual Gaussian, and standard three-sofa course.",
   "simulation_payload": {
     "provenance": "Retained byte-for-byte from the Boba-Demo runtime baseline in commit aa15ab9.",
     "license": "Boba-Demo repository MIT license",

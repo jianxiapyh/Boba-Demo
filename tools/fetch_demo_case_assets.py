@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-ONLY_DEMO_CASE = "rope_game"
+PUBLIC_DEMO_CASES = ("rope_game", "sloth")
 LFS_POINTER_HEADER = "version https://git-lfs.github.com/spec/v1"
 REQUIRED_MANIFEST_PAYLOAD_KEYS = (
     "best_model",
@@ -61,6 +61,30 @@ KNOWN_PAYLOAD_FINGERPRINTS = {
         "sha256": "8447810d581b9401e97514ebee7db44fb41aa086d3c53c0f0e8702d062f7fb42",
         "size": 71960,
     },
+    "assets/sloth/best_model.pth": {
+        "sha256": "b027af7baae371fd4e0ddbf33b7d7d9f919517081b26907bbe10cd2d2161d549",
+        "size": 274034,
+    },
+    "assets/sloth/calibrate.pkl": {
+        "sha256": "160962e646f60bdfd70a71793e11c8152a0d05543762999213d489ef50849f1d",
+        "size": 601,
+    },
+    "assets/sloth/final_data.pkl": {
+        "sha256": "fca68a1dec035f6252cf2cbe35717425f210124fb92d3b8f26d7b4cdef2d4635",
+        "size": 16275526,
+    },
+    "assets/sloth/metadata.json": {
+        "sha256": "dbf86424791736ce7c476ab9e2885f05d29a2228b32352e799d6836fd3970b47",
+        "size": 500,
+    },
+    "assets/sloth/optimal_params.pkl": {
+        "sha256": "bde43cb1d2bdeede2e0407f32cc1fe46e272cb1aaf19c72d8e73c5769472beec",
+        "size": 551,
+    },
+    "assets/sloth/sloth.ply": {
+        "sha256": "fc0301db3e5fd077d153e3bb2d68cf609db1ebc6968932101f34d731b6aec5d2",
+        "size": 55991805,
+    },
 }
 
 
@@ -88,16 +112,19 @@ def _repo_relative_path(repo_root: Path, path: Path) -> str:
 
 def resolve_demo_case_manifest(repo_root: Path, case_name: str) -> tuple[str, Path, dict]:
     normalized_case = str(case_name).strip().lower()
-    if normalized_case != ONLY_DEMO_CASE:
+    if normalized_case not in PUBLIC_DEMO_CASES:
         raise DemoAssetValidationError(
-            f"Unsupported demo case '{case_name}'. This branch contains only '{ONLY_DEMO_CASE}'."
+            f"Unsupported demo case '{case_name}'. Packaged cases: "
+            f"{', '.join(PUBLIC_DEMO_CASES)}."
         )
-    manifest_path = repo_root / "assets" / ONLY_DEMO_CASE / "manifest.json"
+    manifest_path = repo_root / "assets" / normalized_case / "manifest.json"
     if not manifest_path.is_file():
-        raise DemoAssetValidationError(f"Missing rope-game manifest: {manifest_path}")
+        raise DemoAssetValidationError(
+            f"Missing manifest for packaged case '{normalized_case}': {manifest_path}"
+        )
     with manifest_path.open("r", encoding="utf-8") as handle:
         manifest = json.load(handle)
-    return ONLY_DEMO_CASE, manifest_path.parent, manifest
+    return normalized_case, manifest_path.parent, manifest
 
 
 def resolve_manifest_path(
@@ -255,7 +282,8 @@ def _validate_asset(asset: ManifestAsset) -> None:
         )
     if _read_lfs_pointer(asset.path):
         raise DemoAssetValidationError(
-            f"[{asset.case_name}] {asset.key}: Git LFS pointer found instead of payload at {asset.path}"
+            f"[{asset.case_name}] {asset.key}: Git LFS pointer found instead of payload at "
+            f"{asset.path}. Install Git LFS and run 'git lfs pull'."
         )
     if asset.must_start_with_ply:
         with asset.path.open("rb") as handle:
@@ -287,18 +315,20 @@ def validate_demo_case_assets(
     manifest: dict,
 ) -> list[ManifestAsset]:
     normalized_case = str(case_name).strip().lower()
-    if normalized_case != ONLY_DEMO_CASE:
+    if normalized_case not in PUBLIC_DEMO_CASES:
         raise DemoAssetValidationError(
-            f"Unsupported demo case '{case_name}'. This branch contains only '{ONLY_DEMO_CASE}'."
+            f"Unsupported demo case '{case_name}'. Packaged cases: "
+            f"{', '.join(PUBLIC_DEMO_CASES)}."
         )
-    expected_manifest_dir = (repo_root / "assets" / ONLY_DEMO_CASE).resolve()
+    expected_manifest_dir = (repo_root / "assets" / normalized_case).resolve()
     if manifest_dir.resolve() != expected_manifest_dir:
         raise DemoAssetValidationError(
-            f"rope_game manifest must live at {expected_manifest_dir}, got {manifest_dir.resolve()}"
+            f"{normalized_case} manifest must live at {expected_manifest_dir}, "
+            f"got {manifest_dir.resolve()}"
         )
     assets = resolve_case_manifest_assets(
         repo_root,
-        ONLY_DEMO_CASE,
+        normalized_case,
         manifest_dir,
         manifest,
     )
@@ -308,25 +338,59 @@ def validate_demo_case_assets(
     return assets
 
 
+def validate_all_demo_assets(repo_root: Path) -> list[ManifestAsset]:
+    assets = []
+    shared_paths = set()
+    for case_name in PUBLIC_DEMO_CASES:
+        canonical_case, manifest_dir, manifest = resolve_demo_case_manifest(
+            repo_root,
+            case_name,
+        )
+        case_assets = validate_demo_case_assets(
+            repo_root,
+            canonical_case,
+            manifest_dir,
+            manifest,
+        )
+        for asset in case_assets:
+            if asset.case_name == "shared":
+                if asset.repo_relative_path in shared_paths:
+                    continue
+                shared_paths.add(asset.repo_relative_path)
+            assets.append(asset)
+    return assets
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Validate the self-contained rope_game and shared Quest scene assets."
+        description="Validate packaged Rope/Sloth and shared Quest scene assets."
     )
     parser.add_argument(
         "--case",
-        choices=(ONLY_DEMO_CASE,),
-        default=ONLY_DEMO_CASE,
-        help="packaged demo case (this branch contains only rope_game)",
+        choices=PUBLIC_DEMO_CASES + ("all",),
+        default="all",
+        help="packaged demo case, or all selectable cases",
     )
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    case_name, manifest_dir, manifest = resolve_demo_case_manifest(REPO_ROOT, args.case)
-    assets = validate_demo_case_assets(REPO_ROOT, case_name, manifest_dir, manifest)
+    if args.case == "all":
+        assets = validate_all_demo_assets(REPO_ROOT)
+    else:
+        case_name, manifest_dir, manifest = resolve_demo_case_manifest(
+            REPO_ROOT,
+            args.case,
+        )
+        assets = validate_demo_case_assets(
+            REPO_ROOT,
+            case_name,
+            manifest_dir,
+            manifest,
+        )
     print(
-        f"Validated {len(assets)} self-contained rope_game/shared runtime asset entries.",
+        f"Validated {len(assets)} packaged demo/shared runtime asset entries.",
         flush=True,
     )
     return 0

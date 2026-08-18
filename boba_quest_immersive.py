@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import gc
 import os
 import pickle
 import random
@@ -12,18 +13,22 @@ import sys
 from argparse import ArgumentDefaultsHelpFormatter, ArgumentParser
 from pathlib import Path
 
-from tools.fetch_demo_case_assets import DemoAssetValidationError, validate_demo_case_assets
+from tools.fetch_demo_case_assets import (
+    DemoAssetValidationError,
+    validate_all_demo_assets,
+)
 
 np = None
 torch = None
 REPO_ROOT = Path(__file__).resolve().parent
 DEFAULT_SCENE_ASSETS_ROOT = REPO_ROOT / "assets" / "scenes"
-PUBLIC_DEMO_CASES = ("rope_game",)
+PUBLIC_DEMO_CASES = ("rope_game", "sloth")
 SHARED_TUTORIAL_SLIDES = (
     "controls_overview.png",
     "interaction_tips.png",
 )
 RUNTIME_ENV_READY_SENTINEL = "BOBA_IMMERSIVE_RUNTIME_READY"
+REQUIRED_RUNTIME_ENV = "phystwin-cu132"
 DEFAULT_CUDA_HOME = "/usr/local/cuda"
 BRIDGE_DEPS_CHECK_SCRIPT = (
     REPO_ROOT / "linux_pose_probe" / "check_boba_immersive_bridge_deps.sh"
@@ -36,13 +41,15 @@ class StartupConfigurationError(RuntimeError):
 
 
 def detected_conda_prefix() -> str | None:
-    conda_prefix = os.environ.get("CONDA_PREFIX")
-    if conda_prefix and Path(conda_prefix).is_dir():
-        return conda_prefix
-
+    # Prefer the interpreter's real prefix.  CONDA_PREFIX can describe the
+    # caller when this process was started through nested `conda run`.
     inferred_prefix = Path(sys.prefix)
     if (inferred_prefix / "conda-meta").is_dir():
         return str(inferred_prefix)
+
+    conda_prefix = os.environ.get("CONDA_PREFIX")
+    if conda_prefix and Path(conda_prefix).is_dir():
+        return conda_prefix
     return None
 
 
@@ -58,18 +65,38 @@ def ensure_direct_launch_runtime_env(argv: list[str] | None = None) -> None:
     launch_env = current_env.copy()
     launch_env["PYTHONNOUSERSITE"] = "1"
 
-    cuda_home = str(Path(current_env.get("CUDA_HOME") or DEFAULT_CUDA_HOME))
+    conda_prefix = detected_conda_prefix()
+    active_env = Path(conda_prefix).resolve().name if conda_prefix else "none"
+    if active_env != REQUIRED_RUNTIME_ENV:
+        raise StartupConfigurationError(
+            "Boba Demo must execute in the "
+            f"{REQUIRED_RUNTIME_ENV!r} Conda environment; actual interpreter "
+            f"environment is {active_env!r} (sys.prefix={Path(sys.prefix).resolve()}).\n"
+            "Run ./boba_app.sh from any shell to enter the correct environment "
+            "automatically."
+        )
+
+    conda_cuda_home = Path(conda_prefix) if conda_prefix else None
+    if conda_cuda_home is not None and (conda_cuda_home / "bin" / "nvcc").is_file():
+        cuda_home = str(conda_cuda_home)
+    else:
+        cuda_home = str(Path(current_env.get("CUDA_HOME") or DEFAULT_CUDA_HOME))
     launch_env["CUDA_HOME"] = cuda_home
     launch_env["PATH"] = prepend_env_entries(
         current_env.get("PATH"),
         [str(Path(cuda_home) / "bin")],
     )
 
-    conda_prefix = detected_conda_prefix()
     ld_library_leading_entries = []
     if conda_prefix:
         ld_library_leading_entries.append(str(Path(conda_prefix) / "lib"))
+        ld_library_leading_entries.append(
+            str(Path(conda_prefix) / "targets" / "x86_64-linux" / "lib")
+        )
     ld_library_leading_entries.append(str(Path(cuda_home) / "lib64"))
+    ld_library_leading_entries.append(
+        str(Path(cuda_home) / "targets" / "x86_64-linux" / "lib")
+    )
     launch_env["LD_LIBRARY_PATH"] = prepend_env_entries(
         current_env.get("LD_LIBRARY_PATH"),
         ld_library_leading_entries,
@@ -87,7 +114,8 @@ def ensure_direct_launch_runtime_env(argv: list[str] | None = None) -> None:
 
     launch_env[RUNTIME_ENV_READY_SENTINEL] = "1"
     print(
-        "[startup] re-executing with conda/CUDA runtime libraries for RTX6000 compatibility",
+        "[startup] re-executing with phystwin-cu132 CUDA runtime libraries: "
+        f"CUDA_HOME={cuda_home}",
         flush=True,
     )
     exec_argv = [sys.executable, str(Path(__file__).resolve())]
@@ -160,7 +188,8 @@ def resolve_demo_case_manifest(case_name: str) -> tuple[str, Path, dict]:
     canonical_case = canonical_demo_case_name(case_name)
     if canonical_case not in PUBLIC_DEMO_CASES:
         raise ValueError(
-            f"Unsupported demo case '{case_name}'. This branch contains only 'rope_game'."
+            f"Unsupported demo case '{case_name}'. Packaged cases: "
+            f"{', '.join(PUBLIC_DEMO_CASES)}."
         )
     manifest_path = REPO_ROOT / "assets" / canonical_case / "manifest.json"
     if not manifest_path.exists():
@@ -351,6 +380,102 @@ def configure_immersive_viewer_upload_runtime(args) -> None:
     os.environ["BOBA_IMMERSIVE_VIEWER_UPLOAD_BUSY_BACKOFF_US"] = str(busy_backoff_us)
 
 
+def configure_demo_case_runtime(case_name: str, cfg, logger) -> dict:
+    """Load one packaged object's isolated configuration and runtime paths."""
+
+    canonical_case_name, manifest_dir, case_manifest = resolve_demo_case_manifest(
+        case_name
+    )
+    cfg.reset()
+    config_path = manifest_config_path(case_manifest)
+    cfg.load_from_yaml(config_path)
+    cfg.demo_case_name = canonical_case_name
+    cfg.demo_game_mode = str(case_manifest.get("game_mode", "")).strip().lower()
+    cfg.demo_game_course_path = (
+        None
+        if case_manifest.get("game_course") is None
+        else manifest_file_path(manifest_dir, case_manifest, "game_course")
+    )
+    cfg.visual_gaussian_retarget = (
+        str(case_manifest.get("visual_gaussian_retarget") or "").strip().lower()
+    )
+    cfg.visual_gaussian_driver_case = (
+        str(case_manifest.get("visual_gaussian_driver_case") or "").strip().lower()
+    )
+    cfg.visual_gaussian_source_case = (
+        str(case_manifest.get("visual_gaussian_source_case") or "").strip().lower()
+    )
+    cfg.demo_tutorial_slide_paths = resolve_demo_case_tutorial_slides(
+        manifest_dir,
+        case_manifest,
+        canonical_case_name,
+    )
+
+    optimal_path = manifest_file_path(manifest_dir, case_manifest, "optimal_params")
+    with open(optimal_path, "rb") as handle:
+        cfg.set_optimal_params(pickle.load(handle))
+    cfg.demo_case_world_scale = 1.0
+
+    with open(
+        manifest_file_path(manifest_dir, case_manifest, "calibrate"),
+        "rb",
+    ) as handle:
+        c2ws = pickle.load(handle)
+    w2cs = [np.linalg.inv(c2w) for c2w in c2ws]
+    cfg.c2ws = np.array(c2ws)
+    cfg.w2cs = np.array(w2cs)
+
+    with open(
+        manifest_file_path(manifest_dir, case_manifest, "metadata"),
+        "r",
+        encoding="utf-8",
+    ) as handle:
+        metadata = json.load(handle)
+    cfg.intrinsics = np.array(metadata["intrinsics"])
+    cfg.WH = metadata["WH"]
+
+    base_dir = f"./temp_experiments/{canonical_case_name}"
+    logger.set_log_file(path=base_dir, name="inference_log")
+    print(
+        "[quest_display] demo case config: "
+        f"case={canonical_case_name} "
+        f"mode={cfg.demo_game_mode} "
+        f"config={config_path} "
+        f"dt={float(cfg.dt):.8g} "
+        f"num_substeps={int(cfg.num_substeps)} "
+        f"self_collision={bool(getattr(cfg, 'self_collision', False))} "
+        f"object_radius={float(cfg.object_radius):.8f} "
+        f"controller_radius={float(cfg.controller_radius):.8f} "
+        f"collision_dist={float(cfg.collision_dist):.8f}",
+        flush=True,
+    )
+    return {
+        "case_name": canonical_case_name,
+        "manifest_dir": manifest_dir,
+        "manifest": case_manifest,
+        "base_dir": base_dir,
+        "data_path": manifest_file_path(
+            manifest_dir,
+            case_manifest,
+            "final_data",
+        ),
+        "best_model_path": manifest_file_path(
+            manifest_dir,
+            case_manifest,
+            "best_model",
+        ),
+        "gaussians_path": manifest_file_path(
+            manifest_dir,
+            case_manifest,
+            "gaussian_ply",
+        ),
+        "output_dir": os.path.join(
+            "./gaussian_output_dynamic",
+            canonical_case_name,
+        ),
+    }
+
+
 def build_parser() -> ArgumentParser:
     parser = ArgumentParser(
         formatter_class=ArgumentDefaultsHelpFormatter,
@@ -366,7 +491,10 @@ def build_parser() -> ArgumentParser:
         type=str,
         choices=PUBLIC_DEMO_CASES,
         default="rope_game",
-        help="packaged demo case (this branch supports only rope_game)",
+        help=(
+            "initial packaged object; Rope is the normal demo default and both "
+            "objects remain selectable at runtime"
+        ),
     )
     parser.add_argument("--n_dup", type=int, default=0, help="must remain 0 for the shipped Quest demo")
     parser.add_argument(
@@ -674,9 +802,11 @@ def main(argv: list[str] | None = None):
             else "serial"
         )
 
-    case_name = args.case_name
-    canonical_case_name, manifest_dir, case_manifest = resolve_demo_case_manifest(case_name)
-    validate_demo_case_assets(REPO_ROOT, canonical_case_name, manifest_dir, case_manifest)
+    validate_all_demo_assets(REPO_ROOT)
+    print(
+        "[quest_display] validated selectable objects: Rope, Sloth",
+        flush=True,
+    )
     ensure_immersive_bridge_system_deps()
 
     global np, torch
@@ -772,6 +902,15 @@ def main(argv: list[str] | None = None):
         flush=True,
     )
 
+    # Finish all Python/native-module imports before attaching PyCUDA.  If a
+    # dependency is missing, this prevents PyCUDA's context-stack abort from
+    # obscuring the actionable import error during interpreter shutdown.
+    prioritize_conda_bin()
+    prioritize_conda_runtime_libs()
+    prefer_system_ninja_binary()
+    from qqtt import InvPhyTrainerWarp
+    from qqtt.utils import logger, cfg
+
     window = create_gl_window(
         848,
         400,
@@ -790,121 +929,153 @@ def main(argv: list[str] | None = None):
 
     ctx = attach_pycuda_context_for_current_torch_device()
 
-    prioritize_conda_bin()
-    prioritize_conda_runtime_libs()
-    prefer_system_ninja_binary()
-    from qqtt import InvPhyTrainerWarp
-    from qqtt.utils import logger, cfg
-
-    config_path = manifest_config_path(case_manifest)
-    cfg.load_from_yaml(config_path)
-    cfg.demo_case_name = canonical_case_name
-    cfg.demo_game_mode = str(case_manifest.get("game_mode", "")).strip().lower()
-    cfg.demo_game_course_path = (
-        None
-        if case_manifest.get("game_course") is None
-        else manifest_file_path(manifest_dir, case_manifest, "game_course")
-    )
-    cfg.visual_gaussian_retarget = (
-        str(case_manifest.get("visual_gaussian_retarget") or "").strip().lower()
-    )
-    cfg.visual_gaussian_driver_case = (
-        str(case_manifest.get("visual_gaussian_driver_case") or "").strip().lower()
-    )
-    cfg.visual_gaussian_source_case = (
-        str(case_manifest.get("visual_gaussian_source_case") or "").strip().lower()
-    )
-    cfg.demo_tutorial_slide_paths = resolve_demo_case_tutorial_slides(
-        manifest_dir,
-        case_manifest,
-        canonical_case_name,
-    )
-
-    base_dir = f"./temp_experiments/{canonical_case_name}"
-
-    optimal_path = manifest_file_path(manifest_dir, case_manifest, "optimal_params")
-    with open(optimal_path, "rb") as f:
-        optimal_params = pickle.load(f)
-    cfg.set_optimal_params(optimal_params)
-    cfg.demo_case_world_scale = 1.0
-    print(
-        "[quest_display] demo case config: "
-        f"case={canonical_case_name} "
-        f"config={config_path} "
-        f"dt={float(cfg.dt):.8g} "
-        f"num_substeps={int(cfg.num_substeps)} "
-        f"self_collision={bool(getattr(cfg, 'self_collision', False))} "
-        f"object_radius={float(cfg.object_radius):.8f} "
-        f"controller_radius={float(cfg.controller_radius):.8f} "
-        f"collision_dist={float(cfg.collision_dist):.8f}",
-        flush=True,
-    )
-
-    with open(manifest_file_path(manifest_dir, case_manifest, "calibrate"), "rb") as f:
-        c2ws = pickle.load(f)
-    w2cs = [np.linalg.inv(c2w) for c2w in c2ws]
-    cfg.c2ws = np.array(c2ws)
-    cfg.w2cs = np.array(w2cs)
-
-    with open(
-        manifest_file_path(manifest_dir, case_manifest, "metadata"),
-        "r",
-        encoding="utf-8",
-    ) as f:
-        data = json.load(f)
-    cfg.intrinsics = np.array(data["intrinsics"])
-    cfg.WH = data["WH"]
-    gaussians_path = manifest_file_path(manifest_dir, case_manifest, "gaussian_ply")
-
-    logger.set_log_file(path=base_dir, name="inference_log")
-    cfg.live_openxr_verbose_console_diagnostics = bool(args.profile)
-
-    trainer = InvPhyTrainerWarp(
-        data_path=manifest_file_path(manifest_dir, case_manifest, "final_data"),
-        base_dir=base_dir,
-    )
-
-    best_model_path = manifest_file_path(manifest_dir, case_manifest, "best_model")
-    output_dir = os.path.join("./gaussian_output_dynamic", canonical_case_name)
-
+    active_case_name = canonical_demo_case_name(args.case_name)
+    immersive_bridge = None
+    immersive_session_state = {}
+    show_startup_tutorial = True
+    rollback_case_name = None
+    last_switch_result = None
+    trainer = None
     try:
-        trainer.interactive_playground_quest_immersive_balanced(
-            best_model_path,
-            gaussians_path,
-            output_dir=output_dir,
-            n_dup=args.n_dup,
-            window=window,
-            cuda_ctx=ctx,
-            interactive_window_mode=args.interactive_window_mode,
-            scene_assets_root=args.scene_assets_root,
-            profile=args.profile,
-            profile_freq=args.profile_freq,
-            immersive_timewarp=args.immersive_timewarp,
-            immersive_static_scene_overlap=args.immersive_static_scene_overlap,
-            immersive_static_scene_reuse=args.immersive_static_scene_reuse,
-            immersive_static_scene_backend=args.immersive_static_scene_backend,
-            immersive_eye_resolution=args.immersive_eye_resolution,
-            immersive_static_scene_mode=args.immersive_static_scene_mode,
-            immersive_native_gl_texture_mode=args.immersive_native_gl_texture_mode,
-            immersive_native_gl_anisotropy=args.immersive_native_gl_anisotropy,
-            immersive_native_gl_mipmap_lod_bias=(
-                args.immersive_native_gl_mipmap_lod_bias
-            ),
-            immersive_native_gl_msaa_samples=args.immersive_native_gl_msaa_samples,
-            immersive_native_gl_depth_format=args.immersive_native_gl_depth_format,
-            immersive_gaussian_source_validation=(
-                args.immersive_gaussian_source_validation
-            ),
-            immersive_support_entry_overlay=args.immersive_support_entry_overlay,
-            immersive_framegen=args.immersive_framegen,
-            immersive_gaussian_render=args.immersive_gaussian_render,
-            immersive_present_pipeline=immersive_present_pipeline_enabled,
-            immersive_controller_translation_scale=(
-                args.immersive_controller_translation_scale
-            ),
-        )
+        while True:
+            try:
+                set_all_seeds(42)
+                runtime_case = configure_demo_case_runtime(
+                    active_case_name,
+                    cfg,
+                    logger,
+                )
+                cfg.live_openxr_verbose_console_diagnostics = bool(args.profile)
+                trainer = InvPhyTrainerWarp(
+                    data_path=runtime_case["data_path"],
+                    base_dir=runtime_case["base_dir"],
+                )
+                episode_result = (
+                    trainer.interactive_playground_quest_immersive_balanced(
+                        runtime_case["best_model_path"],
+                        runtime_case["gaussians_path"],
+                        output_dir=runtime_case["output_dir"],
+                        n_dup=args.n_dup,
+                        window=window,
+                        cuda_ctx=ctx,
+                        interactive_window_mode=args.interactive_window_mode,
+                        scene_assets_root=args.scene_assets_root,
+                        profile=args.profile,
+                        profile_freq=args.profile_freq,
+                        immersive_timewarp=args.immersive_timewarp,
+                        immersive_static_scene_overlap=(
+                            args.immersive_static_scene_overlap
+                        ),
+                        immersive_static_scene_reuse=(
+                            args.immersive_static_scene_reuse
+                        ),
+                        immersive_static_scene_backend=(
+                            args.immersive_static_scene_backend
+                        ),
+                        immersive_eye_resolution=args.immersive_eye_resolution,
+                        immersive_static_scene_mode=args.immersive_static_scene_mode,
+                        immersive_native_gl_texture_mode=(
+                            args.immersive_native_gl_texture_mode
+                        ),
+                        immersive_native_gl_anisotropy=(
+                            args.immersive_native_gl_anisotropy
+                        ),
+                        immersive_native_gl_mipmap_lod_bias=(
+                            args.immersive_native_gl_mipmap_lod_bias
+                        ),
+                        immersive_native_gl_msaa_samples=(
+                            args.immersive_native_gl_msaa_samples
+                        ),
+                        immersive_native_gl_depth_format=(
+                            args.immersive_native_gl_depth_format
+                        ),
+                        immersive_gaussian_source_validation=(
+                            args.immersive_gaussian_source_validation
+                        ),
+                        immersive_support_entry_overlay=(
+                            args.immersive_support_entry_overlay
+                        ),
+                        immersive_framegen=args.immersive_framegen,
+                        immersive_gaussian_render=args.immersive_gaussian_render,
+                        immersive_present_pipeline=(
+                            immersive_present_pipeline_enabled
+                        ),
+                        immersive_controller_translation_scale=(
+                            args.immersive_controller_translation_scale
+                        ),
+                        existing_immersive_bridge=immersive_bridge,
+                        immersive_session_state=immersive_session_state,
+                        show_startup_tutorial=show_startup_tutorial,
+                        manage_cuda_context=False,
+                    )
+                )
+            except Exception as exc:
+                if rollback_case_name is None or immersive_bridge is None:
+                    raise
+                failed_case_name = active_case_name
+                print(
+                    "[quest_display] object load failed; restoring previous object: "
+                    f"failed_case={failed_case_name} "
+                    f"restore_case={rollback_case_name} "
+                    f"error={type(exc).__name__}: {exc}",
+                    flush=True,
+                )
+                if last_switch_result is not None:
+                    left_frame = last_switch_result.get("last_left_frame")
+                    right_frame = last_switch_result.get("last_right_frame")
+                    if left_frame is not None and right_frame is not None:
+                        try:
+                            immersive_bridge.publish_stereo_frames(
+                                left_frame,
+                                right_frame,
+                                overlay_bitmap_quad=last_switch_result.get(
+                                    "error_overlay_bitmap_quad"
+                                ),
+                            )
+                        except Exception as overlay_exc:
+                            print(
+                                "[quest_display] unable to publish switch error overlay: "
+                                f"{type(overlay_exc).__name__}: {overlay_exc}",
+                                flush=True,
+                            )
+                active_case_name = rollback_case_name
+                rollback_case_name = None
+                show_startup_tutorial = False
+                trainer = None
+                gc.collect()
+                torch.cuda.empty_cache()
+                continue
+
+            immersive_bridge = episode_result.get("bridge", immersive_bridge)
+            action = str(episode_result.get("action", "exit")).strip().lower()
+            if action != "switch":
+                break
+
+            next_case_name = canonical_demo_case_name(
+                episode_result.get("next_case")
+            )
+            if next_case_name not in PUBLIC_DEMO_CASES:
+                raise RuntimeError(
+                    f"Runtime selector requested unsupported case: {next_case_name}"
+                )
+            rollback_case_name = active_case_name
+            active_case_name = next_case_name
+            immersive_session_state = dict(
+                episode_result.get("session_state") or {}
+            )
+            last_switch_result = episode_result
+            show_startup_tutorial = False
+            trainer = None
+            gc.collect()
+            torch.cuda.empty_cache()
     finally:
         import glfw
+
+        if immersive_bridge is not None:
+            try:
+                immersive_bridge.stop()
+            except Exception:
+                pass
 
         try:
             glfw.make_context_current(window)
@@ -916,6 +1087,10 @@ def main(argv: list[str] | None = None):
         except Exception:
             pass
 
+        try:
+            ctx.pop()
+        except Exception:
+            pass
         try:
             ctx.detach()
         except Exception:

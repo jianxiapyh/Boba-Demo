@@ -1,4 +1,5 @@
 {
+  "display_name": "Rope — Game",
   "best_model": "best_model.pth",
   "calibrate": "calibrate.pkl",
   "config": "configs/rope_game.yaml",

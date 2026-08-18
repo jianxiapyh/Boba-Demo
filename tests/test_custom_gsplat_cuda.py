@@ -10,7 +10,7 @@ import torch
 class CustomGsplatCudaTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        os.environ["CONDA_DEFAULT_ENV"] = "phystwin"
+        os.environ["CONDA_DEFAULT_ENV"] = "phystwin-cu132"
         from gaussian_splatting._gsplat_vendor import rasterization
 
         cls.rasterization = staticmethod(rasterization)

@@ -748,7 +748,7 @@ def slide_one() -> Image.Image:
         x=body_x,
         y=body_y,
         button_text="Select",
-        description="Hold to interact with objects.",
+        description="Hold to interact. Trigger selects an object-menu row.",
         width=body_w,
     )
     body_y = draw_control_row(
@@ -756,7 +756,7 @@ def slide_one() -> Image.Image:
         x=body_x,
         y=body_y,
         button_text="X / A",
-        description="Cycle through interaction anchors.",
+        description="Cycle anchors, or move the object selector highlight.",
         width=body_w,
     )
     body_y = draw_control_row(
@@ -764,15 +764,15 @@ def slide_one() -> Image.Image:
         x=body_x,
         y=body_y,
         button_text="Y / B",
-        description="Reset the game.",
+        description="Tap to reset. Hold 0.75 s to switch Rope / Sloth.",
         width=body_w,
     )
     body_y = draw_control_row(
         draw,
         x=body_x,
         y=body_y,
-        button_text="Stick Press",
-        description="Exit anchor cycle.",
+        button_text="Either Stick",
+        description="Up/down moves the selector; press exits anchor cycle.",
         width=body_w,
     )
     draw_control_row(
@@ -872,7 +872,7 @@ def slide_two() -> Image.Image:
         x=body_x,
         y=body_y,
         width=body_w,
-        text="Stick Press exits cycle. Y / B resets.",
+        text="Stick Press exits cycle. Tap Y / B to reset; hold Y / B to switch objects.",
         vertical_gap=SLIDE_TWO_STEP_VERTICAL_GAP,
     )
 

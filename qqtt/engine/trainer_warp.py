@@ -31,6 +31,7 @@ from gaussian_splatting.dynamic_utils import (
     knn_weights_sparse,
     get_topk_indices,
 )
+from gs_render import remove_gaussians_with_low_opacity
 import time
 from types import SimpleNamespace
 
@@ -68,6 +69,12 @@ from qqtt.immersive_gaussian_fusion_triton import (
     fuse_gaussian_scene_depth_aware_roi,
 )
 from qqtt.pyrender_cuda_bridge import PreviewTextureCudaUploader
+from qqtt.object_selector import (
+    OBJECT_CHOICES,
+    RuntimeObjectSelector,
+    selector_lines,
+    selector_row_from_ray,
+)
 
 TINY_BITMAP_FONT = {
     "0": ("111", "101", "101", "101", "111"),
@@ -6452,6 +6459,7 @@ class InvPhyTrainerWarp:
     LIVE_CONTROLLER_ATTACH_ACTIVE_COLOR = [255.0, 64.0, 255.0]
     LIVE_CONTROLLER_TRANSLATION_SCALE_DEFAULT = 1.0
     LIVE_CONTROLLER_CASE_TRANSLATION_SCALE = {
+        "sloth": 2.0,
         "rope_game": 4.0,
     }
     IMMERSIVE_LIVE_HEAD_TRANSLATION_SCALE = 1.0
@@ -6544,6 +6552,7 @@ class InvPhyTrainerWarp:
     IMMERSIVE_IDLE_LOCK_SUPPORT_XY_MARGIN = 0.01
     IMMERSIVE_IDLE_LOCK_SUPPORT_Z_TOL = 0.015
     IMMERSIVE_IDLE_LOCK_CASE_MIN_SUPPORT_FRACTION = {
+        "sloth": 0.18,
         "rope_game": 0.55,
     }
     IMMERSIVE_IDLE_LOCK_SPLIT_SUPPORT_MIN_FRACTION = 0.45
@@ -6652,7 +6661,9 @@ class InvPhyTrainerWarp:
     IMMERSIVE_IDLE_FULLFRAME_FLASH_MAX_LUMA_RATIO = 0.25
     IMMERSIVE_IDLE_FULLFRAME_FLASH_SAMPLE_STRIDE = 8
     IMMERSIVE_STABLE_SAFE_COVER_REFRESH_FRAMES = 4
-    IMMERSIVE_STARTUP_KEEPALIVE_RGBA = [232, 232, 232, 255]
+    # A dark fallback avoids a full-field white flash if a keepalive is ever
+    # published before its tutorial or object-switch artwork is ready.
+    IMMERSIVE_STARTUP_KEEPALIVE_RGBA = [18, 20, 28, 255]
     IMMERSIVE_TUTORIAL_BACKGROUND_RGBA = [18, 20, 28, 255]
     IMMERSIVE_TUTORIAL_SAFE_WIDTH_FRACTION = 0.80
     IMMERSIVE_TUTORIAL_SAFE_HEIGHT_FRACTION = 0.80
@@ -6708,8 +6719,8 @@ class InvPhyTrainerWarp:
         "build_layout": "Aligning room layout",
         "apply_scene_layout_and_check_readback_mode": "Preparing scene layout",
         "validate_table_alignment_and_log_layout": "Checking table alignment",
-        "apply_spawn_shift": "Placing the rope",
-        "build_center_view_and_resolve_rope_endpoints": "Resolving rope anchors",
+        "apply_spawn_shift": "Placing the object",
+        "build_center_view_and_resolve_rope_endpoints": "Resolving object anchors",
         "assign_controller_sources_and_default_anchor_names": "Preparing controllers",
         "build_two_point_runtime_and_batch_buffers": "Building simulation buffers",
         "init_simulator": "Initializing simulation",
@@ -6720,7 +6731,7 @@ class InvPhyTrainerWarp:
         "start_eye_workers_if_enabled": "Starting eye workers",
         "start_static_scene_worker_if_enabled": "Starting static scene worker",
         "prepare_colliders_support_boxes_idle_lock_and_cuda_graph": "Preparing physics graph",
-        "settle_scene_rest_chunk": "Settling the rope",
+        "settle_scene_rest_chunk": "Settling the object",
         "restore_settled_state_and_build_anchor_templates": "Finalizing anchors",
         "validate_startup_scene_mode": "Checking startup scene",
         "startup_validation_prepare": "Preparing validation",
@@ -7160,6 +7171,31 @@ class InvPhyTrainerWarp:
             ordered[:region_node_count], dtype=torch.long, device=object_points.device
         )
 
+    def _pick_predefined_anchor_seed_index(
+        self,
+        depth_valid,
+        required_mask,
+        score_values,
+        prefer_largest,
+        used_indices,
+    ):
+        used_mask = torch.zeros_like(depth_valid)
+        if used_indices:
+            used_mask[list(used_indices)] = True
+
+        mask = depth_valid & required_mask & (~used_mask)
+        if not bool(mask.any().item()):
+            mask = depth_valid & (~used_mask)
+        if not bool(mask.any().item()):
+            mask = depth_valid
+        candidate_indices = torch.nonzero(mask, as_tuple=False).squeeze(1)
+        if candidate_indices.numel() == 0:
+            return None
+
+        candidate_scores = score_values[candidate_indices]
+        order = torch.argsort(candidate_scores, descending=prefer_largest)
+        return int(candidate_indices[order[0]].item())
+
     def _interaction_anchor_case_name(self):
         return str(getattr(cfg, "demo_case_name", "rope_game")).strip().lower()
 
@@ -7195,7 +7231,9 @@ class InvPhyTrainerWarp:
         if case_name is None:
             case_name = self._interaction_anchor_case_name()
         case_name = str(case_name).strip().lower()
-        default_anchor_names = {"left": "left_end", "right": "right_end"}
+        default_anchor_names = {"left": None, "right": None}
+        if self._is_rope_family_case(case_name):
+            default_anchor_names = {"left": "left_end", "right": "right_end"}
         default_translation_scale = self.LIVE_CONTROLLER_CASE_TRANSLATION_SCALE.get(
             case_name,
             self.LIVE_CONTROLLER_TRANSLATION_SCALE_DEFAULT,
@@ -7226,9 +7264,10 @@ class InvPhyTrainerWarp:
         if case_name is None:
             case_name = self._interaction_anchor_case_name()
         case_name = str(case_name).strip().lower()
+        split_support_enabled = self._is_rope_family_case(case_name)
         return {
             "case_name": case_name,
-            "support_case_name": "rope_game",
+            "support_case_name": case_name,
             "stable_frames_required": int(self.IMMERSIVE_IDLE_LOCK_STABLE_FRAMES),
             "max_speed": float(self.IMMERSIVE_IDLE_LOCK_MAX_SPEED),
             "max_mean_frame_delta": float(
@@ -7240,7 +7279,7 @@ class InvPhyTrainerWarp:
                     self.IMMERSIVE_IDLE_LOCK_CASE_MIN_SUPPORT_FRACTION["rope_game"],
                 )
             ),
-            "split_support_enabled": True,
+            "split_support_enabled": bool(split_support_enabled),
             "split_support_min_fraction": float(
                 self.IMMERSIVE_IDLE_LOCK_SPLIT_SUPPORT_MIN_FRACTION
             ),
@@ -8041,6 +8080,67 @@ class InvPhyTrainerWarp:
             "rest_radius": float(radius.item()),
         }
 
+    def _build_sloth_interaction_anchors(self, object_points, intrinsic, w2c):
+        pixels, depth_valid = self._project_points_to_pixels(
+            object_points,
+            intrinsic,
+            w2c,
+        )
+        if not bool(depth_valid.any().item()):
+            return []
+
+        valid_pixels = pixels[depth_valid]
+        center_pixel = valid_pixels.mean(dim=0)
+        spread = valid_pixels.max(dim=0).values - valid_pixels.min(dim=0).values
+        spread_x = float(spread[0].item())
+        spread_y = float(spread[1].item())
+        upper_mask = pixels[:, 1] <= center_pixel[1]
+        lower_mask = pixels[:, 1] > center_pixel[1]
+        left_mask = pixels[:, 0] <= center_pixel[0]
+        right_mask = pixels[:, 0] > center_pixel[0]
+        center_score = torch.linalg.norm(pixels - center_pixel.unsqueeze(0), dim=1)
+        torso_half_width = max(spread_x * 0.18, 8.0)
+        torso_half_height = max(spread_y * 0.16, 10.0)
+        torso_center_mask = (
+            (torch.abs(pixels[:, 0] - center_pixel[0]) <= torso_half_width)
+            & (torch.abs(pixels[:, 1] - center_pixel[1]) <= torso_half_height)
+        )
+
+        anchor_specs = [
+            ("left_leg", left_mask & lower_mask, center_score, True),
+            ("right_leg", right_mask & lower_mask, center_score, True),
+            ("left_arm", left_mask & upper_mask, center_score, True),
+            ("right_arm", right_mask & upper_mask, center_score, True),
+            ("torso_center", torso_center_mask, center_score, False),
+        ]
+
+        used_indices = set()
+        anchors = []
+        region_node_count = min(
+            int(object_points.shape[0]),
+            self.LIVE_CONTROLLER_PREDEFINED_ANCHOR_NODE_COUNT,
+        )
+        for name, required_mask, score_values, prefer_largest in anchor_specs:
+            seed_idx = self._pick_predefined_anchor_seed_index(
+                depth_valid,
+                required_mask,
+                score_values,
+                prefer_largest,
+                used_indices,
+            )
+            if seed_idx is None:
+                continue
+            used_indices.add(seed_idx)
+            anchor_def = self._build_anchor_def_from_seed(
+                name,
+                seed_idx,
+                object_points,
+                region_node_count,
+            )
+            if anchor_def is not None:
+                anchors.append(anchor_def)
+        return anchors
+
     def _graph_shortest_path_indices(self, start_idx, end_idx, object_points):
         if start_idx is None or end_idx is None:
             return []
@@ -8218,7 +8318,9 @@ class InvPhyTrainerWarp:
         return [resolved_left, *other_defs, resolved_right], debug
 
     def _build_case_interaction_anchors(self, object_points, intrinsic, w2c):
-        return self._build_rope_interaction_anchors(object_points, intrinsic, w2c)
+        if self._is_rope_family_case():
+            return self._build_rope_interaction_anchors(object_points, intrinsic, w2c)
+        return self._build_sloth_interaction_anchors(object_points, intrinsic, w2c)
 
     def _compute_predefined_interaction_anchor_states(self, anchor_defs, object_points):
         states = []
@@ -14616,6 +14718,73 @@ class InvPhyTrainerWarp:
         if cached is not None:
             return cached
 
+        if any(any(ord(character) > 127 for character in line) for line in finish_modal_key):
+            body_font = self._load_immersive_tutorial_status_font(38, bold=False)
+            title_font = self._load_immersive_tutorial_status_font(48, bold=True)
+            line_gap = 18
+            pad_x = 36
+            pad_y = 30
+            line_specs = []
+            for line_index, line in enumerate(finish_modal_key):
+                font = title_font if line_index == 0 else body_font
+                bounds = font.getbbox(line)
+                line_specs.append(
+                    {
+                        "text": line,
+                        "font": font,
+                        "width": max(1, int(bounds[2] - bounds[0])),
+                        "height": max(1, int(bounds[3] - bounds[1])),
+                        "top": int(bounds[1]),
+                    }
+                )
+            box_width = max(spec["width"] for spec in line_specs) + 2 * pad_x
+            box_height = (
+                sum(spec["height"] for spec in line_specs)
+                + max(0, len(line_specs) - 1) * line_gap
+                + 2 * pad_y
+            )
+            bg_alpha = int(
+                np.clip(
+                    round(float(self.ROPE_GAME_FINISH_MODAL_BG_BLEND) * 255.0),
+                    0,
+                    255,
+                )
+            )
+            text_alpha = int(
+                np.clip(
+                    round(float(self.ROPE_GAME_FINISH_MODAL_TEXT_BLEND) * 255.0),
+                    0,
+                    255,
+                )
+            )
+            image = Image.new(
+                "RGBA",
+                (int(box_width), int(box_height)),
+                (0, 0, 0, bg_alpha),
+            )
+            draw = ImageDraw.Draw(image)
+            cursor_y = pad_y
+            for spec in line_specs:
+                text_x = (box_width - spec["width"]) // 2
+                draw.text(
+                    (text_x, cursor_y - spec["top"]),
+                    spec["text"],
+                    font=spec["font"],
+                    fill=(255, 255, 255, text_alpha),
+                )
+                cursor_y += spec["height"] + line_gap
+            texture_rgba = np.asarray(image, dtype=np.uint8).copy()
+            texture_entry = {
+                "texture_rgba": texture_rgba,
+                "width_px": int(box_width),
+                "height_px": int(box_height),
+                "aspect_ratio": float(box_height) / max(float(box_width), 1.0),
+            }
+            if len(cache) >= 8:
+                cache.clear()
+            cache[finish_modal_key] = texture_entry
+            return texture_entry
+
         scale_multiplier = float(self.ROPE_GAME_FINISH_MODAL_TEXTURE_SCALE_MULTIPLIER)
         body_scale = float(
             np.clip(
@@ -16582,6 +16751,43 @@ class InvPhyTrainerWarp:
             head_alignment,
         )
 
+    def _map_live_controller_menu_ray_into_scene(
+        self,
+        controller_sample,
+        head_alignment,
+    ):
+        """Map a physical controller aim ray into the head-aligned room frame."""
+
+        if controller_sample is None or head_alignment is None:
+            return None
+        origin_live = controller_pose_position(controller_sample, "aim")
+        direction_live = controller_pose_forward(controller_sample, "aim")
+        if origin_live is None or direction_live is None:
+            return None
+        origin_live_t = torch.as_tensor(
+            np.asarray(origin_live, dtype=np.float32),
+            dtype=torch.float32,
+            device=cfg.device,
+        )
+        origin_scene = head_alignment["reference_scene_head"] + (
+            self._map_live_delta_into_scene(
+                origin_live_t - head_alignment["reference_live_head"],
+                head_alignment,
+            )
+        )
+        direction_scene = head_alignment["basis"] @ torch.as_tensor(
+            np.asarray(direction_live, dtype=np.float32),
+            dtype=torch.float32,
+            device=cfg.device,
+        )
+        direction_norm = torch.linalg.norm(direction_scene)
+        if float(direction_norm.item()) <= 1.0e-6:
+            return None
+        return (
+            origin_scene.detach().cpu().numpy(),
+            (direction_scene / direction_norm).detach().cpu().numpy(),
+        )
+
     def _update_immersive_head_pose_state(
         self,
         sample,
@@ -17029,6 +17235,9 @@ class InvPhyTrainerWarp:
             "substage_name": phase_name,
         }
         bootstrap_state.update(progress)
+        progress_update_callback = bootstrap_state.get("progress_update_callback")
+        if callable(progress_update_callback):
+            progress_update_callback(dict(progress))
         return progress
 
     def _load_immersive_tutorial_status_font(self, size: int, *, bold: bool = False):
@@ -17073,6 +17282,8 @@ class InvPhyTrainerWarp:
         *,
         ready: bool,
         cache=None,
+        title_text=None,
+        ready_text=None,
     ):
         if not torch.is_tensor(base_frame):
             return base_frame
@@ -17086,6 +17297,8 @@ class InvPhyTrainerWarp:
         cache_key = (
             bool(ready),
             int(bucket),
+            str(title_text or ""),
+            str(ready_text or ""),
             tuple(int(v) for v in base_frame.shape),
             str(base_frame.device),
         )
@@ -17231,7 +17444,7 @@ class InvPhyTrainerWarp:
         pad_x = max(18, int(round(panel_w * 0.045)))
         pad_y = max(8, int(round(panel_h * 0.16)))
         if ready:
-            title = "Ready - press select to start the demo"
+            title = str(ready_text or "Ready - press select to start the demo")
             available_w = max(1, panel_x1 - panel_x0 - pad_x * 2)
             ready_font = title_font
             title_w, title_h = self._immersive_tutorial_text_size(
@@ -17263,7 +17476,7 @@ class InvPhyTrainerWarp:
                 fill=(255, 255, 255, 255),
             )
         else:
-            title = "Preparing demo"
+            title = str(title_text or "Preparing demo")
             percent_text = f"{percent}%"
             title_w, title_h = self._immersive_tutorial_text_size(
                 draw,
@@ -17314,6 +17527,106 @@ class InvPhyTrainerWarp:
         if cache is not None:
             cache[cache_key] = result
         return result
+
+    def _make_immersive_object_switch_loading_base_frame(
+        self,
+        eye_width,
+        eye_height,
+        *,
+        case_name,
+    ):
+        """Create the comfortable dark card shown while an object is replaced."""
+
+        width = max(1, int(eye_width))
+        height = max(1, int(eye_height))
+        target_label = next(
+            (
+                choice.label.split(" \u2014 ", 1)[0]
+                for choice in OBJECT_CHOICES
+                if choice.case_name == str(case_name)
+            ),
+            str(case_name).replace("_", " ").title(),
+        )
+        image = Image.new(
+            "RGBA",
+            (width, height),
+            tuple(int(value) for value in self.IMMERSIVE_TUTORIAL_BACKGROUND_RGBA),
+        )
+        draw = ImageDraw.Draw(image, "RGBA")
+        margin_x = max(18, int(round(width * 0.045)))
+        margin_y = max(18, int(round(height * 0.055)))
+        radius = max(16, int(round(min(width, height) * 0.024)))
+        draw.rounded_rectangle(
+            (margin_x, margin_y, width - margin_x, height - margin_y),
+            radius=radius,
+            fill=(20, 27, 44, 255),
+            outline=(43, 58, 92, 255),
+            width=max(2, int(round(height * 0.003))),
+        )
+
+        accent_w = max(72, int(round(width * 0.12)))
+        accent_h = max(5, int(round(height * 0.009)))
+        accent_x0 = (width - accent_w) // 2
+        accent_y0 = margin_y + max(24, int(round(height * 0.075)))
+        draw.rounded_rectangle(
+            (accent_x0, accent_y0, accent_x0 + accent_w, accent_y0 + accent_h),
+            radius=max(2, accent_h // 2),
+            fill=(92, 171, 246, 235),
+        )
+
+        heading_font = self._load_immersive_tutorial_status_font(
+            max(30, int(round(height * 0.052))),
+            bold=True,
+        )
+        target_font = self._load_immersive_tutorial_status_font(
+            max(38, int(round(height * 0.072))),
+            bold=True,
+        )
+        body_font = self._load_immersive_tutorial_status_font(
+            max(20, int(round(height * 0.032))),
+            bold=False,
+        )
+
+        def _draw_centered(text_value, y, font, fill):
+            text_w, _ = self._immersive_tutorial_text_size(
+                draw,
+                str(text_value),
+                font,
+            )
+            draw.text(
+                ((width - text_w) // 2, int(y)),
+                str(text_value),
+                font=font,
+                fill=fill,
+            )
+
+        _draw_centered(
+            "Switching object",
+            accent_y0 + accent_h + int(round(height * 0.055)),
+            heading_font,
+            (184, 207, 238, 255),
+        )
+        _draw_centered(
+            f"Loading {target_label}\u2026",
+            int(round(height * 0.36)),
+            target_font,
+            (248, 251, 255, 255),
+        )
+        _draw_centered(
+            "The room and headset session stay active.",
+            int(round(height * 0.51)),
+            body_font,
+            (169, 183, 207, 255),
+        )
+        _draw_centered(
+            "Please keep the headset on while the object settles.",
+            int(round(height * 0.57)),
+            body_font,
+            (139, 157, 186, 255),
+        )
+
+        frame_np = np.asarray(image, dtype=np.uint8).copy()
+        return torch.from_numpy(frame_np).to(device=cfg.device, dtype=torch.uint8)
 
     def _launch_immersive_scene_renderer_prewarm(
         self,
@@ -17927,7 +18240,13 @@ class InvPhyTrainerWarp:
                 continue
 
             if substage_name == "compute_live_head_alignment_and_initial_eye_state":
-                live_head_alignment = self._compute_immersive_head_alignment(current_sample)
+                live_head_alignment = startup_context.get(
+                    "session_live_head_alignment"
+                )
+                if live_head_alignment is None:
+                    live_head_alignment = self._compute_immersive_head_alignment(
+                        current_sample
+                    )
                 if live_head_alignment is None:
                     raise RuntimeError(
                         "Immersive mode did not receive a valid eye pose for startup.\n"
@@ -18023,11 +18342,19 @@ class InvPhyTrainerWarp:
                     head_forward = np.array([0.0, 1.0, 0.0], dtype=np.float32)
                 else:
                     head_forward /= forward_norm
-                layout = make_simple_lab_layout(
-                    head_position,
-                    head_forward,
-                    scene_up=bootstrap_output["live_head_alignment"]["scene_up"],
-                )
+                layout = startup_context.get("session_layout")
+                if layout is None:
+                    layout = make_simple_lab_layout(
+                        head_position,
+                        head_forward,
+                        scene_up=bootstrap_output["live_head_alignment"]["scene_up"],
+                    )
+                else:
+                    print(
+                        "[quest_display] reusing room layout and head alignment "
+                        "across object switch",
+                        flush=True,
+                    )
                 self._record_immersive_startup_milestone(
                     startup_timeline,
                     "layout_ready",
@@ -33414,6 +33741,10 @@ class InvPhyTrainerWarp:
         immersive_gaussian_render=None,
         immersive_present_pipeline=True,
         immersive_controller_translation_scale=1.2,
+        existing_immersive_bridge=None,
+        immersive_session_state=None,
+        show_startup_tutorial=True,
+        manage_cuda_context=True,
     ):
         immersive_controller_translation_scale = float(
             immersive_controller_translation_scale
@@ -33480,6 +33811,10 @@ class InvPhyTrainerWarp:
         raw_gaussian_count = int(gaussians._xyz.shape[0])
         gaussian_finite_debug = self._sanitize_rope_game_gaussians(gaussians)
         kept_gaussian_count = raw_gaussian_count
+        opacity_pruning_enabled = case_name == "sloth"
+        if opacity_pruning_enabled:
+            gaussians = remove_gaussians_with_low_opacity(gaussians, 0.1)
+            kept_gaussian_count = int(gaussians._xyz.shape[0])
         gaussians.isotropic = True
         visual_retarget_debug = self._apply_visual_gaussian_retarget_to_sim_rest(
             gaussians,
@@ -33501,14 +33836,14 @@ class InvPhyTrainerWarp:
         )
         scaled_object_span = self._principal_axis_span_torch(obj_init_vertices.detach())
         print(
-            "[quest_display] rope_game gaussian import: "
+            "[quest_display] demo gaussian import: "
             f"case={case_name} "
             f"gaussian_source={gs_path} "
             f"total_gaussians={raw_gaussian_count} "
             f"kept_gaussians={kept_gaussian_count} "
             f"object_nodes={int(getattr(self, 'num_original_points', 0))} "
             f"mass_nodes={int(self.num_all_points)} "
-            "opacity_pruning=disabled "
+            f"opacity_pruning={'0.1' if opacity_pruning_enabled else 'disabled'} "
             "gaussian_xyz_finite="
             f"{gaussian_finite_debug.get('xyz_finite', int(gaussians._xyz.numel()))}/"
             f"{gaussian_finite_debug.get('xyz_total', int(gaussians._xyz.numel()))} "
@@ -33592,7 +33927,22 @@ class InvPhyTrainerWarp:
             immersive_render_options["scene_render_scale"],
         )
         active_scene_stereo_mode = immersive_render_options["scene_stereo_mode"]
-        immersive_bridge = None
+        immersive_session_state = dict(immersive_session_state or {})
+        session_live_head_alignment = immersive_session_state.get(
+            "live_head_alignment"
+        )
+        session_layout = immersive_session_state.get("layout")
+        session_scene_renderer = immersive_session_state.get("scene_renderer")
+        scene_renderer_owned_by_run = session_scene_renderer is None
+        immersive_bridge = existing_immersive_bridge
+        bridge_owned_by_run = immersive_bridge is None
+        episode_result = {
+            "action": "exit",
+            "next_case": None,
+            "bridge": immersive_bridge,
+            "session_state": immersive_session_state,
+        }
+        run_completed_normally = False
         scene_renderer = None
         scene_execute_renderer = None
         static_scene_worker = None
@@ -34692,27 +35042,79 @@ class InvPhyTrainerWarp:
                 "bridge_start_begin",
                 immersive_bridge,
             )
-            immersive_bridge = OpenXRImmersiveBridge(
-                repo_root,
-                width=eye_width,
-                height=eye_height,
-            )
-            immersive_bridge.configure_runtime_diagnostics(enabled=profile_enabled)
-            immersive_bridge.start()
+            reusing_immersive_session = immersive_bridge is not None
+            if immersive_bridge is None:
+                immersive_bridge = OpenXRImmersiveBridge(
+                    repo_root,
+                    width=eye_width,
+                    height=eye_height,
+                )
+                immersive_bridge.configure_runtime_diagnostics(enabled=profile_enabled)
+                immersive_bridge.start()
+            else:
+                print(
+                    "[quest_display] reusing active OpenXR session for object switch",
+                    flush=True,
+                )
+            episode_result["bridge"] = immersive_bridge
             self._record_immersive_startup_milestone(
                 startup_timeline,
                 "bridge_started",
                 immersive_bridge,
             )
             _ensure_startup_preview_display_initialized()
-            tutorial_frames = self._load_immersive_startup_tutorial_frames(
-                eye_width,
-                eye_height,
+            tutorial_frames = (
+                self._load_immersive_startup_tutorial_frames(
+                    eye_width,
+                    eye_height,
+                )
+                if bool(show_startup_tutorial)
+                else []
             )
+            object_switch_loading_active = bool(
+                reusing_immersive_session and not bool(show_startup_tutorial)
+            )
+            object_switch_loading_base_frame = None
+            object_switch_loading_title = None
+            object_switch_loading_frame_cache = {}
+            initial_keepalive_frame = tutorial_frames[0] if tutorial_frames else None
+            if object_switch_loading_active:
+                object_switch_loading_base_frame = (
+                    self._make_immersive_object_switch_loading_base_frame(
+                        eye_width,
+                        eye_height,
+                        case_name=case_name,
+                    )
+                )
+                object_switch_target_label = next(
+                    (
+                        choice.label.split(" \u2014 ", 1)[0]
+                        for choice in OBJECT_CHOICES
+                        if choice.case_name == str(case_name)
+                    ),
+                    str(case_name).replace("_", " ").title(),
+                )
+                object_switch_loading_title = (
+                    f"Loading {object_switch_target_label}\u2026"
+                )
+                initial_keepalive_frame = (
+                    self._render_immersive_tutorial_status_frame(
+                        object_switch_loading_base_frame,
+                        {
+                            "progress_fraction": 0.0,
+                            "progress_percent": 0,
+                            "phase_label": "Preparing object",
+                            "complete": False,
+                        },
+                        ready=False,
+                        cache=object_switch_loading_frame_cache,
+                        title_text=object_switch_loading_title,
+                    )
+                )
             startup_keepalive_state = self._make_immersive_startup_keepalive_state(
                 eye_width,
                 eye_height,
-                left_frame=(tutorial_frames[0] if tutorial_frames else None),
+                left_frame=initial_keepalive_frame,
                 presentation_mode="head_locked_panel",
             )
             startup_keepalive_state["preview_present_callback"] = (
@@ -34747,21 +35149,53 @@ class InvPhyTrainerWarp:
                 startup_timeline=startup_timeline,
                 force=True,
             )
-            scene_renderer_prewarm_state = self._launch_immersive_scene_renderer_prewarm(
-                scene_assets_root=scene_assets_root,
-                scene_width=scene_width,
-                scene_height=scene_height,
-                immersive_render_options=immersive_render_options,
-                active_scene_stereo_mode=active_scene_stereo_mode,
-                immersive_static_scene_backend_mode=immersive_static_scene_backend_mode,
-                immersive_native_gl_texture_mode=immersive_native_gl_texture_mode,
-                immersive_native_gl_anisotropy=immersive_native_gl_anisotropy,
-                immersive_native_gl_mipmap_lod_bias=immersive_native_gl_mipmap_lod_bias,
-                immersive_native_gl_msaa_samples=immersive_native_gl_msaa_samples,
-                immersive_native_gl_depth_format=immersive_native_gl_depth_format,
-                immersive_bridge=immersive_bridge,
-                startup_timeline=startup_timeline,
-            )
+            if session_scene_renderer is None:
+                scene_renderer_prewarm_state = (
+                    self._launch_immersive_scene_renderer_prewarm(
+                        scene_assets_root=scene_assets_root,
+                        scene_width=scene_width,
+                        scene_height=scene_height,
+                        immersive_render_options=immersive_render_options,
+                        active_scene_stereo_mode=active_scene_stereo_mode,
+                        immersive_static_scene_backend_mode=(
+                            immersive_static_scene_backend_mode
+                        ),
+                        immersive_native_gl_texture_mode=(
+                            immersive_native_gl_texture_mode
+                        ),
+                        immersive_native_gl_anisotropy=(
+                            immersive_native_gl_anisotropy
+                        ),
+                        immersive_native_gl_mipmap_lod_bias=(
+                            immersive_native_gl_mipmap_lod_bias
+                        ),
+                        immersive_native_gl_msaa_samples=(
+                            immersive_native_gl_msaa_samples
+                        ),
+                        immersive_native_gl_depth_format=(
+                            immersive_native_gl_depth_format
+                        ),
+                        immersive_bridge=immersive_bridge,
+                        startup_timeline=startup_timeline,
+                    )
+                )
+            else:
+                reused_renderer_future = concurrent.futures.Future()
+                reused_renderer_future.set_result(session_scene_renderer)
+                scene_renderer_prewarm_state = {
+                    "executor": None,
+                    "future": reused_renderer_future,
+                    "status": {
+                        "phase": "reused",
+                        "phase_label": "Reusing room renderer",
+                        "phase_fraction": 1.0,
+                    },
+                    "status_lock": None,
+                }
+                print(
+                    "[quest_display] preserving room renderer across object switch",
+                    flush=True,
+                )
             startup_bootstrap_state = {
                 "stage_index": 0,
                 "substage_index": 0,
@@ -34777,6 +35211,38 @@ class InvPhyTrainerWarp:
                 "complete": False,
                 "output": {"initial_sample": initial_sample},
             }
+            refresh_object_switch_loading = None
+            if object_switch_loading_active:
+                def _refresh_object_switch_loading(progress, *, force=False):
+                    frame = self._render_immersive_tutorial_status_frame(
+                        object_switch_loading_base_frame,
+                        progress,
+                        ready=False,
+                        cache=object_switch_loading_frame_cache,
+                        title_text=object_switch_loading_title,
+                    )
+                    self._set_immersive_startup_keepalive_frames(
+                        startup_keepalive_state,
+                        left_frame=frame,
+                    )
+                    self._maybe_publish_immersive_startup_keepalive(
+                        immersive_bridge,
+                        startup_keepalive_state,
+                        reason="object_switch_loading_progress",
+                        startup_timeline=startup_timeline,
+                        force=bool(force),
+                    )
+
+                refresh_object_switch_loading = _refresh_object_switch_loading
+                startup_bootstrap_state["progress_update_callback"] = (
+                    refresh_object_switch_loading
+                )
+                refresh_object_switch_loading(
+                    self._immersive_startup_bootstrap_progress(
+                        startup_bootstrap_state
+                    ),
+                    force=True,
+                )
             startup_bootstrap_context = locals().copy()
             last_immersive_sample = initial_sample
             if tutorial_frames:
@@ -36165,6 +36631,13 @@ class InvPhyTrainerWarp:
                 force=True,
                 startup_context=startup_bootstrap_context,
             )
+            if callable(refresh_object_switch_loading):
+                refresh_object_switch_loading(
+                    self._immersive_startup_bootstrap_progress(
+                        startup_bootstrap_state
+                    ),
+                    force=True,
+                )
             startup_bootstrap_output = startup_bootstrap_state["output"]
             if not bool(startup_bootstrap_state.get("complete", False)):
                 raise RuntimeError(
@@ -36335,6 +36808,16 @@ class InvPhyTrainerWarp:
                 layout,
                 scene_rest_state,
             )
+            object_selector = RuntimeObjectSelector(
+                case_name,
+                blocked_until=float(
+                    immersive_session_state.get("input_blocked_until", 0.0) or 0.0
+                ),
+            )
+            object_selector_world_corners = None
+            object_selector_frozen_sim_state = None
+            object_selector_selected_case = None
+            object_selector_switch_after_publish = False
             startup_input_gate_state = {
                 "active": True,
                 "opened_logged": False,
@@ -38157,6 +38640,7 @@ class InvPhyTrainerWarp:
                         alignment_pose_role="grip",
                         controller_position_pose_role="grip",
                         controller_ray_pose_role="aim",
+                        collect_reset_edges=False,
                     )
                     (
                         controller_runtime_state,
@@ -38213,7 +38697,130 @@ class InvPhyTrainerWarp:
                     if last_right_eye_pose_world is None:
                         last_right_eye_pose_world = last_left_eye_pose_world
 
-                    controller_reset_sources = controller_runtime_state["reset_sources"]
+                    selector_buttons_by_source = {}
+                    selector_samples_by_source = {
+                        "left": latest_sample.left,
+                        "right": latest_sample.right,
+                    }
+                    for selector_source, selector_sample in (
+                        ("left", latest_sample.left),
+                        ("right", latest_sample.right),
+                    ):
+                        selector_buttons_by_source[selector_source] = {
+                            "menu": bool(
+                                selector_sample is not None
+                                and getattr(
+                                    selector_sample,
+                                    "snap_assist_available",
+                                    False,
+                                )
+                                and getattr(
+                                    selector_sample,
+                                    "snap_assist_pressed",
+                                    False,
+                                )
+                            ),
+                            "navigate": bool(
+                                selector_sample is not None
+                                and getattr(
+                                    selector_sample,
+                                    "anchor_cycle_available",
+                                    False,
+                                )
+                                and getattr(
+                                    selector_sample,
+                                    "anchor_cycle_pressed",
+                                    False,
+                                )
+                            ),
+                            "select": bool(
+                                selector_sample is not None
+                                and getattr(
+                                    selector_sample,
+                                    "select_available",
+                                    False,
+                                )
+                                and getattr(
+                                    selector_sample,
+                                    "select_pressed",
+                                    False,
+                                )
+                            ),
+                            "vertical": float(
+                                getattr(selector_sample, "thumbstick_y", 0.0)
+                            )
+                            if bool(
+                                selector_sample is not None
+                                and getattr(
+                                    selector_sample,
+                                    "thumbstick_available",
+                                    False,
+                                )
+                            )
+                            else 0.0,
+                        }
+                    selector_hovered_index = None
+                    if object_selector.is_open and object_selector_world_corners is not None:
+                        for selector_source in ("left", "right"):
+                            selector_ray = (
+                                self._map_live_controller_menu_ray_into_scene(
+                                    selector_samples_by_source.get(selector_source),
+                                    live_head_alignment,
+                                )
+                            )
+                            if selector_ray is None:
+                                continue
+                            selector_origin, selector_direction = selector_ray
+                            selector_hit = selector_row_from_ray(
+                                selector_origin,
+                                selector_direction,
+                                object_selector_world_corners,
+                            )
+                            if selector_hit is not None:
+                                selector_hovered_index = int(selector_hit)
+                                break
+                    selector_events = object_selector.update(
+                        time.perf_counter(),
+                        selector_buttons_by_source,
+                        hovered_index=selector_hovered_index,
+                    )
+                    if bool(selector_events.get("opened", False)):
+                        for selector_source in ("left", "right"):
+                            self._clear_live_controller_interaction(
+                                selector_source,
+                                controller_interaction_state,
+                                controller_attachment_metadata,
+                                reason="object_selector_opened",
+                            )
+                            self._reset_controller_anchor_preview_state(
+                                controller_anchor_preview_state,
+                                selector_source,
+                            )
+                        object_selector_frozen_sim_state = self._capture_sim_state()
+                        print(
+                            "[quest_display] object selector opened via Y/B hold",
+                            flush=True,
+                        )
+                    if bool(selector_events.get("cancelled", False)):
+                        object_selector_frozen_sim_state = None
+                        object_selector_world_corners = None
+                        print(
+                            "[quest_display] object selector cancelled",
+                            flush=True,
+                        )
+                    selected_case = selector_events.get("selected_case")
+                    if selected_case is not None:
+                        object_selector_selected_case = str(selected_case)
+                        object_selector_switch_after_publish = True
+                        print(
+                            "[quest_display] object switch requested: "
+                            f"{case_name} -> {object_selector_selected_case}",
+                            flush=True,
+                        )
+
+                    controller_reset_sources = list(
+                        selector_events.get("reset_sources", [])
+                    )
                     if controller_reset_sources:
                         pressed_buttons = [
                             "Y" if source == "left" else "B"
@@ -38704,7 +39311,14 @@ class InvPhyTrainerWarp:
                     )
 
                 sim_timer.start()
-                if idle_lock_state.get("active", False):
+                if (
+                    object_selector.blocks_object_input
+                    and object_selector_frozen_sim_state is not None
+                ):
+                    self._restore_sim_state(object_selector_frozen_sim_state)
+                    x = object_selector_frozen_sim_state["x"].detach().clone()
+                    current_v = object_selector_frozen_sim_state["v"].detach().clone()
+                elif idle_lock_state.get("active", False):
                     locked_state = idle_lock_state.get("locked_state")
                     if locked_state is None:
                         raise RuntimeError(
@@ -38800,14 +39414,15 @@ class InvPhyTrainerWarp:
                 )
                 rope_game_overlay_state = None
                 if rope_game_state is not None:
-                    self._evaluate_rope_game_runtime_state(
-                        rope_game_state,
-                        object_points,
-                        current_v[: self.num_all_points],
-                        layout.scene_up,
-                        controller_interaction_state=controller_interaction_state,
-                        now_wall=time.perf_counter(),
-                    )
+                    if not object_selector.blocks_object_input:
+                        self._evaluate_rope_game_runtime_state(
+                            rope_game_state,
+                            object_points,
+                            current_v[: self.num_all_points],
+                            layout.scene_up,
+                            controller_interaction_state=controller_interaction_state,
+                            now_wall=time.perf_counter(),
+                        )
                     rope_game_overlay_state = self._build_rope_game_overlay_state(
                         rope_game_state,
                         left_eye_pose_world=last_left_eye_pose_world,
@@ -38815,6 +39430,29 @@ class InvPhyTrainerWarp:
                         left_intrinsic=left_intrinsic,
                         right_intrinsic=right_intrinsic,
                     )
+                if object_selector.blocks_object_input:
+                    object_selector_lines = selector_lines(
+                        case_name,
+                        object_selector.highlighted_index,
+                        mode=object_selector.mode,
+                        selected_case=object_selector_selected_case,
+                    )
+                    object_selector_world_corners = (
+                        self._make_rope_game_finish_modal_world_corners(
+                            object_selector_lines,
+                            left_eye_pose_world=last_left_eye_pose_world,
+                            right_eye_pose_world=last_right_eye_pose_world,
+                            left_intrinsic=left_intrinsic,
+                            right_intrinsic=right_intrinsic,
+                        )
+                    )
+                    rope_game_overlay_state = {
+                        "state": "course_finished",
+                        "finish_modal_lines": object_selector_lines,
+                        "finish_modal_world_corners": (
+                            object_selector_world_corners
+                        ),
+                    }
                 controller_predefined_anchor_states = (
                     self._compute_predefined_interaction_anchor_states(
                         controller_predefined_anchor_defs,
@@ -38899,16 +39537,23 @@ class InvPhyTrainerWarp:
                         preview_context=preview_context,
                     )
                     if overlay_entry is not None:
-                        cycle_edge = self._controller_anchor_cycle_edge(
-                            source,
-                            controller_world,
-                            controller_anchor_cycle_edge_cache,
-                        )
-                        reset_edge = self._controller_anchor_reset_edge(
-                            source,
-                            controller_world,
-                            controller_anchor_reset_edge_cache,
-                        )
+                        if (
+                            object_selector.blocks_object_input
+                            or startup_input_gate_active
+                        ):
+                            cycle_edge = False
+                            reset_edge = False
+                        else:
+                            cycle_edge = self._controller_anchor_cycle_edge(
+                                source,
+                                controller_world,
+                                controller_anchor_cycle_edge_cache,
+                            )
+                            reset_edge = self._controller_anchor_reset_edge(
+                                source,
+                                controller_world,
+                                controller_anchor_reset_edge_cache,
+                            )
                         selected_preview_anchor = self._update_controller_anchor_preview_state(
                             source,
                             controller_world,
@@ -41838,6 +42483,77 @@ class InvPhyTrainerWarp:
                             render_profile_frame,
                         )
 
+                if object_selector_switch_after_publish:
+                    if presentation_backend_enabled and presentation_worker is not None:
+                        if not presentation_worker.wait_for_idle(timeout=5.0):
+                            raise RuntimeError(
+                                "Timed out while draining the current object presentation "
+                                "runtime before an object switch."
+                            )
+                        _drain_presentation_results()
+
+                    error_lines = selector_lines(
+                        case_name,
+                        object_selector.highlighted_index,
+                        mode="error",
+                        selected_case=object_selector_selected_case,
+                    )
+                    error_world_corners = (
+                        self._make_rope_game_finish_modal_world_corners(
+                            error_lines,
+                            left_eye_pose_world=last_left_eye_pose_world,
+                            right_eye_pose_world=last_right_eye_pose_world,
+                            left_intrinsic=left_intrinsic,
+                            right_intrinsic=right_intrinsic,
+                        )
+                    )
+                    error_overlay_state = {
+                        "state": "course_finished",
+                        "finish_modal_lines": error_lines,
+                        "finish_modal_world_corners": error_world_corners,
+                    }
+                    error_overlay_bitmap_quad = (
+                        self._build_rope_game_finish_modal_viewer_overlay_bitmap_quad(
+                            error_overlay_state,
+                            left_overlay_eye_render_state,
+                            right_overlay_eye_render_state,
+                        )
+                    )
+
+                    def _switch_frame_cpu_u8(frame):
+                        if torch.is_tensor(frame):
+                            frame_t = frame.detach()
+                            if frame_t.dtype != torch.uint8:
+                                frame_t = frame_t.clamp(0.0, 255.0).to(torch.uint8)
+                            return np.ascontiguousarray(frame_t.cpu().numpy())
+                        return np.ascontiguousarray(
+                            np.clip(np.asarray(frame), 0, 255).astype(np.uint8)
+                        )
+
+                    input_blocked_until = time.perf_counter() + 0.35
+                    episode_result.update(
+                        {
+                            "action": "switch",
+                            "next_case": object_selector_selected_case,
+                            "bridge": immersive_bridge,
+                            "session_state": {
+                                "live_head_alignment": live_head_alignment,
+                                "layout": layout,
+                                "scene_renderer": scene_renderer,
+                                "input_blocked_until": input_blocked_until,
+                            },
+                            "last_left_frame": _switch_frame_cpu_u8(left_eye_frame),
+                            "last_right_frame": _switch_frame_cpu_u8(right_eye_frame),
+                            "error_overlay_bitmap_quad": error_overlay_bitmap_quad,
+                        }
+                    )
+                    print(
+                        "[quest_display] previous object runtime drained; "
+                        f"loading {object_selector_selected_case}",
+                        flush=True,
+                    )
+                    break
+
                 next_prev_target = current_target.clone()
                 next_target = self._compute_next_live_controller_target(
                     controller_runtime_base_target,
@@ -41861,7 +42577,10 @@ class InvPhyTrainerWarp:
                     controller_motion_state_cache=controller_motion_state_cache,
                     frame_index=frame_count,
                     runtime_label="immersive",
-                    allow_interaction_start=not startup_input_gate_active,
+                    allow_interaction_start=(
+                        not startup_input_gate_active
+                        and not object_selector.blocks_object_input
+                    ),
                     interaction_release_callback=_arm_post_release_landing_lock,
                 )
                 frame_count += 1
@@ -41870,6 +42589,8 @@ class InvPhyTrainerWarp:
 
                 if preview_display_active and glfw.window_should_close(window):
                     break
+
+            run_completed_normally = True
 
         except RuntimeError as exc:
             bridge_died_pre_first_publish = (
@@ -44065,7 +44786,12 @@ class InvPhyTrainerWarp:
                         "w",
                     ) as log_file:
                         log_file.write("\n".join(log_lines) + "\n")
-            if immersive_bridge is not None:
+            keep_bridge_alive = str(episode_result.get("action", "exit")) == "switch"
+            if (
+                immersive_bridge is not None
+                and bridge_owned_by_run
+                and not keep_bridge_alive
+            ):
                 immersive_bridge.stop()
             if window is not None:
                 try:
@@ -44094,10 +44820,17 @@ class InvPhyTrainerWarp:
                     pass
             if scene_execute_renderer is not None and scene_execute_renderer is not scene_renderer:
                 scene_execute_renderer.delete()
-            if scene_renderer is not None:
+            keep_scene_renderer = str(episode_result.get("action", "exit")) == "switch"
+            delete_scene_renderer = (
+                not keep_scene_renderer
+                and (run_completed_normally or scene_renderer_owned_by_run)
+            )
+            if scene_renderer is not None and delete_scene_renderer:
                 scene_renderer.delete()
-            if cuda_ctx is not None:
+            if cuda_ctx is not None and bool(manage_cuda_context):
                 cuda_ctx.pop()
+
+        return episode_result
 
     def interactive_playground_quest_immersive_balanced(
         self,
@@ -44128,6 +44861,10 @@ class InvPhyTrainerWarp:
         immersive_gaussian_render=None,
         immersive_present_pipeline=True,
         immersive_controller_translation_scale=1.2,
+        existing_immersive_bridge=None,
+        immersive_session_state=None,
+        show_startup_tutorial=True,
+        manage_cuda_context=True,
     ):
         if n_dup != 0:
             raise ValueError(
@@ -44164,6 +44901,10 @@ class InvPhyTrainerWarp:
             immersive_controller_translation_scale=(
                 immersive_controller_translation_scale
             ),
+            existing_immersive_bridge=existing_immersive_bridge,
+            immersive_session_state=immersive_session_state,
+            show_startup_tutorial=show_startup_tutorial,
+            manage_cuda_context=manage_cuda_context,
         )
 
     def _create_gs_view(

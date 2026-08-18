@@ -140,6 +140,9 @@ class ControllerPoseSample:
     exit_pressed: bool
     exit_value: float
     exit_source: str
+    thumbstick_available: bool = False
+    thumbstick_x: float = 0.0
+    thumbstick_y: float = 0.0
     grip_active: bool = False
     grip_position_valid: bool = False
     grip_orientation_valid: bool = False
@@ -322,6 +325,9 @@ def parse_controller_payload(payload: dict) -> ControllerPoseSample:
         exit_pressed=bool(payload.get("exit_pressed", False)),
         exit_value=float(payload.get("exit_value", 0.0)),
         exit_source=str(payload.get("exit_source", "none")),
+        thumbstick_available=bool(payload.get("thumbstick_available", False)),
+        thumbstick_x=float(payload.get("thumbstick_x", 0.0)),
+        thumbstick_y=float(payload.get("thumbstick_y", 0.0)),
         grip_active=bool(payload.get("grip_active", payload["active"])),
         grip_position_valid=bool(payload.get("grip_position_valid", payload["position_valid"])),
         grip_orientation_valid=bool(

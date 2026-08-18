@@ -35,7 +35,7 @@ class _FakeCamera:
 
 class CustomGsplatTests(unittest.TestCase):
     def setUp(self):
-        os.environ["CONDA_DEFAULT_ENV"] = "phystwin"
+        os.environ["CONDA_DEFAULT_ENV"] = "phystwin-cu132"
 
     def test_vendor_replaces_preloaded_external_gsplat(self):
         script = textwrap.dedent(

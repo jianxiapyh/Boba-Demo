@@ -1,0 +1,12 @@
+{
+  "display_name": "Sloth — Free Play",
+  "best_model": "best_model.pth",
+  "calibrate": "calibrate.pkl",
+  "config": "configs/sloth.yaml",
+  "final_data": "final_data.pkl",
+  "gaussian_ply": "sloth.ply",
+  "metadata": "metadata.json",
+  "optimal_params": "optimal_params.pkl",
+  "game_mode": "free_play",
+  "tutorial_extra_slides": []
+}

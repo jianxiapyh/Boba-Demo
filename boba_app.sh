@@ -4,19 +4,35 @@ set -euo pipefail
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 cd "${REPO_ROOT}"
 
-if ! command -v conda >/dev/null 2>&1; then
+RUNTIME_ENV="phystwin-cu132"
+CONDA_BIN="${CONDA_EXE:-}"
+if [[ -z "${CONDA_BIN}" ]]; then
+  CONDA_BIN="$(command -v conda || true)"
+fi
+
+if [[ -z "${CONDA_BIN}" || ! -x "${CONDA_BIN}" ]]; then
   echo "conda was not found on PATH." >&2
-  echo "Initialize Conda, then rerun this launcher. The required environment is 'phystwin'." >&2
+  echo "Initialize Conda, then rerun this launcher. The required environment is '${RUNTIME_ENV}'." >&2
   exit 127
 fi
 
-if ! conda env list | awk '$1 == "phystwin" { found = 1 } END { exit !found }'; then
-  echo "The required Conda environment 'phystwin' was not found." >&2
+if ! "${CONDA_BIN}" env list | awk -v wanted="${RUNTIME_ENV}" '$1 == wanted { found = 1 } END { exit !found }'; then
+  echo "The required Conda environment '${RUNTIME_ENV}' was not found." >&2
   echo "Install and successfully run Boba-Batched first, then rerun this launcher." >&2
   exit 1
 fi
 
-exec conda run --no-capture-output -n phystwin env PYTHONNOUSERSITE=1 \
+# Always launch a clean child in the supported Boba runtime.  In particular,
+# inherited CONDA_* values can make a nested `conda run` execute the right
+# Python while incorrectly advertising the parent environment to subprocesses.
+exec env \
+  -u CONDA_PREFIX \
+  -u CONDA_DEFAULT_ENV \
+  -u CONDA_SHLVL \
+  -u CUDA_HOME \
+  -u LD_LIBRARY_PATH \
+  "${CONDA_BIN}" run --no-capture-output -n "${RUNTIME_ENV}" \
+  env PYTHONNOUSERSITE=1 \
   python boba_quest_immersive.py \
   --case_name rope_game \
   --n_dup 0 \

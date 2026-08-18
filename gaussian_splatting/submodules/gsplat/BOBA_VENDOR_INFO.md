@@ -16,6 +16,6 @@ excluded from the demo distribution. The upstream Apache-2.0 license is in
 
 Boba-Demo imports this source tree directly and JIT-compiles its CUDA extension
 when first needed. It deliberately does not install an editable package into
-the shared `phystwin` environment. The demo uses this fork's standard
+the shared `phystwin-cu132` environment. The demo uses this fork's standard
 `rasterization()` entry point for its one-instance/two-camera render while
 validating `rasterization_shared_template()` as the custom-fork marker.

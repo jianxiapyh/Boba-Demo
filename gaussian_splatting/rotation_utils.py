@@ -1,7 +1,6 @@
 import os
 import torch
 import torch.nn.functional as F
-import einops
 # from e3nn import o3
 
 

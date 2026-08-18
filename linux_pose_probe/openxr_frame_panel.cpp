@@ -339,6 +339,12 @@ struct SelectStateSample {
     float value = 0.0f;
 };
 
+struct ThumbstickStateSample {
+    bool available = false;
+    float x = 0.0f;
+    float y = 0.0f;
+};
+
 template <typename T>
 T MakeXrStruct(XrStructureType type) {
     T value{};
@@ -890,6 +896,30 @@ bool AppendAnchorResetBindings(
     return true;
 }
 
+bool AppendThumbstickBindings(
+    XrInstance instance,
+    XrAction thumbstick_axis_action,
+    const char* profile_string,
+    std::vector<XrActionSuggestedBinding>* bindings) {
+    if (std::strcmp(profile_string, "/interaction_profiles/oculus/touch_controller") != 0) {
+        return true;
+    }
+
+    const char* paths[] = {
+        "/user/hand/left/input/thumbstick",
+        "/user/hand/right/input/thumbstick",
+    };
+    bindings->reserve(bindings->size() + 2);
+    for (const char* path_string : paths) {
+        XrPath path = XR_NULL_PATH;
+        if (!StringToPath(instance, path_string, &path)) {
+            return false;
+        }
+        bindings->push_back({thumbstick_axis_action, path});
+    }
+    return true;
+}
+
 bool AppendSnapAssistBindings(
     XrInstance instance,
     XrAction snap_assist_click_action,
@@ -1022,6 +1052,32 @@ bool QueryBooleanActionState(
     return true;
 }
 
+bool QueryThumbstickState(
+    XrInstance instance,
+    XrSession session,
+    XrAction thumbstick_axis_action,
+    XrPath subaction_path,
+    ThumbstickStateSample* sample) {
+    XrActionStateGetInfo get_info =
+        MakeXrStruct<XrActionStateGetInfo>(XR_TYPE_ACTION_STATE_GET_INFO);
+    get_info.action = thumbstick_axis_action;
+    get_info.subactionPath = subaction_path;
+
+    XrActionStateVector2f state =
+        MakeXrStruct<XrActionStateVector2f>(XR_TYPE_ACTION_STATE_VECTOR2F);
+    if (!CheckXr(instance, xrGetActionStateVector2f(session, &get_info, &state),
+                 "xrGetActionStateVector2f(thumbstick)")) {
+        return false;
+    }
+
+    if (state.isActive == XR_TRUE) {
+        sample->available = true;
+        sample->x = state.currentState.x;
+        sample->y = state.currentState.y;
+    }
+    return true;
+}
+
 bool QuerySelectValueState(
     XrInstance instance,
     XrSession session,
@@ -1082,6 +1138,7 @@ void PrintControllerJson(const char* prefix, const ControllerPoseSample& pose,
                          const SelectStateSample& select,
                          const SelectStateSample& anchor_cycle,
                          const SelectStateSample& anchor_reset,
+                         const ThumbstickStateSample& thumbstick,
                          const SelectStateSample& snap_assist,
                          const SelectStateSample& exit_value) {
     std::cout << "\"" << prefix << "\":{";
@@ -1131,6 +1188,9 @@ void PrintControllerJson(const char* prefix, const ControllerPoseSample& pose,
     std::cout << "\"anchor_reset_available\":" << (anchor_reset.available ? 1 : 0) << ",";
     std::cout << "\"anchor_reset_pressed\":" << (anchor_reset.pressed ? 1 : 0) << ",";
     std::cout << "\"anchor_reset_source\":\"" << anchor_reset.source << "\",";
+    std::cout << "\"thumbstick_available\":" << (thumbstick.available ? 1 : 0) << ",";
+    std::cout << "\"thumbstick_x\":" << thumbstick.x << ",";
+    std::cout << "\"thumbstick_y\":" << thumbstick.y << ",";
     std::cout << "\"snap_assist_available\":" << (snap_assist.available ? 1 : 0) << ",";
     std::cout << "\"snap_assist_pressed\":" << (snap_assist.pressed ? 1 : 0) << ",";
     std::cout << "\"snap_assist_source\":\"" << snap_assist.source << "\",";
@@ -2968,6 +3028,7 @@ int main(int argc, char** argv) {
     XrAction select_value_action = XR_NULL_HANDLE;
     XrAction anchor_cycle_click_action = XR_NULL_HANDLE;
     XrAction anchor_reset_click_action = XR_NULL_HANDLE;
+    XrAction thumbstick_axis_action = XR_NULL_HANDLE;
     XrAction snap_assist_click_action = XR_NULL_HANDLE;
     XrAction exit_value_action = XR_NULL_HANDLE;
     if (!create_action("grip_pose", "Grip Pose", XR_ACTION_TYPE_POSE_INPUT,
@@ -2981,6 +3042,8 @@ int main(int argc, char** argv) {
                        XR_ACTION_TYPE_BOOLEAN_INPUT, &anchor_cycle_click_action) ||
         !create_action("anchor_reset_click", "Anchor Reset Click",
                        XR_ACTION_TYPE_BOOLEAN_INPUT, &anchor_reset_click_action) ||
+        !create_action("thumbstick_axis", "Thumbstick Axis",
+                       XR_ACTION_TYPE_VECTOR2F_INPUT, &thumbstick_axis_action) ||
         !create_action("snap_assist_click", "Snap Assist Click",
                        XR_ACTION_TYPE_BOOLEAN_INPUT, &snap_assist_click_action) ||
         !create_action("exit_value", "Exit Value", XR_ACTION_TYPE_FLOAT_INPUT,
@@ -3008,6 +3071,7 @@ int main(int argc, char** argv) {
                                   &bindings) ||
             !AppendAnchorCycleBindings(instance, anchor_cycle_click_action, profile, &bindings) ||
             !AppendAnchorResetBindings(instance, anchor_reset_click_action, profile, &bindings) ||
+            !AppendThumbstickBindings(instance, thumbstick_axis_action, profile, &bindings) ||
             !AppendSnapAssistBindings(instance, snap_assist_click_action, profile, &bindings) ||
             !AppendExitBindings(instance, exit_value_action, profile, &bindings) ||
             !SuggestBindingsForProfile(instance, profile, bindings)) {
@@ -4152,6 +4216,8 @@ int main(int argc, char** argv) {
         SelectStateSample anchor_cycle_right;
         SelectStateSample anchor_reset_left;
         SelectStateSample anchor_reset_right;
+        ThumbstickStateSample thumbstick_left;
+        ThumbstickStateSample thumbstick_right;
         SelectStateSample snap_assist_left;
         SelectStateSample snap_assist_right;
         SelectStateSample exit_left;
@@ -4172,6 +4238,10 @@ int main(int argc, char** argv) {
                                      left_hand_path, &anchor_reset_left) ||
             !QueryBooleanActionState(instance, session, anchor_reset_click_action,
                                      right_hand_path, &anchor_reset_right) ||
+            !QueryThumbstickState(instance, session, thumbstick_axis_action,
+                                  left_hand_path, &thumbstick_left) ||
+            !QueryThumbstickState(instance, session, thumbstick_axis_action,
+                                  right_hand_path, &thumbstick_right) ||
             !QueryBooleanActionState(instance, session, snap_assist_click_action,
                                      left_hand_path, &snap_assist_left) ||
             !QueryBooleanActionState(instance, session, snap_assist_click_action,
@@ -4214,6 +4284,7 @@ int main(int argc, char** argv) {
             select_left,
             anchor_cycle_left,
             anchor_reset_left,
+            thumbstick_left,
             snap_assist_left,
             exit_left
         );
@@ -4226,6 +4297,7 @@ int main(int argc, char** argv) {
             select_right,
             anchor_cycle_right,
             anchor_reset_right,
+            thumbstick_right,
             snap_assist_right,
             exit_right
         );

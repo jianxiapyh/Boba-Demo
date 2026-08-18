@@ -5,6 +5,9 @@ import yaml
 @singleton
 class Config:
     def __init__(self):
+        self._set_defaults()
+
+    def _set_defaults(self):
         self.data_type = "real"
         self.FPS = 30
         self.dt = 5e-5
@@ -66,6 +69,11 @@ class Config:
         # Other parameters for visualization
         self.overlay_path = None
 
+    def reset(self):
+        """Restore defaults and discard case/runtime attributes from a prior session."""
+        self.__dict__.clear()
+        self._set_defaults()
+
     def to_dict(self):
         # Convert the class to dictionary
         return {
@@ -92,8 +100,9 @@ class Config:
         self.update_from_dict(config_dict)
 
     def set_optimal_params(self, optimal_params):
-        optimal_params["init_spring_Y"] = optimal_params.pop("global_spring_Y")
-        self.update_from_dict(optimal_params)
+        normalized_params = dict(optimal_params)
+        normalized_params["init_spring_Y"] = normalized_params.pop("global_spring_Y")
+        self.update_from_dict(normalized_params)
 
 
 cfg = Config()

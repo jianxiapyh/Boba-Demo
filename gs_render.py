@@ -29,8 +29,6 @@ except:
 import numpy as np
 from kornia import create_meshgrid
 import copy
-import pytorch3d
-import pytorch3d.ops as ops
 
 
 def render_set(model_path, name, iteration, views, gaussians, pipeline, background, train_test_exp, separate_sh, disable_sh=False):

@@ -112,6 +112,10 @@ class ExpLogger(logging.Logger):
 
     @master_only
     def set_log_file(self, path: str, name: Optional[str] = None):
+        if self.filehandler is not None:
+            self.removeHandler(self.filehandler)
+            self.filehandler.close()
+            self.filehandler = None
         if not os.path.exists(path):
             os.makedirs(path)
         file_path = os.path.join(

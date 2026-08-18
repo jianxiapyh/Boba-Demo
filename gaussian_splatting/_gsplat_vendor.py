@@ -11,7 +11,7 @@ from typing import Any
 import torch
 
 
-EXPECTED_CONDA_ENV = "phystwin"
+EXPECTED_CONDA_ENV = "phystwin-cu132"
 REPO_ROOT = Path(__file__).resolve().parents[1]
 VENDORED_GSPLAT_ROOT = Path(__file__).resolve().parent / "submodules" / "gsplat"
 VENDORED_GSPLAT_PACKAGE = VENDORED_GSPLAT_ROOT / "gsplat"
@@ -28,15 +28,19 @@ CUSTOM_API_MARKERS = (
 
 
 def _active_env_name() -> str:
-    env_name = os.environ.get("CONDA_DEFAULT_ENV")
-    if env_name:
-        return env_name
-    return Path(sys.prefix).resolve().name
+    # sys.prefix identifies the interpreter that is actually executing the
+    # demo.  CONDA_DEFAULT_ENV is display metadata and can remain set to a
+    # parent environment across nested `conda run` calls.
+    prefix_name = Path(sys.prefix).resolve().name
+    if prefix_name:
+        return prefix_name
+    return str(os.environ.get("CONDA_DEFAULT_ENV", "unknown"))
 
 
 def _runtime_hint() -> str:
     return (
-        f"Run the demo in the existing {EXPECTED_CONDA_ENV!r} environment, for example:\n"
+        "Launch with ./boba_app.sh; it starts a clean child in the existing "
+        f"{EXPECTED_CONDA_ENV!r} environment. For a direct launch, use:\n"
         f"  conda run -n {EXPECTED_CONDA_ENV} env PYTHONNOUSERSITE=1 "
         "python boba_quest_immersive.py --case_name rope_game\n"
         "The gsplat source is committed in Boba-Demo and must not be replaced by "

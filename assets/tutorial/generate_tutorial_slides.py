@@ -882,7 +882,8 @@ def slide_two() -> Image.Image:
     intro_y = draw_wrapped_text(
         draw,
         (legend_x, legend_y),
-        "Candidate boxes stay on the object. They show who owns the current anchor.",
+        "Selector labels identify Game or Free Play. Garden labels both objects Free Play. "
+        "Candidate boxes stay on the object and show who owns the current anchor.",
         font=BODY_FONT,
         fill=BODY_COLOR,
         max_width=legend_w,

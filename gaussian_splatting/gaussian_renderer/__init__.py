@@ -110,7 +110,8 @@ def render_gsplat(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.T
         sh_degree=sh_degree,
         render_mode='RGB+ED',
         rasterize_mode=rasterize_mode,
-        absgrad=True
+        absgrad=bool(getattr(pipe, "absgrad", True)),
+        radius_clip=float(getattr(pipe, "radius_clip", 0.0)),
     )
     # [1, H, W, 4] -> [3, H, W]
     rendered_image = render_colors[0].permute(2, 0, 1)[:3]
@@ -275,7 +276,8 @@ def render_gsplat_batch(viewpoint_cameras, pc : GaussianModel, pipe, bg_color : 
         sh_degree=sh_degree,
         render_mode="RGB+ED",
         rasterize_mode=rasterize_mode,
-        absgrad=True,
+        absgrad=bool(getattr(pipe, "absgrad", True)),
+        radius_clip=float(getattr(pipe, "radius_clip", 0.0)),
     )
 
     try:

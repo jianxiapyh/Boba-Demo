@@ -1,0 +1,70 @@
+{
+  "schema_version": 1,
+  "coordinate_convention": "canonical x=right, y=forward, z=down; table surface center is the origin",
+  "contact": {
+    "query_distance_m": 0.16,
+    "margin_m": 0.0025,
+    "friction": 0.62,
+    "restitution": 0.04
+  },
+  "primitives": [
+    {
+      "name": "round_tabletop",
+      "kind": "cylinder",
+      "center": [0.0, 0.0, 0.0325],
+      "radius": 0.78,
+      "height": 0.065,
+      "segments": 64,
+      "support": true
+    },
+    {
+      "name": "table_leg_front_left",
+      "kind": "box",
+      "center": [-0.47, -0.24, 0.36],
+      "size": [0.095, 0.095, 0.65],
+      "support": false
+    },
+    {
+      "name": "table_leg_front_right",
+      "kind": "box",
+      "center": [0.47, -0.24, 0.36],
+      "size": [0.095, 0.095, 0.65],
+      "support": false
+    },
+    {
+      "name": "table_leg_back_left",
+      "kind": "box",
+      "center": [-0.47, 0.24, 0.36],
+      "size": [0.095, 0.095, 0.65],
+      "support": false
+    },
+    {
+      "name": "table_leg_back_right",
+      "kind": "box",
+      "center": [0.47, 0.24, 0.36],
+      "size": [0.095, 0.095, 0.65],
+      "support": false
+    },
+    {
+      "name": "table_foot_x",
+      "kind": "box",
+      "center": [0.0, 0.0, 0.69],
+      "size": [1.15, 0.13, 0.09],
+      "support": false
+    },
+    {
+      "name": "table_foot_y",
+      "kind": "box",
+      "center": [0.0, 0.0, 0.69],
+      "size": [0.13, 1.15, 0.09],
+      "support": false
+    },
+    {
+      "name": "stone_patio",
+      "kind": "box",
+      "center": [0.0, 0.25, 0.77],
+      "size": [5.0, 4.2, 0.1],
+      "support": true
+    }
+  ]
+}

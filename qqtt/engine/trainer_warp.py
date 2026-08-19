@@ -64,14 +64,20 @@ from qqtt.immersive_scene import (
     ensure_simple_lab_assets,
     make_simple_lab_layout,
 )
+from qqtt.garden_assets import validate_garden_runtime_selection
+from qqtt.garden_scene import (
+    GardenSceneRenderer,
+    garden_direct_output_enabled,
+    make_garden_layout,
+)
 from qqtt.immersive_gaussian_fusion_triton import (
     fuse_gaussian_scene_depth_aware,
     fuse_gaussian_scene_depth_aware_roi,
 )
 from qqtt.pyrender_cuda_bridge import PreviewTextureCudaUploader
 from qqtt.object_selector import (
-    OBJECT_CHOICES,
     RuntimeObjectSelector,
+    object_choices_for_scene,
     selector_lines,
     selector_row_from_ray,
 )
@@ -12831,6 +12837,14 @@ class InvPhyTrainerWarp:
         if frame_profile is None or compose_metrics is None:
             return
         eye_label = str(eye_label)
+        garden_direct_output = bool(
+            compose_metrics.get("garden_direct_output", False)
+            or compose_metrics.get("compose_mode") == "garden_direct_output"
+        )
+        frame_profile["garden_direct_output_active_ratio"] = max(
+            float(frame_profile.get("garden_direct_output_active_ratio", 0.0)),
+            1.0 if garden_direct_output else 0.0,
+        )
         frame_profile[f"gaussian_raw_{eye_label}_ratio"] = float(
             compose_metrics.get("raw_gaussian_coverage_ratio", 0.0)
         )
@@ -12848,7 +12862,13 @@ class InvPhyTrainerWarp:
         )
         compose_roi_ratio = float(compose_metrics.get("compose_roi_ratio", 0.0))
         frame_profile[f"gaussian_compose_roi_fullframe_guard_{eye_label}_ratio"] = (
-            1.0 if visible_ratio < 0.01 and compose_roi_ratio >= 0.999 else 0.0
+            1.0
+            if (
+                not garden_direct_output
+                and visible_ratio < 0.01
+                and compose_roi_ratio >= 0.999
+            )
+            else 0.0
         )
         frame_profile[f"compose_{eye_label}_roi_bounds_wall"] = float(
             compose_metrics.get("compose_roi_bounds_wall", 0.0)
@@ -13021,7 +13041,12 @@ class InvPhyTrainerWarp:
             float(
                 0.0
                 if compose_metrics.get("compose_mode")
-                in {"depth_aware", "depth_aware_fused", "depth_aware_fused_roi"}
+                in {
+                    "depth_aware",
+                    "depth_aware_fused",
+                    "depth_aware_fused_roi",
+                    "garden_direct_output",
+                }
                 else 1.0
             ),
         )
@@ -13585,6 +13610,17 @@ class InvPhyTrainerWarp:
         node_children_by_key = {
             "static_scene_render_ms": static_scene_children,
             "gaussian_render_wall_ms": [
+                (
+                    "garden_chunk_selection_wall",
+                    "Garden stereo chunk selection",
+                    [
+                        (
+                            "garden_chunk_rebuild_cuda",
+                            "Garden chunk rebuild CUDA",
+                            [],
+                        ),
+                    ],
+                ),
                 ("gaussian_render_left_cuda", "gaussian_render_left_cuda", []),
                 ("gaussian_render_right_cuda", "gaussian_render_right_cuda", []),
                 (
@@ -13594,6 +13630,17 @@ class InvPhyTrainerWarp:
                 ),
             ],
             "compositing_ms": [
+                (
+                    "garden_direct_output_wall",
+                    "Garden direct output",
+                    [
+                        (
+                            "garden_direct_output_cuda",
+                            "Garden direct output CUDA",
+                            [],
+                        ),
+                    ],
+                ),
                 (
                     "scene_publish_state_resolve_wall",
                     "scene_publish_state_resolve_wall",
@@ -14136,6 +14183,13 @@ class InvPhyTrainerWarp:
             f"gaussian=L{frame_profile.get('gaussian_render_left_cuda', 0.0) * 1000.0:.2f}/"
             f"R{frame_profile.get('gaussian_render_right_cuda', 0.0) * 1000.0:.2f}/"
             f"B{frame_profile.get('gaussian_render_stereo_batched_cuda', 0.0) * 1000.0:.2f}ms "
+            f"garden_direct={frame_profile.get('garden_direct_output_active_ratio', 0.0):.0f}/"
+            f"{frame_profile.get('garden_direct_output_cuda', 0.0) * 1000.0:.2f}ms "
+            f"garden_chunks=req{frame_profile.get('garden_required_chunk_count', 0.0):.0f}/"
+            f"sel{frame_profile.get('garden_selected_chunk_count', 0.0):.0f} "
+            f"static={frame_profile.get('garden_selected_static_ratio', 0.0) * 100.0:.1f}% "
+            f"rebuild={frame_profile.get('garden_chunk_rebuild_ratio', 0.0):.0f}/"
+            f"{frame_profile.get('garden_chunk_rebuild_cuda', 0.0) * 1000.0:.2f}ms "
             f"compose=L{frame_profile.get('compose_left_cuda', 0.0) * 1000.0:.2f}/"
             f"R{frame_profile.get('compose_right_cuda', 0.0) * 1000.0:.2f}ms "
             f"fusion=L{frame_profile.get('scene_gaussian_fusion_left_cuda', 0.0) * 1000.0:.2f}/"
@@ -17534,6 +17588,7 @@ class InvPhyTrainerWarp:
         eye_height,
         *,
         case_name,
+        scene_name="lab",
     ):
         """Create the comfortable dark card shown while an object is replaced."""
 
@@ -17542,7 +17597,7 @@ class InvPhyTrainerWarp:
         target_label = next(
             (
                 choice.label.split(" \u2014 ", 1)[0]
-                for choice in OBJECT_CHOICES
+                for choice in object_choices_for_scene(scene_name)
                 if choice.case_name == str(case_name)
             ),
             str(case_name).replace("_", " ").title(),
@@ -17644,6 +17699,10 @@ class InvPhyTrainerWarp:
         immersive_native_gl_depth_format="depth32f",
         immersive_bridge=None,
         startup_timeline=None,
+        scene_name="lab",
+        repo_root=None,
+        garden_quality="balanced",
+        eye_resolution=None,
     ):
         self._record_immersive_startup_milestone(
             startup_timeline,
@@ -17696,26 +17755,39 @@ class InvPhyTrainerWarp:
             max_workers=1,
             thread_name_prefix="immersive_scene_prewarm",
         )
-        future = executor.submit(
-            SimpleLabSceneRenderer,
-            scene_assets_root=scene_assets_root,
-            width=scene_width,
-            height=scene_height,
-            lighting_mode=immersive_render_options["lighting_mode"],
-            balanced_render_backend=balanced_render_backend,
-            native_gl_texture_mode=immersive_native_gl_texture_mode,
-            native_gl_anisotropy=immersive_native_gl_anisotropy,
-            native_gl_mipmap_lod_bias=immersive_native_gl_mipmap_lod_bias,
-            native_gl_msaa_samples=immersive_native_gl_msaa_samples,
-            native_gl_depth_format=immersive_native_gl_depth_format,
-            native_gl_progress_callback=(
-                _native_gl_progress_callback
-                if balanced_render_backend == "native_gl"
-                else None
-            ),
-        )
+        normalized_scene_name = str(scene_name or "lab").strip().lower()
+        if normalized_scene_name == "garden":
+            future = executor.submit(
+                GardenSceneRenderer,
+                scene_assets_root=scene_assets_root,
+                width=scene_width,
+                height=scene_height,
+                repo_root=repo_root,
+                garden_quality=garden_quality,
+                eye_resolution=eye_resolution,
+            )
+        else:
+            future = executor.submit(
+                SimpleLabSceneRenderer,
+                scene_assets_root=scene_assets_root,
+                width=scene_width,
+                height=scene_height,
+                lighting_mode=immersive_render_options["lighting_mode"],
+                balanced_render_backend=balanced_render_backend,
+                native_gl_texture_mode=immersive_native_gl_texture_mode,
+                native_gl_anisotropy=immersive_native_gl_anisotropy,
+                native_gl_mipmap_lod_bias=immersive_native_gl_mipmap_lod_bias,
+                native_gl_msaa_samples=immersive_native_gl_msaa_samples,
+                native_gl_depth_format=immersive_native_gl_depth_format,
+                native_gl_progress_callback=(
+                    _native_gl_progress_callback
+                    if balanced_render_backend == "native_gl"
+                    else None
+                ),
+            )
         print(
             "[quest_display] immersive scene renderer prewarm launched: "
+            f"scene={normalized_scene_name} "
             f"scene_resolution={scene_width}x{scene_height} "
             f"lighting_mode={immersive_render_options['lighting_mode']} "
             f"balanced_render_backend={balanced_render_backend}",
@@ -17999,6 +18071,8 @@ class InvPhyTrainerWarp:
         live_controller_case_profile = startup_context["live_controller_case_profile"]
         shared_scene_compose_cache = startup_context["shared_scene_compose_cache"]
         shared_scene_reproject_caches = startup_context["shared_scene_reproject_caches"]
+        scene_name = str(startup_context.get("scene_name", "lab")).strip().lower()
+        repo_root = Path(startup_context.get("repo_root", Path(__file__).resolve().parents[2]))
 
         bootstrap_output.setdefault(
             "head_pose_state",
@@ -18344,12 +18418,28 @@ class InvPhyTrainerWarp:
                     head_forward /= forward_norm
                 layout = startup_context.get("session_layout")
                 if layout is None:
-                    layout = make_simple_lab_layout(
-                        head_position,
-                        head_forward,
-                        scene_up=bootstrap_output["live_head_alignment"]["scene_up"],
-                    )
+                    if scene_name == "garden":
+                        layout = make_garden_layout(
+                            head_position,
+                            head_forward,
+                            scene_up=bootstrap_output["live_head_alignment"]["scene_up"],
+                            repo_root=repo_root,
+                        )
+                    else:
+                        layout = make_simple_lab_layout(
+                            head_position,
+                            head_forward,
+                            scene_up=bootstrap_output["live_head_alignment"]["scene_up"],
+                        )
                 else:
+                    layout_scene_name = str(
+                        getattr(layout, "scene_name", "lab") or "lab"
+                    ).strip().lower()
+                    if layout_scene_name != scene_name:
+                        raise RuntimeError(
+                            "Cannot reuse an immersive layout from a different scene: "
+                            f"active={scene_name} cached={layout_scene_name}."
+                        )
                     print(
                         "[quest_display] reusing room layout and head alignment "
                         "across object switch",
@@ -19420,22 +19510,61 @@ class InvPhyTrainerWarp:
                         f"source={pipeline_source} backend={presentation_backend_kind}",
                         flush=True,
                     )
-                self._set_scene_collider_boxes(bootstrap_output["layout"])
-                if bootstrap_output["layout"].support_surface_boxes is not None:
+                if garden_direct_output_enabled(
+                    scene_name,
+                    bootstrap_output["scene_renderer"],
+                ):
+                    print(
+                        "[quest_display] garden output: "
+                        "mode=direct_combined_gaussian "
+                        "lab_compositor=off overlays=on stable_cover=on",
+                        flush=True,
+                    )
+                layout = bootstrap_output["layout"]
+                if scene_name == "garden":
+                    garden_boxes = torch.as_tensor(
+                        layout.static_collision_boxes,
+                        dtype=torch.float32,
+                        device=cfg.device,
+                    )
+                    self.simulator.set_static_collision_boxes(garden_boxes)
+                    contact = dict(
+                        getattr(layout, "static_collision_mesh_contact", {}) or {}
+                    )
+                    self.simulator.set_static_collision_surfaces(
+                        layout.static_collision_surfaces,
+                        query_distance=contact.get("query_distance_m", 0.16),
+                        margin=contact.get("margin_m", 0.0025),
+                        restitution=contact.get("restitution", 0.04),
+                        friction=contact.get("friction", 0.62),
+                    )
+                    print(
+                        "[quest_display] Garden primitive collision ready: "
+                        f"surfaces={len(layout.static_collision_surfaces)} "
+                        f"boxes={len(layout.static_collision_boxes)} "
+                        "kinds=closed_cylinder,rectangle "
+                        f"debug_proxy_faces={len(layout.static_collision_mesh_faces)} "
+                        f"margin_m={float(contact.get('margin_m', 0.0025)):.4f}",
+                        flush=True,
+                    )
+                else:
+                    self.simulator.set_static_collision_surfaces(None)
+                    self._set_scene_collider_boxes(layout)
+                if layout.support_surface_boxes is not None:
                     support_surface_boxes_np = np.asarray(
-                        bootstrap_output["layout"].support_surface_boxes,
+                        layout.support_surface_boxes,
                         dtype=np.float32,
                     )
                 else:
                     support_surface_boxes_np = np.array(
                         [
                             [
-                                bootstrap_output["layout"].table_box.mins,
-                                bootstrap_output["layout"].table_box.maxs,
+                                layout.table_box.mins,
+                                layout.table_box.maxs,
                             ],
                             [
-                                bootstrap_output["layout"].floor_box.mins,
-                                bootstrap_output["layout"].floor_box.maxs,
+                                layout.floor_box.mins,
+                                layout.floor_box.maxs,
                             ],
                         ],
                         dtype=np.float32,
@@ -19514,6 +19643,27 @@ class InvPhyTrainerWarp:
                 )
                 gaussians._xyz = current_pos
                 gaussians._rotation = current_rot
+                render_gaussians = gaussians
+                if scene_name == "garden":
+                    render_gaussians = bootstrap_output[
+                        "scene_renderer"
+                    ].bind_dynamic_gaussians(gaussians)
+                    if bool(startup_context.get("garden_debug_collision", False)):
+                        debug_path = (
+                            repo_root
+                            / "data"
+                            / "garden"
+                            / "debug"
+                            / "collision_proxy_world.obj"
+                        )
+                        bootstrap_output["scene_renderer"].export_collision_proxy_obj(
+                            debug_path
+                        )
+                        print(
+                            "[quest_display] Garden collision proxy exported: "
+                            f"{debug_path}",
+                            flush=True,
+                        )
                 settled_support_center = self._validate_scene_spawn_alignment(
                     x[: self.num_all_points],
                     bootstrap_output["layout"],
@@ -19581,6 +19731,7 @@ class InvPhyTrainerWarp:
                 bootstrap_output.update(
                     {
                         "x": x,
+                        "render_gaussians": render_gaussians,
                         "controller_anchor_templates": controller_anchor_templates,
                     }
                 )
@@ -19605,7 +19756,7 @@ class InvPhyTrainerWarp:
                             eye_height,
                             scene_width,
                             scene_height,
-                            gaussians,
+                            bootstrap_output.get("render_gaussians", gaussians),
                             shared_scene_compose_cache=shared_scene_compose_cache,
                             reproject_caches=shared_scene_reproject_caches,
                             scene_stereo_mode=active_scene_stereo_mode,
@@ -19734,7 +19885,7 @@ class InvPhyTrainerWarp:
                     right_eye_pose_world=bootstrap_output["last_right_eye_pose_world"],
                     eye_width=eye_width,
                     eye_height=eye_height,
-                    gaussians=gaussians,
+                    gaussians=bootstrap_output.get("render_gaussians", gaussians),
                     scene_stereo_mode=bootstrap_output["active_scene_stereo_mode"],
                     scene_width=scene_width,
                     scene_height=scene_height,
@@ -19783,7 +19934,7 @@ class InvPhyTrainerWarp:
                     validation_state,
                     "left",
                     scene_renderer=bootstrap_output["scene_renderer"],
-                    gaussians=gaussians,
+                    gaussians=bootstrap_output.get("render_gaussians", gaussians),
                     render_pipe=render_pipe,
                     background_black=background_black,
                     background_white=background_white,
@@ -19810,7 +19961,7 @@ class InvPhyTrainerWarp:
                     validation_state,
                     "right",
                     scene_renderer=bootstrap_output["scene_renderer"],
-                    gaussians=gaussians,
+                    gaussians=bootstrap_output.get("render_gaussians", gaussians),
                     render_pipe=render_pipe,
                     background_black=background_black,
                     background_white=background_white,
@@ -32064,6 +32215,8 @@ class InvPhyTrainerWarp:
         eye_render_state=None,
         output_dtype=torch.uint8,
         timing_out=None,
+        scene_name="lab",
+        direct_output_renderer=None,
     ):
         view_setup_start = (
             time.perf_counter()
@@ -32104,14 +32257,34 @@ class InvPhyTrainerWarp:
             )
             timing_out["gaussian_ready_monotonic"] = time.perf_counter()
         self._render_profile_end_cuda_span(render_profile_frame, gaussian_span)
+        direct_output_active = garden_direct_output_enabled(
+            scene_name,
+            direct_output_renderer,
+        )
+        compose_profile_key = (
+            "garden_direct_output_cuda"
+            if direct_output_active
+            else f"compose_{eye_label}_cuda"
+        )
         compose_span = self._render_profile_begin_cuda_span(
             render_profile_frame,
-            f"compose_{eye_label}_cuda",
+            compose_profile_key,
         )
         compose_wall_start = time.perf_counter() if timing_out is not None else None
         compose_metrics = None
         compose_debug_maps = None
-        if collect_compose_debug or collect_debug_maps:
+        if direct_output_active:
+            # The direct Garden image is already the final scene. Produce the
+            # bridge's native byte format here so the later shared overlay path
+            # can draw in place without another full-frame dtype conversion.
+            composed, gaussian_depth, compose_metrics = (
+                direct_output_renderer.prepare_direct_gaussian_eye_output(
+                    gaussian_rgba,
+                    gaussian_depth,
+                    output_dtype=torch.uint8,
+                )
+            )
+        elif collect_compose_debug or collect_debug_maps:
             composed, compose_metrics, compose_debug_maps = (
                 self._compose_immersive_eye_frame(
                     scene_color,
@@ -33745,7 +33918,14 @@ class InvPhyTrainerWarp:
         immersive_session_state=None,
         show_startup_tutorial=True,
         manage_cuda_context=True,
+        scene_name="lab",
+        garden_quality="balanced",
+        garden_debug_collision=False,
     ):
+        scene_name = str(scene_name or "lab").strip().lower()
+        if scene_name not in {"lab", "garden"}:
+            raise ValueError(f"Unsupported immersive scene: {scene_name}")
+        garden_quality = str(garden_quality or "balanced").strip().lower()
         immersive_controller_translation_scale = float(
             immersive_controller_translation_scale
         )
@@ -33909,10 +34089,15 @@ class InvPhyTrainerWarp:
             antialiasing=True,
             compute_cov3D_python=False,
             convert_SHs_python=False,
+            absgrad=scene_name != "garden",
+            radius_clip=0.25 if scene_name == "garden" else 0.0,
         )
 
         repo_root = Path(__file__).resolve().parents[2]
-        ensure_simple_lab_assets(scene_assets_root)
+        if scene_name == "garden":
+            validate_garden_runtime_selection(repo_root, garden_quality)
+        else:
+            ensure_simple_lab_assets(scene_assets_root)
         eye_width = int(immersive_eye_resolution)
         eye_height = int(immersive_eye_resolution)
         immersive_render_options = self._resolve_immersive_render_options(
@@ -33928,6 +34113,14 @@ class InvPhyTrainerWarp:
         )
         active_scene_stereo_mode = immersive_render_options["scene_stereo_mode"]
         immersive_session_state = dict(immersive_session_state or {})
+        cached_scene_name = str(
+            immersive_session_state.get("scene_name", scene_name) or scene_name
+        ).strip().lower()
+        if cached_scene_name != scene_name:
+            raise RuntimeError(
+                "Runtime object switching cannot change the launch-time scene: "
+                f"requested={scene_name} cached={cached_scene_name}."
+            )
         session_live_head_alignment = immersive_session_state.get(
             "live_head_alignment"
         )
@@ -34359,6 +34552,10 @@ class InvPhyTrainerWarp:
             else self.IMMERSIVE_BALANCED_INTERNAL_STEREO_MODE,
             immersive_overlay_mode="minimal",
         )
+        if scene_name == "garden":
+            immersive_render_options = dict(immersive_render_options)
+            immersive_render_options["scene_render_scale"] = 1.0
+            immersive_render_options["scene_stereo_mode"] = "per_eye"
         scene_width, scene_height = self._resolve_immersive_scene_resolution(
             eye_width,
             eye_height,
@@ -34566,6 +34763,18 @@ class InvPhyTrainerWarp:
             "scene_publish_state_resolve_wall",
             "scene_stable_compose_analysis_wall",
             "scene_stable_compose_artifact_finalize_wall",
+            "garden_direct_output_wall",
+            "garden_direct_output_cuda",
+            "garden_direct_output_active_ratio",
+            "garden_chunk_selection_wall",
+            "garden_chunk_rebuild_cuda",
+            "garden_chunk_rebuild_ratio",
+            "garden_selected_static_ratio",
+            "garden_selected_chunk_ratio",
+            "garden_selected_static_count",
+            "garden_selected_chunk_count",
+            "garden_required_chunk_count",
+            "garden_render_gaussian_count",
             "compose_left_roi_bounds_wall",
             "compose_right_roi_bounds_wall",
             "compose_left_base_copy_wall",
@@ -35074,22 +35283,64 @@ class InvPhyTrainerWarp:
             object_switch_loading_active = bool(
                 reusing_immersive_session and not bool(show_startup_tutorial)
             )
-            object_switch_loading_base_frame = None
+            object_switch_loading_left_base_frame = None
+            object_switch_loading_right_base_frame = None
             object_switch_loading_title = None
-            object_switch_loading_frame_cache = {}
+            object_switch_loading_left_frame_cache = {}
+            object_switch_loading_right_frame_cache = {}
             initial_keepalive_frame = tutorial_frames[0] if tutorial_frames else None
+            initial_keepalive_right_frame = None
             if object_switch_loading_active:
-                object_switch_loading_base_frame = (
-                    self._make_immersive_object_switch_loading_base_frame(
-                        eye_width,
+                def _coerce_switch_loading_frame(frame):
+                    if frame is None:
+                        return None
+                    if not torch.is_tensor(frame):
+                        try:
+                            frame = torch.from_numpy(
+                                np.ascontiguousarray(np.asarray(frame))
+                            )
+                        except Exception:
+                            return None
+                    if frame.ndim != 3 or tuple(frame.shape) != (
                         eye_height,
-                        case_name=case_name,
-                    )
+                        eye_width,
+                        4,
+                    ):
+                        return None
+                    if frame.dtype != torch.uint8:
+                        frame = frame.clamp(0.0, 255.0).to(torch.uint8)
+                    return frame.contiguous()
+
+                previous_left_frame = _coerce_switch_loading_frame(
+                    immersive_session_state.get("loading_left_frame")
                 )
+                previous_right_frame = _coerce_switch_loading_frame(
+                    immersive_session_state.get("loading_right_frame")
+                )
+                if previous_left_frame is not None and previous_right_frame is not None:
+                    object_switch_loading_left_base_frame = previous_left_frame
+                    object_switch_loading_right_base_frame = previous_right_frame
+                    print(
+                        "[quest_display] retaining the last valid frame "
+                        "behind the object-switch progress overlay",
+                        flush=True,
+                    )
+                else:
+                    object_switch_loading_left_base_frame = (
+                        self._make_immersive_object_switch_loading_base_frame(
+                            eye_width,
+                            eye_height,
+                            case_name=case_name,
+                            scene_name=scene_name,
+                        )
+                    )
+                    object_switch_loading_right_base_frame = (
+                        object_switch_loading_left_base_frame
+                    )
                 object_switch_target_label = next(
                     (
                         choice.label.split(" \u2014 ", 1)[0]
-                        for choice in OBJECT_CHOICES
+                        for choice in object_choices_for_scene(scene_name)
                         if choice.case_name == str(case_name)
                     ),
                     str(case_name).replace("_", " ").title(),
@@ -35097,17 +35348,27 @@ class InvPhyTrainerWarp:
                 object_switch_loading_title = (
                     f"Loading {object_switch_target_label}\u2026"
                 )
+                initial_progress = {
+                    "progress_fraction": 0.0,
+                    "progress_percent": 0,
+                    "phase_label": "Preparing object",
+                    "complete": False,
+                }
                 initial_keepalive_frame = (
                     self._render_immersive_tutorial_status_frame(
-                        object_switch_loading_base_frame,
-                        {
-                            "progress_fraction": 0.0,
-                            "progress_percent": 0,
-                            "phase_label": "Preparing object",
-                            "complete": False,
-                        },
+                        object_switch_loading_left_base_frame,
+                        initial_progress,
                         ready=False,
-                        cache=object_switch_loading_frame_cache,
+                        cache=object_switch_loading_left_frame_cache,
+                        title_text=object_switch_loading_title,
+                    )
+                )
+                initial_keepalive_right_frame = (
+                    self._render_immersive_tutorial_status_frame(
+                        object_switch_loading_right_base_frame,
+                        initial_progress,
+                        ready=False,
+                        cache=object_switch_loading_right_frame_cache,
                         title_text=object_switch_loading_title,
                     )
                 )
@@ -35115,6 +35376,7 @@ class InvPhyTrainerWarp:
                 eye_width,
                 eye_height,
                 left_frame=initial_keepalive_frame,
+                right_frame=initial_keepalive_right_frame,
                 presentation_mode="head_locked_panel",
             )
             startup_keepalive_state["preview_present_callback"] = (
@@ -35177,6 +35439,10 @@ class InvPhyTrainerWarp:
                         ),
                         immersive_bridge=immersive_bridge,
                         startup_timeline=startup_timeline,
+                        scene_name=scene_name,
+                        repo_root=repo_root,
+                        garden_quality=garden_quality,
+                        eye_resolution=eye_width,
                     )
                 )
             else:
@@ -35214,16 +35480,24 @@ class InvPhyTrainerWarp:
             refresh_object_switch_loading = None
             if object_switch_loading_active:
                 def _refresh_object_switch_loading(progress, *, force=False):
-                    frame = self._render_immersive_tutorial_status_frame(
-                        object_switch_loading_base_frame,
+                    left_frame = self._render_immersive_tutorial_status_frame(
+                        object_switch_loading_left_base_frame,
                         progress,
                         ready=False,
-                        cache=object_switch_loading_frame_cache,
+                        cache=object_switch_loading_left_frame_cache,
+                        title_text=object_switch_loading_title,
+                    )
+                    right_frame = self._render_immersive_tutorial_status_frame(
+                        object_switch_loading_right_base_frame,
+                        progress,
+                        ready=False,
+                        cache=object_switch_loading_right_frame_cache,
                         title_text=object_switch_loading_title,
                     )
                     self._set_immersive_startup_keepalive_frames(
                         startup_keepalive_state,
-                        left_frame=frame,
+                        left_frame=left_frame,
+                        right_frame=right_frame,
                     )
                     self._maybe_publish_immersive_startup_keepalive(
                         immersive_bridge,
@@ -36756,6 +37030,21 @@ class InvPhyTrainerWarp:
             static_scene_layer_cache = startup_bootstrap_output[
                 "static_scene_layer_cache"
             ]
+            render_gaussians = startup_bootstrap_output.get(
+                "render_gaussians",
+                gaussians,
+            )
+
+            def _sync_active_scene_gaussians():
+                nonlocal render_gaussians
+                if scene_name == "garden":
+                    render_gaussians = scene_renderer.sync_dynamic_gaussians(
+                        gaussians
+                    )
+                else:
+                    render_gaussians = gaussians
+                return render_gaussians
+
             last_valid_sim_state = self._capture_sim_state()
             last_valid_target = current_target.clone()
             last_valid_gaussian_state = self._capture_gaussian_runtime_state(gaussians)
@@ -36813,6 +37102,7 @@ class InvPhyTrainerWarp:
                 blocked_until=float(
                     immersive_session_state.get("input_blocked_until", 0.0) or 0.0
                 ),
+                scene_name=scene_name,
             )
             object_selector_world_corners = None
             object_selector_frozen_sim_state = None
@@ -36872,6 +37162,7 @@ class InvPhyTrainerWarp:
                 and visual_contact_sink_band_m > 0.0
                 and support_surface_boxes_t is not None
                 and int(support_surface_boxes_t.numel()) > 0
+                and scene_name != "garden"
             )
             visual_contact_sink_diagnostic_state = {"last_log_frame": -1000000}
 
@@ -37817,6 +38108,7 @@ class InvPhyTrainerWarp:
                 prev_x = x.clone()
                 current_pos = gaussians.get_xyz
                 current_rot = gaussians.get_rotation
+                _sync_active_scene_gaussians()
                 last_valid_sim_state = {
                     "x": committed_safe_sim_state["x"].clone(),
                     "v": committed_safe_sim_state["v"].clone(),
@@ -39387,6 +39679,7 @@ class InvPhyTrainerWarp:
                 )
                 gaussians._xyz = current_pos
                 gaussians._rotation = current_rot
+                _sync_active_scene_gaussians()
                 interp_time = interp_timer.stop()
                 if frame_count > 1:
                     _record_component_time("full_motion_interpolation", interp_time)
@@ -39436,6 +39729,7 @@ class InvPhyTrainerWarp:
                         object_selector.highlighted_index,
                         mode=object_selector.mode,
                         selected_case=object_selector_selected_case,
+                        scene_name=scene_name,
                     )
                     object_selector_world_corners = (
                         self._make_rope_game_finish_modal_world_corners(
@@ -39747,6 +40041,7 @@ class InvPhyTrainerWarp:
                 static_scene_assemble_wall_s = 0.0
                 static_scene_render_wall_s = 0.0
                 gaussian_render_wall_s = 0.0
+                garden_chunk_selection_wall_s = 0.0
                 branch_b_ready_wall_s = 0.0
                 pre_compose_ready_wall_s = 0.0
                 compositing_wall_s = 0.0
@@ -39790,6 +40085,57 @@ class InvPhyTrainerWarp:
                         "scene_render_eye_state_setup_wall",
                         eye_state_setup_elapsed_s,
                     )
+                if scene_name == "garden":
+                    garden_chunk_selection_start = time.perf_counter()
+                    render_gaussians, garden_chunk_debug = (
+                        scene_renderer.select_stereo_frustum_gaussians(
+                            left_eye_render_state,
+                            right_eye_render_state,
+                        )
+                    )
+                    garden_chunk_selection_wall_s = (
+                        time.perf_counter() - garden_chunk_selection_start
+                    )
+                    if render_profile_frame is not None:
+                        self._render_profile_add_wall_time(
+                            render_profile_frame,
+                            "garden_chunk_selection_wall",
+                            garden_chunk_selection_wall_s,
+                        )
+                        render_profile_frame["garden_chunk_rebuild_ratio"] = (
+                            1.0
+                            if (
+                                garden_chunk_debug["rebuilt"]
+                                or garden_chunk_debug["rebuild_started"]
+                            )
+                            else 0.0
+                        )
+                        render_profile_frame["garden_chunk_rebuild_cuda"] = (
+                            float(
+                                garden_chunk_debug[
+                                    "completed_rebuild_cuda_ms"
+                                ]
+                            )
+                            / 1000.0
+                        )
+                        render_profile_frame["garden_selected_static_ratio"] = float(
+                            garden_chunk_debug["selected_static_ratio"]
+                        )
+                        render_profile_frame["garden_selected_chunk_ratio"] = float(
+                            garden_chunk_debug["selected_chunk_ratio"]
+                        )
+                        render_profile_frame["garden_selected_static_count"] = float(
+                            garden_chunk_debug["selected_static_count"]
+                        )
+                        render_profile_frame["garden_selected_chunk_count"] = float(
+                            garden_chunk_debug["selected_chunk_count"]
+                        )
+                        render_profile_frame["garden_required_chunk_count"] = float(
+                            garden_chunk_debug["required_chunk_count"]
+                        )
+                        render_profile_frame["garden_render_gaussian_count"] = float(
+                            garden_chunk_debug["render_gaussian_count"]
+                        )
                 left_overlay_eye_render_state = left_eye_render_state
                 right_overlay_eye_render_state = right_eye_render_state
                 left_compose_metrics = None
@@ -39928,7 +40274,7 @@ class InvPhyTrainerWarp:
                             ) = _render_immersive_stereo_gaussians_with_visual_contact_sink(
                                 left_eye_render_state,
                                 right_eye_render_state,
-                                gaussians,
+                                render_gaussians,
                                 render_pipe,
                                 background_black,
                                 background_white,
@@ -39949,6 +40295,7 @@ class InvPhyTrainerWarp:
                                 gaussian_render_failure_logged = True
                             immersive_gaussian_render_mode = "serial"
                             gaussian_render_mode_for_frame = "serial"
+                    gaussian_render_wall_s += garden_chunk_selection_wall_s
                     branch_b_ready_wall_s = (
                         float(simulation_lbs_wall_s) + float(gaussian_render_wall_s)
                     )
@@ -40426,7 +40773,7 @@ class InvPhyTrainerWarp:
                             ) = _render_immersive_stereo_gaussians_with_visual_contact_sink(
                                 left_eye_render_state,
                                 right_eye_render_state,
-                                gaussians,
+                                render_gaussians,
                                 render_pipe,
                                 background_black,
                                 background_white,
@@ -40447,6 +40794,7 @@ class InvPhyTrainerWarp:
                                 gaussian_render_failure_logged = True
                             immersive_gaussian_render_mode = "serial"
                             gaussian_render_mode_for_frame = "serial"
+                    gaussian_render_wall_s += garden_chunk_selection_wall_s
                     branch_b_ready_wall_s = (
                         float(simulation_lbs_wall_s) + float(gaussian_render_wall_s)
                     )
@@ -40629,8 +40977,12 @@ class InvPhyTrainerWarp:
                     right_compose_artifact_pre_stabilization = None
                     stable_compose_analysis_start = None
                     native_gl_gaussian_fusion_active = False
+                    garden_direct_output_active_for_frame = (
+                        garden_direct_output_enabled(scene_name, scene_renderer)
+                    )
                     native_gl_gaussian_fusion_attempted = bool(
-                        immersive_static_scene_backend_mode == "native_gl"
+                        not garden_direct_output_active_for_frame
+                        and immersive_static_scene_backend_mode == "native_gl"
                         and str(immersive_compose_mode).strip().lower()
                         == "depth_aware"
                         and eye_frame_output_dtype is torch.uint8
@@ -40695,6 +41047,54 @@ class InvPhyTrainerWarp:
                                 _fusion_output_slot
                             ],
                         }
+                    garden_direct_output_result = None
+                    if garden_direct_output_active_for_frame:
+                        garden_direct_output_start = time.perf_counter()
+                        garden_direct_output_span = (
+                            self._render_profile_begin_cuda_span(
+                                render_profile_frame,
+                                "garden_direct_output_cuda",
+                            )
+                        )
+                        (
+                            left_eye_frame,
+                            left_eye_frame_depth,
+                            left_compose_metrics,
+                        ) = scene_renderer.prepare_direct_gaussian_eye_output(
+                            left_gaussian_rgba,
+                            left_gaussian_depth,
+                            output_dtype=torch.uint8,
+                        )
+                        (
+                            right_eye_frame,
+                            right_eye_frame_depth,
+                            right_compose_metrics,
+                        ) = scene_renderer.prepare_direct_gaussian_eye_output(
+                            right_gaussian_rgba,
+                            right_gaussian_depth,
+                            output_dtype=torch.uint8,
+                        )
+                        self._render_profile_end_cuda_span(
+                            render_profile_frame,
+                            garden_direct_output_span,
+                        )
+                        if render_profile_frame is not None:
+                            self._render_profile_add_wall_time(
+                                render_profile_frame,
+                                "garden_direct_output_wall",
+                                time.perf_counter() - garden_direct_output_start,
+                            )
+                            render_profile_frame[
+                                "garden_direct_output_active_ratio"
+                            ] = 1.0
+                        garden_direct_output_result = (
+                            left_eye_frame,
+                            left_eye_frame_depth,
+                            left_compose_metrics,
+                            right_eye_frame,
+                            right_eye_frame_depth,
+                            right_compose_metrics,
+                        )
                     fused_compose_result = (
                         self._try_fuse_immersive_gaussian_scene_stereo(
                             left_scene_color,
@@ -40733,7 +41133,16 @@ class InvPhyTrainerWarp:
                         if native_gl_gaussian_fusion_attempted
                         else None
                     )
-                    if fused_compose_result is not None:
+                    if garden_direct_output_result is not None:
+                        (
+                            left_eye_frame,
+                            left_eye_frame_depth,
+                            left_compose_metrics,
+                            right_eye_frame,
+                            right_eye_frame_depth,
+                            right_compose_metrics,
+                        ) = garden_direct_output_result
+                    elif fused_compose_result is not None:
                         (
                             left_eye_frame,
                             left_eye_frame_depth,
@@ -40844,6 +41253,7 @@ class InvPhyTrainerWarp:
 
                     stable_compose_full_analysis_active = bool(
                         stable_compose_safety_enabled
+                        and not garden_direct_output_active_for_frame
                         and (
                             (
                                 stable_expensive_validation_active
@@ -41603,6 +42013,7 @@ class InvPhyTrainerWarp:
                         x = last_valid_sim_state["x"].clone()
                         current_pos = gaussians.get_xyz
                         current_rot = gaussians.get_rotation
+                        _sync_active_scene_gaussians()
                         object_points = x[: self.num_all_points]
                         (
                             object_bounds_min,
@@ -41653,7 +42064,7 @@ class InvPhyTrainerWarp:
                                 eye_width,
                                 left_scene_color,
                                 left_scene_depth,
-                                gaussians,
+                                render_gaussians,
                                 render_pipe,
                                 background_black,
                                 background_white,
@@ -41661,6 +42072,8 @@ class InvPhyTrainerWarp:
                                 compose_roi_padding=gaussian_compose_roi_padding,
                                 eye_render_state=left_eye_render_state,
                                 output_dtype=eye_frame_output_dtype,
+                                scene_name=scene_name,
+                                direct_output_renderer=scene_renderer,
                             )
                         )
                         (
@@ -41677,7 +42090,7 @@ class InvPhyTrainerWarp:
                                 eye_width,
                                 right_scene_color,
                                 right_scene_depth,
-                                gaussians,
+                                render_gaussians,
                                 render_pipe,
                                 background_black,
                                 background_white,
@@ -41685,6 +42098,8 @@ class InvPhyTrainerWarp:
                                 compose_roi_padding=gaussian_compose_roi_padding,
                                 eye_render_state=right_eye_render_state,
                                 output_dtype=eye_frame_output_dtype,
+                                scene_name=scene_name,
+                                direct_output_renderer=scene_renderer,
                             )
                         )
                     else:
@@ -42421,6 +42836,8 @@ class InvPhyTrainerWarp:
                 total_time = time.perf_counter() - total_frame_start
                 if frame_count > 1:
                     _record_component_time("total", total_time)
+                    if scene_name == "garden":
+                        scene_renderer.record_source_frame_seconds(total_time)
 
                 if render_profile_frame is not None:
                     self._render_profile_capture_cuda_memory(render_profile_frame)
@@ -42497,6 +42914,7 @@ class InvPhyTrainerWarp:
                         object_selector.highlighted_index,
                         mode="error",
                         selected_case=object_selector_selected_case,
+                        scene_name=scene_name,
                     )
                     error_world_corners = (
                         self._make_rope_game_finish_modal_world_corners(
@@ -42525,11 +42943,15 @@ class InvPhyTrainerWarp:
                             frame_t = frame.detach()
                             if frame_t.dtype != torch.uint8:
                                 frame_t = frame_t.clamp(0.0, 255.0).to(torch.uint8)
-                            return np.ascontiguousarray(frame_t.cpu().numpy())
-                        return np.ascontiguousarray(
-                            np.clip(np.asarray(frame), 0, 255).astype(np.uint8)
+                            return frame_t.cpu().contiguous()
+                        return torch.from_numpy(
+                            np.ascontiguousarray(
+                                np.clip(np.asarray(frame), 0, 255).astype(np.uint8)
+                            )
                         )
 
+                    switch_left_frame = _switch_frame_cpu_u8(left_eye_frame)
+                    switch_right_frame = _switch_frame_cpu_u8(right_eye_frame)
                     input_blocked_until = time.perf_counter() + 0.35
                     episode_result.update(
                         {
@@ -42540,10 +42962,13 @@ class InvPhyTrainerWarp:
                                 "live_head_alignment": live_head_alignment,
                                 "layout": layout,
                                 "scene_renderer": scene_renderer,
+                                "scene_name": scene_name,
                                 "input_blocked_until": input_blocked_until,
+                                "loading_left_frame": switch_left_frame,
+                                "loading_right_frame": switch_right_frame,
                             },
-                            "last_left_frame": _switch_frame_cpu_u8(left_eye_frame),
-                            "last_right_frame": _switch_frame_cpu_u8(right_eye_frame),
+                            "last_left_frame": switch_left_frame,
+                            "last_right_frame": switch_right_frame,
                             "error_overlay_bitmap_quad": error_overlay_bitmap_quad,
                         }
                     )
@@ -44865,6 +45290,9 @@ class InvPhyTrainerWarp:
         immersive_session_state=None,
         show_startup_tutorial=True,
         manage_cuda_context=True,
+        scene_name="lab",
+        garden_quality="balanced",
+        garden_debug_collision=False,
     ):
         if n_dup != 0:
             raise ValueError(
@@ -44905,6 +45333,9 @@ class InvPhyTrainerWarp:
             immersive_session_state=immersive_session_state,
             show_startup_tutorial=show_startup_tutorial,
             manage_cuda_context=manage_cuda_context,
+            scene_name=scene_name,
+            garden_quality=garden_quality,
+            garden_debug_collision=garden_debug_collision,
         )
 
     def _create_gs_view(

@@ -1,0 +1,98 @@
+{
+  "schema_version": 1,
+  "coordinate_convention": "canonical x=right, y=forward, z=down; table surface center is the origin",
+  "calibration_method": "Table plane fitted to official model depth samples from cameras 0, 1, 2, 3, and 23; forward is the projected camera-0 viewing direction.",
+  "source_table_center": [
+    0.41413339,
+    1.48170241,
+    1.0819722
+  ],
+  "source_to_canonical_rotation": [
+    [
+      -0.999757978,
+      0.0031598024,
+      0.0217715671
+    ],
+    [
+      0.0176017398,
+      -0.47876982,
+      0.8777639992
+    ],
+    [
+      0.01319713,
+      0.8779347784,
+      0.4785983291
+    ]
+  ],
+  "meters_per_source_unit": 0.54,
+  "fit_diagnostics": {
+    "table_plane_rms_m": 0.0055,
+    "table_to_sampled_patio_m": 0.7161,
+    "camera_0_canonical_position_m": [
+      0.0,
+      -2.4339,
+      -0.3960
+    ]
+  },
+  "interaction_roi": {
+    "radius_m": 1.15,
+    "z_min_m": -1.1,
+    "z_max_m": 1.0,
+    "gaussian_extent_sigma": 3.0,
+    "max_center_radius_m": 2.5
+  },
+  "centerpiece_removal": {
+    "volumes": [
+      {
+        "name": "vase_and_flowers",
+        "shape": "cylinder",
+        "radius_m": 0.61,
+        "z_min_m": -1.0,
+        "z_max_m": -0.04,
+        "gaussian_extent_sigma": 3.0,
+        "max_center_radius_m": 1.5
+      },
+      {
+        "name": "gray_tray",
+        "shape": "cylinder",
+        "radius_m": 0.43,
+        "z_min_m": -0.06,
+        "z_max_m": 0.32,
+        "gaussian_extent_sigma": 3.0,
+        "max_center_radius_m": 1.5
+      }
+    ]
+  },
+  "tabletop_patch": {
+    "source_ring_inner_radius_m": 0.52,
+    "source_ring_outer_radius_m": 0.66,
+    "surface_z_min_m": -0.025,
+    "surface_z_max_m": 0.025,
+    "target_radius_m": 0.44,
+    "placement": "golden_disk",
+    "surface_z_m": -0.004,
+    "angular_copies": 1,
+    "tangent_scale_m": 0.0025,
+    "normal_scale_m": 0.0008,
+    "opacity_logit": 5.0,
+    "dc_variation_scale": 0.0,
+    "dc_variation_clip": 0.0,
+    "procedural_wood": {
+      "base_rgb_mode": "source_ring_median",
+      "base_rgb_scale": 0.92,
+      "plank_count": 28,
+      "seam_width_m": 0.006,
+      "seam_darkening": 0.52,
+      "plank_variation": 0.035,
+      "grain_variation": 0.018,
+      "grain_frequency_per_m": 82.0
+    },
+    "zero_directional_sh": true
+  },
+  "tabletop_opacity_support": {
+    "radius_m": 0.8,
+    "z_min_m": -0.035,
+    "z_max_m": 0.035,
+    "opacity_floor_logit": 0.0
+  }
+}

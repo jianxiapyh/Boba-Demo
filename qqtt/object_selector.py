@@ -30,6 +30,20 @@ OBJECT_CHOICES: tuple[ObjectChoice, ...] = (
     ObjectChoice("sloth", "Sloth \u2014 Free Play"),
 )
 
+GARDEN_OBJECT_CHOICES: tuple[ObjectChoice, ...] = (
+    ObjectChoice("rope_game", "Rope \u2014 Free Play"),
+    ObjectChoice("sloth", "Sloth \u2014 Free Play"),
+)
+
+
+def object_choices_for_scene(scene_name: str = "lab") -> tuple[ObjectChoice, ...]:
+    normalized = str(scene_name or "lab").strip().lower()
+    if normalized == "garden":
+        return GARDEN_OBJECT_CHOICES
+    if normalized == "lab":
+        return OBJECT_CHOICES
+    raise ValueError(f"Unsupported immersive scene: {scene_name}")
+
 
 def _pressed(source: Mapping[str, object] | None, field: str) -> bool:
     return bool(source is not None and source.get(field, False))
@@ -109,8 +123,11 @@ class RuntimeObjectSelector:
         hold_seconds: float = OBJECT_SELECTOR_HOLD_SECONDS,
         debounce_seconds: float = OBJECT_SELECTOR_DEBOUNCE_SECONDS,
         blocked_until: float = 0.0,
+        scene_name: str = "lab",
     ) -> None:
-        case_names = tuple(choice.case_name for choice in OBJECT_CHOICES)
+        self.scene_name = str(scene_name or "lab").strip().lower()
+        self.choices = object_choices_for_scene(self.scene_name)
+        case_names = tuple(choice.case_name for choice in self.choices)
         if active_case not in case_names:
             raise ValueError(f"Unsupported active object: {active_case}")
         self.active_case = active_case
@@ -144,7 +161,7 @@ class RuntimeObjectSelector:
 
     @property
     def highlighted_case(self) -> str:
-        return OBJECT_CHOICES[self.highlighted_index].case_name
+        return self.choices[self.highlighted_index].case_name
 
     def set_loading(self) -> None:
         self.mode = "loading"
@@ -295,7 +312,7 @@ class RuntimeObjectSelector:
             if (
                 not self._manual_navigation_active
                 and hovered_index is not None
-                and 0 <= int(hovered_index) < len(OBJECT_CHOICES)
+                and 0 <= int(hovered_index) < len(self.choices)
             ):
                 self.hovered_index = int(hovered_index)
                 self.highlighted_index = int(hovered_index)
@@ -311,18 +328,18 @@ class RuntimeObjectSelector:
                 if edges["left"]["navigate"]:
                     self.highlighted_index = (
                         self.highlighted_index - 1
-                    ) % len(OBJECT_CHOICES)
+                    ) % len(self.choices)
                     self.hovered_index = None
                 if edges["right"]["navigate"]:
                     self.highlighted_index = (
                         self.highlighted_index + 1
-                    ) % len(OBJECT_CHOICES)
+                    ) % len(self.choices)
                     self.hovered_index = None
                 for source in ("left", "right"):
                     if stick_steps[source]:
                         self.highlighted_index = (
                             self.highlighted_index + stick_steps[source]
-                        ) % len(OBJECT_CHOICES)
+                        ) % len(self.choices)
                         self.hovered_index = None
                 if edges["left"]["select"] or edges["right"]["select"]:
                     selected_index = (
@@ -331,7 +348,7 @@ class RuntimeObjectSelector:
                         else self.highlighted_index
                     )
                     self.highlighted_index = int(selected_index)
-                    selected_case = OBJECT_CHOICES[self.highlighted_index].case_name
+                    selected_case = self.choices[self.highlighted_index].case_name
                     self.mode = "loading"
                     events["selected_case"] = selected_case
 
@@ -346,12 +363,14 @@ def selector_lines(
     *,
     mode: str = "open",
     selected_case: str | None = None,
+    scene_name: str = "lab",
 ) -> list[str]:
+    choices = object_choices_for_scene(scene_name)
     if mode == "loading":
         target = selected_case or active_case
         target_label = next(
             choice.label.split(" \u2014 ", 1)[0]
-            for choice in OBJECT_CHOICES
+            for choice in choices
             if choice.case_name == target
         )
         return [f"Loading {target_label}…", "Please wait"]
@@ -359,7 +378,7 @@ def selector_lines(
         return ["Object switch failed", "Restoring previous object…"]
 
     lines = ["Choose Object"]
-    for index, choice in enumerate(OBJECT_CHOICES):
+    for index, choice in enumerate(choices):
         pointer = ">" if index == int(highlighted_index) else " "
         active = "  [Active]" if choice.case_name == active_case else ""
         lines.append(f"{pointer} {choice.label}{active}")

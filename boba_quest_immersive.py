@@ -380,7 +380,12 @@ def configure_immersive_viewer_upload_runtime(args) -> None:
     os.environ["BOBA_IMMERSIVE_VIEWER_UPLOAD_BUSY_BACKOFF_US"] = str(busy_backoff_us)
 
 
-def configure_demo_case_runtime(case_name: str, cfg, logger) -> dict:
+def configure_demo_case_runtime(
+    case_name: str,
+    cfg,
+    logger,
+    scene_name: str = "lab",
+) -> dict:
     """Load one packaged object's isolated configuration and runtime paths."""
 
     canonical_case_name, manifest_dir, case_manifest = resolve_demo_case_manifest(
@@ -410,6 +415,15 @@ def configure_demo_case_runtime(case_name: str, cfg, logger) -> dict:
         case_manifest,
         canonical_case_name,
     )
+    scene_name = str(scene_name).strip().lower()
+    cfg.immersive_scene_name = scene_name
+    if scene_name == "garden":
+        cfg.demo_game_mode = "free_play"
+        cfg.demo_game_course_path = None
+        cfg.demo_tutorial_slide_paths = [
+            str(REPO_ROOT / "assets" / "tutorial" / slide_name)
+            for slide_name in SHARED_TUTORIAL_SLIDES
+        ]
 
     optimal_path = manifest_file_path(manifest_dir, case_manifest, "optimal_params")
     with open(optimal_path, "rb") as handle:
@@ -482,9 +496,29 @@ def build_parser() -> ArgumentParser:
         description=(
             "Run the shipped Boba Quest immersive demo. "
             "This launcher is fixed to live OpenXR controllers, immersive Quest display, "
-            "the ILLIXR_lab scene, and the balanced immersive preset. "
+            "a launch-time Lab or Garden scene, and the balanced immersive preset. "
             "Runtime demo assets are resolved from ./assets/."
         )
+    )
+    parser.add_argument(
+        "--scene",
+        choices=("lab", "garden"),
+        default="lab",
+        help="launch the existing Lab scene or Gaussian Mip-NeRF 360 Garden",
+    )
+    parser.add_argument(
+        "--garden-quality",
+        choices=("auto", "full", "balanced", "performance"),
+        default="balanced",
+        help=(
+            "Garden Gaussian tier; balanced is the default, while auto uses "
+            "the cached 72-FPS hardware profile"
+        ),
+    )
+    parser.add_argument(
+        "--garden-debug-collision",
+        action="store_true",
+        help="export the aligned Garden collision mesh for developer inspection",
     )
     parser.add_argument(
         "--case_name",
@@ -769,6 +803,18 @@ def main(argv: list[str] | None = None):
     ensure_direct_launch_runtime_env(argv)
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.scene == "garden":
+        # Garden is itself part of the batched Gaussian render.  The static
+        # adapter supplies a depthless retained frame, so static workers and
+        # cross-frame scene reuse are intentionally disabled.
+        args.immersive_timewarp = "off"
+        args.immersive_static_scene_overlap = "off"
+        args.immersive_static_scene_reuse = "off"
+        args.immersive_static_scene_backend = "gpu"
+        args.immersive_static_scene_mode = "balanced_support_focus"
+        args.immersive_framegen = "off"
+        args.immersive_gaussian_render = "stereo_batched"
+        args.immersive_present_pipeline = "off"
     immersive_present_pipeline_enabled = (
         str(args.immersive_present_pipeline).strip().lower() == "on"
     )
@@ -802,7 +848,11 @@ def main(argv: list[str] | None = None):
             else "serial"
         )
 
-    validate_all_demo_assets(REPO_ROOT)
+    validate_all_demo_assets(
+        REPO_ROOT,
+        scene_name=args.scene,
+        garden_quality=args.garden_quality,
+    )
     print(
         "[quest_display] validated selectable objects: Rope, Sloth",
         flush=True,
@@ -823,7 +873,16 @@ def main(argv: list[str] | None = None):
     print("[quest_display] input_source=live_openxr_controller", flush=True)
     print("[quest_display] controller_mode=multi_points", flush=True)
     print("[quest_display] mode=immersive", flush=True)
-    print("[quest_display] scene_preset=ILLIXR_lab", flush=True)
+    print(
+        "[quest_display] scene_preset="
+        + ("Mip-NeRF_360_garden" if args.scene == "garden" else "ILLIXR_lab"),
+        flush=True,
+    )
+    if args.scene == "garden":
+        print(
+            f"[quest_display] garden_quality={args.garden_quality} mode=free_play",
+            flush=True,
+        )
     print("[quest_display] immersive_render_preset=balanced", flush=True)
     print(
         "[quest_display] immersive_eye_resolution="
@@ -944,6 +1003,7 @@ def main(argv: list[str] | None = None):
                     active_case_name,
                     cfg,
                     logger,
+                    scene_name=args.scene,
                 )
                 cfg.live_openxr_verbose_console_diagnostics = bool(args.profile)
                 trainer = InvPhyTrainerWarp(
@@ -1007,6 +1067,9 @@ def main(argv: list[str] | None = None):
                         immersive_session_state=immersive_session_state,
                         show_startup_tutorial=show_startup_tutorial,
                         manage_cuda_context=False,
+                        scene_name=args.scene,
+                        garden_quality=args.garden_quality,
+                        garden_debug_collision=args.garden_debug_collision,
                     )
                 )
             except Exception as exc:

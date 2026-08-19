@@ -4,6 +4,7 @@ import numpy as np
 
 from qqtt.object_selector import (
     RuntimeObjectSelector,
+    object_choices_for_scene,
     selector_lines,
     selector_row_from_ray,
 )
@@ -239,3 +240,20 @@ def test_selector_copy_marks_active_mode_and_loading_target():
         mode="loading",
         selected_case="sloth",
     ) == ["Loading Sloth…", "Please wait"]
+
+
+def test_garden_selector_labels_both_objects_as_free_play():
+    choices = object_choices_for_scene("garden")
+    assert [choice.label for choice in choices] == [
+        "Rope — Free Play",
+        "Sloth — Free Play",
+    ]
+    selector = RuntimeObjectSelector("rope_game", scene_name="garden")
+    assert selector.highlighted_case == "rope_game"
+    lines = selector_lines(
+        "rope_game",
+        1,
+        scene_name="garden",
+    )
+    assert lines[1] == "  Rope — Free Play  [Active]"
+    assert lines[2] == "> Sloth — Free Play"

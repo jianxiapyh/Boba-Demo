@@ -1,0 +1,57 @@
+{
+  "schema_version": 1,
+  "scene_name": "garden",
+  "display_name": "Mip-NeRF 360 Garden",
+  "source": {
+    "project_url": "https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/",
+    "official_archive_url": "https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/datasets/pretrained/models.zip",
+    "archive_filename": "graphdeco-pretrained-models.zip",
+    "archive_sha256": "b922a42bb4e938fe8e2ac5fbc2577724884335ada7deb3c4b86c5a4c92c5813d",
+    "point_cloud_member": "garden/point_cloud/iteration_30000/point_cloud.ply",
+    "cameras_member": "garden/cameras.json",
+    "point_cloud_sha256": "16701d5e0630dfaca74f8794ed7ce2aa23fa922f87dc09a7e37484e8d3f82d5a"
+  },
+  "local": {
+    "download_dir": "data/garden/downloads",
+    "source_dir": "data/garden/source",
+    "runtime_dir": "data/garden/runtime",
+    "profile_cache": "data/garden/profile_cache.json"
+  },
+  "calibration": "assets/scenes/garden/calibration.json",
+  "collision_proxy": "assets/scenes/garden/collision_proxy.json",
+  "license": "assets/scenes/garden/ASSET_LICENSE.md",
+  "dynamic_gaussian_capacity": 262144,
+  "spatial_chunks": {
+    "cell_size_m": 1.5,
+    "gaussian_extent_sigma": 4.0,
+    "frustum_padding_m": 0.1,
+    "prefetch_margin_ratio": 0.2,
+    "near_plane_m": 0.01
+  },
+  "default_uncalibrated_auto_quality": "balanced",
+  "quality_order": [
+    "full",
+    "balanced",
+    "performance"
+  ],
+  "qualities": {
+    "full": {
+      "retention": 1.0,
+      "pruning_mode": "opacity",
+      "ply": "data/garden/runtime/garden_full.ply",
+      "metadata": "data/garden/runtime/garden_full.json"
+    },
+    "balanced": {
+      "retention": 0.3,
+      "pruning_mode": "opacity",
+      "ply": "data/garden/runtime/garden_balanced.ply",
+      "metadata": "data/garden/runtime/garden_balanced.json"
+    },
+    "performance": {
+      "retention": 0.1,
+      "pruning_mode": "opacity",
+      "ply": "data/garden/runtime/garden_performance.ply",
+      "metadata": "data/garden/runtime/garden_performance.json"
+    }
+  }
+}

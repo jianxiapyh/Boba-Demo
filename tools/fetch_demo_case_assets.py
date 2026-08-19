@@ -4,11 +4,16 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 PUBLIC_DEMO_CASES = ("rope_game", "sloth")
+PUBLIC_SCENES = ("lab", "garden")
+GARDEN_QUALITIES = ("auto", "full", "balanced", "performance")
 LFS_POINTER_HEADER = "version https://git-lfs.github.com/spec/v1"
 REQUIRED_MANIFEST_PAYLOAD_KEYS = (
     "best_model",
@@ -203,7 +208,16 @@ def resolve_case_manifest_assets(
     return assets
 
 
-def resolve_shared_runtime_assets(repo_root: Path) -> list[ManifestAsset]:
+def resolve_shared_runtime_assets(
+    repo_root: Path,
+    scene_name: str = "lab",
+    garden_quality: str = "balanced",
+) -> list[ManifestAsset]:
+    scene_name = str(scene_name).strip().lower()
+    if scene_name not in PUBLIC_SCENES:
+        raise DemoAssetValidationError(
+            f"Unsupported scene {scene_name!r}; expected one of {PUBLIC_SCENES}."
+        )
     shared_assets = []
     tutorial_dir = repo_root / "assets" / "tutorial"
     for slide_name in SHARED_TUTORIAL_SLIDES:
@@ -216,6 +230,33 @@ def resolve_shared_runtime_assets(repo_root: Path) -> list[ManifestAsset]:
                 repo_relative_path=_repo_relative_path(repo_root, path),
             )
         )
+
+    if scene_name == "garden":
+        try:
+            from qqtt.garden_assets import validate_garden_runtime_selection
+
+            garden_paths = validate_garden_runtime_selection(
+                repo_root,
+                garden_quality,
+            )
+        except Exception as exc:
+            raise DemoAssetValidationError(
+                f"Garden scene assets are not ready: {exc}\n"
+                "Install them once with:\n"
+                "  conda run -n phystwin-cu132 env PYTHONNOUSERSITE=1 "
+                "python tools/fetch_demo_case_assets.py --scene garden --fetch"
+            ) from exc
+        for index, path in enumerate(garden_paths):
+            shared_assets.append(
+                ManifestAsset(
+                    case_name="shared",
+                    key=f"garden[{index}]",
+                    path=Path(path).resolve(),
+                    repo_relative_path=_repo_relative_path(repo_root, Path(path)),
+                    must_start_with_ply=(Path(path).suffix.lower() == ".ply"),
+                )
+            )
+        return shared_assets
 
     scene_dir = repo_root / "assets" / "scenes" / "ILLIXR_lab"
     scene_manifest_path = scene_dir / "manifest.json"
@@ -313,6 +354,8 @@ def validate_demo_case_assets(
     case_name: str,
     manifest_dir: Path,
     manifest: dict,
+    scene_name: str = "lab",
+    garden_quality: str = "balanced",
 ) -> list[ManifestAsset]:
     normalized_case = str(case_name).strip().lower()
     if normalized_case not in PUBLIC_DEMO_CASES:
@@ -332,13 +375,23 @@ def validate_demo_case_assets(
         manifest_dir,
         manifest,
     )
-    assets.extend(resolve_shared_runtime_assets(repo_root))
+    assets.extend(
+        resolve_shared_runtime_assets(
+            repo_root,
+            scene_name=scene_name,
+            garden_quality=garden_quality,
+        )
+    )
     for asset in assets:
         _validate_asset(asset)
     return assets
 
 
-def validate_all_demo_assets(repo_root: Path) -> list[ManifestAsset]:
+def validate_all_demo_assets(
+    repo_root: Path,
+    scene_name: str = "lab",
+    garden_quality: str = "balanced",
+) -> list[ManifestAsset]:
     assets = []
     shared_paths = set()
     for case_name in PUBLIC_DEMO_CASES:
@@ -351,6 +404,8 @@ def validate_all_demo_assets(repo_root: Path) -> list[ManifestAsset]:
             canonical_case,
             manifest_dir,
             manifest,
+            scene_name=scene_name,
+            garden_quality=garden_quality,
         )
         for asset in case_assets:
             if asset.case_name == "shared":
@@ -371,13 +426,72 @@ def build_parser() -> argparse.ArgumentParser:
         default="all",
         help="packaged demo case, or all selectable cases",
     )
+    parser.add_argument(
+        "--scene",
+        choices=PUBLIC_SCENES,
+        default="lab",
+        help="validate assets for only the selected launch-time scene",
+    )
+    parser.add_argument(
+        "--garden-quality",
+        choices=GARDEN_QUALITIES,
+        default="balanced",
+        help="Garden runtime quality tier to prepare or validate",
+    )
+    parser.add_argument(
+        "--fetch",
+        action="store_true",
+        help="download and deterministically prepare Garden assets when needed",
+    )
+    parser.add_argument(
+        "--garden-archive",
+        type=Path,
+        default=None,
+        help="optional already-downloaded official models.zip archive",
+    )
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.fetch:
+        if args.scene != "garden":
+            raise DemoAssetValidationError("--fetch is currently supported only with --scene garden.")
+        try:
+            from qqtt.garden_assets import fetch_and_prepare_garden
+
+            last_percent = [-1]
+
+            def report_progress(downloaded: int, total: int | None) -> None:
+                if total is None or total <= 0:
+                    return
+                percent = int(100 * downloaded / total)
+                if percent >= last_percent[0] + 5:
+                    print(f"Garden archive download: {percent}%", flush=True)
+                    last_percent[0] = percent
+
+            outputs = fetch_and_prepare_garden(
+                REPO_ROOT,
+                archive_override=args.garden_archive,
+                progress_callback=report_progress,
+            )
+            print(
+                "Prepared Garden tiers: "
+                + ", ".join(
+                    f"{quality} ({metadata['gaussian_count']:,} Gaussians, "
+                    f"{metadata['spatial_chunk_count']:,} spatial chunks)"
+                    for quality, metadata in outputs.items()
+                ),
+                flush=True,
+            )
+        except Exception as exc:
+            raise DemoAssetValidationError(f"Garden setup failed: {exc}") from exc
     if args.case == "all":
-        assets = validate_all_demo_assets(REPO_ROOT)
+        assets = validate_all_demo_assets(
+            REPO_ROOT,
+            scene_name=args.scene,
+            garden_quality=args.garden_quality,
+        )
     else:
         case_name, manifest_dir, manifest = resolve_demo_case_manifest(
             REPO_ROOT,
@@ -388,6 +502,8 @@ def main(argv: list[str] | None = None) -> int:
             case_name,
             manifest_dir,
             manifest,
+            scene_name=args.scene,
+            garden_quality=args.garden_quality,
         )
     print(
         f"Validated {len(assets)} packaged demo/shared runtime asset entries.",

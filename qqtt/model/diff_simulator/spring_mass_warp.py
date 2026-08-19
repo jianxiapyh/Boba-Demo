@@ -1,3 +1,4 @@
+import numpy as np
 import torch
 from qqtt.utils import logger, cfg
 import warp as wp
@@ -408,6 +409,26 @@ def integrate_ground_collision(
     static_box_mins: wp.array(dtype=wp.vec3),
     static_box_maxs: wp.array(dtype=wp.vec3),
     static_box_count: int,
+    static_surface_centers: wp.array(dtype=wp.vec3),
+    static_surface_normals: wp.array(dtype=wp.vec3),
+    static_surface_axes_u: wp.array(dtype=wp.vec3),
+    static_surface_axes_v: wp.array(dtype=wp.vec3),
+    static_surface_extents_u: wp.array(dtype=float),
+    static_surface_extents_v: wp.array(dtype=float),
+    static_surface_kinds: wp.array(dtype=wp.int32),
+    static_surface_count: int,
+    static_surface_query_distance: float,
+    static_surface_margin: float,
+    static_surface_restitution: float,
+    static_surface_friction: float,
+    static_mesh_enabled: int,
+    static_mesh: wp.uint64,
+    static_mesh_query_distance: float,
+    static_mesh_winding_accuracy: float,
+    static_mesh_winding_threshold: float,
+    static_mesh_margin: float,
+    static_mesh_restitution: float,
+    static_mesh_friction: float,
     x_new: wp.array(dtype=wp.vec3),
     v_new: wp.array(dtype=wp.vec3),
 ):
@@ -576,6 +597,223 @@ def integrate_ground_collision(
                 best_hit_normal = candidate_normal
                 has_sweep_hit = int(1)
 
+    # Fast finite primitives are used by Garden: a closed circular tabletop and
+    # a rectangular patio. Plane/cylinder sweeps prevent tunnelling, while the
+    # bounded recovery path resolves resting penetration. kind=0 is a local
+    # rectangle, kind=1 is a top-only disk, and kind=2 is a finite cylinder
+    # whose extent_u is its radius and extent_v is its depth below the top.
+    best_surface_t = float(2.0)
+    best_surface_normal = wp.vec3(0.0, 0.0, 0.0)
+    has_surface_sweep = int(0)
+    best_surface_penetration = float(1.0e8)
+    best_surface_recovery_normal = wp.vec3(0.0, 0.0, 0.0)
+    has_surface_recovery = int(0)
+    surface_motion = x_result - x0
+    surface_margin = wp.max(static_surface_margin, 0.0)
+    surface_query_distance = wp.max(static_surface_query_distance, surface_margin)
+
+    for surface_index in range(static_surface_count):
+        surface_center = static_surface_centers[surface_index]
+        surface_normal = static_surface_normals[surface_index]
+        surface_axis_u = static_surface_axes_u[surface_index]
+        surface_axis_v = static_surface_axes_v[surface_index]
+        surface_extent_u = static_surface_extents_u[surface_index]
+        surface_extent_v = static_surface_extents_v[surface_index]
+        surface_kind = static_surface_kinds[surface_index]
+
+        previous_distance = wp.dot(x0 - surface_center, surface_normal)
+        candidate_distance = wp.dot(x_result - surface_center, surface_normal)
+        distance_delta = previous_distance - candidate_distance
+
+        if (
+            previous_distance >= surface_margin
+            and candidate_distance < surface_margin
+            and distance_delta > collision_eps
+        ):
+            hit_t = (previous_distance - surface_margin) / distance_delta
+            if hit_t >= 0.0 and hit_t <= 1.0:
+                hit_point = x0 + surface_motion * hit_t
+                hit_relative = hit_point - surface_center
+                hit_u = wp.dot(hit_relative, surface_axis_u)
+                hit_v = wp.dot(hit_relative, surface_axis_v)
+                inside_footprint = int(0)
+                if surface_kind == 1 or surface_kind == 2:
+                    footprint_radius = surface_extent_u
+                    if surface_kind == 2:
+                        footprint_radius = footprint_radius + surface_margin
+                    if (
+                        hit_u * hit_u + hit_v * hit_v
+                        <= footprint_radius * footprint_radius
+                    ):
+                        inside_footprint = int(1)
+                elif (
+                    wp.abs(hit_u) <= surface_extent_u
+                    and wp.abs(hit_v) <= surface_extent_v
+                ):
+                    inside_footprint = int(1)
+                if inside_footprint != 0 and hit_t < best_surface_t:
+                    best_surface_t = hit_t
+                    best_surface_normal = surface_normal
+                    has_surface_sweep = int(1)
+
+        candidate_relative = x_result - surface_center
+        candidate_u = wp.dot(candidate_relative, surface_axis_u)
+        candidate_v = wp.dot(candidate_relative, surface_axis_v)
+
+        if surface_kind == 2:
+            # The tabletop is a closed finite cylinder. The side sweep catches
+            # fast lateral motion at the rim; the bottom sweep prevents a rope
+            # hanging over the edge from swinging through the underside.
+            cylinder_radius = surface_extent_u
+            cylinder_depth = surface_extent_v
+            expanded_radius = cylinder_radius + surface_margin
+            bottom_distance = -cylinder_depth - surface_margin
+            candidate_radius_sq = (
+                candidate_u * candidate_u + candidate_v * candidate_v
+            )
+
+            distance_up = candidate_distance - previous_distance
+            if (
+                previous_distance <= bottom_distance
+                and candidate_distance > bottom_distance
+                and distance_up > collision_eps
+            ):
+                bottom_hit_t = (
+                    bottom_distance - previous_distance
+                ) / distance_up
+                if bottom_hit_t >= 0.0 and bottom_hit_t <= 1.0:
+                    bottom_hit = x0 + surface_motion * bottom_hit_t
+                    bottom_relative = bottom_hit - surface_center
+                    bottom_u = wp.dot(bottom_relative, surface_axis_u)
+                    bottom_v = wp.dot(bottom_relative, surface_axis_v)
+                    if (
+                        bottom_u * bottom_u + bottom_v * bottom_v
+                        <= expanded_radius * expanded_radius
+                        and bottom_hit_t < best_surface_t
+                    ):
+                        best_surface_t = bottom_hit_t
+                        best_surface_normal = -surface_normal
+                        has_surface_sweep = int(1)
+
+            previous_relative = x0 - surface_center
+            previous_u = wp.dot(previous_relative, surface_axis_u)
+            previous_v = wp.dot(previous_relative, surface_axis_v)
+            motion_u = candidate_u - previous_u
+            motion_v = candidate_v - previous_v
+            radial_a = motion_u * motion_u + motion_v * motion_v
+            radial_b = 2.0 * (
+                previous_u * motion_u + previous_v * motion_v
+            )
+            radial_c = (
+                previous_u * previous_u
+                + previous_v * previous_v
+                - expanded_radius * expanded_radius
+            )
+            if radial_a > collision_eps and radial_c >= 0.0:
+                discriminant = radial_b * radial_b - 4.0 * radial_a * radial_c
+                if discriminant >= 0.0:
+                    side_hit_t = (
+                        -radial_b - wp.sqrt(discriminant)
+                    ) / (2.0 * radial_a)
+                    if side_hit_t >= 0.0 and side_hit_t <= 1.0:
+                        side_hit_distance = previous_distance + (
+                            candidate_distance - previous_distance
+                        ) * side_hit_t
+                        if (
+                            side_hit_distance <= surface_margin
+                            and side_hit_distance >= bottom_distance
+                        ):
+                            side_u = previous_u + motion_u * side_hit_t
+                            side_v = previous_v + motion_v * side_hit_t
+                            side_radius = wp.sqrt(
+                                side_u * side_u + side_v * side_v
+                            )
+                            if side_radius > collision_eps:
+                                side_normal = (
+                                    surface_axis_u * (side_u / side_radius)
+                                    + surface_axis_v * (side_v / side_radius)
+                                )
+                                if (
+                                    wp.dot(surface_motion, side_normal)
+                                    < -collision_eps
+                                    and side_hit_t < best_surface_t
+                                ):
+                                    best_surface_t = side_hit_t
+                                    best_surface_normal = side_normal
+                                    has_surface_sweep = int(1)
+
+            # Signed distance and gradient for a capped cylinder give a smooth
+            # rounded contact normal just outside the sharp top/bottom rims.
+            # Inside the solid, they select the nearest exit face, avoiding the
+            # large topward corrections that destabilized a hanging rope.
+            candidate_radius = wp.sqrt(candidate_radius_sq)
+            radial_direction = surface_axis_u
+            if candidate_radius > collision_eps:
+                radial_direction = (
+                    surface_axis_u * (candidate_u / candidate_radius)
+                    + surface_axis_v * (candidate_v / candidate_radius)
+                )
+            half_depth = 0.5 * cylinder_depth
+            axial_from_middle = candidate_distance + half_depth
+            axial_sign = float(1.0)
+            if axial_from_middle < 0.0:
+                axial_sign = -1.0
+            radial_q = candidate_radius - cylinder_radius
+            axial_q = wp.abs(axial_from_middle) - half_depth
+            cylinder_signed_distance = float(0.0)
+            cylinder_normal = surface_normal * axial_sign
+            if radial_q > 0.0 and axial_q > 0.0:
+                corner_distance = wp.sqrt(
+                    radial_q * radial_q + axial_q * axial_q
+                )
+                cylinder_signed_distance = corner_distance
+                if corner_distance > collision_eps:
+                    cylinder_normal = (
+                        radial_direction * (radial_q / corner_distance)
+                        + surface_normal
+                        * (axial_sign * axial_q / corner_distance)
+                    )
+            elif radial_q > axial_q:
+                cylinder_signed_distance = radial_q
+                cylinder_normal = radial_direction
+            else:
+                cylinder_signed_distance = axial_q
+                cylinder_normal = surface_normal * axial_sign
+
+            cylinder_penetration = surface_margin - cylinder_signed_distance
+            if (
+                cylinder_penetration > 0.0
+                and cylinder_penetration <= surface_query_distance
+                and cylinder_penetration < best_surface_penetration
+            ):
+                best_surface_penetration = cylinder_penetration
+                best_surface_recovery_normal = cylinder_normal
+                has_surface_recovery = int(1)
+        else:
+            penetration = surface_margin - candidate_distance
+            if penetration > 0.0 and penetration <= surface_query_distance:
+                inside_recovery_footprint = int(0)
+                if surface_kind == 1:
+                    if (
+                        candidate_u * candidate_u + candidate_v * candidate_v
+                        <= surface_extent_u * surface_extent_u
+                    ):
+                        inside_recovery_footprint = int(1)
+                elif (
+                    wp.abs(candidate_u) <= surface_extent_u
+                    and wp.abs(candidate_v) <= surface_extent_v
+                ):
+                    inside_recovery_footprint = int(1)
+                if (
+                    inside_recovery_footprint != 0
+                    and penetration < best_surface_penetration
+                ):
+                    best_surface_penetration = penetration
+                    best_surface_recovery_normal = surface_normal
+                    has_surface_recovery = int(1)
+
+    surface_restitution = wp.clamp(static_surface_restitution, 0.0, 1.0)
+    surface_friction = wp.clamp(static_surface_friction, 0.0, 2.0)
     if has_inside_hit != 0:
         v_after = v0
         if wp.dot(v0, best_inside_normal) < -1e-4:
@@ -587,17 +825,110 @@ def integrate_ground_collision(
             )
         x_result = best_inside_projected + v_after * dt
         v_result = v_after
-    elif has_sweep_hit != 0:
-        toi = best_hit_t * dt
-        hit_point = x0 + v0 * toi + best_hit_normal * collision_eps
-        v_after = apply_surface_collision_response(
-            v0,
-            best_hit_normal,
-            clamp_collide_elas,
-            clamp_collide_fric,
+    elif has_surface_sweep != 0 or has_sweep_hit != 0:
+        if (
+            has_surface_sweep != 0
+            and (has_sweep_hit == 0 or best_surface_t <= best_hit_t)
+        ):
+            v_after = v_result
+            if wp.dot(v_result, best_surface_normal) < -1.0e-4:
+                v_after = apply_surface_collision_response(
+                    v_result,
+                    best_surface_normal,
+                    surface_restitution,
+                    surface_friction,
+                )
+            x_result = x0 + surface_motion * best_surface_t
+            v_result = v_after
+        else:
+            toi = best_hit_t * dt
+            hit_point = x0 + v0 * toi + best_hit_normal * collision_eps
+            v_after = apply_surface_collision_response(
+                v0,
+                best_hit_normal,
+                clamp_collide_elas,
+                clamp_collide_fric,
+            )
+            x_result = hit_point + v_after * (dt - toi)
+            v_result = v_after
+    elif has_surface_recovery != 0:
+        if wp.dot(v_result, best_surface_recovery_normal) < -1.0e-4:
+            v_result = apply_surface_collision_response(
+                v_result,
+                best_surface_recovery_normal,
+                surface_restitution,
+                surface_friction,
+            )
+        x_result = (
+            x_result
+            + best_surface_recovery_normal * best_surface_penetration
         )
-        x_result = hit_point + v_after * (dt - toi)
-        v_result = v_after
+
+    # Retained as a generic fallback for other callers. Garden does not enable
+    # this signed-winding mesh path at runtime.
+    if static_mesh_enabled != 0:
+        mesh_restitution = wp.clamp(static_mesh_restitution, 0.0, 1.0)
+        mesh_friction = wp.clamp(static_mesh_friction, 0.0, 2.0)
+        resolved_mesh = int(0)
+        motion = x_result - x0
+        motion_length = wp.length(motion)
+        if motion_length > 1.0e-8:
+            direction = motion / motion_length
+            ray = wp.mesh_query_ray(
+                static_mesh,
+                x0,
+                direction,
+                motion_length,
+            )
+            if ray.result and wp.dot(direction, ray.normal) < 0.0:
+                surface_point = wp.mesh_eval_position(
+                    static_mesh,
+                    ray.face,
+                    ray.u,
+                    ray.v,
+                )
+                mesh_normal = wp.normalize(ray.normal)
+                if wp.dot(v_result, mesh_normal) < -1.0e-4:
+                    v_result = apply_surface_collision_response(
+                        v_result,
+                        mesh_normal,
+                        mesh_restitution,
+                        mesh_friction,
+                    )
+                x_result = surface_point + mesh_normal * static_mesh_margin
+                resolved_mesh = int(1)
+
+        if resolved_mesh == 0:
+            query = wp.mesh_query_point_sign_winding_number(
+                static_mesh,
+                x_result,
+                max_dist=static_mesh_query_distance,
+                accuracy=static_mesh_winding_accuracy,
+                threshold=static_mesh_winding_threshold,
+            )
+            if query.result:
+                surface_point = wp.mesh_eval_position(
+                    static_mesh,
+                    query.face,
+                    query.u,
+                    query.v,
+                )
+                delta = x_result - surface_point
+                delta_length = wp.length(delta)
+                signed_distance = delta_length * query.sign
+                contact_error = signed_distance - static_mesh_margin
+                if contact_error < 0.0 and delta_length > 1.0e-8:
+                    # Negative sign means the candidate is inside the closed
+                    # mesh, so this reverses delta into the outward normal.
+                    mesh_normal = delta / delta_length * query.sign
+                    if wp.dot(v_result, mesh_normal) < -1.0e-4:
+                        v_result = apply_surface_collision_response(
+                            v_result,
+                            mesh_normal,
+                            mesh_restitution,
+                            mesh_friction,
+                        )
+                    x_result = x_result + mesh_normal * (-contact_error)
 
     x_new[tid] = x_result
     v_new[tid] = v_result
@@ -716,6 +1047,55 @@ class SpringMassSystemWarp:
         self.wp_static_box_maxs = wp.from_torch(
             zero_boxes.clone(), dtype=wp.vec3, requires_grad=False
         )
+        self.static_surface_count = 0
+        zero_surface_vec3 = torch.zeros((1, 3), dtype=torch.float32, device=self.device)
+        zero_surface_float = torch.zeros((1,), dtype=torch.float32, device=self.device)
+        zero_surface_kind = torch.zeros((1,), dtype=torch.int32, device=self.device)
+        self.torch_static_surface_centers = zero_surface_vec3.clone()
+        self.torch_static_surface_normals = zero_surface_vec3.clone()
+        self.torch_static_surface_axes_u = zero_surface_vec3.clone()
+        self.torch_static_surface_axes_v = zero_surface_vec3.clone()
+        self.torch_static_surface_extents_u = zero_surface_float.clone()
+        self.torch_static_surface_extents_v = zero_surface_float.clone()
+        self.torch_static_surface_kinds = zero_surface_kind.clone()
+        self.wp_static_surface_centers = wp.from_torch(
+            self.torch_static_surface_centers, dtype=wp.vec3, requires_grad=False
+        )
+        self.wp_static_surface_normals = wp.from_torch(
+            self.torch_static_surface_normals, dtype=wp.vec3, requires_grad=False
+        )
+        self.wp_static_surface_axes_u = wp.from_torch(
+            self.torch_static_surface_axes_u, dtype=wp.vec3, requires_grad=False
+        )
+        self.wp_static_surface_axes_v = wp.from_torch(
+            self.torch_static_surface_axes_v, dtype=wp.vec3, requires_grad=False
+        )
+        self.wp_static_surface_extents_u = wp.from_torch(
+            self.torch_static_surface_extents_u, dtype=wp.float32, requires_grad=False
+        )
+        self.wp_static_surface_extents_v = wp.from_torch(
+            self.torch_static_surface_extents_v, dtype=wp.float32, requires_grad=False
+        )
+        self.wp_static_surface_kinds = wp.from_torch(
+            self.torch_static_surface_kinds, dtype=wp.int32, requires_grad=False
+        )
+        self.static_surface_query_distance = 0.1
+        self.static_surface_margin = 0.0
+        self.static_surface_restitution = 0.0
+        self.static_surface_friction = 0.5
+        self.static_mesh_enabled = 0
+        self.static_mesh_id = 0
+        self.static_mesh_query_distance = 0.1
+        self.static_mesh_winding_accuracy = 2.0
+        self.static_mesh_winding_threshold = 0.5
+        self.static_mesh_margin = 0.0
+        self.static_mesh_restitution = 0.0
+        self.static_mesh_friction = 0.5
+        self.wp_static_mesh_points = None
+        self.wp_static_mesh_indices = None
+        self.torch_static_mesh_points = None
+        self.torch_static_mesh_indices = None
+        self.static_collision_mesh = None
         
         if self_collision:
             self.object_collision_flag = 1
@@ -831,6 +1211,243 @@ class SpringMassSystemWarp:
         self.wp_static_box_mins = wp.from_torch(mins, dtype=wp.vec3, requires_grad=False)
         self.wp_static_box_maxs = wp.from_torch(maxs, dtype=wp.vec3, requires_grad=False)
         self.static_box_count = int(boxes.shape[0])
+
+    def set_static_collision_surfaces(
+        self,
+        surfaces,
+        *,
+        query_distance=0.1,
+        margin=0.0,
+        restitution=0.0,
+        friction=0.5,
+    ):
+        """Install immutable finite primitive colliders before CUDA graph capture."""
+
+        if not surfaces:
+            self.static_surface_count = 0
+            return
+
+        centers = []
+        normals = []
+        axes_u = []
+        axes_v = []
+        extents_u = []
+        extents_v = []
+        kinds = []
+        for index, surface in enumerate(surfaces):
+            kind_name = str(surface.get("kind", "")).strip().lower()
+            if kind_name not in {"rectangle", "disk", "cylinder"}:
+                raise ValueError(
+                    f"static collision surface {index} has unsupported kind {kind_name!r}"
+                )
+            center = np.asarray(surface["center"], dtype=np.float32).reshape(3)
+            normal = np.asarray(surface["normal"], dtype=np.float32).reshape(3)
+            axis_u = np.asarray(surface["axis_u"], dtype=np.float32).reshape(3)
+            axis_v = np.asarray(surface["axis_v"], dtype=np.float32).reshape(3)
+            extent_u = float(surface["extent_u"])
+            extent_v = float(surface["extent_v"])
+            values = np.concatenate([center, normal, axis_u, axis_v])
+            if not np.isfinite(values).all() or not np.isfinite(
+                [extent_u, extent_v]
+            ).all():
+                raise ValueError(
+                    f"static collision surface {index} contains non-finite values"
+                )
+            if extent_u <= 0.0 or extent_v <= 0.0:
+                raise ValueError(
+                    f"static collision surface {index} extents must be positive"
+                )
+            normal_length = float(np.linalg.norm(normal))
+            axis_u_length = float(np.linalg.norm(axis_u))
+            axis_v_length = float(np.linalg.norm(axis_v))
+            if min(normal_length, axis_u_length, axis_v_length) <= 1.0e-6:
+                raise ValueError(
+                    f"static collision surface {index} basis contains a zero vector"
+                )
+            normal = normal / normal_length
+            axis_u = axis_u / axis_u_length
+            axis_v = axis_v / axis_v_length
+            if (
+                abs(float(np.dot(normal, axis_u))) > 1.0e-4
+                or abs(float(np.dot(normal, axis_v))) > 1.0e-4
+                or abs(float(np.dot(axis_u, axis_v))) > 1.0e-4
+            ):
+                raise ValueError(
+                    f"static collision surface {index} basis must be orthogonal"
+                )
+            centers.append(center)
+            normals.append(normal)
+            axes_u.append(axis_u)
+            axes_v.append(axis_v)
+            extents_u.append(extent_u)
+            extents_v.append(extent_v)
+            kinds.append({"rectangle": 0, "disk": 1, "cylinder": 2}[kind_name])
+
+        scalar_values = {
+            "query_distance": float(query_distance),
+            "margin": float(margin),
+            "restitution": float(restitution),
+            "friction": float(friction),
+        }
+        if not all(np.isfinite(value) for value in scalar_values.values()):
+            raise ValueError("static collision surface contact parameters must be finite")
+        if scalar_values["query_distance"] <= 0.0:
+            raise ValueError("static surface query_distance must be positive")
+        if scalar_values["margin"] < 0.0:
+            raise ValueError("static surface margin must be non-negative")
+        if not 0.0 <= scalar_values["restitution"] <= 1.0:
+            raise ValueError("static surface restitution must be in [0, 1]")
+        if not 0.0 <= scalar_values["friction"] <= 2.0:
+            raise ValueError("static surface friction must be in [0, 2]")
+
+        def _float_tensor(values):
+            return torch.as_tensor(
+                np.ascontiguousarray(values, dtype=np.float32),
+                dtype=torch.float32,
+                device=self.device,
+            ).contiguous()
+
+        self.torch_static_surface_centers = _float_tensor(centers)
+        self.torch_static_surface_normals = _float_tensor(normals)
+        self.torch_static_surface_axes_u = _float_tensor(axes_u)
+        self.torch_static_surface_axes_v = _float_tensor(axes_v)
+        self.torch_static_surface_extents_u = _float_tensor(extents_u)
+        self.torch_static_surface_extents_v = _float_tensor(extents_v)
+        self.torch_static_surface_kinds = torch.as_tensor(
+            np.ascontiguousarray(kinds, dtype=np.int32),
+            dtype=torch.int32,
+            device=self.device,
+        ).contiguous()
+        self.wp_static_surface_centers = wp.from_torch(
+            self.torch_static_surface_centers, dtype=wp.vec3, requires_grad=False
+        )
+        self.wp_static_surface_normals = wp.from_torch(
+            self.torch_static_surface_normals, dtype=wp.vec3, requires_grad=False
+        )
+        self.wp_static_surface_axes_u = wp.from_torch(
+            self.torch_static_surface_axes_u, dtype=wp.vec3, requires_grad=False
+        )
+        self.wp_static_surface_axes_v = wp.from_torch(
+            self.torch_static_surface_axes_v, dtype=wp.vec3, requires_grad=False
+        )
+        self.wp_static_surface_extents_u = wp.from_torch(
+            self.torch_static_surface_extents_u, dtype=wp.float32, requires_grad=False
+        )
+        self.wp_static_surface_extents_v = wp.from_torch(
+            self.torch_static_surface_extents_v, dtype=wp.float32, requires_grad=False
+        )
+        self.wp_static_surface_kinds = wp.from_torch(
+            self.torch_static_surface_kinds, dtype=wp.int32, requires_grad=False
+        )
+        self.static_surface_count = len(surfaces)
+        self.static_surface_query_distance = scalar_values["query_distance"]
+        self.static_surface_margin = scalar_values["margin"]
+        self.static_surface_restitution = scalar_values["restitution"]
+        self.static_surface_friction = scalar_values["friction"]
+
+    def set_static_collision_mesh(
+        self,
+        vertices,
+        faces,
+        *,
+        query_distance=0.1,
+        winding_accuracy=2.0,
+        winding_threshold=0.5,
+        margin=0.0,
+        restitution=0.0,
+        friction=0.5,
+    ):
+        """Install one immutable closed collision mesh before graph capture."""
+
+        vertices_np = np.asarray(vertices, dtype=np.float32)
+        faces_np = np.asarray(faces, dtype=np.int32)
+        if vertices_np.ndim != 2 or vertices_np.shape[1] != 3:
+            raise ValueError("static mesh vertices must have shape (V, 3)")
+        if faces_np.ndim != 2 or faces_np.shape[1] != 3:
+            raise ValueError("static mesh faces must have shape (F, 3)")
+        if len(vertices_np) == 0 or len(faces_np) == 0:
+            raise ValueError("static collision mesh must be non-empty")
+        if not np.isfinite(vertices_np).all():
+            raise ValueError("static mesh vertices contain non-finite values")
+        if int(faces_np.min()) < 0 or int(faces_np.max()) >= len(vertices_np):
+            raise ValueError("static mesh contains an invalid face index")
+
+        # Signed winding requires a closed surface.  Every undirected edge of
+        # each disconnected proxy component must therefore occur twice.
+        edge_counts = {}
+        for face in faces_np:
+            for first, second in (
+                (int(face[0]), int(face[1])),
+                (int(face[1]), int(face[2])),
+                (int(face[2]), int(face[0])),
+            ):
+                edge = (min(first, second), max(first, second))
+                edge_counts[edge] = edge_counts.get(edge, 0) + 1
+        open_edges = [edge for edge, count in edge_counts.items() if count != 2]
+        if open_edges:
+            raise ValueError(
+                "static collision mesh is not closed; "
+                f"{len(open_edges)} edges do not have exactly two incident faces"
+            )
+
+        scalar_values = {
+            "query_distance": float(query_distance),
+            "winding_accuracy": float(winding_accuracy),
+            "winding_threshold": float(winding_threshold),
+            "margin": float(margin),
+            "restitution": float(restitution),
+            "friction": float(friction),
+        }
+        if not all(np.isfinite(value) for value in scalar_values.values()):
+            raise ValueError("static mesh contact parameters must be finite")
+        if scalar_values["query_distance"] <= 0.0:
+            raise ValueError("static mesh query_distance must be positive")
+        if scalar_values["winding_accuracy"] <= 0.0:
+            raise ValueError("static mesh winding_accuracy must be positive")
+        if not 0.0 <= scalar_values["winding_threshold"] <= 1.0:
+            raise ValueError("static mesh winding_threshold must be in [0, 1]")
+        if scalar_values["margin"] < 0.0:
+            raise ValueError("static mesh margin must be non-negative")
+        if not 0.0 <= scalar_values["restitution"] <= 1.0:
+            raise ValueError("static mesh restitution must be in [0, 1]")
+        if not 0.0 <= scalar_values["friction"] <= 2.0:
+            raise ValueError("static mesh friction must be in [0, 2]")
+
+        vertices_t = torch.as_tensor(
+            np.ascontiguousarray(vertices_np),
+            dtype=torch.float32,
+            device=self.device,
+        ).contiguous()
+        faces_t = torch.as_tensor(
+            np.ascontiguousarray(faces_np.reshape(-1)),
+            dtype=torch.int32,
+            device=self.device,
+        ).contiguous()
+        self.torch_static_mesh_points = vertices_t
+        self.torch_static_mesh_indices = faces_t
+        self.wp_static_mesh_points = wp.from_torch(
+            vertices_t,
+            dtype=wp.vec3,
+            requires_grad=False,
+        )
+        self.wp_static_mesh_indices = wp.from_torch(
+            faces_t,
+            dtype=wp.int32,
+            requires_grad=False,
+        )
+        self.static_collision_mesh = wp.Mesh(
+            points=self.wp_static_mesh_points,
+            indices=self.wp_static_mesh_indices,
+            support_winding_number=True,
+        )
+        self.static_mesh_enabled = 1
+        self.static_mesh_id = self.static_collision_mesh.id
+        self.static_mesh_query_distance = scalar_values["query_distance"]
+        self.static_mesh_winding_accuracy = scalar_values["winding_accuracy"]
+        self.static_mesh_winding_threshold = scalar_values["winding_threshold"]
+        self.static_mesh_margin = scalar_values["margin"]
+        self.static_mesh_restitution = scalar_values["restitution"]
+        self.static_mesh_friction = scalar_values["friction"]
 
     def update_local_spring_subset(self, spring_indices, springs, rest_lengths):
         spring_indices = spring_indices.to(
@@ -1047,6 +1664,26 @@ class SpringMassSystemWarp:
                     self.wp_static_box_mins,
                     self.wp_static_box_maxs,
                     self.static_box_count,
+                    self.wp_static_surface_centers,
+                    self.wp_static_surface_normals,
+                    self.wp_static_surface_axes_u,
+                    self.wp_static_surface_axes_v,
+                    self.wp_static_surface_extents_u,
+                    self.wp_static_surface_extents_v,
+                    self.wp_static_surface_kinds,
+                    self.static_surface_count,
+                    self.static_surface_query_distance,
+                    self.static_surface_margin,
+                    self.static_surface_restitution,
+                    self.static_surface_friction,
+                    self.static_mesh_enabled,
+                    self.static_mesh_id,
+                    self.static_mesh_query_distance,
+                    self.static_mesh_winding_accuracy,
+                    self.static_mesh_winding_threshold,
+                    self.static_mesh_margin,
+                    self.static_mesh_restitution,
+                    self.static_mesh_friction,
                 ],
                 outputs=[self.wp_states[i + 1].wp_x, self.wp_states[i + 1].wp_v],
             )         

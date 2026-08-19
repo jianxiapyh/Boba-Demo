@@ -50,4 +50,5 @@ exec env \
   --immersive_eye_resolution 1344 \
   --immersive_controller_translation_scale 0.25 \
   --immersive_viewer_upload_mode pbo \
-  --immersive_viewer_upload_thread auto
+  --immersive_viewer_upload_thread auto \
+  "$@"

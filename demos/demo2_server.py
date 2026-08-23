@@ -23,6 +23,7 @@ from demos.demo2.case_assets import (
     select_controller_bank,
 )
 from demos.demo2.qr_overlay import make_public_url, make_qr_rgb
+from demos.demo2.replay_state import ReplayStateStore
 from demos.demo2.session_manager import SessionManager
 from demos.demo2.streaming import MjpegFrameStore
 
@@ -56,6 +57,15 @@ def build_parser():
     )
     parser.add_argument("--replay_start", type=int, default=0)
     parser.add_argument("--replay_end", type=int, default=None)
+    parser.add_argument(
+        "--demo2_runtime_fps",
+        type=float,
+        default=None,
+        help=(
+            "Simulation/replay frame rate. Defaults to the packaged case metadata "
+            "FPS instead of running as fast as the renderer allows."
+        ),
+    )
     parser.add_argument("--phone_stream_size", type=parse_size, default=parse_size("640x480"))
     parser.add_argument("--phone_stream_fps", type=float, default=10.0)
     parser.add_argument("--heartbeat_timeout_s", type=float, default=10.0)
@@ -67,6 +77,21 @@ def build_parser():
         help="Maximum accumulated manual offset; 0 disables clamping.",
     )
     parser.add_argument("--demo2_control_parts", choices=("auto", "1", "2"), default="auto")
+    parser.add_argument(
+        "--demo2_replay_marker_session",
+        type=int,
+        default=None,
+        help="Show the real replay interaction-point marker on one unclaimed tile.",
+    )
+    parser.add_argument(
+        "--demo2_replay_action_threshold",
+        type=float,
+        default=0.0,
+        help=(
+            "Minimum aggregate controller motion per runtime step before poster "
+            "arrows activate; use a small positive value to suppress subpixel easing."
+        ),
+    )
     parser.add_argument("--demo2_double_control_cases", type=str, default="weird_package")
     parser.add_argument(
         "--demo2_debug_motion",
@@ -95,7 +120,7 @@ def request_token():
     return data.get("token") or request.args.get("token") or ""
 
 
-def create_app(session_manager, stream_store):
+def create_app(session_manager, stream_store, replay_state_store=None):
     app = Flask(__name__)
     phone_html = load_phone_client_html()
     asset_dir = REPO_ROOT / "assets"
@@ -149,6 +174,16 @@ def create_app(session_manager, stream_store):
     @app.get("/api/sessions")
     def list_sessions():
         return jsonify({"sessions": session_manager.list_sessions(token=request.args.get("token"))})
+
+    @app.get("/api/replay/<int:session_id>")
+    def replay_state(session_id):
+        require_valid_session(session_id)
+        if replay_state_store is None:
+            return jsonify({"error": "Replay state is unavailable"}), 503
+        state = replay_state_store.get(session_id)
+        if state is None:
+            return jsonify({"error": "Replay state is not ready"}), 503
+        return jsonify(state)
 
     @app.post("/api/sessions/<int:session_id>/claim")
     def claim_session(session_id):
@@ -270,6 +305,14 @@ def main():
         raise ValueError("--phone_control_step must be non-negative")
     if args.phone_control_max_offset < 0:
         raise ValueError("--phone_control_max_offset must be non-negative")
+    if args.demo2_runtime_fps is not None and args.demo2_runtime_fps <= 0:
+        raise ValueError("--demo2_runtime_fps must be positive")
+    if args.demo2_replay_marker_session is not None and not (
+        0 <= args.demo2_replay_marker_session < args.batch_size
+    ):
+        raise ValueError("--demo2_replay_marker_session must fit inside the batch")
+    if args.demo2_replay_action_threshold < 0:
+        raise ValueError("--demo2_replay_action_threshold must be non-negative")
     double_control_cases = [
         value.strip()
         for value in args.demo2_double_control_cases.split(",")
@@ -324,7 +367,11 @@ def main():
         heartbeat_timeout_s=args.heartbeat_timeout_s,
     )
     stream_store = MjpegFrameStore(jpeg_quality=80)
-    app = create_app(session_manager, stream_store)
+    replay_state_store = ReplayStateStore(
+        args.batch_size,
+        control_parts=resolved_control_parts,
+    )
+    app = create_app(session_manager, stream_store, replay_state_store)
     start_flask_server(app, args.host, args.port)
 
     output_dir = args.output_dir or os.path.join("results", "demo2", args.case_name)
@@ -346,7 +393,16 @@ def main():
         from qqtt import InvPhyTrainerWarp
         from qqtt.utils import cfg, logger
 
-        load_demo2_case_config(case_assets, cfg, logger)
+        case_metadata = load_demo2_case_config(case_assets, cfg, logger)
+        demo2_runtime_fps = (
+            float(args.demo2_runtime_fps)
+            if args.demo2_runtime_fps is not None
+            else float(case_metadata.get("fps", 30.0))
+        )
+        if demo2_runtime_fps <= 0:
+            raise ValueError("Demo 2 runtime FPS resolved to a non-positive value")
+        replay_state_store.set_runtime_fps(demo2_runtime_fps)
+        print(f"[Demo2] Runtime FPS: {demo2_runtime_fps:g}")
 
         logger.set_log_file(path=output_dir, name="demo2_server")
         trainer = InvPhyTrainerWarp(
@@ -376,12 +432,16 @@ def main():
             replay_end=args.replay_end,
             session_snapshot_fn=session_manager.snapshot_sessions,
             publish_frame_fn=stream_store.publish_rgb,
+            publish_replay_state_fn=replay_state_store.publish,
             qr_overlay_rgb=qr_overlay,
             phone_stream_size=args.phone_stream_size,
             phone_stream_fps=args.phone_stream_fps,
+            demo2_runtime_fps=demo2_runtime_fps,
             phone_control_step=args.phone_control_step,
             phone_control_max_offset=args.phone_control_max_offset,
             demo2_control_parts=resolved_control_parts,
+            demo2_replay_marker_session=args.demo2_replay_marker_session,
+            demo2_replay_action_threshold=args.demo2_replay_action_threshold,
             demo2_debug_motion=args.demo2_debug_motion,
             demo2_debug_motion_path=motion_debug_path,
             max_frames=args.max_frames,

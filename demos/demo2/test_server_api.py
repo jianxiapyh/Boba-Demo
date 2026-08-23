@@ -15,6 +15,11 @@ from demos.demo2.case_assets import (
     select_controller_bank,
 )
 from demos.demo2.session_manager import SessionManager
+from demos.demo2.replay_state import (
+    ReplayStateStore,
+    build_replay_action_table,
+    controls_from_world_delta,
+)
 from demos.demo2.streaming import MjpegFrameStore
 from demos.demo2_server import (
     REPO_ROOT,
@@ -41,6 +46,73 @@ class ButtonParser(HTMLParser):
 
 
 class Demo2ServerApiTest(unittest.TestCase):
+    def test_replay_state_route_reports_rendered_actions(self):
+        manager = SessionManager(num_sessions=2)
+        store = ReplayStateStore(num_sessions=2, control_parts=2)
+        store.set_runtime_fps(30)
+        app = create_app(manager, MjpegFrameStore(), store)
+        client = app.test_client()
+
+        self.assertEqual(client.get("/api/replay/0").status_code, 503)
+        store.publish(
+            17,
+            [4, 8],
+            [(('left', 'zneg'), ('right', 'xpos')), ()],
+        )
+        response = client.get("/api/replay/0")
+        self.assertEqual(response.status_code, 200)
+        state = response.get_json()
+        self.assertEqual(state["sequence"], 17)
+        self.assertEqual(state["frame_idx"], 4)
+        self.assertEqual(state["control_parts"], 2)
+        self.assertEqual(state["runtime_fps"], 30.0)
+        self.assertEqual(
+            state["controls"],
+            [
+                {"hand": "left", "control": "zneg"},
+                {"hand": "right", "control": "xpos"},
+            ],
+        )
+
+    def test_replay_world_motion_maps_to_phone_buttons(self):
+        self.assertEqual(
+            controls_from_world_delta("left", (-1, 2, -3)),
+            (("left", "xneg"), ("left", "ypos"), ("left", "zneg")),
+        )
+        self.assertEqual(
+            controls_from_world_delta("right", (1, -2, 3)),
+            (("right", "xpos"), ("right", "yneg"), ("right", "zpos")),
+        )
+
+    def test_replay_action_table_is_neutral_on_reset_and_tracks_both_hands(self):
+        points = np.zeros((1, 3, 4, 3), dtype=np.float32)
+        points[0, 1, :2, 0] = -0.1
+        points[0, 1, 2:, 2] = 0.2
+        points[0, 2] = points[0, 1]
+        actions = build_replay_action_table(points, ([0, 1], [2, 3]))
+        self.assertEqual(actions[0][0], ())
+        self.assertEqual(
+            actions[0][1],
+            (("left", "xneg"), ("right", "zpos")),
+        )
+        self.assertEqual(actions[0][2], ())
+
+    def test_single_interaction_point_uses_one_aggregate_control_pad(self):
+        points = np.zeros((1, 2, 4, 3), dtype=np.float32)
+        points[0, 1, :2, 0] = -0.2
+        points[0, 1, 2:, 2] = 0.4
+        actions = build_replay_action_table(points, ([0, 1, 2, 3],))
+        self.assertEqual(
+            actions[0][1],
+            (("left", "xneg"), ("left", "zpos")),
+        )
+        filtered = build_replay_action_table(
+            points,
+            ([0, 1, 2, 3],),
+            motion_epsilon=0.3,
+        )
+        self.assertEqual(filtered[0][1], ())
+
     def test_claim_conflict_and_input_auth(self):
         manager = SessionManager(num_sessions=2)
         app = create_app(manager, MjpegFrameStore())
@@ -239,6 +311,9 @@ class Demo2ServerApiTest(unittest.TestCase):
         self.assertEqual(args.case_name, "single_push_rope_4")
         self.assertEqual(args.phone_stream_size, (640, 480))
         self.assertEqual(args.phone_control_max_offset, 0.0)
+        self.assertIsNone(args.demo2_runtime_fps)
+        self.assertIsNone(args.demo2_replay_marker_session)
+        self.assertEqual(args.demo2_replay_action_threshold, 0.0)
         self.assertIsNone(args.controller_pkl)
         self.assertFalse(hasattr(args, "base_path"))
         self.assertFalse(hasattr(args, "gaussian_path"))

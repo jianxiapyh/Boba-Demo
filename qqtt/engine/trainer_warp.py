@@ -17,6 +17,7 @@ import warp as wp
 import open3d as o3d
 
 from demos.demo2.control import add_vectors_clamped, control_vector_to_step
+from demos.demo2.replay_state import build_replay_action_table
 from gaussian_splatting.scene.cameras import Camera
 from gaussian_splatting.scene.gaussian_model import GaussianModel
 from gaussian_splatting.dynamic_utils import (
@@ -1382,6 +1383,45 @@ class InvPhyTrainerWarp:
             for mask in masks
         ]
 
+    def _resolve_demo2_interaction_masks(self, control_masks, runtime):
+        """Keep only controller nodes that can physically drive the object.
+
+        The controller trajectories can contain points without any spring to the
+        object. Averaging those points makes a displayed hand move more slowly
+        than the controller nodes that actually move the rope, and can introduce
+        phone directions that exert no force. The interaction marker and replay
+        buttons must therefore use the controller endpoints present in
+        controller-object springs.
+        """
+        object_nodes = int(runtime.object_nodes_per_instance)
+        controller_nodes = int(runtime.controller_nodes_per_instance)
+        springs = self.init_springs.detach().to(dtype=torch.long)
+        endpoint_a = springs[:, 0]
+        endpoint_b = springs[:, 1]
+        a_is_controller = endpoint_a >= object_nodes
+        b_is_controller = endpoint_b >= object_nodes
+        cross_springs = torch.logical_xor(a_is_controller, b_is_controller)
+        controller_endpoints = torch.where(
+            a_is_controller,
+            endpoint_a,
+            endpoint_b,
+        )[cross_springs]
+        connected = torch.unique(controller_endpoints - object_nodes)
+        connected = connected[
+            (connected >= 0) & (connected < controller_nodes)
+        ]
+
+        interaction_masks = []
+        for part_idx, indices in enumerate(control_masks):
+            connected_for_part = indices[torch.isin(indices, connected)]
+            if connected_for_part.numel() == 0:
+                raise RuntimeError(
+                    "Demo 2 interaction region "
+                    f"{part_idx} has no controller-object spring endpoints"
+                )
+            interaction_masks.append(connected_for_part)
+        return interaction_masks
+
     def _update_demo2_control_offsets(
         self,
         control_offsets,
@@ -1475,6 +1515,7 @@ class InvPhyTrainerWarp:
     def _load_demo2_hand_icons(self, render_backend, dtype, device):
         asset_dir = Path(__file__).resolve().parents[2] / "assets"
         icons = []
+        fingertip_anchors = []
         for filename in ("Picture2.png", "Picture1.png"):
             path = asset_dir / filename
             image = render_backend.cv2.imread(
@@ -1485,9 +1526,34 @@ class InvPhyTrainerWarp:
                 raise FileNotFoundError(f"Missing Demo 2 hand icon asset: {path}")
             if image.ndim != 3 or image.shape[2] != 4:
                 raise ValueError(f"Expected RGBA hand icon asset: {path}")
+
+            # The largest opaque component is the hand; the smaller components
+            # are the decorative arrows. Anchor the physical interaction point
+            # at the top of the index fingertip instead of the image center.
+            alpha_mask = (image[:, :, 3] > 0).astype(np.uint8)
+            component_count, labels, stats, _ = (
+                render_backend.cv2.connectedComponentsWithStats(
+                    alpha_mask,
+                    connectivity=8,
+                )
+            )
+            if component_count < 2:
+                raise ValueError(f"Hand icon has no opaque component: {path}")
+            hand_label = 1 + int(np.argmax(stats[1:, 4]))
+            hand_y, hand_x = np.where(labels == hand_label)
+            fingertip_y = int(hand_y.min())
+            fingertip_cap = hand_y <= fingertip_y + 3
+            fingertip_x = float(np.median(hand_x[fingertip_cap]))
+            image_height, image_width = image.shape[:2]
+            fingertip_anchors.append(
+                (
+                    fingertip_x / float(max(1, image_width - 1)),
+                    fingertip_y / float(max(1, image_height - 1)),
+                )
+            )
             image = np.ascontiguousarray(image[:, :, [2, 1, 0, 3]])
             icons.append(torch.tensor(image, device=device, dtype=dtype))
-        return icons
+        return icons, fingertip_anchors
 
     def _project_demo2_point_to_tile(
         self,
@@ -1552,7 +1618,15 @@ class InvPhyTrainerWarp:
         )
         return max(1, min(size, 100))
 
-    def _overlay_demo2_hand_icon(self, frame, x, y, icon, icon_size):
+    def _overlay_demo2_hand_icon(
+        self,
+        frame,
+        x,
+        y,
+        icon,
+        icon_size,
+        fingertip_anchor,
+    ):
         icon_size = int(icon_size)
         if icon_size < 1:
             return
@@ -1564,8 +1638,9 @@ class InvPhyTrainerWarp:
         ).squeeze(0).permute(1, 2, 0)
         icon_h, icon_w = int(resized.shape[0]), int(resized.shape[1])
         frame_h, frame_w = int(frame.shape[0]), int(frame.shape[1])
-        left = int(round(x)) - icon_w // 2
-        top = int(round(y)) - icon_h // 2
+        anchor_x, anchor_y = [float(value) for value in fingertip_anchor]
+        left = int(round(float(x) - anchor_x * float(icon_w - 1)))
+        top = int(round(float(y) - anchor_y * float(icon_h - 1)))
         roi_x0 = max(0, left)
         roi_y0 = max(0, top)
         roi_x1 = min(frame_w, left + icon_w)
@@ -1589,28 +1664,43 @@ class InvPhyTrainerWarp:
         runtime,
         control_offsets,
         occupied_sessions,
+        replay_marker_sessions,
         control_masks,
         hand_anchor_points,
         hand_icons,
+        hand_icon_fingertip_anchors,
         camera_x_axis,
         w2c_T,
         intrinsic_T,
+        current_target,
+        replay_base_target,
     ):
-        if not occupied_sessions:
+        marker_sessions = sorted(
+            set(int(value) for value in occupied_sessions)
+            | set(int(value) for value in replay_marker_sessions)
+        )
+        if not marker_sessions:
             return batch_frames
 
         tile_height, tile_width = int(batch_frames.shape[1]), int(batch_frames.shape[2])
         hand_size = 0.1
-        for session_id in sorted(int(value) for value in occupied_sessions):
+        occupied_set = set(int(value) for value in occupied_sessions)
+        controller_nodes = int(runtime.controller_nodes_per_instance)
+        for session_id in marker_sessions:
             if session_id < 0 or session_id >= int(runtime.batch_size):
                 continue
             for part_idx, indices in enumerate(control_masks):
                 if indices.numel() == 0:
                     continue
-                local_point = hand_anchor_points[part_idx] + control_offsets[
-                    session_id,
-                    part_idx,
-                ]
+                if session_id in occupied_set:
+                    point_offset = control_offsets[session_id, part_idx]
+                else:
+                    start = session_id * controller_nodes
+                    point_offset = (
+                        current_target[start + indices]
+                        - replay_base_target[start + indices]
+                    ).mean(dim=0)
+                local_point = hand_anchor_points[part_idx] + point_offset
                 pixel = self._project_demo2_point_to_tile(
                     local_point,
                     w2c_T=w2c_T,
@@ -1629,12 +1719,14 @@ class InvPhyTrainerWarp:
                     tile_width,
                     tile_height,
                 )
+                icon_idx = min(part_idx, len(hand_icons) - 1)
                 self._overlay_demo2_hand_icon(
                     batch_frames[session_id],
                     pixel[0],
                     pixel[1],
-                    hand_icons[min(part_idx, len(hand_icons) - 1)],
+                    hand_icons[icon_idx],
                     icon_size,
+                    hand_icon_fingertip_anchors[icon_idx],
                 )
         return batch_frames
 
@@ -2361,12 +2453,16 @@ class InvPhyTrainerWarp:
         input_snapshot_fn=None,
         occupied_sessions_fn=None,
         publish_frame_fn=None,
+        publish_replay_state_fn=None,
         qr_overlay_rgb=None,
         phone_stream_size=(640, 480),
         phone_stream_fps=10.0,
+        demo2_runtime_fps=30.0,
         phone_control_step=0.005,
         phone_control_max_offset=0.0,
         demo2_control_parts=1,
+        demo2_replay_marker_session=None,
+        demo2_replay_action_threshold=0.0,
         demo2_debug_motion=False,
         demo2_debug_motion_path=None,
         max_frames=None,
@@ -2389,6 +2485,8 @@ class InvPhyTrainerWarp:
             raise ValueError("batch_grid_cols must be a positive integer.")
         if phone_stream_fps <= 0:
             raise ValueError("phone_stream_fps must be positive.")
+        if demo2_runtime_fps <= 0:
+            raise ValueError("demo2_runtime_fps must be positive.")
         if phone_control_step < 0:
             raise ValueError("phone_control_step must be non-negative.")
         if phone_control_max_offset < 0:
@@ -2396,6 +2494,12 @@ class InvPhyTrainerWarp:
         demo2_control_parts = int(demo2_control_parts)
         if demo2_control_parts not in (1, 2):
             raise ValueError("demo2_control_parts must be 1 or 2.")
+        if demo2_replay_marker_session is not None and not (
+            0 <= int(demo2_replay_marker_session) < batch_size
+        ):
+            raise ValueError("demo2_replay_marker_session must fit inside the batch")
+        if demo2_replay_action_threshold < 0:
+            raise ValueError("demo2_replay_action_threshold must be non-negative")
 
         runtime = self._build_runtime_core(
             model_path=model_path,
@@ -2413,7 +2517,7 @@ class InvPhyTrainerWarp:
             "[Demo2] Runtime ready: "
             f"batch_size={runtime.batch_size}, replay={replay_start}:{replay_end}, "
             f"gaussian_render_mode={gaussian_render_mode}, sim_force_mode={sim_force_mode}, "
-            f"control_parts={demo2_control_parts}"
+            f"control_parts={demo2_control_parts}, runtime_fps={float(demo2_runtime_fps):g}"
         )
         reset_state = self._snapshot_demo2_reset_state(runtime)
 
@@ -2448,7 +2552,23 @@ class InvPhyTrainerWarp:
             w2c=w2c,
             intrinsic=intrinsic,
         )
-        hand_anchor_points = self._resolve_demo2_hand_anchor_points(control_masks)
+        interaction_masks = self._resolve_demo2_interaction_masks(
+            control_masks,
+            runtime,
+        )
+        print(
+            "[Demo2] Physical interaction controllers: "
+            + ", ".join(
+                f"part {part_idx + 1}={int(indices.numel())}"
+                for part_idx, indices in enumerate(interaction_masks)
+            )
+        )
+        replay_action_table = build_replay_action_table(
+            controller_points_group[:batch_size].detach().cpu().numpy(),
+            [indices.detach().cpu().numpy() for indices in interaction_masks],
+            motion_epsilon=float(demo2_replay_action_threshold),
+        )
+        hand_anchor_points = self._resolve_demo2_hand_anchor_points(interaction_masks)
         c2w = np.linalg.inv(np.asarray(w2c, dtype=np.float32))
         camera_x_axis = torch.tensor(
             c2w[:3, 0],
@@ -2467,7 +2587,7 @@ class InvPhyTrainerWarp:
                 interpolation=render_backend.cv2.INTER_LINEAR,
             )
         overlay = torch.tensor(overlay, dtype=torch.float32, device=cfg.device)
-        hand_icons = self._load_demo2_hand_icons(
+        hand_icons, hand_icon_fingertip_anchors = self._load_demo2_hand_icons(
             render_backend,
             dtype=overlay.dtype,
             device=cfg.device,
@@ -2642,12 +2762,30 @@ class InvPhyTrainerWarp:
             )
             replay_cursors = [int(replay_start) for _ in range(int(runtime.batch_size))]
             active_claim_ids = [None for _ in range(int(runtime.batch_size))]
+            replay_marker_sessions = (
+                ()
+                if demo2_replay_marker_session is None
+                else (int(demo2_replay_marker_session),)
+            )
 
             frame_counter = 0
             prev_target = self.batch_controller_points[replay_start].clone()
+            runtime_frame_interval = 1.0 / float(demo2_runtime_fps)
+            next_runtime_frame = time.monotonic()
             while not render_backend.glfw.window_should_close(window):
                 if max_frames is not None and frame_counter >= int(max_frames):
                     break
+
+                now = time.monotonic()
+                delay = next_runtime_frame - now
+                if delay > 0.0:
+                    time.sleep(delay)
+                    now = time.monotonic()
+                elif now - next_runtime_frame > runtime_frame_interval:
+                    # Do not burst through several simulation steps after an
+                    # occasional slow render; resume the real-time cadence.
+                    next_runtime_frame = now
+                next_runtime_frame += runtime_frame_interval
 
                 raw_snapshot = session_snapshot_fn()
                 session_snapshot = {
@@ -2735,6 +2873,35 @@ class InvPhyTrainerWarp:
                     self.simulator.wp_states[-1].wp_v,
                 )
 
+                # Render the object state produced by this controller target.
+                # Updating the Gaussians after display would show rope state t-1
+                # beside the interaction marker and phone action for target t.
+                try:
+                    current_pos, current_rot = lbs_with_rotation_reuse(
+                        current_mass_nodes=x,
+                        cache=runtime.rotation_cache,
+                    )
+                except torch._C._LinAlgError as exc:
+                    batch_element = self._parse_linalg_batch_element(exc)
+                    hinted_instance = None
+                    if batch_element is not None:
+                        hinted_instance = int(batch_element) // int(
+                            runtime.object_nodes_per_instance
+                        )
+                        if hinted_instance < 0 or hinted_instance >= runtime.batch_size:
+                            hinted_instance = None
+                    raise BatchedReplayCheckError(
+                        "Demo 2 LBS failed with torch.linalg.eigh "
+                        f"at runtime frame {frame_counter}. "
+                        "Regenerate the filtered trajectory bank with this replay range.",
+                        frame_idx=frame_counter,
+                        batch_element=batch_element,
+                        hinted_instance=hinted_instance,
+                        original_error=exc,
+                    ) from exc
+                runtime.gaussians._xyz = current_pos
+                runtime.gaussians._rotation = current_rot
+
                 results = render_backend.render_gaussian(
                     view,
                     render_gaussians,
@@ -2763,12 +2930,16 @@ class InvPhyTrainerWarp:
                     runtime=runtime,
                     control_offsets=control_offsets,
                     occupied_sessions=occupied_sessions,
-                    control_masks=control_masks,
+                    replay_marker_sessions=replay_marker_sessions,
+                    control_masks=interaction_masks,
                     hand_anchor_points=hand_anchor_points,
                     hand_icons=hand_icons,
+                    hand_icon_fingertip_anchors=hand_icon_fingertip_anchors,
                     camera_x_axis=camera_x_axis,
                     w2c_T=w2c_T,
                     intrinsic_T=intrinsic_T,
+                    current_target=current_target,
+                    replay_base_target=self.batch_controller_points[replay_start],
                 )
 
                 batch_grid = self._make_batch_image_grid(
@@ -2874,6 +3045,23 @@ class InvPhyTrainerWarp:
                 render_backend.glfw.swap_buffers(window)
                 render_backend.glfw.poll_events()
 
+                if publish_replay_state_fn is not None:
+                    controls_by_session = [
+                        (
+                            ()
+                            if active_claim_ids[session_id] is not None
+                            else replay_action_table[session_id][
+                                replay_cursors[session_id]
+                            ]
+                        )
+                        for session_id in range(int(runtime.batch_size))
+                    ]
+                    publish_replay_state_fn(
+                        frame_counter,
+                        list(replay_cursors),
+                        controls_by_session,
+                    )
+
                 end_of_replay_sessions = []
                 for session_id in range(int(runtime.batch_size)):
                     if active_claim_ids[session_id] is not None:
@@ -2898,32 +3086,6 @@ class InvPhyTrainerWarp:
                         next_prev_target[start:end].copy_(
                             self.batch_controller_points[replay_start, start:end]
                         )
-
-                try:
-                    current_pos, current_rot = lbs_with_rotation_reuse(
-                        current_mass_nodes=x,
-                        cache=runtime.rotation_cache,
-                    )
-                except torch._C._LinAlgError as exc:
-                    batch_element = self._parse_linalg_batch_element(exc)
-                    hinted_instance = None
-                    if batch_element is not None:
-                        hinted_instance = int(batch_element) // int(
-                            runtime.object_nodes_per_instance
-                        )
-                        if hinted_instance < 0 or hinted_instance >= runtime.batch_size:
-                            hinted_instance = None
-                    raise BatchedReplayCheckError(
-                        "Demo 2 LBS failed with torch.linalg.eigh "
-                        f"at runtime frame {frame_counter}. "
-                        "Regenerate the filtered trajectory bank with this replay range.",
-                        frame_idx=frame_counter,
-                        batch_element=batch_element,
-                        hinted_instance=hinted_instance,
-                        original_error=exc,
-                    ) from exc
-                runtime.gaussians._xyz = current_pos
-                runtime.gaussians._rotation = current_rot
 
                 prev_target = next_prev_target
                 frame_counter += 1

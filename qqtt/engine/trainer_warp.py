@@ -58,7 +58,7 @@ from qqtt.live_openxr import (
     controller_pose_position,
     hand_anchor,
 )
-from qqtt.quest_display import OpenXRFramePanelMirror, OpenXRImmersiveBridge
+from qqtt.quest_display import OpenXRFramePanelMirror, create_immersive_bridge
 from qqtt.immersive_scene import (
     SimpleLabSceneRenderer,
     ensure_simple_lab_assets,
@@ -35253,7 +35253,7 @@ class InvPhyTrainerWarp:
             )
             reusing_immersive_session = immersive_bridge is not None
             if immersive_bridge is None:
-                immersive_bridge = OpenXRImmersiveBridge(
+                immersive_bridge = create_immersive_bridge(
                     repo_root,
                     width=eye_width,
                     height=eye_height,

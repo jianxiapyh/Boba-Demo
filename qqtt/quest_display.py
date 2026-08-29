@@ -4440,3 +4440,12 @@ class OpenXRImmersiveBridge(OpenXRFramePanelMirror):
             recommended_width=int(payload["recommended_width"]),
             recommended_height=int(payload["recommended_height"]),
         )
+
+
+def create_immersive_bridge(repo_root: Path, width: int, height: int):
+    """Create the live bridge selected by the launch environment."""
+    if os.environ.get("BOBA_ILLIXR_INPUT_SOCKET"):
+        from qqtt.illixr_bridge import ILLIXRImmersiveBridge
+
+        return ILLIXRImmersiveBridge(repo_root, width=width, height=height)
+    return OpenXRImmersiveBridge(repo_root, width=width, height=height)

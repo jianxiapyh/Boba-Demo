@@ -34,6 +34,12 @@ BRIDGE_DEPS_CHECK_SCRIPT = (
     REPO_ROOT / "linux_pose_probe" / "check_boba_immersive_bridge_deps.sh"
 )
 CUDA_STARTUP_DEBUG_ENV = "BOBA_CUDA_STARTUP_DEBUG"
+ILLIXR_BRIDGE_ENV_VARS = (
+    "BOBA_ILLIXR_INPUT_SOCKET",
+    "BOBA_ILLIXR_FRAME_PATH",
+    "BOBA_ILLIXR_OVERLAY_PATH",
+    "BOBA_ILLIXR_MODAL_PATH",
+)
 
 
 class StartupConfigurationError(RuntimeError):
@@ -124,6 +130,8 @@ def ensure_direct_launch_runtime_env(argv: list[str] | None = None) -> None:
 
 
 def ensure_immersive_bridge_system_deps() -> None:
+    if os.environ.get("BOBA_ILLIXR_INPUT_SOCKET"):
+        return
     clean_env = os.environ.copy()
     clean_env.pop("LD_LIBRARY_PATH", None)
     result = subprocess.run(
@@ -141,6 +149,21 @@ def ensure_immersive_bridge_system_deps() -> None:
         "Immersive bridge dependency preflight failed."
     )
     raise StartupConfigurationError(detail)
+
+
+def configure_illixr_launch(enabled: bool) -> None:
+    """Make the ILLIXR bridge an explicit launch-time opt-in."""
+    if not enabled:
+        for name in ILLIXR_BRIDGE_ENV_VARS:
+            os.environ.pop(name, None)
+        return
+
+    missing = [name for name in ILLIXR_BRIDGE_ENV_VARS if not os.environ.get(name)]
+    if missing:
+        raise StartupConfigurationError(
+            "--illixr requires the ILLIXR launcher environment; missing "
+            + ", ".join(missing)
+        )
 
 
 def env_flag_enabled(name: str) -> bool:
@@ -495,10 +518,19 @@ def build_parser() -> ArgumentParser:
         formatter_class=ArgumentDefaultsHelpFormatter,
         description=(
             "Run the shipped Boba Quest immersive demo. "
-            "This launcher is fixed to live OpenXR controllers, immersive Quest display, "
+            "Standalone OpenXR is the default; --illixr enables the ILLIXR-managed bridge. "
+            "The launcher uses immersive Quest display, "
             "a launch-time Lab or Garden scene, and the balanced immersive preset. "
             "Runtime demo assets are resolved from ./assets/."
         )
+    )
+    parser.add_argument(
+        "--illixr",
+        action="store_true",
+        help=(
+            "use the ILLIXR-managed input/output bridge; intended for the ILLIXR "
+            "plugin, which supplies the required socket and shared-memory paths"
+        ),
     )
     parser.add_argument(
         "--scene",
@@ -803,6 +835,7 @@ def main(argv: list[str] | None = None):
     ensure_direct_launch_runtime_env(argv)
     parser = build_parser()
     args = parser.parse_args(argv)
+    configure_illixr_launch(args.illixr)
     if args.scene == "garden":
         # Garden is itself part of the batched Gaussian render.  The static
         # adapter supplies a depthless retained frame, so static workers and
@@ -870,7 +903,12 @@ def main(argv: list[str] | None = None):
     except AttributeError:
         pass
 
-    print("[quest_display] input_source=live_openxr_controller", flush=True)
+    input_source = (
+        "illixr_switchboard"
+        if os.environ.get("BOBA_ILLIXR_INPUT_SOCKET")
+        else "live_openxr_controller"
+    )
+    print(f"[quest_display] input_source={input_source}", flush=True)
     print("[quest_display] controller_mode=multi_points", flush=True)
     print("[quest_display] mode=immersive", flush=True)
     print(

@@ -151,3 +151,11 @@ If that import fails, rebuild PyCUDA with CUDA OpenGL interoperability enabled f
 ### No display or OpenGL context
 
 Run from the working X11 desktop session and confirm `DISPLAY` is set. Hidden-window mode still creates an OpenGL context and cannot run from a display-less shell.
+
+## License
+
+Except where otherwise noted, Boba-Demo is licensed under the
+[Apache License 2.0](LICENSE). See [NOTICE](NOTICE) for attribution information.
+Vendored software and externally sourced assets retain their respective
+licenses; consult the license files distributed with those components and the
+asset-specific licensing documents under `assets/`.

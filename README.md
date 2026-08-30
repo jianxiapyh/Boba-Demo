@@ -88,3 +88,9 @@ python interactive_playground_batched_view_orin.py \
 ## OpenXR helper programs
 
 `linux_pose_probe/` contains the standalone OpenXR/Linux helper programs used for headset, hand, controller, and Quest frame-panel bring-up. Build scripts are included; binaries are intentionally not committed.
+
+## License
+
+Except where otherwise noted, Boba-Demo is licensed under the
+[Apache License 2.0](LICENSE). See [NOTICE](NOTICE) for attribution information.
+Third-party software and assets retain their respective licenses.

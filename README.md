@@ -1,5 +1,11 @@
 # Boba Phone Demo
 
+> **Operating the demo?** Start with the
+> [copy-friendly HTML operator guide](PHONE_DEMO_OPERATOR_GUIDE.html). After
+> cloning this branch, open it locally with
+> `xdg-open PHONE_DEMO_OPERATOR_GUIDE.html`. A
+> [plain Markdown version](PHONE_DEMO_OPERATOR_GUIDE.md) is also available.
+
 This branch packages Boba Demo 2: a 100-session batched replay on the workstation display with QR-based phone claiming, phone controls, and a low-latency per-session phone stream.
 
 ## Prerequisite: working Boba-Batched

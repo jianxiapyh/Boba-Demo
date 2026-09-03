@@ -436,6 +436,12 @@
     };
     const heldControls = new Map();
     const pointerButtons = new Map();
+    let streamSocket = null;
+    let streamFallbackTimer = null;
+    let streamObjectUrl = "";
+    let inputDirty = false;
+    let inputSendRunning = false;
+    let inputRetryTimer = null;
 
     function setStatus(text) {
       statusEl.textContent = text;
@@ -487,21 +493,143 @@
       document.body.classList.remove("controller-mode", "portrait-controller");
     }
 
+    function mjpegStreamUrl(sessionId, claimToken) {
+      return (
+        "/stream/" + sessionId + ".mjpg?token="
+        + encodeURIComponent(claimToken)
+        + "&t=" + Date.now()
+      );
+    }
+
+    function stopPhoneStream() {
+      if (streamFallbackTimer !== null) {
+        clearTimeout(streamFallbackTimer);
+        streamFallbackTimer = null;
+      }
+      const socket = streamSocket;
+      streamSocket = null;
+      if (socket && socket.readyState < WebSocket.CLOSING) {
+        socket.close();
+      }
+      streamEl.onload = null;
+      streamEl.onerror = null;
+      streamEl.removeAttribute("src");
+      if (streamObjectUrl) {
+        URL.revokeObjectURL(streamObjectUrl);
+        streamObjectUrl = "";
+      }
+      document.body.dataset.streamTransport = "none";
+    }
+
+    function useMjpegFallback(sessionId, claimToken) {
+      if (currentSession !== sessionId || token !== claimToken) return;
+      if (streamFallbackTimer !== null) {
+        clearTimeout(streamFallbackTimer);
+        streamFallbackTimer = null;
+      }
+      const socket = streamSocket;
+      streamSocket = null;
+      if (socket && socket.readyState < WebSocket.CLOSING) {
+        socket.close();
+      }
+      streamEl.onload = null;
+      streamEl.onerror = null;
+      if (streamObjectUrl) {
+        URL.revokeObjectURL(streamObjectUrl);
+        streamObjectUrl = "";
+      }
+      document.body.dataset.streamTransport = "mjpeg";
+      streamEl.src = mjpegStreamUrl(sessionId, claimToken);
+    }
+
+    function startPhoneStream(sessionId, claimToken) {
+      stopPhoneStream();
+      const scheme = window.location.protocol === "https:" ? "wss" : "ws";
+      const socketUrl = (
+        scheme + "://" + window.location.host + "/ws/stream/" + sessionId
+        + "?token=" + encodeURIComponent(claimToken)
+      );
+      let socket;
+      try {
+        socket = new WebSocket(socketUrl);
+      } catch (_) {
+        useMjpegFallback(sessionId, claimToken);
+        return;
+      }
+
+      streamSocket = socket;
+      socket.binaryType = "blob";
+      document.body.dataset.streamTransport = "connecting";
+      streamFallbackTimer = window.setTimeout(() => {
+        if (streamSocket === socket) {
+          useMjpegFallback(sessionId, claimToken);
+        }
+      }, 4000);
+
+      socket.addEventListener("message", (event) => {
+        if (
+          streamSocket !== socket
+          || currentSession !== sessionId
+          || token !== claimToken
+          || typeof event.data === "string"
+        ) {
+          return;
+        }
+
+        if (streamFallbackTimer !== null) {
+          clearTimeout(streamFallbackTimer);
+          streamFallbackTimer = null;
+        }
+        document.body.dataset.streamTransport = "websocket";
+        const previousUrl = streamObjectUrl;
+        const nextUrl = URL.createObjectURL(event.data);
+        streamObjectUrl = nextUrl;
+        streamEl.onload = () => {
+          if (previousUrl) URL.revokeObjectURL(previousUrl);
+          if (streamSocket === socket && socket.readyState === WebSocket.OPEN) {
+            socket.send("next");
+          }
+        };
+        streamEl.onerror = () => {
+          URL.revokeObjectURL(nextUrl);
+          if (streamObjectUrl === nextUrl) streamObjectUrl = "";
+          useMjpegFallback(sessionId, claimToken);
+        };
+        streamEl.src = nextUrl;
+      });
+      socket.addEventListener("error", () => {
+        if (streamSocket === socket) {
+          useMjpegFallback(sessionId, claimToken);
+        }
+      });
+      socket.addEventListener("close", () => {
+        if (streamSocket === socket) {
+          useMjpegFallback(sessionId, claimToken);
+        }
+      });
+    }
+
     function setClaim(sessionId, newToken) {
       currentSession = sessionId;
       token = newToken;
       localStorage.setItem("bobaDemo2Session", String(sessionId));
       localStorage.setItem("bobaDemo2Token", newToken);
-      streamEl.src = `/stream/${sessionId}.mjpg?token=${encodeURIComponent(newToken)}&t=${Date.now()}`;
+      startPhoneStream(sessionId, newToken);
       enterControllerMode();
+      queueInputSend();
     }
 
     function clearClaim() {
+      stopPhoneStream();
       currentSession = null;
       token = "";
+      inputDirty = false;
+      if (inputRetryTimer !== null) {
+        clearTimeout(inputRetryTimer);
+        inputRetryTimer = null;
+      }
       localStorage.removeItem("bobaDemo2Session");
       localStorage.removeItem("bobaDemo2Token");
-      streamEl.removeAttribute("src");
       viewerEl.classList.remove("active");
       clearHeldControls();
       exitControllerMode();
@@ -606,6 +734,7 @@
           heldControls.has(`${button.dataset.hand}:${button.dataset.key}`)
         );
       });
+      queueInputSend();
     }
 
     function pressButton(button) {
@@ -677,16 +806,60 @@
       }, { passive: false });
     }
 
-    async function sendInput() {
+    function queueInputSend() {
       if (currentSession === null || !token) return;
+      inputDirty = true;
+      if (inputRetryTimer !== null) {
+        clearTimeout(inputRetryTimer);
+        inputRetryTimer = null;
+      }
+      void flushInput();
+    }
+
+    function retryInputSoon() {
+      if (inputRetryTimer !== null) return;
+      inputRetryTimer = window.setTimeout(() => {
+        inputRetryTimer = null;
+        void flushInput();
+      }, 100);
+    }
+
+    async function flushInput() {
+      if (inputSendRunning || !inputDirty || currentSession === null || !token) return;
+      inputSendRunning = true;
       try {
-        await fetch(`/api/sessions/${currentSession}/input`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ token, left: input.left, right: input.right })
-        });
-      } catch (_) {
-        // Keep the control loop quiet; heartbeat handles stale sessions visibly.
+        while (inputDirty && currentSession !== null && token) {
+          inputDirty = false;
+          const sessionId = currentSession;
+          const claimToken = token;
+          const payload = JSON.stringify({
+            token: claimToken,
+            left: input.left,
+            right: input.right
+          });
+          try {
+            const response = await fetch(
+              "/api/sessions/" + sessionId + "/input",
+              {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: payload
+              }
+            );
+            if (!response.ok) throw new Error("HTTP " + response.status);
+          } catch (_) {
+            if (currentSession === sessionId && token === claimToken) {
+              inputDirty = true;
+              retryInputSoon();
+            }
+            break;
+          }
+        }
+      } finally {
+        inputSendRunning = false;
+        if (inputDirty && inputRetryTimer === null) {
+          void flushInput();
+        }
       }
     }
 
@@ -708,7 +881,6 @@
 
     setInterval(refreshSessions, 2000);
     setInterval(heartbeat, 3000);
-    setInterval(sendInput, 33);
     updateViewportVars();
     refreshSessions();
     if (currentSession !== null && token) {

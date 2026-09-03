@@ -16,8 +16,19 @@ import warp as wp
 
 import open3d as o3d
 
-from demos.demo2.control import add_vectors_clamped, control_vector_to_step
+from demos.demo2.control import (
+    add_vectors_clamped,
+    control_vector_to_step,
+    resolve_controller_part_indices,
+    resolve_phone_to_world_axis_signs,
+)
+from demos.demo2.ground_control import (
+    build_ground_offset_limits,
+    clamp_control_offsets_to_ground,
+)
 from demos.demo2.replay_state import build_replay_action_table
+from demos.demo2.stream_activity import ActivityStreamPolicy
+from demos.demo2.throughput import AggregateThroughputMeter
 from gaussian_splatting.scene.cameras import Camera
 from gaussian_splatting.scene.gaussian_model import GaussianModel
 from gaussian_splatting.dynamic_utils import (
@@ -46,6 +57,22 @@ SIM_FORCE_MODES = (
     SIM_FORCE_MODE_GATHER,
     SIM_FORCE_MODE_TEMPLATE_STATE_BATCHED_ATOMIC,
 )
+
+_DEMO2_PIXEL_FONT = {
+    "A": ("01110", "10001", "10001", "11111", "10001", "10001", "10001"),
+    "G": ("01110", "10001", "10000", "10111", "10001", "10001", "01110"),
+    "H": ("10001", "10001", "10001", "11111", "10001", "10001", "10001"),
+    "I": ("11111", "00100", "00100", "00100", "00100", "00100", "11111"),
+    "N": ("10001", "11001", "10101", "10011", "10001", "10001", "10001"),
+    "O": ("01110", "10001", "10001", "10001", "10001", "10001", "01110"),
+    "P": ("11110", "10001", "10001", "11110", "10000", "10000", "10000"),
+    "R": ("11110", "10001", "10001", "11110", "10100", "10010", "10001"),
+    "S": ("01111", "10000", "10000", "01110", "00001", "00001", "11110"),
+    "T": ("11111", "00100", "00100", "00100", "00100", "00100", "00100"),
+    "U": ("10001", "10001", "10001", "10001", "10001", "10001", "01110"),
+    "/": ("00001", "00010", "00010", "00100", "01000", "01000", "10000"),
+    " ": ("00000",) * 7,
+}
 
 
 class BatchedReplayCheckError(RuntimeError):
@@ -1337,50 +1364,19 @@ class InvPhyTrainerWarp:
 
     def _resolve_demo2_control_masks(self, demo2_control_parts, w2c, intrinsic):
         controller_points = self.controller_points[0].detach()
-        num_controller_points = int(controller_points.shape[0])
-        all_indices = torch.arange(
-            num_controller_points,
-            device=controller_points.device,
-            dtype=torch.long,
+        part_indices = resolve_controller_part_indices(
+            controller_points.detach().cpu().numpy(),
+            demo2_control_parts,
+            w2c=w2c,
+            intrinsic=intrinsic,
         )
-        if int(demo2_control_parts) == 1:
-            return [all_indices]
-        if num_controller_points < 2:
-            return [all_indices, all_indices]
-
-        try:
-            from sklearn.cluster import KMeans
-        except Exception as exc:
-            raise RuntimeError(
-                "Demo 2 two-hand control requires scikit-learn for controller "
-                "point splitting."
-            ) from exc
-
-        points_np = controller_points.detach().cpu().numpy()
-        labels = KMeans(n_clusters=2, random_state=0, n_init=10).fit_predict(points_np)
-        masks = [labels == 0, labels == 1]
-        if not masks[0].any() or not masks[1].any():
-            return [all_indices, all_indices]
-
-        centers = [points_np[mask].mean(axis=0) for mask in masks]
-        proj_mat = np.asarray(intrinsic, dtype=np.float32) @ np.asarray(
-            w2c[:3, :], dtype=np.float32
-        )
-        projected_x = []
-        for center in centers:
-            center_h = np.concatenate([center, [1.0]], axis=0)
-            projected = proj_mat @ center_h
-            projected = projected / projected[-1]
-            projected_x.append(float(projected[0]))
-        if projected_x[0] > projected_x[1]:
-            masks = [masks[1], masks[0]]
-
         return [
-            torch.from_numpy(mask)
-            .to(device=controller_points.device, dtype=torch.bool)
-            .nonzero(as_tuple=False)
-            .squeeze(1)
-            for mask in masks
+            torch.as_tensor(
+                indices,
+                device=controller_points.device,
+                dtype=torch.long,
+            )
+            for indices in part_indices
         ]
 
     def _resolve_demo2_interaction_masks(self, control_masks, runtime):
@@ -1429,6 +1425,7 @@ class InvPhyTrainerWarp:
         control_step,
         control_max_offset,
         control_parts,
+        control_axis_signs,
     ):
         occupied_set = {
             int(session_id)
@@ -1455,6 +1452,7 @@ class InvPhyTrainerWarp:
                     control_vector[1],
                     control_vector[2],
                     control_step,
+                    axis_signs=control_axis_signs,
                 )
                 step_tensor = torch.tensor(
                     step,
@@ -1776,6 +1774,148 @@ class InvPhyTrainerWarp:
                 )
             cursor += 6 * scale
 
+    def _demo2_text_width(self, value, scale):
+        text = str(value)
+        if not text:
+            return 0
+        return (len(text) * 6 - 1) * int(scale)
+
+    def _draw_demo2_text(self, frame, value, x, y, scale, color):
+        scale = max(1, int(scale))
+        cursor = int(x)
+        for character in str(value).upper():
+            rows = _DEMO2_PIXEL_FONT.get(character, _DEMO2_PIXEL_FONT[" "])
+            for row_idx, row in enumerate(rows):
+                for col_idx, enabled in enumerate(row):
+                    if enabled != "1":
+                        continue
+                    self._draw_demo2_rect(
+                        frame,
+                        cursor + col_idx * scale,
+                        y + row_idx * scale,
+                        cursor + (col_idx + 1) * scale,
+                        y + (row_idx + 1) * scale,
+                        color,
+                    )
+            cursor += 6 * scale
+
+    def _overlay_demo2_aggregate_throughput(
+        self,
+        frame,
+        aggregate_throughput,
+        *,
+        margin,
+        qr_bounds=None,
+    ):
+        display_height, display_width = int(frame.shape[0]), int(frame.shape[1])
+        available_width = display_width - 2 * int(margin)
+        if available_width < 120 or display_height < 60:
+            return
+
+        qr_width = 0 if qr_bounds is None else int(qr_bounds[2] - qr_bounds[0])
+        panel_width = min(max(260, qr_width), available_width)
+        inner_width = panel_width - 18
+        label = "AGG THROUGHPUT"
+        label_scale = max(
+            1,
+            min(3, inner_width // max(1, self._demo2_text_width(label, 1))),
+        )
+        value = float(aggregate_throughput)
+        if not math.isfinite(value):
+            value = 0.0
+        digits = str(min(999999, max(0, int(round(value)))))
+        suffix = "INST/S"
+        suffix_scale = label_scale
+        value_scale = 5
+        while value_scale > 1:
+            row_width = (
+                self._demo2_text_width(digits, value_scale)
+                + 2 * label_scale
+                + self._demo2_text_width(suffix, suffix_scale)
+            )
+            if row_width <= inner_width:
+                break
+            value_scale -= 1
+
+        padding = max(6, 3 * label_scale)
+        row_gap = max(4, 2 * label_scale)
+        label_height = 7 * label_scale
+        value_height = 8 * value_scale
+        panel_height = 2 * padding + label_height + row_gap + value_height
+        panel_x = display_width - panel_width - int(margin)
+        panel_y = int(margin)
+        if qr_bounds is not None:
+            below_qr = int(qr_bounds[3]) + int(margin)
+            if below_qr + panel_height <= display_height - int(margin):
+                panel_y = below_qr
+            else:
+                panel_x = max(
+                    int(margin),
+                    int(qr_bounds[0]) - panel_width - int(margin),
+                )
+        panel_y = max(0, min(panel_y, display_height - panel_height))
+
+        panel_bg = torch.tensor(
+            [0.0, 0.0, 0.0], device=frame.device, dtype=frame.dtype
+        )
+        panel_fg = torch.tensor(
+            [255.0, 255.0, 255.0], device=frame.device, dtype=frame.dtype
+        )
+        panel_accent = torch.tensor(
+            [0.0, 220.0, 255.0], device=frame.device, dtype=frame.dtype
+        )
+        self._draw_demo2_rect(
+            frame,
+            panel_x,
+            panel_y,
+            panel_x + panel_width,
+            panel_y + panel_height,
+            panel_bg,
+        )
+        border = max(2, label_scale)
+        self._draw_demo2_rect(
+            frame,
+            panel_x,
+            panel_y,
+            panel_x + panel_width,
+            panel_y + border,
+            panel_accent,
+        )
+        label_x = panel_x + padding
+        label_y = panel_y + padding
+        self._draw_demo2_text(
+            frame,
+            label,
+            label_x,
+            label_y,
+            label_scale,
+            panel_accent,
+        )
+        value_x = label_x
+        value_y = label_y + label_height + row_gap
+        self._draw_demo2_number(
+            frame,
+            digits,
+            value_x,
+            value_y,
+            value_scale,
+            panel_fg,
+        )
+        suffix_x = (
+            value_x
+            + self._demo2_text_width(digits, value_scale)
+            + 2 * label_scale
+        )
+        suffix_y = value_y + max(0, (value_height - 7 * suffix_scale) // 2)
+        self._draw_demo2_text(
+            frame,
+            suffix,
+            suffix_x,
+            suffix_y,
+            suffix_scale,
+            panel_fg,
+        )
+
     def _overlay_demo2_public_display(
         self,
         frame,
@@ -1784,8 +1924,11 @@ class InvPhyTrainerWarp:
         batch_grid_cols,
         occupied_sessions,
         qr_overlay=None,
+        wifi_qr_overlay=None,
+        aggregate_throughput=None,
     ):
         display_height, display_width = int(frame.shape[0]), int(frame.shape[1])
+        margin = max(12, min(display_width, display_height) // 80)
         cols = (
             int(batch_grid_cols)
             if batch_grid_cols is not None
@@ -1827,14 +1970,36 @@ class InvPhyTrainerWarp:
                 label_fg,
             )
 
+        if wifi_qr_overlay is not None:
+            wifi_qr_height = int(wifi_qr_overlay.shape[0])
+            wifi_qr_width = int(wifi_qr_overlay.shape[1])
+            wifi_x0 = int(margin)
+            wifi_y0 = int(margin)
+            wifi_x1 = min(display_width, wifi_x0 + wifi_qr_width)
+            wifi_y1 = min(display_height, wifi_y0 + wifi_qr_height)
+            frame[wifi_y0:wifi_y1, wifi_x0:wifi_x1, :] = wifi_qr_overlay[
+                : wifi_y1 - wifi_y0,
+                : wifi_x1 - wifi_x0,
+                :,
+            ]
+
+        qr_bounds = None
         if qr_overlay is not None:
             qr_height, qr_width = int(qr_overlay.shape[0]), int(qr_overlay.shape[1])
-            margin = max(12, min(display_width, display_height) // 80)
             x0 = max(0, display_width - qr_width - margin)
             y0 = margin
             x1 = min(display_width, x0 + qr_width)
             y1 = min(display_height, y0 + qr_height)
             frame[y0:y1, x0:x1, :] = qr_overlay[: y1 - y0, : x1 - x0, :]
+            qr_bounds = (x0, y0, x1, y1)
+
+        if aggregate_throughput is not None:
+            self._overlay_demo2_aggregate_throughput(
+                frame,
+                aggregate_throughput,
+                margin=margin,
+                qr_bounds=qr_bounds,
+            )
 
     def _update_demo2_motion_debug(
         self,
@@ -2452,11 +2617,17 @@ class InvPhyTrainerWarp:
         session_snapshot_fn=None,
         input_snapshot_fn=None,
         occupied_sessions_fn=None,
+        stream_session_ids_fn=None,
         publish_frame_fn=None,
         publish_replay_state_fn=None,
         qr_overlay_rgb=None,
+        wifi_qr_overlay_rgb=None,
         phone_stream_size=(640, 480),
-        phone_stream_fps=10.0,
+        phone_stream_max_fps=0.0,
+        phone_stream_settle_motion=1e-4,
+        phone_stream_settle_frames=5,
+        phone_stream_full_rate_settle_s=1.0,
+        phone_stream_recovery_fps=2.0,
         demo2_runtime_fps=30.0,
         phone_control_step=0.005,
         phone_control_max_offset=0.0,
@@ -2483,8 +2654,15 @@ class InvPhyTrainerWarp:
             )
         if batch_grid_cols is not None and int(batch_grid_cols) < 1:
             raise ValueError("batch_grid_cols must be a positive integer.")
-        if phone_stream_fps <= 0:
-            raise ValueError("phone_stream_fps must be positive.")
+        if phone_stream_max_fps < 0:
+            raise ValueError("phone_stream_max_fps must be non-negative.")
+        stream_activity_policy = ActivityStreamPolicy(
+            batch_size,
+            motion_threshold=phone_stream_settle_motion,
+            stable_frames=phone_stream_settle_frames,
+            full_rate_settle_s=phone_stream_full_rate_settle_s,
+            recovery_fps=phone_stream_recovery_fps,
+        )
         if demo2_runtime_fps <= 0:
             raise ValueError("demo2_runtime_fps must be positive.")
         if phone_control_step < 0:
@@ -2520,6 +2698,14 @@ class InvPhyTrainerWarp:
             f"control_parts={demo2_control_parts}, runtime_fps={float(demo2_runtime_fps):g}"
         )
         reset_state = self._snapshot_demo2_reset_state(runtime)
+        object_nodes = int(runtime.object_nodes_per_instance)
+        object_state_count = int(runtime.batch_size) * object_nodes
+        reset_object_positions = reset_state.object_x[:object_state_count].reshape(
+            int(runtime.batch_size),
+            object_nodes,
+            3,
+        )
+        previous_object_positions = reset_object_positions.clone()
 
         render_backend = self._load_render_backend()
         render_backend.glfw.make_context_current(window)
@@ -2547,10 +2733,32 @@ class InvPhyTrainerWarp:
         w2c_cuda = torch.tensor(w2c, dtype=torch.float32, device=cfg.device)
         w2c_T = w2c_cuda.T.contiguous()
         intrinsic_T = K_cuda.T.contiguous()
+        control_axis_signs = resolve_phone_to_world_axis_signs(
+            self.controller_points[0].detach().cpu().numpy(),
+            w2c=w2c,
+            intrinsic=intrinsic,
+        )
+        print(
+            "[Demo2] Phone-to-world axis signs: "
+            + ", ".join(
+                f"{axis}={sign:+g}"
+                for axis, sign in zip("XYZ", control_axis_signs)
+            )
+        )
         control_masks = self._resolve_demo2_control_masks(
             demo2_control_parts,
             w2c=w2c,
             intrinsic=intrinsic,
+        )
+        base_phone_targets = self.batch_controller_points[replay_start].reshape(
+            int(runtime.batch_size),
+            int(runtime.controller_nodes_per_instance),
+            3,
+        )
+        ground_offset_limits = build_ground_offset_limits(
+            base_phone_targets,
+            control_masks,
+            self.simulator.reverse_factor,
         )
         interaction_masks = self._resolve_demo2_interaction_masks(
             control_masks,
@@ -2567,6 +2775,7 @@ class InvPhyTrainerWarp:
             controller_points_group[:batch_size].detach().cpu().numpy(),
             [indices.detach().cpu().numpy() for indices in interaction_masks],
             motion_epsilon=float(demo2_replay_action_threshold),
+            axis_signs=control_axis_signs,
         )
         hand_anchor_points = self._resolve_demo2_hand_anchor_points(interaction_masks)
         c2w = np.linalg.inv(np.asarray(w2c, dtype=np.float32))
@@ -2722,6 +2931,13 @@ class InvPhyTrainerWarp:
                     device=cfg.device,
                     dtype=frame.dtype,
                 )
+            wifi_qr_overlay = None
+            if wifi_qr_overlay_rgb is not None:
+                wifi_qr_overlay = torch.tensor(
+                    wifi_qr_overlay_rgb,
+                    device=cfg.device,
+                    dtype=frame.dtype,
+                )
 
             input_snapshot_fn = input_snapshot_fn or (lambda: {})
             occupied_sessions_fn = occupied_sessions_fn or (lambda: [])
@@ -2740,7 +2956,11 @@ class InvPhyTrainerWarp:
 
             session_snapshot_fn = session_snapshot_fn or legacy_session_snapshot
             stream_width, stream_height = [int(value) for value in phone_stream_size]
-            stream_interval = 1.0 / float(phone_stream_fps)
+            stream_interval = (
+                1.0 / float(phone_stream_max_fps)
+                if phone_stream_max_fps > 0
+                else None
+            )
             next_stream_publish = 0.0
             control_offsets = torch.zeros(
                 (int(runtime.batch_size), demo2_control_parts, 3),
@@ -2771,6 +2991,11 @@ class InvPhyTrainerWarp:
             frame_counter = 0
             prev_target = self.batch_controller_points[replay_start].clone()
             runtime_frame_interval = 1.0 / float(demo2_runtime_fps)
+            throughput_meter = AggregateThroughputMeter(
+                runtime.batch_size,
+                window_size=max(2, int(round(float(demo2_runtime_fps)))),
+            )
+            aggregate_throughput = 0.0
             next_runtime_frame = time.monotonic()
             while not render_backend.glfw.window_should_close(window):
                 if max_frames is not None and frame_counter >= int(max_frames):
@@ -2786,6 +3011,7 @@ class InvPhyTrainerWarp:
                     # occasional slow render; resume the real-time cadence.
                     next_runtime_frame = now
                 next_runtime_frame += runtime_frame_interval
+                aggregate_throughput = throughput_meter.sample(now)
 
                 raw_snapshot = session_snapshot_fn()
                 session_snapshot = {
@@ -2793,6 +3019,7 @@ class InvPhyTrainerWarp:
                     for session_id, claim in raw_snapshot.items()
                     if 0 <= int(session_id) < int(runtime.batch_size)
                 }
+                stream_activity_policy.observe_inputs(session_snapshot, now)
                 occupied_sessions = sorted(session_snapshot.keys())
                 current_claim_ids = {
                     session_id: int(claim.get("claim_id", 1))
@@ -2820,6 +3047,9 @@ class InvPhyTrainerWarp:
                         reset_sessions,
                     )
                     control_offsets[reset_sessions].zero_()
+                    previous_object_positions[reset_sessions].copy_(
+                        reset_object_positions[reset_sessions]
+                    )
                     for session_id in reset_sessions:
                         replay_cursors[session_id] = replay_start
 
@@ -2834,6 +3064,12 @@ class InvPhyTrainerWarp:
                     float(phone_control_step),
                     float(phone_control_max_offset),
                     demo2_control_parts,
+                    control_axis_signs,
+                )
+                clamp_control_offsets_to_ground(
+                    control_offsets,
+                    ground_offset_limits,
+                    self.simulator.reverse_factor,
                 )
 
                 current_target = self.batch_controller_points[replay_start].clone()
@@ -2872,6 +3108,31 @@ class InvPhyTrainerWarp:
                     self.simulator.wp_states[-1].wp_x,
                     self.simulator.wp_states[-1].wp_v,
                 )
+
+                current_object_positions = x[:object_state_count].reshape(
+                    int(runtime.batch_size),
+                    object_nodes,
+                    3,
+                )
+                motion_session_ids = stream_activity_policy.motion_session_ids()
+                if motion_session_ids:
+                    motion_ids = torch.tensor(
+                        motion_session_ids,
+                        device=current_object_positions.device,
+                        dtype=torch.long,
+                    )
+                    displacement = (
+                        current_object_positions[motion_ids]
+                        - previous_object_positions[motion_ids]
+                    )
+                    rms_motion = torch.sqrt(
+                        torch.mean(torch.sum(displacement.square(), dim=2), dim=1)
+                    )
+                    stream_activity_policy.observe_motion(
+                        dict(zip(motion_session_ids, rms_motion.detach().cpu().tolist())),
+                        time.monotonic(),
+                    )
+                previous_object_positions.copy_(current_object_positions)
 
                 # Render the object state produced by this controller target.
                 # Updating the Gaussians after display would show rope state t-1
@@ -2965,16 +3226,35 @@ class InvPhyTrainerWarp:
                     batch_grid_cols=batch_grid_cols,
                     occupied_sessions=occupied_sessions,
                     qr_overlay=qr_overlay,
+                    wifi_qr_overlay=wifi_qr_overlay,
+                    aggregate_throughput=aggregate_throughput,
                 )
 
-                now = time.time()
+                stream_session_ids = None
+                now = time.monotonic()
                 if (
                     publish_frame_fn is not None
                     and occupied_sessions
-                    and now >= next_stream_publish
+                    and (stream_interval is None or now >= next_stream_publish)
                 ):
+                    stream_session_ids = occupied_sessions
+                    if stream_session_ids_fn is not None:
+                        occupied_set = set(occupied_sessions)
+                        stream_session_ids = [
+                            int(session_id)
+                            for session_id in stream_session_ids_fn(occupied_sessions)
+                            if int(session_id) in occupied_set
+                        ]
+                    stream_session_ids = stream_activity_policy.eligible_sessions(
+                        stream_session_ids,
+                        now,
+                    )
+                    if not stream_session_ids:
+                        stream_session_ids = None
+
+                if stream_session_ids:
                     occupied_ids = torch.tensor(
-                        occupied_sessions,
+                        stream_session_ids,
                         device=batch_frames.device,
                         dtype=torch.long,
                     )
@@ -2991,10 +3271,12 @@ class InvPhyTrainerWarp:
                         .cpu()
                         .numpy()
                     )
-                    for idx, session_id in enumerate(occupied_sessions):
+                    for idx, session_id in enumerate(stream_session_ids):
                         rgb = stream_rgbs[idx]
                         publish_frame_fn(session_id, rgb)
-                    next_stream_publish = now + stream_interval
+                    stream_activity_policy.mark_published(stream_session_ids, now)
+                    if stream_interval is not None:
+                        next_stream_publish = now + stream_interval
 
                 frame_u8 = frame.clamp(0, 255).to(torch.uint8)
                 frame_rgba[:, :, :3] = frame_u8

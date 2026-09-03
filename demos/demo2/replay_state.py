@@ -7,12 +7,22 @@ import time
 
 import numpy as np
 
+from demos.demo2.control import (
+    PHONE_TO_WORLD_AXIS_SIGNS,
+    normalize_axis_signs,
+)
+
 
 VALID_HANDS = ("left", "right")
 VALID_CONTROLS = ("xneg", "xpos", "yneg", "ypos", "zneg", "zpos")
 
 
-def controls_from_world_delta(hand: str, delta, epsilon: float = 1e-7):
+def controls_from_world_delta(
+    hand: str,
+    delta,
+    epsilon: float = 1e-7,
+    axis_signs=PHONE_TO_WORLD_AXIS_SIGNS,
+):
     """Map a controller's world-space motion to the matching phone buttons."""
     if hand not in VALID_HANDS:
         raise ValueError(f"Unknown hand: {hand!r}")
@@ -20,15 +30,17 @@ def controls_from_world_delta(hand: str, delta, epsilon: float = 1e-7):
     if delta.shape != (3,):
         raise ValueError(f"Expected a 3D delta, got shape {delta.shape}")
     epsilon = abs(float(epsilon))
+    phone_delta = delta * np.asarray(normalize_axis_signs(axis_signs))
 
     controls = []
-    # Phone X/Y are mirrored relative to this scene's world axes; Z agrees.
-    if abs(float(delta[0])) > epsilon:
-        controls.append((hand, "xneg" if delta[0] < 0 else "xpos"))
-    if abs(float(delta[1])) > epsilon:
-        controls.append((hand, "ypos" if delta[1] > 0 else "yneg"))
-    if abs(float(delta[2])) > epsilon:
-        controls.append((hand, "zneg" if delta[2] < 0 else "zpos"))
+    # Control names match the fixed phone/poster button cells. Convert world
+    # motion back through the per-case sign calibration before choosing them.
+    if abs(float(phone_delta[0])) > epsilon:
+        controls.append((hand, "xneg" if phone_delta[0] > 0 else "xpos"))
+    if abs(float(phone_delta[1])) > epsilon:
+        controls.append((hand, "yneg" if phone_delta[1] > 0 else "ypos"))
+    if abs(float(phone_delta[2])) > epsilon:
+        controls.append((hand, "zpos" if phone_delta[2] > 0 else "zneg"))
     return tuple(controls)
 
 
@@ -37,6 +49,7 @@ def build_replay_action_table(
     hand_indices,
     epsilon: float = 1e-7,
     motion_epsilon: float = 0.0,
+    axis_signs=PHONE_TO_WORLD_AXIS_SIGNS,
 ):
     """Return active phone buttons for every trajectory and replay frame.
 
@@ -55,6 +68,7 @@ def build_replay_action_table(
     if len(hand_indices) not in (1, 2):
         raise ValueError("hand_indices must contain one or two interaction regions")
     motion_epsilon = abs(float(motion_epsilon))
+    axis_signs = normalize_axis_signs(axis_signs)
 
     normalized_indices = []
     for indices in hand_indices:
@@ -78,7 +92,14 @@ def build_replay_action_table(
                 mean_delta = frame_delta[indices].mean(axis=0)
                 if float(np.linalg.norm(mean_delta)) <= motion_epsilon:
                     continue
-                active.extend(controls_from_world_delta(hand, mean_delta, epsilon))
+                active.extend(
+                    controls_from_world_delta(
+                        hand,
+                        mean_delta,
+                        epsilon,
+                        axis_signs,
+                    )
+                )
             trajectory_actions.append(tuple(active))
         result.append(tuple(trajectory_actions))
     return tuple(result)

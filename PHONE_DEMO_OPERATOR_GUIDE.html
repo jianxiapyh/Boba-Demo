@@ -1,0 +1,918 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Phone Demo — On-Site Launch Guide</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --ink: #171528;
+      --muted: #625f73;
+      --paper: #fffdf8;
+      --panel: #ffffff;
+      --line: #ded9e9;
+      --purple: #5b3cc4;
+      --purple-dark: #402493;
+      --purple-soft: #eee9ff;
+      --green: #18724b;
+      --green-soft: #e3f6ec;
+      --amber: #8a5400;
+      --amber-soft: #fff1cd;
+      --code: #171522;
+      --code-ink: #f8f6ff;
+      --shadow: 0 16px 45px rgba(49, 35, 93, 0.11);
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    html {
+      scroll-behavior: smooth;
+    }
+
+    body {
+      margin: 0;
+      background:
+        radial-gradient(circle at 8% 0%, #eee7ff 0, transparent 28rem),
+        radial-gradient(circle at 100% 20%, #fff0ca 0, transparent 25rem),
+        var(--paper);
+      color: var(--ink);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+        "Segoe UI", sans-serif;
+      font-size: 17px;
+      line-height: 1.6;
+    }
+
+    a {
+      color: var(--purple-dark);
+    }
+
+    button {
+      font: inherit;
+    }
+
+    .page {
+      width: min(1100px, calc(100% - 32px));
+      margin: 0 auto;
+      padding: 42px 0 80px;
+    }
+
+    .hero {
+      padding: clamp(28px, 5vw, 56px);
+      overflow: hidden;
+      position: relative;
+      border: 1px solid rgba(91, 60, 196, 0.18);
+      border-radius: 28px;
+      background: rgba(255, 255, 255, 0.88);
+      box-shadow: var(--shadow);
+    }
+
+    .hero::after {
+      content: "";
+      position: absolute;
+      width: 220px;
+      height: 220px;
+      right: -75px;
+      top: -90px;
+      border-radius: 50%;
+      background: linear-gradient(145deg, #7557df, #e1d8ff);
+      opacity: 0.36;
+    }
+
+    .eyebrow {
+      margin: 0 0 8px;
+      color: var(--purple-dark);
+      font-size: 0.82rem;
+      font-weight: 800;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+    }
+
+    h1,
+    h2,
+    h3 {
+      line-height: 1.18;
+    }
+
+    h1 {
+      max-width: 760px;
+      margin: 0;
+      font-size: clamp(2.15rem, 6vw, 4.25rem);
+      letter-spacing: -0.045em;
+    }
+
+    h2 {
+      margin: 0 0 18px;
+      font-size: clamp(1.7rem, 4vw, 2.45rem);
+      letter-spacing: -0.025em;
+    }
+
+    h3 {
+      margin: 26px 0 10px;
+      font-size: 1.18rem;
+    }
+
+    .lede {
+      max-width: 750px;
+      margin: 18px 0 0;
+      color: var(--muted);
+      font-size: 1.08rem;
+    }
+
+    .tags {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 9px;
+      margin-top: 24px;
+    }
+
+    .tag {
+      padding: 7px 12px;
+      border-radius: 999px;
+      background: var(--purple-soft);
+      color: var(--purple-dark);
+      font-size: 0.88rem;
+      font-weight: 750;
+    }
+
+    .mode-grid,
+    .check-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 18px;
+      margin-top: 24px;
+    }
+
+    .mode-card {
+      display: block;
+      padding: 24px;
+      border: 1px solid var(--line);
+      border-radius: 20px;
+      background: var(--panel);
+      color: inherit;
+      text-decoration: none;
+      box-shadow: 0 8px 25px rgba(38, 28, 72, 0.06);
+      transition: transform 150ms ease, border-color 150ms ease;
+    }
+
+    .mode-card:hover {
+      transform: translateY(-2px);
+      border-color: var(--purple);
+    }
+
+    .mode-number {
+      color: var(--purple);
+      font-size: 0.8rem;
+      font-weight: 850;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+    }
+
+    .mode-title {
+      display: block;
+      margin-top: 5px;
+      font-size: 1.35rem;
+      font-weight: 800;
+    }
+
+    .mode-card p {
+      margin: 8px 0 0;
+      color: var(--muted);
+    }
+
+    section {
+      margin-top: 34px;
+      padding: clamp(24px, 4vw, 42px);
+      border: 1px solid var(--line);
+      border-radius: 24px;
+      background: rgba(255, 255, 255, 0.94);
+      box-shadow: 0 10px 32px rgba(40, 30, 76, 0.06);
+      scroll-margin-top: 20px;
+    }
+
+    .section-kicker {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 10px;
+      padding: 5px 10px;
+      border-radius: 999px;
+      color: var(--green);
+      background: var(--green-soft);
+      font-size: 0.78rem;
+      font-weight: 850;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+
+    .internet {
+      color: var(--purple-dark);
+      background: var(--purple-soft);
+    }
+
+    ol,
+    ul {
+      padding-left: 1.4em;
+    }
+
+    li + li {
+      margin-top: 7px;
+    }
+
+    .callout {
+      margin: 20px 0;
+      padding: 16px 18px;
+      border-left: 5px solid #eaa72a;
+      border-radius: 10px;
+      background: var(--amber-soft);
+      color: #633e05;
+    }
+
+    .success {
+      border-left-color: var(--green);
+      background: var(--green-soft);
+      color: #145239;
+    }
+
+    .wifi-card {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+      margin: 22px 0;
+    }
+
+    .credential {
+      padding: 16px;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: #faf9fd;
+    }
+
+    .credential-label {
+      display: block;
+      color: var(--muted);
+      font-size: 0.82rem;
+      font-weight: 750;
+      text-transform: uppercase;
+    }
+
+    .credential-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      margin-top: 5px;
+    }
+
+    .credential-value {
+      overflow-wrap: anywhere;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 1.14rem;
+      font-weight: 750;
+    }
+
+    .code-card {
+      margin: 15px 0 24px;
+      overflow: hidden;
+      border: 1px solid #302c42;
+      border-radius: 16px;
+      background: var(--code);
+      box-shadow: 0 12px 28px rgba(23, 21, 34, 0.18);
+    }
+
+    .code-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 15px;
+      min-height: 48px;
+      padding: 8px 10px 8px 17px;
+      border-bottom: 1px solid #393547;
+      color: #c9c3db;
+      font-size: 0.82rem;
+      font-weight: 750;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+    }
+
+    .copy-button {
+      flex: 0 0 auto;
+      padding: 7px 13px;
+      border: 1px solid #706887;
+      border-radius: 9px;
+      background: #282437;
+      color: #ffffff;
+      cursor: pointer;
+      font-size: 0.82rem;
+      font-weight: 800;
+    }
+
+    .copy-button:hover,
+    .copy-button:focus-visible {
+      border-color: #b6a5ff;
+      outline: none;
+      background: #37304e;
+    }
+
+    .copy-button.copied {
+      border-color: #75dcad;
+      background: #145a3c;
+    }
+
+    .copy-button:disabled {
+      border-color: #514c60;
+      background: #302c3a;
+      color: #918b9e;
+      cursor: not-allowed;
+    }
+
+    .copy-light {
+      border-color: #bcb5cc;
+      background: #ffffff;
+      color: var(--purple-dark);
+    }
+
+    .copy-light:hover,
+    .copy-light:focus-visible {
+      border-color: var(--purple);
+      background: var(--purple-soft);
+    }
+
+    pre {
+      margin: 0;
+      padding: 20px;
+      overflow-x: auto;
+      color: var(--code-ink);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 0.9rem;
+      line-height: 1.55;
+      tab-size: 2;
+    }
+
+    .terminal-output {
+      color: #a9efc5;
+    }
+
+    .replace {
+      color: #ffe18a;
+      font-weight: 800;
+    }
+
+    .url-label {
+      display: block;
+      margin: 18px 0 7px;
+      font-weight: 780;
+    }
+
+    .url-input {
+      width: 100%;
+      padding: 13px 15px;
+      border: 2px solid #bbb3ce;
+      border-radius: 11px;
+      background: #ffffff;
+      color: var(--ink);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 0.95rem;
+    }
+
+    .url-input:focus {
+      border-color: var(--purple);
+      outline: 3px solid rgba(91, 60, 196, 0.14);
+    }
+
+    .url-status {
+      min-height: 1.5em;
+      margin: 6px 0 14px;
+      color: var(--muted);
+      font-size: 0.88rem;
+    }
+
+    .url-status.ready {
+      color: var(--green);
+      font-weight: 750;
+    }
+
+    .small {
+      color: var(--muted);
+      font-size: 0.92rem;
+    }
+
+    .check-card {
+      padding: 18px;
+      border-radius: 14px;
+      background: #f7f5fc;
+    }
+
+    .check-card strong {
+      display: block;
+      margin-bottom: 5px;
+    }
+
+    details {
+      border-top: 1px solid var(--line);
+      padding: 15px 0;
+    }
+
+    details:last-child {
+      padding-bottom: 0;
+    }
+
+    summary {
+      cursor: pointer;
+      font-weight: 780;
+    }
+
+    details p {
+      margin: 10px 0 0;
+      color: var(--muted);
+    }
+
+    .footer {
+      padding: 30px 4px 0;
+      color: var(--muted);
+      text-align: center;
+      font-size: 0.9rem;
+    }
+
+    @media (max-width: 720px) {
+      .page {
+        width: min(100% - 20px, 1100px);
+        padding-top: 10px;
+      }
+
+      .hero,
+      section {
+        border-radius: 18px;
+      }
+
+      .mode-grid,
+      .check-grid,
+      .wifi-card {
+        grid-template-columns: 1fr;
+      }
+
+      pre {
+        font-size: 0.8rem;
+      }
+    }
+
+    @media print {
+      body {
+        background: #ffffff;
+        font-size: 11pt;
+      }
+
+      .page {
+        width: 100%;
+        padding: 0;
+      }
+
+      .hero,
+      section {
+        break-inside: avoid;
+        box-shadow: none;
+      }
+
+      .copy-button {
+        display: none;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <header class="hero">
+      <p class="eyebrow">Boba phone demo</p>
+      <h1>On-Site Launch Guide</h1>
+      <p class="lede">
+        Exact, copy-ready commands for the <strong>double_stretch_sloth</strong>
+        demo. This page is fully local and works without Internet access.
+      </p>
+      <div class="tags" aria-label="Guide features">
+        <span class="tag">Two network modes</span>
+        <span class="tag">Copy-ready commands</span>
+        <span class="tag">Offline guide</span>
+      </div>
+      <nav class="mode-grid" aria-label="Choose a demo mode">
+        <a class="mode-card" href="#travel-router">
+          <span class="mode-number">Mode 1</span>
+          <span class="mode-title">Travel router</span>
+          <p>No venue Internet required. Attendees join the Emacs Wi-Fi.</p>
+        </a>
+        <a class="mode-card" href="#cloudflare">
+          <span class="mode-number">Mode 2</span>
+          <span class="mode-title">Cloudflare</span>
+          <p>The computer needs Internet. Attendees keep their current connection.</p>
+        </a>
+      </nav>
+    </header>
+
+    <section id="before-starting">
+      <h2>Before opening the venue</h2>
+      <ul>
+        <li>Connect the demo computer to its monitor, keyboard, mouse, and power.</li>
+        <li>Have one phone ready for a complete test.</li>
+        <li>For Mode 1, bring the travel router, its power supply, and an Ethernet cable.</li>
+        <li>Phone video adapts automatically; do not add a phone-FPS flag to the commands.</li>
+      </ul>
+    </section>
+
+    <section id="travel-router">
+      <div class="section-kicker">No Internet required</div>
+      <h2>Mode 1: Travel router</h2>
+
+      <ol>
+        <li>Power on the travel router and wait for it to finish starting.</li>
+        <li>Connect the router to the demo computer with Ethernet.</li>
+        <li>Open a terminal and copy the complete command below.</li>
+      </ol>
+
+      <div class="code-card">
+        <div class="code-head">
+          <span>Launch travel-router mode</span>
+          <button class="copy-button" type="button" data-copy-target="travel-command">Copy command</button>
+        </div>
+        <pre><code id="travel-command">source /home/yihan/miniconda3/etc/profile.d/conda.sh
+conda activate phystwin
+cd /home/yihan/Research/Boba-Phone-Demo
+
+bash scripts/run_demo2.sh \
+  --case_name double_stretch_sloth \
+  --batch_size 100 \
+  --batch_grid_cols 10 \
+  --batch_image_resolution 640x480 \
+  --host 0.0.0.0 \
+  --port 7860 \
+  --qr_size 320 \
+  --travel_router</code></pre>
+      </div>
+      <p class="small">
+        The backslashes shown at line ends only make the command readable on
+        screen. The Copy button removes them and produces clean terminal input.
+      </p>
+
+      <h3>Smaller option: 49 instances in a 7 × 7 grid</h3>
+      <p>
+        Use this option when the 100-instance configuration is too demanding.
+      </p>
+      <div class="code-card">
+        <div class="code-head">
+          <span>Launch smaller travel-router mode</span>
+          <button
+            class="copy-button"
+            type="button"
+            data-copy-target="travel-command-small"
+          >Copy smaller command</button>
+        </div>
+        <pre><code id="travel-command-small">source /home/yihan/miniconda3/etc/profile.d/conda.sh
+conda activate phystwin
+cd /home/yihan/Research/Boba-Phone-Demo
+
+bash scripts/run_demo2.sh \
+  --case_name double_stretch_sloth \
+  --batch_size 49 \
+  --batch_grid_cols 7 \
+  --batch_image_resolution 640x480 \
+  --host 0.0.0.0 \
+  --port 7860 \
+  --qr_size 320 \
+  --travel_router</code></pre>
+      </div>
+
+      <h3>Travel-router Wi-Fi</h3>
+      <div class="wifi-card">
+        <div class="credential">
+          <span class="credential-label">Network</span>
+          <div class="credential-row">
+            <span class="credential-value">Emacs</span>
+            <button class="copy-button copy-light" type="button" data-copy-text="Emacs">Copy</button>
+          </div>
+        </div>
+        <div class="credential">
+          <span class="credential-label">Password</span>
+          <div class="credential-row">
+            <span class="credential-value">315810612</span>
+            <button class="copy-button copy-light" type="button" data-copy-text="315810612">Copy</button>
+          </div>
+        </div>
+      </div>
+
+      <h3>What attendees do</h3>
+      <ol>
+        <li>If already on another Wi-Fi network, disconnect from it.</li>
+        <li>Scan the <strong>left QR</strong> and join <strong>Emacs</strong>.</li>
+        <li>Scan the <strong>right QR</strong> to open the controller.</li>
+      </ol>
+
+      <div class="callout">
+        If the phone warns that Emacs has no Internet, choose to remain
+        connected. This mode does not require Internet.
+      </div>
+
+      <div class="callout success">
+        <strong>Ready check:</strong> The monitor shows the Wi-Fi QR at far left,
+        the controller QR at far right, and aggregate throughput below the
+        controller QR. Test both interaction points from a phone.
+      </div>
+    </section>
+
+    <section id="cloudflare">
+      <div class="section-kicker internet">Internet required on demo computer</div>
+      <h2>Mode 2: Cloudflare</h2>
+      <p>
+        Attendee phones stay on conference Wi-Fi or cellular data. Keep both
+        terminals below open throughout the demo.
+      </p>
+
+      <h3>Terminal 1: Create the public address</h3>
+      <div class="code-card">
+        <div class="code-head">
+          <span>Start Cloudflare tunnel</span>
+          <button class="copy-button" type="button" data-copy-target="cloudflare-command">Copy command</button>
+        </div>
+        <pre><code id="cloudflare-command">cloudflared tunnel --url http://127.0.0.1:7860</code></pre>
+      </div>
+
+      <p>Cloudflare prints a box like this:</p>
+      <div class="code-card">
+        <div class="code-head">
+          <span>Example terminal output</span>
+        </div>
+        <pre class="terminal-output"><code>2026-09-02T13:53:52Z INF +--------------------------------------------------------------------------------------------+
+2026-09-02T13:53:52Z INF |  Your quick Tunnel has been created! Visit it at (it may take some time to be reachable):  |
+2026-09-02T13:53:52Z INF |  https://attending-graduated-streams-distributors.trycloudflare.com                         |
+2026-09-02T13:53:52Z INF +--------------------------------------------------------------------------------------------+</code></pre>
+      </div>
+
+      <div class="callout">
+        Copy only the complete address beginning with <strong>https://</strong>
+        and ending with <strong>.trycloudflare.com</strong>. Its words change
+        every time. Precheck messages followed by silence are normal.
+      </div>
+
+      <h3>Terminal 2: Start the phone demo</h3>
+      <p>
+        Paste only the generated address from Terminal 1 into this field. The
+        page inserts it into the command automatically.
+      </p>
+      <label class="url-label" for="tunnel-url">Generated Cloudflare address</label>
+      <input
+        class="url-input"
+        id="tunnel-url"
+        type="url"
+        inputmode="url"
+        autocomplete="off"
+        spellcheck="false"
+        placeholder="https://random-words.trycloudflare.com"
+      >
+      <p class="url-status" id="url-status" aria-live="polite">
+        Paste a valid trycloudflare.com address to enable the copy button.
+      </p>
+      <div class="code-card">
+        <div class="code-head">
+          <span>Launch Cloudflare mode</span>
+          <button
+            class="copy-button"
+            id="public-copy"
+            type="button"
+            data-copy-target="public-command"
+            data-requires-public-url
+            disabled
+          >Copy final command</button>
+        </div>
+        <pre><code id="public-command">source /home/yihan/miniconda3/etc/profile.d/conda.sh
+conda activate phystwin
+cd /home/yihan/Research/Boba-Phone-Demo
+
+DEMO_PUBLIC_URL='<span class="replace" id="public-url-value" data-public-url-value>https://PASTE-THE-GENERATED-URL.trycloudflare.com</span>'
+
+bash scripts/run_demo2.sh \
+  --case_name double_stretch_sloth \
+  --batch_size 100 \
+  --batch_grid_cols 10 \
+  --batch_image_resolution 640x480 \
+  --host 127.0.0.1 \
+  --port 7860 \
+  --qr_size 320 \
+  --public_url "$DEMO_PUBLIC_URL"</code></pre>
+      </div>
+      <p class="small">
+        The Copy button removes the displayed line-ending backslashes before
+        placing this command on the clipboard.
+      </p>
+
+      <h3>Smaller option: 49 instances in a 7 × 7 grid</h3>
+      <p>
+        Use this option when the 100-instance configuration is too demanding.
+        It uses the same generated Cloudflare address entered above.
+      </p>
+      <div class="code-card">
+        <div class="code-head">
+          <span>Launch smaller Cloudflare mode</span>
+          <button
+            class="copy-button"
+            id="public-copy-small"
+            type="button"
+            data-copy-target="public-command-small"
+            data-requires-public-url
+            disabled
+          >Copy smaller command</button>
+        </div>
+        <pre><code id="public-command-small">source /home/yihan/miniconda3/etc/profile.d/conda.sh
+conda activate phystwin
+cd /home/yihan/Research/Boba-Phone-Demo
+
+DEMO_PUBLIC_URL='<span class="replace" id="public-url-value-small" data-public-url-value>https://PASTE-THE-GENERATED-URL.trycloudflare.com</span>'
+
+bash scripts/run_demo2.sh \
+  --case_name double_stretch_sloth \
+  --batch_size 49 \
+  --batch_grid_cols 7 \
+  --batch_image_resolution 640x480 \
+  --host 127.0.0.1 \
+  --port 7860 \
+  --qr_size 320 \
+  --public_url "$DEMO_PUBLIC_URL"</code></pre>
+      </div>
+
+      <div class="callout success">
+        <strong>Ready check:</strong> The controller QR and aggregate throughput
+        are visible. The left-side Wi-Fi QR is intentionally absent. Test the
+        controller using a phone on cellular data if possible.
+      </div>
+
+      <p class="small">
+        The generated address is public while Terminal 1 is running. Do not
+        post it publicly, and stop the tunnel after the demo.
+      </p>
+    </section>
+
+    <section id="stop">
+      <h2>Stop the demo</h2>
+      <div class="check-grid">
+        <div class="check-card">
+          <strong>Travel-router mode</strong>
+          Press <kbd>Ctrl</kbd>+<kbd>C</kbd> in the demo terminal.
+        </div>
+        <div class="check-card">
+          <strong>Cloudflare mode</strong>
+          Press <kbd>Ctrl</kbd>+<kbd>C</kbd> in Terminal 2, then in Terminal 1.
+        </div>
+      </div>
+    </section>
+
+    <section id="troubleshooting">
+      <h2>Quick troubleshooting</h2>
+
+      <details>
+        <summary>The phystwin environment is not active</summary>
+        <p>Copy these two commands, then retry the launch command.</p>
+        <div class="code-card">
+          <div class="code-head">
+            <span>Activate environment</span>
+            <button class="copy-button" type="button" data-copy-target="conda-command">Copy command</button>
+          </div>
+          <pre><code id="conda-command">source /home/yihan/miniconda3/etc/profile.d/conda.sh
+conda activate phystwin</code></pre>
+        </div>
+      </details>
+
+      <details>
+        <summary>Emacs does not appear immediately</summary>
+        <p>
+          Wait several seconds. Confirm that the router has power and Ethernet.
+          If necessary, join manually using Emacs and password 315810612.
+        </p>
+      </details>
+
+      <details>
+        <summary>A phone cannot join Emacs</summary>
+        <p>
+          Disconnect the phone from its current Wi-Fi, wait until Emacs appears,
+          and scan the Wi-Fi QR again.
+        </p>
+      </details>
+
+      <details>
+        <summary>The travel-router controller page does not open</summary>
+        <p>
+          Confirm that the phone is on Emacs. The terminal's [Demo2] Phone URL
+          should normally begin with http://192.168.0.
+        </p>
+        <div class="code-card">
+          <div class="code-head">
+            <span>Check computer address</span>
+            <button class="copy-button" type="button" data-copy-target="ip-command">Copy command</button>
+          </div>
+          <pre><code id="ip-command">ip -4 -brief address show enp0s31f6</code></pre>
+        </div>
+      </details>
+
+      <details>
+        <summary>The Cloudflare address is hard to find</summary>
+        <p>
+          Scroll upward in Terminal 1 and look for trycloudflare.com. If no
+          address appears after about one minute, press Ctrl+C and retry.
+        </p>
+      </details>
+
+      <details>
+        <summary>Cloudflare shows Error 502</summary>
+        <p>
+          Terminal 1 can reach Cloudflare, but the local demo is unavailable.
+          Confirm that Terminal 2 is running and both commands use port 7860,
+          then reload the phone page.
+        </p>
+      </details>
+
+      <details>
+        <summary>Port 7860 is already in use</summary>
+        <p>
+          An older demo is probably running. Return to its terminal, press
+          Ctrl+C, and run the selected mode again.
+        </p>
+      </details>
+    </section>
+
+    <p class="footer">
+      Local operator guide for Boba Phone Demo · double_stretch_sloth
+    </p>
+  </main>
+
+  <script>
+    function fallbackCopy(text) {
+      var area = document.createElement("textarea");
+      area.value = text;
+      area.setAttribute("readonly", "");
+      area.style.position = "fixed";
+      area.style.opacity = "0";
+      document.body.appendChild(area);
+      area.select();
+      var copied = document.execCommand("copy");
+      document.body.removeChild(area);
+      if (!copied) {
+        throw new Error("Copy command was rejected");
+      }
+    }
+
+    async function copyText(text, button) {
+      try {
+        if (navigator.clipboard && window.isSecureContext) {
+          await navigator.clipboard.writeText(text);
+        } else {
+          fallbackCopy(text);
+        }
+        var original = button.textContent;
+        button.textContent = "Copied!";
+        button.classList.add("copied");
+        window.setTimeout(function () {
+          button.textContent = original;
+          button.classList.remove("copied");
+        }, 1600);
+      } catch (error) {
+        window.prompt("Copy this text:", text);
+      }
+    }
+
+    document.querySelectorAll("[data-copy-target]").forEach(function (button) {
+      button.addEventListener("click", function () {
+        var target = document.getElementById(button.dataset.copyTarget);
+        var cleanCommand = target.textContent
+          .replace(/[ \t]*\\\r?\n[ \t]*/g, " ")
+          .trim();
+        copyText(cleanCommand, button);
+      });
+    });
+
+    document.querySelectorAll("[data-copy-text]").forEach(function (button) {
+      button.addEventListener("click", function () {
+        copyText(button.dataset.copyText, button);
+      });
+    });
+
+    var urlInput = document.getElementById("tunnel-url");
+    var urlStatus = document.getElementById("url-status");
+    var urlValues = document.querySelectorAll("[data-public-url-value]");
+    var publicCopyButtons = document.querySelectorAll("[data-requires-public-url]");
+    var placeholderUrl = "https://PASTE-THE-GENERATED-URL.trycloudflare.com";
+    var quickTunnelPattern = /^https:\/\/[a-z0-9-]+\.trycloudflare\.com\/?$/i;
+
+    urlInput.addEventListener("input", function () {
+      var enteredUrl = urlInput.value.trim();
+      var isValid = quickTunnelPattern.test(enteredUrl);
+      urlValues.forEach(function (urlValue) {
+        urlValue.textContent = enteredUrl || placeholderUrl;
+      });
+      publicCopyButtons.forEach(function (copyButton) {
+        copyButton.disabled = !isValid;
+      });
+      urlStatus.classList.toggle("ready", isValid);
+      urlStatus.textContent = isValid
+        ? "Address accepted. The final launch command is ready to copy."
+        : "Paste a valid trycloudflare.com address to enable the copy button.";
+    });
+  </script>
+</body>
+</html>

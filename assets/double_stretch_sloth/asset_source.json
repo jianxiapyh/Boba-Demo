@@ -1,0 +1,53 @@
+{
+  "schema_version": 1,
+  "case_name": "double_stretch_sloth",
+  "source_checkout": {
+    "environment_variable": "BOBA_BATCHED_ROOT",
+    "default_path": "/home/yihan/Research/Boba_Latest",
+    "branch": "Boba_Batched",
+    "commit": "b7498f038fda34a8e4f9af85fc1108241f4f0b3f"
+  },
+  "files": {
+    "best_model.pth": {
+      "source_path": "experiments/double_stretch_sloth/train/best_199.pth",
+      "size_bytes": 274034,
+      "sha256": "b027af7baae371fd4e0ddbf33b7d7d9f919517081b26907bbe10cd2d2161d549"
+    },
+    "calibrate.pkl": {
+      "source_path": "data/different_types/double_stretch_sloth/calibrate.pkl",
+      "size_bytes": 601,
+      "sha256": "160962e646f60bdfd70a71793e11c8152a0d05543762999213d489ef50849f1d"
+    },
+    "final_data.pkl": {
+      "source_path": "data/different_types/double_stretch_sloth/final_data.pkl",
+      "size_bytes": 16275526,
+      "sha256": "fca68a1dec035f6252cf2cbe35717425f210124fb92d3b8f26d7b4cdef2d4635"
+    },
+    "gaussian.ply": {
+      "source_path": "gaussian_output/double_stretch_sloth/init=hybrid_iso=True_ldepth=0.001_lnormal=0.0_laniso_0.0_lseg=1.0/point_cloud/iteration_10000/point_cloud.ply",
+      "size_bytes": 55991805,
+      "sha256": "fc0301db3e5fd077d153e3bb2d68cf609db1ebc6968932101f34d731b6aec5d2"
+    },
+    "metadata.json": {
+      "source_path": "data/different_types/double_stretch_sloth/metadata.json",
+      "transformation": "Removed physical camera serial_numbers; Demo 2 uses only intrinsics and image dimensions.",
+      "size_bytes": 463,
+      "sha256": "5eea9eae7c9a7a256bd7fcd3a710212066e4fe166700b327128b75c8ec168a71"
+    },
+    "optimal_params.pkl": {
+      "source_path": "experiments_optimization/double_stretch_sloth/optimal_params.pkl",
+      "size_bytes": 551,
+      "sha256": "bde43cb1d2bdeede2e0407f32cc1fe46e272cb1aaf19c72d8e73c5769472beec"
+    },
+    "controller_bank.pkl": {
+      "source_path": "data/different_types/double_stretch_sloth/multi_ctrls_demo2_filtered.pkl",
+      "size_bytes": 6916588,
+      "sha256": "a621ef007487453a2433d345111ce0ac33198804634cabc03599dc74d6284c4f"
+    },
+    "background.png": {
+      "source_path": "data/bg.png",
+      "size_bytes": 427861,
+      "sha256": "8ce9519a96aec636bfed25ec7149d55b190063ad266c7bbf37f8c00cc33b9710"
+    }
+  }
+}

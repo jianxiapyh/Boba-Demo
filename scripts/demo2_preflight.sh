@@ -232,7 +232,9 @@ fi
 
 if extras_report="$(${PYTHON} <<'PY' 2>&1
 import flask
+import flask_sock
 import qrcode
+import simple_websocket
 from PIL import Image
 import shutil
 import sys
@@ -247,6 +249,10 @@ try:
 except ValueError as exc:
     raise RuntimeError(f"ninja resolves outside phystwin: {ninja}") from exc
 print(f"Flask={metadata.version('Flask')}")
+print(
+    f"Flask-Sock={metadata.version('Flask-Sock')}; "
+    f"simple-websocket={metadata.version('simple-websocket')}"
+)
 print(f"qrcode={metadata.version('qrcode')}; Pillow={Image.__version__}")
 print(f"ninja={metadata.version('ninja')} ({ninja})")
 PY
@@ -259,19 +265,23 @@ fi
 
 asset_validator="${REPO_ROOT}/tools/validate_demo2_assets.py"
 if [[ -f "${asset_validator}" ]]; then
-  if asset_report="$(cd "${REPO_ROOT}" && "${PYTHON}" "${asset_validator}" --case single_push_rope_4 2>&1)"; then
-    ok "packaged single_push_rope_4 assets validate"
-    printf '%s\n' "${asset_report}" | sed 's/^/[Demo2 preflight]   /'
-  else
-    fail "packaged asset validation failed: ${asset_report}"
-  fi
+  for packaged_case in single_push_rope_4 double_stretch_sloth; do
+    if asset_report="$(cd "${REPO_ROOT}" && "${PYTHON}" "${asset_validator}" --case "${packaged_case}" 2>&1)"; then
+      ok "packaged ${packaged_case} assets validate"
+      printf '%s\n' "${asset_report}" | sed 's/^/[Demo2 preflight]   /'
+    else
+      fail "packaged ${packaged_case} asset validation failed: ${asset_report}"
+    fi
+  done
 else
   warn "asset validator is unavailable: ${asset_validator}"
-  if [[ -f "${REPO_ROOT}/assets/single_push_rope_4/manifest.json" ]]; then
-    ok "packaged case manifest exists (full validation skipped)"
-  else
-    fail "packaged case manifest is missing"
-  fi
+  for packaged_case in single_push_rope_4 double_stretch_sloth; do
+    if [[ -f "${REPO_ROOT}/assets/${packaged_case}/manifest.json" ]]; then
+      ok "packaged ${packaged_case} manifest exists (full validation skipped)"
+    else
+      fail "packaged ${packaged_case} manifest is missing"
+    fi
+  done
 fi
 
 if (( failures > 0 )); then

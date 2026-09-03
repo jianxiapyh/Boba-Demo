@@ -136,6 +136,12 @@ def distribution_exists(distribution_name):
 if not (distribution_exists("Flask") and imports_cleanly("flask")):
     print("Flask")
 if not (
+    distribution_exists("Flask-Sock")
+    and imports_cleanly("flask_sock")
+    and imports_cleanly("simple_websocket")
+):
+    print("flask-sock")
+if not (
     distribution_exists("qrcode")
     and distribution_exists("Pillow")
     and imports_cleanly("qrcode")
@@ -164,7 +170,7 @@ import sys
 from importlib import metadata
 from pathlib import Path
 
-for module_name in ("flask", "qrcode", "PIL"):
+for module_name in ("flask", "flask_sock", "simple_websocket", "qrcode", "PIL"):
     importlib.import_module(module_name)
 
 ninja = shutil.which("ninja")
@@ -176,7 +182,7 @@ except ValueError as exc:
     raise RuntimeError(f"ninja resolves outside the active environment: {ninja}") from exc
 
 print("[Demo2 extras] Installed web-demo versions:")
-for distribution_name in ("Flask", "qrcode", "Pillow", "ninja"):
+for distribution_name in ("Flask", "Flask-Sock", "simple-websocket", "qrcode", "Pillow", "ninja"):
     try:
         version = metadata.version(distribution_name)
     except metadata.PackageNotFoundError:
@@ -192,7 +198,7 @@ write_installed_constraints
 
 mapfile -t missing_extras < <(detect_missing_extras)
 if (( ${#missing_extras[@]} == 0 )); then
-  printf '[Demo2 extras] Flask, qrcode[pil], and Ninja are already available; nothing to install.\n'
+  printf '[Demo2 extras] Flask, Flask-Sock, qrcode[pil], and Ninja are already available; nothing to install.\n'
 else
   printf '[Demo2 extras] Installing missing additions only:'
   printf ' %q' "${missing_extras[@]}"

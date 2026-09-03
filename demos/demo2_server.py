@@ -1,5 +1,6 @@
 import argparse
 import json
+import math
 import os
 import pickle
 import sys
@@ -9,6 +10,13 @@ from pathlib import Path
 import torch
 from flask import Flask, Response, abort, jsonify, request, send_from_directory
 from werkzeug.serving import make_server
+
+try:
+    from flask_sock import Sock
+    from simple_websocket import ConnectionClosed
+except ImportError:
+    Sock = None
+    ConnectionClosed = None
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -22,7 +30,11 @@ from demos.demo2.case_assets import (
     resolve_demo2_case_assets,
     select_controller_bank,
 )
-from demos.demo2.qr_overlay import make_public_url, make_qr_rgb
+from demos.demo2.qr_overlay import (
+    TRAVEL_ROUTER_WIFI_SSID,
+    make_public_display_qr_overlays,
+    make_public_url,
+)
 from demos.demo2.replay_state import ReplayStateStore
 from demos.demo2.session_manager import SessionManager
 from demos.demo2.streaming import MjpegFrameStore
@@ -67,7 +79,51 @@ def build_parser():
         ),
     )
     parser.add_argument("--phone_stream_size", type=parse_size, default=parse_size("640x480"))
-    parser.add_argument("--phone_stream_fps", type=float, default=10.0)
+    parser.add_argument(
+        "--phone_stream_max_fps",
+        "--phone_stream_fps",
+        dest="phone_stream_max_fps",
+        type=float,
+        default=0.0,
+        help=(
+            "Optional phone-stream ceiling. 0 (default) publishes the newest "
+            "simulation frame whenever a phone is ready. --phone_stream_fps is "
+            "retained as a compatibility alias."
+        ),
+    )
+    parser.add_argument(
+        "--phone_stream_encode_workers",
+        type=int,
+        default=2,
+        help=(
+            "Background JPEG workers. Pending frames are replaced with the newest "
+            "frame instead of delaying the simulation; 0 encodes synchronously."
+        ),
+    )
+    parser.add_argument(
+        "--phone_stream_settle_motion",
+        type=float,
+        default=1e-4,
+        help="RMS object displacement per simulation frame considered settled.",
+    )
+    parser.add_argument(
+        "--phone_stream_settle_frames",
+        type=int,
+        default=5,
+        help="Consecutive low-motion frames required before the phone image freezes.",
+    )
+    parser.add_argument(
+        "--phone_stream_full_rate_settle_s",
+        type=float,
+        default=1.0,
+        help="Maximum full-rate settling time before switching to recovery FPS.",
+    )
+    parser.add_argument(
+        "--phone_stream_recovery_fps",
+        type=float,
+        default=2.0,
+        help="Low-rate phone updates when motion remains after the full-rate window.",
+    )
     parser.add_argument("--heartbeat_timeout_s", type=float, default=10.0)
     parser.add_argument("--phone_control_step", type=float, default=0.005)
     parser.add_argument(
@@ -104,7 +160,15 @@ def build_parser():
         default=None,
         help="Optional JSON path for --demo2_debug_motion output.",
     )
-    parser.add_argument("--qr_size", type=int, default=220)
+    parser.add_argument("--qr_size", type=int, default=320)
+    parser.add_argument(
+        "--travel_router",
+        action="store_true",
+        help=(
+            "Show the hardcoded travel-router Wi-Fi QR at the far-left of the "
+            "public display. Omit this flag for Cloudflare and other networks."
+        ),
+    )
     parser.add_argument("--output_dir", type=str, default=None)
     parser.add_argument("--max_frames", type=int, default=None, help="Optional smoke-test frame limit.")
     return parser
@@ -122,6 +186,7 @@ def request_token():
 
 def create_app(session_manager, stream_store, replay_state_store=None):
     app = Flask(__name__)
+    app.config["SOCK_SERVER_OPTIONS"] = {"ping_interval": 25}
     phone_html = load_phone_client_html()
     asset_dir = REPO_ROOT / "assets"
     allowed_assets = {
@@ -247,8 +312,63 @@ def create_app(session_manager, stream_store, replay_state_store=None):
         return Response(
             generator,
             mimetype="multipart/x-mixed-replace; boundary=frame",
-            headers={"Cache-Control": "no-cache"},
+            headers={
+                "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+                "Pragma": "no-cache",
+            },
         )
+
+    app.extensions["demo2_websocket_enabled"] = Sock is not None
+    if Sock is not None:
+        sock = Sock(app)
+
+        @sock.route("/ws/stream/<int:session_id>")
+        def websocket_stream(ws, session_id):
+            if session_id < 0 or session_id >= session_manager.num_sessions:
+                ws.close()
+                return
+            token = request.args.get("token", "")
+            if not session_manager.validate(session_id, token):
+                ws.close()
+                return
+
+            consumer_id = object()
+            current_packet = stream_store.latest_packet(session_id)
+            last_sequence = current_packet[1] if current_packet is not None else None
+            try:
+                while session_manager.validate(session_id, token):
+                    if not stream_store.request_frame(session_id, consumer_id):
+                        return
+                    packet = stream_store.wait_for_frame(
+                        session_id,
+                        after_sequence=last_sequence,
+                        timeout_s=0.5,
+                        stop_fn=lambda: not session_manager.validate(session_id, token),
+                    )
+                    if packet is None:
+                        continue
+
+                    jpeg, sequence, _ = packet
+                    ws.send(jpeg)
+
+                    acknowledged = False
+                    while session_manager.validate(session_id, token):
+                        try:
+                            message = ws.receive(timeout=1.0)
+                        except TimeoutError:
+                            continue
+                        if message is None:
+                            continue
+                        if message == "next":
+                            acknowledged = True
+                            break
+                    if not acknowledged:
+                        return
+                    last_sequence = sequence
+            except (ConnectionClosed, OSError):
+                return
+            finally:
+                stream_store.cancel_frame_request(session_id, consumer_id)
 
     return app
 
@@ -305,6 +425,29 @@ def main():
         raise ValueError("--phone_control_step must be non-negative")
     if args.phone_control_max_offset < 0:
         raise ValueError("--phone_control_max_offset must be non-negative")
+    if args.phone_stream_max_fps < 0:
+        raise ValueError("--phone_stream_max_fps must be non-negative")
+    if args.phone_stream_encode_workers < 0:
+        raise ValueError("--phone_stream_encode_workers must be non-negative")
+    if (
+        not math.isfinite(args.phone_stream_settle_motion)
+        or args.phone_stream_settle_motion < 0
+    ):
+        raise ValueError("--phone_stream_settle_motion must be finite and non-negative")
+    if args.phone_stream_settle_frames < 1:
+        raise ValueError("--phone_stream_settle_frames must be positive")
+    if (
+        not math.isfinite(args.phone_stream_full_rate_settle_s)
+        or args.phone_stream_full_rate_settle_s < 0
+    ):
+        raise ValueError(
+            "--phone_stream_full_rate_settle_s must be finite and non-negative"
+        )
+    if (
+        not math.isfinite(args.phone_stream_recovery_fps)
+        or args.phone_stream_recovery_fps <= 0
+    ):
+        raise ValueError("--phone_stream_recovery_fps must be finite and positive")
     if args.demo2_runtime_fps is not None and args.demo2_runtime_fps <= 0:
         raise ValueError("--demo2_runtime_fps must be positive")
     if args.demo2_replay_marker_session is not None and not (
@@ -313,6 +456,8 @@ def main():
         raise ValueError("--demo2_replay_marker_session must fit inside the batch")
     if args.demo2_replay_action_threshold < 0:
         raise ValueError("--demo2_replay_action_threshold must be non-negative")
+    if args.qr_size < 1:
+        raise ValueError("--qr_size must be positive")
     double_control_cases = [
         value.strip()
         for value in args.demo2_double_control_cases.split(",")
@@ -358,21 +503,51 @@ def main():
     )
 
     public_url = make_public_url(args.host, args.port, public_url=args.public_url)
-    qr_overlay = make_qr_rgb(public_url, size=args.qr_size)
+    qr_overlay, wifi_qr_overlay = make_public_display_qr_overlays(
+        public_url,
+        size=args.qr_size,
+        include_travel_router_wifi=args.travel_router,
+    )
     print(f"[Demo2] Phone URL: {public_url}")
+    if args.travel_router:
+        print(
+            "[Demo2] Travel-router Wi-Fi QR enabled for SSID: "
+            f"{TRAVEL_ROUTER_WIFI_SSID}"
+        )
     print(f"[Demo2] Control parts: {resolved_control_parts}")
 
     session_manager = SessionManager(
         num_sessions=args.batch_size,
         heartbeat_timeout_s=args.heartbeat_timeout_s,
     )
-    stream_store = MjpegFrameStore(jpeg_quality=80)
+    stream_store = MjpegFrameStore(
+        jpeg_quality=80,
+        encode_workers=args.phone_stream_encode_workers,
+    )
     replay_state_store = ReplayStateStore(
         args.batch_size,
         control_parts=resolved_control_parts,
     )
     app = create_app(session_manager, stream_store, replay_state_store)
     start_flask_server(app, args.host, args.port)
+    print(
+        "[Demo2] Phone stream transport: "
+        + ("WebSocket with MJPEG fallback" if Sock is not None else "MJPEG fallback only")
+    )
+    if args.phone_stream_max_fps > 0:
+        print(
+            "[Demo2] Adaptive phone stream maximum: "
+            f"{args.phone_stream_max_fps:g} FPS"
+        )
+    else:
+        print("[Demo2] Adaptive phone stream maximum: simulation frame rate")
+    print(
+        "[Demo2] Activity-gated phone stream: "
+        f"settle_motion={args.phone_stream_settle_motion:g}, "
+        f"stable_frames={args.phone_stream_settle_frames}, "
+        f"full_rate_s={args.phone_stream_full_rate_settle_s:g}, "
+        f"recovery_fps={args.phone_stream_recovery_fps:g}"
+    )
 
     output_dir = args.output_dir or os.path.join("results", "demo2", args.case_name)
     os.makedirs(output_dir, exist_ok=True)
@@ -431,11 +606,17 @@ def main():
             replay_start=args.replay_start,
             replay_end=args.replay_end,
             session_snapshot_fn=session_manager.snapshot_sessions,
-            publish_frame_fn=stream_store.publish_rgb,
+            stream_session_ids_fn=stream_store.requested_sessions,
+            publish_frame_fn=stream_store.submit_rgb,
             publish_replay_state_fn=replay_state_store.publish,
             qr_overlay_rgb=qr_overlay,
+            wifi_qr_overlay_rgb=wifi_qr_overlay,
             phone_stream_size=args.phone_stream_size,
-            phone_stream_fps=args.phone_stream_fps,
+            phone_stream_max_fps=args.phone_stream_max_fps,
+            phone_stream_settle_motion=args.phone_stream_settle_motion,
+            phone_stream_settle_frames=args.phone_stream_settle_frames,
+            phone_stream_full_rate_settle_s=args.phone_stream_full_rate_settle_s,
+            phone_stream_recovery_fps=args.phone_stream_recovery_fps,
             demo2_runtime_fps=demo2_runtime_fps,
             phone_control_step=args.phone_control_step,
             phone_control_max_offset=args.phone_control_max_offset,
@@ -449,6 +630,7 @@ def main():
     finally:
         import glfw
 
+        stream_store.close()
         try:
             cuda_ctx.pop()
         except Exception:

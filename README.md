@@ -1,5 +1,10 @@
 # Boba Quest Immersive Demo
 
+> **Operating the demo?** Start with the
+> [copy-friendly HTML operator guide](IMMERSIVE_DEMO_OPERATOR_GUIDE.html), or
+> clone this branch and run `./open_operator_guide.sh` to open it locally. A
+> [plain Markdown version](IMMERSIVE_DEMO_OPERATOR_GUIDE.md) is also available.
+
 This repository contains one Quest/OpenXR experience with two runtime-selectable Gaussian objects and three launch-time scenes:
 
 | Scene | Rope | Sloth |

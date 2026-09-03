@@ -79,8 +79,8 @@ def _prepare_vendored_gsplat_import() -> None:
     if loaded_gsplat is None or _is_vendored_gsplat_module(loaded_gsplat):
         return
 
-    # An editable Boba-Batched or PyPI install may already have been imported by
-    # another dependency. Purge that package tree before resolving our local fork.
+    # An editable package from another checkout or PyPI may already have been
+    # imported by another dependency. Purge it before resolving our local fork.
     for module_name in tuple(sys.modules):
         if module_name == "gsplat" or module_name.startswith("gsplat."):
             del sys.modules[module_name]
@@ -90,7 +90,7 @@ def validate_gsplat_runtime(gsplat_module: Any) -> None:
     active_env = _active_env_name()
     if active_env != EXPECTED_CONDA_ENV:
         raise RuntimeError(
-            "Boba Demo requires the working Boba-Batched conda environment. "
+            "Boba Demo requires its supported conda environment. "
             f"Expected {EXPECTED_CONDA_ENV!r}, active {active_env!r}, "
             f"sys.prefix={Path(sys.prefix).resolve()}.\n{_runtime_hint()}"
         )
@@ -116,7 +116,7 @@ def validate_gsplat_runtime(gsplat_module: Any) -> None:
     ]
     if missing_markers:
         raise RuntimeError(
-            "Boba Demo's vendored gsplat does not match the Boba-Batched custom fork. "
+            "Boba Demo's vendored gsplat does not match its required custom fork. "
             f"Missing callable API marker(s): {', '.join(missing_markers)}.\n"
             f"Resolved path: {module_file}"
         )
@@ -125,7 +125,7 @@ def validate_gsplat_runtime(gsplat_module: Any) -> None:
 def import_gsplat():
     if _active_env_name() != EXPECTED_CONDA_ENV:
         raise RuntimeError(
-            "Boba Demo requires the working Boba-Batched conda environment. "
+            "Boba Demo requires its supported conda environment. "
             f"Expected {EXPECTED_CONDA_ENV!r}, active {_active_env_name()!r}.\n"
             f"{_runtime_hint()}"
         )
@@ -145,7 +145,7 @@ def import_gsplat():
 
 def gsplat_provenance() -> dict[str, str]:
     return {
-        "fork": "Boba-Batched custom gsplat",
+        "fork": "Boba custom gsplat",
         "version": GSPLAT_VERSION,
         "boba_batched_source_commit": BOBA_BATCHED_SOURCE_COMMIT,
         "upstream_commit": UPSTREAM_GSPLAT_COMMIT,

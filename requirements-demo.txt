@@ -1,4 +1,4 @@
-# Add-ons for the Quest demo. The Boba-Batched phystwin-cu132 environment supplies
+# Add-ons for the Quest demo. The existing phystwin-cu132 environment supplies
 # Torch/CUDA, NumPy, Warp, Open3D, PyCUDA, GLFW, PyOpenGL, PyRender, Trimesh,
 # scikit-learn, and gsplat build dependencies. Keep its working versions intact.
 rtree==1.4.1

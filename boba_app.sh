@@ -18,11 +18,12 @@ fi
 
 if ! "${CONDA_BIN}" env list | awk -v wanted="${RUNTIME_ENV}" '$1 == wanted { found = 1 } END { exit !found }'; then
   echo "The required Conda environment '${RUNTIME_ENV}' was not found." >&2
-  echo "Install and successfully run Boba-Batched first, then rerun this launcher." >&2
+  echo "Create or restore that CUDA/rendering environment, then rerun this launcher." >&2
+  echo "The Boba runtime and event assets are already included in this checkout." >&2
   exit 1
 fi
 
-# Always launch a clean child in the supported Boba runtime.  In particular,
+# Always launch a clean child in the supported demo environment.  In particular,
 # inherited CONDA_* values can make a nested `conda run` execute the right
 # Python while incorrectly advertising the parent environment to subprocesses.
 exec env \

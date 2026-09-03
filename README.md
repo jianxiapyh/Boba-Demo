@@ -15,13 +15,26 @@ This repository contains one Quest/OpenXR experience with two runtime-selectable
 
 Switching Rope/Sloth keeps the OpenXR session, selected scene, and head alignment alive. Garden and Ambulance each combine their static scene with the active object in one stereo-batched Gaussian pass; Lab retains its mesh/Gaussian depth compositor. Garden's static Gaussians are stored in deterministic spatial chunks and use an analytic patio-table collision proxy. The launcher now uses an explicit standing layout by default, with no automatic posture detection. Lab starts at a 1.55 m eye height. Ambulance decodes the bundled SOG v2 asset directly, places the active object on top of the stretcher, anchors the launch-time headset in the clear aisle at a 1.45 m eye height with a 30-degree downward view toward the mattress, and uses the captured full-resolution padded-mattress shell plus aggressively simplified source-mesh geometry for the side hardware and undercarriage. Pass `--immersive_start_posture seated` to use the preserved seated layouts.
 
-## Prerequisite: a working Boba-Batched machine
+## Self-contained runtime and prerequisites
 
-Before setting up this demo, install and successfully run the current `Boba_Batched` branch in its recommended `phystwin-cu132` Conda environment. That proves the machine already has the compatible NVIDIA driver, CUDA toolkit, PyTorch/CUDA stack, Conda installation, compiler toolchain, and desktop OpenGL/X11 support.
+This branch contains all Boba runtime source, its custom `gsplat` fork, the Rope
+and Sloth data, and the Lab and Ambulance scene assets needed by the two event
+demos. A separate Boba or Boba-Batched checkout is **not** required. The Sloth
+Gaussian is tracked with Git LFS, so clone with Git LFS enabled to receive the
+PLY payload instead of an LFS pointer. The optional Garden scene is the only
+exception: its upstream model is intentionally downloaded by the separate
+one-time Garden setup below.
 
-This demo reuses the installed packages in `phystwin-cu132`; it does **not** import source or assets from the Boba-Batched checkout. The custom `gsplat` source, Rope and Sloth data, and room assets required at runtime are committed here, so the Boba-Batched checkout does not need to be beside this repository. The Sloth Gaussian is tracked with Git LFS; clone with Git LFS enabled so the PLY payload is checked out rather than left as a pointer.
-
-Launch from the same working X11 session used for Boba-Batched. A valid `DISPLAY` is required. The interactive window is visible by default and uses an independent spectator camera: the selected scene, deformable object, controller rays, and tracked 3D headset mesh are rendered together in scene space. The headset mesh is the asset used by ILLIXR's `plugins/debugview`; the Quest continues to receive its normal stereo eye views. Pass `--interactive_window_mode hidden` to disable the desktop spectator view.
+The repository does not bundle a Conda environment, GPU driver, or SteamVR/ALVR.
+Before setup, the demo computer must have the `phystwin-cu132` environment with
+its CUDA/rendering dependencies, an NVIDIA CUDA toolkit, and a working
+OpenGL/X11 desktop session. A valid `DISPLAY` is required. The interactive
+window is visible by default and uses an independent spectator camera: the
+selected scene, deformable object, controller rays, and tracked 3D headset mesh
+are rendered together in scene space. The headset mesh is the asset used by
+ILLIXR's `plugins/debugview`; the Quest continues to receive its normal stereo
+eye views. Pass `--interactive_window_mode hidden` to disable the desktop
+spectator view.
 
 ## Install the demo additions
 
@@ -36,9 +49,14 @@ conda run -n phystwin-cu132 env PYTHONNOUSERSITE=1 \
   python -m pip install -r requirements-demo.txt
 ```
 
-`requirements-demo.txt` intentionally omits Torch, CUDA, NumPy, Warp, Open3D, PyCUDA, and the rest of the Boba-Batched core stack. Pip's normal only-if-needed behavior leaves compatible installed dependencies in place; do not use `--upgrade` with this command.
+`requirements-demo.txt` intentionally omits Torch, CUDA, NumPy, Warp, Open3D,
+PyCUDA, and the other core packages already required in `phystwin-cu132`. Pip's
+normal only-if-needed behavior leaves compatible installed dependencies in
+place; do not use `--upgrade` with this command.
 
-The command also does not install or replace `gsplat` in `phystwin-cu132`. The demo selects its committed fork only inside the demo process, so a later Boba-Batched process continues to use the source and backend from its own checkout.
+The command also does not install or replace `gsplat` in `phystwin-cu132`. The
+demo imports its committed fork directly and only inside the demo process, so
+other projects continue using their own installed source and backend.
 
 Validate both selectable objects and the default Lab assets:
 
@@ -73,7 +91,10 @@ The native OpenXR bridge requires OpenXR, GLFW, OpenGL, and X11 development file
 bash linux_pose_probe/check_boba_immersive_bridge_deps.sh
 ```
 
-Only if that check reports missing packages, install the command it prints. This is the only additional Ubuntu development setup normally needed beyond a working Boba-Batched machine. The bridge builds automatically on first launch if its ignored local binary is absent.
+Only if that check reports missing packages, install the command it prints.
+This is the only additional Ubuntu development setup normally needed once the
+CUDA/OpenGL environment is working. The bridge builds automatically on first
+launch if its ignored local binary is absent.
 
 ## Set up SteamVR and ALVR
 
@@ -145,11 +166,18 @@ Stop the game with `Ctrl+C` in the launching terminal.
 
 ### `phystwin-cu132` is missing or core imports fail
 
-Return to Boba-Batched and confirm it runs successfully in `phystwin-cu132`. Repair that baseline there rather than installing a second Torch/CUDA stack in this repository.
+The source and event assets are already in this branch, but the Conda environment
+is not stored in Git. Create or repair `phystwin-cu132` with compatible
+Torch/CUDA, Warp, Open3D, PyCUDA, GLFW, PyOpenGL, PyRender, Trimesh, and
+scikit-learn packages. Do not point the demo at another Boba checkout.
 
 ### Custom `gsplat` fails to compile
 
-Confirm that `nvcc` is on `PATH`, its CUDA toolkit is compatible with the Torch build in `phystwin-cu132`, the NVIDIA driver is available, and the Torch extension cache is writable. The demo must report its `gsplat` source inside this checkout; it must not resolve from Boba-Batched or a global installation.
+Confirm that `nvcc` is on `PATH`, its CUDA toolkit is compatible with the Torch
+build in `phystwin-cu132`, the NVIDIA driver is available, and the Torch
+extension cache is writable. The demo must report its `gsplat` source inside
+this checkout; it must not resolve from another checkout or a global
+installation.
 
 ### Garden reports missing or stale data
 
@@ -157,7 +185,8 @@ Rerun the one-time setup command shown above. Setup verifies the official source
 
 ### PyCUDA/OpenGL interop fails
 
-Boba-Batched installs PyCUDA, but this demo additionally requires `pycuda.gl`. Verify it without changing the environment:
+The `phystwin-cu132` environment must provide PyCUDA with `pycuda.gl` support.
+Verify it without changing the environment:
 
 ```bash
 conda run -n phystwin-cu132 env PYTHONNOUSERSITE=1 \

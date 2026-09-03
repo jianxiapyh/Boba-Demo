@@ -826,6 +826,8 @@ def test_launcher_keeps_the_visible_window_default_explicit():
     assert "--immersive_start_posture standing" in launcher_source
     assert "--immersive_start_posture auto" not in launcher_source
     assert "--immersive_controller_max_motion_interval_m 0.05" in launcher_source
+    assert "Boba-Batched first" not in launcher_source
+    assert "runtime and event assets are already included" in launcher_source
 
 
 def test_interactive_window_covers_over_half_of_standard_monitor_workarea():

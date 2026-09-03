@@ -7,24 +7,16 @@ from pathlib import Path
 
 
 EXPECTED_CONDA_ENV = "phystwin"
-REPO_ROOT = Path(__file__).resolve().parents[1]
-BOBA_BATCHED_ROOT_ENV_VAR = "BOBA_BATCHED_ROOT"
-DEFAULT_BOBA_BATCHED_ROOT = Path("/home/yihan/Research/Boba_Latest")
-BOBA_BATCHED_ROOT = Path(
-    os.environ.get(BOBA_BATCHED_ROOT_ENV_VAR, DEFAULT_BOBA_BATCHED_ROOT)
-).expanduser().resolve()
-VENDORED_GSPLAT_ROOT = (
-    BOBA_BATCHED_ROOT / "gaussian_splatting" / "submodules" / "gsplat"
-)
+VENDORED_GSPLAT_ROOT = Path(__file__).resolve().parent / "submodules" / "gsplat"
 VENDORED_GSPLAT_PACKAGE = VENDORED_GSPLAT_ROOT / "gsplat"
 
 
 def _install_hint() -> str:
     return (
-        "Prepare and validate Boba-Batched first, then point this demo at that checkout:\n"
-        f"  export {BOBA_BATCHED_ROOT_ENV_VAR}={BOBA_BATCHED_ROOT}\n"
+        "The phone-demo branch includes its required gsplat source.\n"
         "  conda activate phystwin\n"
-        f"Expected gsplat source: {VENDORED_GSPLAT_ROOT}"
+        "  bash env_install/install_demo2_extras.sh\n"
+        f"Bundled gsplat source: {VENDORED_GSPLAT_ROOT}"
     )
 
 
@@ -118,9 +110,6 @@ rasterization_shared_template = gsplat.rasterization_shared_template
 
 
 __all__ = [
-    "BOBA_BATCHED_ROOT",
-    "BOBA_BATCHED_ROOT_ENV_VAR",
-    "DEFAULT_BOBA_BATCHED_ROOT",
     "EXPECTED_CONDA_ENV",
     "VENDORED_GSPLAT_PACKAGE",
     "VENDORED_GSPLAT_ROOT",

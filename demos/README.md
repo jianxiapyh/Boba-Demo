@@ -3,9 +3,11 @@
 Demo 2 runs a batched replay on the workstation monitor and lets phone users claim
 individual sessions through a QR-code mobile web client.
 
-Demo 2 reuses the working `phystwin` environment from the Boba-Batched checkout at
-`/home/yihan/Research/Boba_Latest`. From the phone-demo repository, install the
-small web dependency layer and validate the runtime first:
+The phone-demo branch includes its Boba-Batched runtime source and packaged
+assets, so it does not require another Boba checkout. It uses the existing
+`phystwin` Conda environment for third-party CUDA/rendering dependencies. From
+the phone-demo repository, install the small web dependency layer and validate
+the bundled runtime first:
 
 ```bash
 conda activate phystwin

@@ -3,7 +3,6 @@ set -euo pipefail
 
 EXPECTED_ENV="phystwin"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
-export BOBA_BATCHED_ROOT="${BOBA_BATCHED_ROOT:-/home/yihan/Research/Boba_Latest}"
 
 die() {
   printf '[Demo2 launcher] ERROR: %s\n' "$*" >&2
@@ -18,10 +17,6 @@ fi
 if [[ -z "${CONDA_PREFIX:-}" || ! -x "${CONDA_PREFIX}/bin/python" ]]; then
   die "CONDA_PREFIX does not identify the active ${EXPECTED_ENV} environment."
 fi
-if [[ ! -d "${BOBA_BATCHED_ROOT}" ]]; then
-  die "BOBA_BATCHED_ROOT is not a directory: ${BOBA_BATCHED_ROOT}"
-fi
-
 resolved_cuda_home="${CUDA_HOME:-}"
 if [[ -z "${resolved_cuda_home}" || ! -x "${resolved_cuda_home}/bin/nvcc" ]]; then
   if command -v nvcc >/dev/null 2>&1; then

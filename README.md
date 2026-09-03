@@ -8,23 +8,17 @@
 
 This branch packages Boba Demo 2: a 100-session batched replay on the workstation display with QR-based phone claiming, phone controls, and a low-latency per-session phone stream.
 
-## Prerequisite: working Boba-Batched
+## Prerequisites
 
-This branch deliberately reuses the environment prepared for Boba-Batched. Before setting up the phone demo, the following must already work:
+This branch already contains the Boba-Batched runtime source, the custom
+`gsplat` source, and the packaged Rope and Sloth demo assets. A separate
+Boba-Batched checkout is **not** required.
 
-- `Boba_Batched` is checked out at `/home/yihan/Research/Boba_Latest`.
-- Its `phystwin` Conda environment can run a CUDA/rendering Boba-Batched workload.
-- NVIDIA CUDA, X11/OpenGL, PyCUDA OpenGL interoperability, and the custom Boba-Batched `gsplat` runtime are operational.
-
-The runtime snapshot in this branch was imported from `Boba_Batched@99e50055a60a4bc7e5022abba1a938bf386b273d`. The preflight also verifies the expected interfaces in the active `Boba_Batched` checkout so a later compatible revision can be reused.
-
-If the Boba-Batched checkout is elsewhere, export its location before setup and launch:
-
-```bash
-export BOBA_BATCHED_ROOT=/path/to/Boba_Latest
-```
-
-The phone-demo setup does not install or upgrade PyTorch, CUDA, Warp, PyCUDA, NumPy, Open3D, or `gsplat`.
+The repository does not bundle a Conda environment. Before setup, the demo
+computer must have the `phystwin` environment with its CUDA/rendering
+dependencies, an NVIDIA CUDA toolkit, and a working X11/OpenGL desktop session.
+The phone-demo setup adds only the small web/QR packages; it does not replace or
+upgrade PyTorch, CUDA, Warp, PyCUDA, NumPy, or Open3D.
 
 ## One-time phone-demo setup
 
@@ -65,7 +59,7 @@ Run a bounded one-session smoke test first:
 
 ```bash
 bash scripts/run_demo2.sh \
-  --case_name single_push_rope_4 \
+  --case_name double_stretch_sloth \
   --batch_size 1 \
   --batch_grid_cols 1 \
   --max_frames 3
@@ -75,7 +69,7 @@ Start the full demo:
 
 ```bash
 bash scripts/run_demo2.sh \
-  --case_name single_push_rope_4 \
+  --case_name double_stretch_sloth \
   --batch_size 100 \
   --batch_grid_cols 10 \
   --batch_image_resolution 640x480 \
@@ -83,11 +77,10 @@ bash scripts/run_demo2.sh \
   --port 7860
 ```
 
-To run the two-interaction-point sloth demo, use the same command with
-`--case_name double_stretch_sloth`. Its left and right phone controls drive the
-viewer-left and viewer-right attachment regions independently. Phone arrow
-directions are calibrated from the selected case's camera, which accounts for
-the sloth view's opposite X/Y orientation without changing Z behavior.
+The default event experience above is the two-interaction-point Sloth. Its left
+and right phone controls drive the viewer-left and viewer-right attachment
+regions independently. The packaged Rope alternative is available by replacing
+the case with `--case_name single_push_rope_4`.
 
 Batch 100 is the target configuration and has been exercised on RTX PRO 6000 Blackwell. Use a smaller explicit `--batch_size` on GPUs that cannot fit the full workload.
 
@@ -160,8 +153,7 @@ The raw trajectory bank and original training dataset are intentionally excluded
 ## Troubleshooting
 
 - **Wrong environment:** activate `phystwin`; the scripts reject other environments.
-- **Missing Boba-Batched checkout:** set `BOBA_BATCHED_ROOT` to the working checkout.
-- **OpenGL/display failure:** confirm `DISPLAY` is set and that a Boba-Batched rendering command works in the same shell.
+- **OpenGL/display failure:** confirm `DISPLAY` is set and launch from the computer's local X11 desktop session.
 - **`libstdc++` import errors:** launch through `scripts/run_demo2.sh`, which places `$CONDA_PREFIX/lib` before system libraries.
 - **Phone cannot connect:** confirm both devices are on the same non-isolated LAN, allow TCP `7860`, and use an explicit `--public_url`.
 - **CUDA out of memory:** retry with a smaller explicit `--batch_size` and matching `--batch_grid_cols`.

@@ -3,7 +3,6 @@ set -euo pipefail
 
 EXPECTED_ENV="phystwin"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
-BOBA_BATCHED_ROOT="${BOBA_BATCHED_ROOT:-/home/yihan/Research/Boba_Latest}"
 failures=0
 
 ok() {
@@ -42,40 +41,15 @@ else
 fi
 
 export PYTHONNOUSERSITE=1
-export BOBA_BATCHED_ROOT
-
-if [[ -d "${BOBA_BATCHED_ROOT}" ]]; then
-  BOBA_BATCHED_ROOT="$(cd "${BOBA_BATCHED_ROOT}" && pwd -P)"
-  export BOBA_BATCHED_ROOT
-  ok "Boba-Batched checkout exists: ${BOBA_BATCHED_ROOT}"
-else
-  fail "BOBA_BATCHED_ROOT is not a directory: ${BOBA_BATCHED_ROOT}"
-fi
-
-if [[ -d "${BOBA_BATCHED_ROOT}" ]] && command -v git >/dev/null 2>&1 \
-  && git -C "${BOBA_BATCHED_ROOT}" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-  batched_branch="$(git -C "${BOBA_BATCHED_ROOT}" symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
-  batched_commit="$(git -C "${BOBA_BATCHED_ROOT}" rev-parse --short=12 HEAD 2>/dev/null || true)"
-  if [[ "${batched_branch}" == "Boba_Batched" ]]; then
-    ok "Boba-Batched branch is Boba_Batched at ${batched_commit}"
-  else
-    fail "${BOBA_BATCHED_ROOT} must be checked out on Boba_Batched (current: ${batched_branch:-detached})"
-  fi
-  if [[ -n "$(git -C "${BOBA_BATCHED_ROOT}" status --porcelain 2>/dev/null)" ]]; then
-    warn "Boba-Batched checkout has local changes; preflight will not modify them"
-  fi
-else
-  fail "${BOBA_BATCHED_ROOT} is not a readable Git checkout"
-fi
 
 for runtime_marker in \
   "interactive_playground.py" \
   "qqtt/engine/trainer_warp.py" \
   "gaussian_splatting/submodules/gsplat/gsplat/__init__.py"; do
-  if [[ -f "${BOBA_BATCHED_ROOT}/${runtime_marker}" ]]; then
-    ok "Boba-Batched runtime marker exists: ${runtime_marker}"
+  if [[ -f "${REPO_ROOT}/${runtime_marker}" ]]; then
+    ok "bundled Boba runtime exists: ${runtime_marker}"
   else
-    fail "compatible Boba-Batched runtime marker is missing: ${runtime_marker}"
+    fail "bundled Boba runtime file is missing: ${runtime_marker}"
   fi
 done
 
@@ -114,7 +88,7 @@ from importlib import metadata
 missing = []
 for name in (
     "torch", "torchvision", "torchaudio", "numpy", "scipy", "warp-lang",
-    "pycuda", "gsplat", "pytorch3d", "open3d", "PyOpenGL", "glfw", "kornia", "Pillow",
+    "pycuda", "pytorch3d", "open3d", "PyOpenGL", "glfw", "kornia", "Pillow",
 ):
     try:
         version = metadata.version(name)
@@ -175,6 +149,7 @@ from gaussian_splatting._gsplat_vendor import gsplat, rasterization_shared_templ
 if not callable(rasterization_shared_template):
     raise RuntimeError("gsplat.rasterization_shared_template is not callable")
 print(f"gsplat source: {gsplat.__file__}")
+print(f"gsplat version: {gsplat.__version__}")
 print("gsplat.rasterization_shared_template is available")
 PY
 )"; then

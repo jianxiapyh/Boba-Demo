@@ -389,6 +389,20 @@ class Demo2ServerApiTest(unittest.TestCase):
         self.assertIn('suffix = "INST/S"', trainer_source)
         self.assertIn("aggregate_throughput=aggregate_throughput", trainer_source)
 
+    def test_launcher_uses_only_the_runtime_bundled_in_this_branch(self):
+        launcher_source = (REPO_ROOT / "scripts" / "run_demo2.sh").read_text()
+        preflight_source = (REPO_ROOT / "scripts" / "demo2_preflight.sh").read_text()
+        vendor_source = (REPO_ROOT / "gaussian_splatting" / "_gsplat_vendor.py").read_text()
+
+        for source in (launcher_source, preflight_source, vendor_source):
+            self.assertNotIn("BOBA_BATCHED_ROOT", source)
+            self.assertNotIn("/home/yihan/Research/Boba_Latest", source)
+        self.assertIn(
+            'Path(__file__).resolve().parent / "submodules" / "gsplat"',
+            vendor_source,
+        )
+        self.assertIn('${REPO_ROOT}/${runtime_marker}', preflight_source)
+
 
 class Demo2CaseManifestTest(unittest.TestCase):
     def setUp(self):

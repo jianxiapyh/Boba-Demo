@@ -2,7 +2,8 @@
 set -euo pipefail
 
 # Install only the small web/QR additions needed by Demo 2. The existing
-# Boba-Batched phystwin environment remains the source of all core packages.
+# phystwin environment remains the source of third-party core packages; the
+# Boba runtime source itself is bundled in this branch.
 
 EXPECTED_ENV="phystwin"
 

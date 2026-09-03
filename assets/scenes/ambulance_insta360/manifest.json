@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "scene_name": "ambulance",
+  "display_name": "Insta360 Ambulance",
+  "sog": "assets/scenes/ambulance_insta360/ambulance_insta360.sog",
+  "sog_sha256": "203f8d93e81d97bd52301bf34fedc51938f1b5807f4f20e8e8ca5b91b4f15297",
+  "sog_version": 2,
+  "gaussian_count": 999410,
+  "sh_degree": 3,
+  "generator": "splat-transform v3.3.0",
+  "format_reference": "https://github.com/playcanvas/splat-transform",
+  "calibration": "assets/scenes/ambulance_insta360/calibration.json",
+  "collision_proxy": "assets/scenes/ambulance_insta360/stretcher_collision_proxy.glb",
+  "collision_proxy_sha256": "7becf3bcce9a8cceded1717d61342a066f9b7f36c6563dfb6ffa6125c12588c0",
+  "collision_proxy_source_sha256": "41b6e4537f8ad6b55ca9a71ca5e75e5c58435da66b208e18f75932be47d072f4",
+  "collision_proxy_vertex_count": 30619,
+  "collision_proxy_face_count": 57342,
+  "dynamic_gaussian_capacity": 262144,
+  "spatial_chunks": {
+    "frustum_padding_m": 0.1,
+    "prefetch_margin_ratio": 0.2,
+    "near_plane_m": 0.01
+  }
+}

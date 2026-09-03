@@ -356,7 +356,7 @@ def object_collision(
 @wp.kernel(enable_backward=False)
 def build_resting_collision_pairs(
     x: wp.array(dtype=wp.vec3),
-    collision_dist: float,
+    rest_exclusion_dist: float,
     grid: wp.uint64,
     resting_collision_pairs: wp.array2d(dtype=wp.bool),
 ):
@@ -368,9 +368,11 @@ def build_resting_collision_pairs(
 
     x1 = x[i]
 
-    neighbors = wp.hash_grid_query(grid, x1, collision_dist * 5.0)
+    neighbors = wp.hash_grid_query(grid, x1, rest_exclusion_dist)
     for index in neighbors:
         if index < i:
+            # Preserve PhysTwin's trained behavior: the rest map contains the
+            # hash-query candidates, not a second exact-distance-filtered set.
             resting_collision_pairs[i][index] = wp.bool(1)
             resting_collision_pairs[index][i] = wp.bool(1)
 
@@ -397,6 +399,176 @@ def apply_surface_collision_response(
     v_tangent_new = tangent_scale * v_tangent
     return v_normal_new + v_tangent_new
 
+
+@wp.func
+def sample_static_surface_heightfield(
+    offsets: wp.array(dtype=float),
+    offset_start: int,
+    cells_u: int,
+    cells_v: int,
+    extent_u: float,
+    extent_v: float,
+    local_u: float,
+    local_v: float,
+):
+    """Return height and local derivatives for a triangulated heightfield."""
+
+    normalized_u = wp.clamp(
+        (local_u + extent_u) / (2.0 * extent_u),
+        0.0,
+        1.0,
+    )
+    normalized_v = wp.clamp(
+        (local_v + extent_v) / (2.0 * extent_v),
+        0.0,
+        1.0,
+    )
+    scaled_u = normalized_u * float(cells_u)
+    scaled_v = normalized_v * float(cells_v)
+    cell_u = wp.min(int(scaled_u), cells_u - 1)
+    cell_v = wp.min(int(scaled_v), cells_v - 1)
+    fraction_u = scaled_u - float(cell_u)
+    fraction_v = scaled_v - float(cell_v)
+    row_stride = cells_u + 1
+    index_00 = offset_start + cell_v * row_stride + cell_u
+    height_00 = offsets[index_00]
+    height_10 = offsets[index_00 + 1]
+    height_01 = offsets[index_00 + row_stride]
+    height_11 = offsets[index_00 + row_stride + 1]
+
+    height = float(0.0)
+    derivative_fraction_u = float(0.0)
+    derivative_fraction_v = float(0.0)
+    if (cell_u + cell_v) % 2 == 0:
+        if fraction_v <= fraction_u:
+            height = (
+                height_00
+                + fraction_u * (height_10 - height_00)
+                + fraction_v * (height_11 - height_10)
+            )
+            derivative_fraction_u = height_10 - height_00
+            derivative_fraction_v = height_11 - height_10
+        else:
+            height = (
+                height_00
+                + fraction_u * (height_11 - height_01)
+                + fraction_v * (height_01 - height_00)
+            )
+            derivative_fraction_u = height_11 - height_01
+            derivative_fraction_v = height_01 - height_00
+    else:
+        if fraction_u + fraction_v <= 1.0:
+            height = (
+                height_00
+                + fraction_u * (height_10 - height_00)
+                + fraction_v * (height_01 - height_00)
+            )
+            derivative_fraction_u = height_10 - height_00
+            derivative_fraction_v = height_01 - height_00
+        else:
+            height = (
+                height_11
+                + (1.0 - fraction_u) * (height_01 - height_11)
+                + (1.0 - fraction_v) * (height_10 - height_11)
+            )
+            derivative_fraction_u = height_11 - height_01
+            derivative_fraction_v = height_11 - height_10
+
+    derivative_u = derivative_fraction_u * float(cells_u) / (2.0 * extent_u)
+    derivative_v = derivative_fraction_v * float(cells_v) / (2.0 * extent_v)
+    return wp.vec3(height, derivative_u, derivative_v)
+
+
+@wp.func
+def rounded_capsule_heightfield_contact(
+    offsets: wp.array(dtype=float),
+    offset_start: int,
+    cells_u: int,
+    cells_v: int,
+    surface_normal: wp.vec3,
+    surface_axis_u: wp.vec3,
+    surface_axis_v: wp.vec3,
+    surface_extent_u: float,
+    surface_extent_v: float,
+    edge_radius: float,
+    relative_position: wp.vec3,
+):
+    """Return signed distance and normal for a crowned rounded capsule top."""
+
+    local_u = wp.dot(relative_position, surface_axis_u)
+    local_v = wp.dot(relative_position, surface_axis_v)
+    axial_distance = wp.dot(relative_position, surface_normal)
+    height_sample = sample_static_surface_heightfield(
+        offsets,
+        offset_start,
+        cells_u,
+        cells_v,
+        surface_extent_u,
+        surface_extent_v,
+        local_u,
+        local_v,
+    )
+    height_distance = axial_distance - height_sample[0]
+    top_normal = wp.normalize(
+        surface_normal
+        - surface_axis_u * height_sample[1]
+        - surface_axis_v * height_sample[2]
+    )
+
+    capsule_radius = surface_extent_v
+    capsule_spine_half_length = wp.max(
+        surface_extent_u - capsule_radius,
+        0.0,
+    )
+    closest_spine_u = wp.clamp(
+        local_u,
+        -capsule_spine_half_length,
+        capsule_spine_half_length,
+    )
+    radial_u = local_u - closest_spine_u
+    radial_v = local_v
+    radial_length = wp.sqrt(radial_u * radial_u + radial_v * radial_v)
+    outward_normal = surface_axis_v
+    if radial_length > 1.0e-8:
+        outward_normal = (
+            surface_axis_u * (radial_u / radial_length)
+            + surface_axis_v * (radial_v / radial_length)
+        )
+
+    footprint_distance = radial_length - capsule_radius
+    rounded_radius = wp.clamp(
+        edge_radius,
+        1.0e-5,
+        0.5 * capsule_radius,
+    )
+    corner_u = footprint_distance + rounded_radius
+    corner_h = height_distance + rounded_radius
+    positive_u = wp.max(corner_u, 0.0)
+    positive_h = wp.max(corner_h, 0.0)
+    outside_length = wp.sqrt(
+        positive_u * positive_u + positive_h * positive_h
+    )
+    signed_distance = (
+        wp.min(wp.max(corner_u, corner_h), 0.0)
+        + outside_length
+        - rounded_radius
+    )
+
+    contact_normal = top_normal
+    if corner_u > 0.0 and corner_h > 0.0:
+        contact_normal = wp.normalize(
+            outward_normal * corner_u + top_normal * corner_h
+        )
+    elif corner_u > corner_h:
+        contact_normal = outward_normal
+    return wp.vec4(
+        signed_distance,
+        contact_normal[0],
+        contact_normal[1],
+        contact_normal[2],
+    )
+
+
 @wp.kernel
 def integrate_ground_collision(
     x: wp.array(dtype=wp.vec3),
@@ -416,13 +588,23 @@ def integrate_ground_collision(
     static_surface_extents_u: wp.array(dtype=float),
     static_surface_extents_v: wp.array(dtype=float),
     static_surface_kinds: wp.array(dtype=wp.int32),
+    static_surface_edge_radii: wp.array(dtype=float),
+    static_surface_heightfield_offsets: wp.array(dtype=float),
+    static_surface_heightfield_starts: wp.array(dtype=wp.int32),
+    static_surface_heightfield_cells_u: wp.array(dtype=wp.int32),
+    static_surface_heightfield_cells_v: wp.array(dtype=wp.int32),
     static_surface_count: int,
     static_surface_query_distance: float,
     static_surface_margin: float,
     static_surface_restitution: float,
     static_surface_friction: float,
     static_mesh_enabled: int,
+    static_mesh_sweep_start: wp.array(dtype=wp.vec3),
     static_mesh: wp.uint64,
+    static_mesh_two_sided: int,
+    static_mesh_component_mins: wp.array(dtype=wp.vec3),
+    static_mesh_component_maxs: wp.array(dtype=wp.vec3),
+    static_mesh_component_count: int,
     static_mesh_query_distance: float,
     static_mesh_winding_accuracy: float,
     static_mesh_winding_threshold: float,
@@ -597,11 +779,13 @@ def integrate_ground_collision(
                 best_hit_normal = candidate_normal
                 has_sweep_hit = int(1)
 
-    # Fast finite primitives are used by Garden: a closed circular tabletop and
-    # a rectangular patio. Plane/cylinder sweeps prevent tunnelling, while the
-    # bounded recovery path resolves resting penetration. kind=0 is a local
-    # rectangle, kind=1 is a top-only disk, and kind=2 is a finite cylinder
-    # whose extent_u is its radius and extent_v is its depth below the top.
+    # Fast finite primitives are used by Garden and Ambulance. Sweeps prevent
+    # tunnelling, while the bounded recovery path resolves resting penetration.
+    # kind=0 is a local rectangle, kind=1 is a top-only disk, kind=2 is a finite
+    # cylinder, kind=3 is a rectangular heightfield, kind=4 is the same
+    # heightfield clipped to a fourth-power superellipse, kind=5 clips the
+    # heightfield to a long-axis capsule, and kind=6 gives that capsule a
+    # continuous padded roll-off instead of a hard top-only edge.
     best_surface_t = float(2.0)
     best_surface_normal = wp.vec3(0.0, 0.0, 0.0)
     has_surface_sweep = int(0)
@@ -620,24 +804,278 @@ def integrate_ground_collision(
         surface_extent_u = static_surface_extents_u[surface_index]
         surface_extent_v = static_surface_extents_v[surface_index]
         surface_kind = static_surface_kinds[surface_index]
+        surface_edge_radius = static_surface_edge_radii[surface_index]
 
-        previous_distance = wp.dot(x0 - surface_center, surface_normal)
-        candidate_distance = wp.dot(x_result - surface_center, surface_normal)
+        previous_relative = x0 - surface_center
+        candidate_relative = x_result - surface_center
+        previous_u = wp.dot(previous_relative, surface_axis_u)
+        previous_v = wp.dot(previous_relative, surface_axis_v)
+        candidate_u = wp.dot(candidate_relative, surface_axis_u)
+        candidate_v = wp.dot(candidate_relative, surface_axis_v)
+        previous_distance = wp.dot(previous_relative, surface_normal)
+        candidate_distance = wp.dot(candidate_relative, surface_normal)
+        candidate_surface_normal = surface_normal
+        if surface_kind == 6:
+            previous_contact = rounded_capsule_heightfield_contact(
+                static_surface_heightfield_offsets,
+                static_surface_heightfield_starts[surface_index],
+                static_surface_heightfield_cells_u[surface_index],
+                static_surface_heightfield_cells_v[surface_index],
+                surface_normal,
+                surface_axis_u,
+                surface_axis_v,
+                surface_extent_u,
+                surface_extent_v,
+                surface_edge_radius,
+                previous_relative,
+            )
+            candidate_contact = rounded_capsule_heightfield_contact(
+                static_surface_heightfield_offsets,
+                static_surface_heightfield_starts[surface_index],
+                static_surface_heightfield_cells_u[surface_index],
+                static_surface_heightfield_cells_v[surface_index],
+                surface_normal,
+                surface_axis_u,
+                surface_axis_v,
+                surface_extent_u,
+                surface_extent_v,
+                surface_edge_radius,
+                candidate_relative,
+            )
+            previous_distance = previous_contact[0]
+            candidate_distance = candidate_contact[0]
+            candidate_surface_normal = wp.vec3(
+                candidate_contact[1],
+                candidate_contact[2],
+                candidate_contact[3],
+            )
+        elif surface_kind == 3 or surface_kind == 4 or surface_kind == 5:
+            heightfield_start = static_surface_heightfield_starts[surface_index]
+            heightfield_cells_u = static_surface_heightfield_cells_u[surface_index]
+            heightfield_cells_v = static_surface_heightfield_cells_v[surface_index]
+            previous_sample = sample_static_surface_heightfield(
+                static_surface_heightfield_offsets,
+                heightfield_start,
+                heightfield_cells_u,
+                heightfield_cells_v,
+                surface_extent_u,
+                surface_extent_v,
+                previous_u,
+                previous_v,
+            )
+            candidate_sample = sample_static_surface_heightfield(
+                static_surface_heightfield_offsets,
+                heightfield_start,
+                heightfield_cells_u,
+                heightfield_cells_v,
+                surface_extent_u,
+                surface_extent_v,
+                candidate_u,
+                candidate_v,
+            )
+            previous_distance = previous_distance - previous_sample[0]
+            candidate_distance = candidate_distance - candidate_sample[0]
+            candidate_surface_normal = wp.normalize(
+                surface_normal
+                - surface_axis_u * candidate_sample[1]
+                - surface_axis_v * candidate_sample[2]
+            )
         distance_delta = previous_distance - candidate_distance
-
+        surface_sweep_detected = int(0)
+        rounded_bracketed_sweep = int(0)
+        sweep_lower_hit_t = float(0.0)
+        sweep_upper_hit_t = float(1.0)
         if (
             previous_distance >= surface_margin
             and candidate_distance < surface_margin
             and distance_delta > collision_eps
         ):
-            hit_t = (previous_distance - surface_margin) / distance_delta
+            surface_sweep_detected = int(1)
+
+        if (
+            surface_kind == 6
+            and surface_sweep_detected == 0
+            and previous_distance >= surface_margin
+            and wp.length(surface_motion) > 0.5 * surface_edge_radius
+            and wp.min(previous_u, candidate_u)
+            <= surface_extent_u + surface_edge_radius
+            and wp.max(previous_u, candidate_u)
+            >= -surface_extent_u - surface_edge_radius
+            and wp.min(previous_v, candidate_v)
+            <= surface_extent_v + surface_edge_radius
+            and wp.max(previous_v, candidate_v)
+            >= -surface_extent_v - surface_edge_radius
+        ):
+            previous_probe_distance = previous_distance
+            previous_probe_t = float(0.0)
+            for edge_probe_index in range(1, 9):
+                edge_probe_t = float(edge_probe_index) / 8.0
+                edge_probe_relative = (
+                    x0 + surface_motion * edge_probe_t - surface_center
+                )
+                edge_probe_contact = rounded_capsule_heightfield_contact(
+                    static_surface_heightfield_offsets,
+                    static_surface_heightfield_starts[surface_index],
+                    static_surface_heightfield_cells_u[surface_index],
+                    static_surface_heightfield_cells_v[surface_index],
+                    surface_normal,
+                    surface_axis_u,
+                    surface_axis_v,
+                    surface_extent_u,
+                    surface_extent_v,
+                    surface_edge_radius,
+                    edge_probe_relative,
+                )
+                if (
+                    surface_sweep_detected == 0
+                    and previous_probe_distance >= surface_margin
+                    and edge_probe_contact[0] < surface_margin
+                ):
+                    surface_sweep_detected = int(1)
+                    rounded_bracketed_sweep = int(1)
+                    sweep_lower_hit_t = previous_probe_t
+                    sweep_upper_hit_t = edge_probe_t
+                previous_probe_distance = edge_probe_contact[0]
+                previous_probe_t = edge_probe_t
+
+        if surface_sweep_detected != 0:
+            hit_t = 0.5 * (sweep_lower_hit_t + sweep_upper_hit_t)
+            if rounded_bracketed_sweep == 0:
+                hit_t = (previous_distance - surface_margin) / distance_delta
+            if surface_kind == 6:
+                # The rounded edge distance is nonlinear along a fast sweep.
+                # Refine its time of impact so a vertical drop cannot be left
+                # embedded in the curved roll-off by linear interpolation.
+                capsule_spine_half_length = wp.max(
+                    surface_extent_u - surface_extent_v,
+                    0.0,
+                )
+                previous_spine_u = wp.clamp(
+                    previous_u,
+                    -capsule_spine_half_length,
+                    capsule_spine_half_length,
+                )
+                candidate_spine_u = wp.clamp(
+                    candidate_u,
+                    -capsule_spine_half_length,
+                    capsule_spine_half_length,
+                )
+                previous_radial_u = previous_u - previous_spine_u
+                candidate_radial_u = candidate_u - candidate_spine_u
+                previous_footprint_distance = (
+                    wp.sqrt(
+                        previous_radial_u * previous_radial_u
+                        + previous_v * previous_v
+                    )
+                    - surface_extent_v
+                )
+                candidate_footprint_distance = (
+                    wp.sqrt(
+                        candidate_radial_u * candidate_radial_u
+                        + candidate_v * candidate_v
+                    )
+                    - surface_extent_v
+                )
+                if (
+                    rounded_bracketed_sweep != 0
+                    or previous_footprint_distance > -surface_edge_radius
+                    or candidate_footprint_distance > -surface_edge_radius
+                ):
+                    lower_hit_t = sweep_lower_hit_t
+                    upper_hit_t = sweep_upper_hit_t
+                    for _edge_sweep_iteration in range(8):
+                        probe_hit_t = 0.5 * (lower_hit_t + upper_hit_t)
+                        probe_relative = (
+                            x0 + surface_motion * probe_hit_t - surface_center
+                        )
+                        probe_contact = rounded_capsule_heightfield_contact(
+                            static_surface_heightfield_offsets,
+                            static_surface_heightfield_starts[surface_index],
+                            static_surface_heightfield_cells_u[surface_index],
+                            static_surface_heightfield_cells_v[surface_index],
+                            surface_normal,
+                            surface_axis_u,
+                            surface_axis_v,
+                            surface_extent_u,
+                            surface_extent_v,
+                            surface_edge_radius,
+                            probe_relative,
+                        )
+                        if probe_contact[0] >= surface_margin:
+                            lower_hit_t = probe_hit_t
+                        else:
+                            upper_hit_t = probe_hit_t
+                    hit_t = 0.5 * (lower_hit_t + upper_hit_t)
             if hit_t >= 0.0 and hit_t <= 1.0:
                 hit_point = x0 + surface_motion * hit_t
                 hit_relative = hit_point - surface_center
                 hit_u = wp.dot(hit_relative, surface_axis_u)
                 hit_v = wp.dot(hit_relative, surface_axis_v)
                 inside_footprint = int(0)
-                if surface_kind == 1 or surface_kind == 2:
+                hit_normal = surface_normal
+                if surface_kind == 6:
+                    hit_contact = rounded_capsule_heightfield_contact(
+                        static_surface_heightfield_offsets,
+                        static_surface_heightfield_starts[surface_index],
+                        static_surface_heightfield_cells_u[surface_index],
+                        static_surface_heightfield_cells_v[surface_index],
+                        surface_normal,
+                        surface_axis_u,
+                        surface_axis_v,
+                        surface_extent_u,
+                        surface_extent_v,
+                        surface_edge_radius,
+                        hit_relative,
+                    )
+                    hit_normal = wp.vec3(
+                        hit_contact[1],
+                        hit_contact[2],
+                        hit_contact[3],
+                    )
+                    inside_footprint = int(1)
+                elif surface_kind == 3 or surface_kind == 4 or surface_kind == 5:
+                    hit_sample = sample_static_surface_heightfield(
+                        static_surface_heightfield_offsets,
+                        static_surface_heightfield_starts[surface_index],
+                        static_surface_heightfield_cells_u[surface_index],
+                        static_surface_heightfield_cells_v[surface_index],
+                        surface_extent_u,
+                        surface_extent_v,
+                        hit_u,
+                        hit_v,
+                    )
+                    hit_normal = wp.normalize(
+                        surface_normal
+                        - surface_axis_u * hit_sample[1]
+                        - surface_axis_v * hit_sample[2]
+                    )
+                if surface_kind == 4:
+                    normalized_hit_u = hit_u / surface_extent_u
+                    normalized_hit_v = hit_v / surface_extent_v
+                    normalized_hit_u_sq = normalized_hit_u * normalized_hit_u
+                    normalized_hit_v_sq = normalized_hit_v * normalized_hit_v
+                    if (
+                        normalized_hit_u_sq * normalized_hit_u_sq
+                        + normalized_hit_v_sq * normalized_hit_v_sq
+                        <= 1.0
+                    ):
+                        inside_footprint = int(1)
+                elif surface_kind == 5:
+                    capsule_radius = surface_extent_v
+                    capsule_spine_half_length = wp.max(
+                        surface_extent_u - capsule_radius,
+                        0.0,
+                    )
+                    capsule_end_u = wp.max(
+                        wp.abs(hit_u) - capsule_spine_half_length,
+                        0.0,
+                    )
+                    if (
+                        capsule_end_u * capsule_end_u + hit_v * hit_v
+                        <= capsule_radius * capsule_radius
+                    ):
+                        inside_footprint = int(1)
+                elif surface_kind == 1 or surface_kind == 2:
                     footprint_radius = surface_extent_u
                     if surface_kind == 2:
                         footprint_radius = footprint_radius + surface_margin
@@ -653,12 +1091,8 @@ def integrate_ground_collision(
                     inside_footprint = int(1)
                 if inside_footprint != 0 and hit_t < best_surface_t:
                     best_surface_t = hit_t
-                    best_surface_normal = surface_normal
+                    best_surface_normal = hit_normal
                     has_surface_sweep = int(1)
-
-        candidate_relative = x_result - surface_center
-        candidate_u = wp.dot(candidate_relative, surface_axis_u)
-        candidate_v = wp.dot(candidate_relative, surface_axis_v)
 
         if surface_kind == 2:
             # The tabletop is a closed finite cylinder. The side sweep catches
@@ -793,7 +1227,40 @@ def integrate_ground_collision(
             penetration = surface_margin - candidate_distance
             if penetration > 0.0 and penetration <= surface_query_distance:
                 inside_recovery_footprint = int(0)
-                if surface_kind == 1:
+                if surface_kind == 6:
+                    inside_recovery_footprint = int(1)
+                elif surface_kind == 4:
+                    normalized_candidate_u = candidate_u / surface_extent_u
+                    normalized_candidate_v = candidate_v / surface_extent_v
+                    normalized_candidate_u_sq = (
+                        normalized_candidate_u * normalized_candidate_u
+                    )
+                    normalized_candidate_v_sq = (
+                        normalized_candidate_v * normalized_candidate_v
+                    )
+                    if (
+                        normalized_candidate_u_sq * normalized_candidate_u_sq
+                        + normalized_candidate_v_sq * normalized_candidate_v_sq
+                        <= 1.0
+                    ):
+                        inside_recovery_footprint = int(1)
+                elif surface_kind == 5:
+                    capsule_radius = surface_extent_v
+                    capsule_spine_half_length = wp.max(
+                        surface_extent_u - capsule_radius,
+                        0.0,
+                    )
+                    capsule_end_u = wp.max(
+                        wp.abs(candidate_u) - capsule_spine_half_length,
+                        0.0,
+                    )
+                    if (
+                        capsule_end_u * capsule_end_u
+                        + candidate_v * candidate_v
+                        <= capsule_radius * capsule_radius
+                    ):
+                        inside_recovery_footprint = int(1)
+                elif surface_kind == 1:
                     if (
                         candidate_u * candidate_u + candidate_v * candidate_v
                         <= surface_extent_u * surface_extent_u
@@ -809,7 +1276,7 @@ def integrate_ground_collision(
                     and penetration < best_surface_penetration
                 ):
                     best_surface_penetration = penetration
-                    best_surface_recovery_normal = surface_normal
+                    best_surface_recovery_normal = candidate_surface_normal
                     has_surface_recovery = int(1)
 
     surface_restitution = wp.clamp(static_surface_restitution, 0.0, 1.0)
@@ -864,23 +1331,66 @@ def integrate_ground_collision(
             + best_surface_recovery_normal * best_surface_penetration
         )
 
-    # Retained as a generic fallback for other callers. Garden does not enable
-    # this signed-winding mesh path at runtime.
+    # Triangle meshes handle detail that is not well represented by the fast
+    # analytic surfaces. Closed meshes use signed winding; source-derived open
+    # meshes can instead act as a two-sided shell with a small contact margin.
+    mesh_broadphase_hit = int(0)
     if static_mesh_enabled != 0:
+        # A costly source-mesh query may be scheduled less often than the
+        # spring integrator.  Sweep from the state immediately following the
+        # previous query so skipped substeps cannot tunnel through a thin
+        # triangle shell.
+        mesh_x0 = static_mesh_sweep_start[tid]
+        motion_min = wp.vec3(
+            wp.min(mesh_x0[0], x_result[0]),
+            wp.min(mesh_x0[1], x_result[1]),
+            wp.min(mesh_x0[2], x_result[2]),
+        )
+        motion_max = wp.vec3(
+            wp.max(mesh_x0[0], x_result[0]),
+            wp.max(mesh_x0[1], x_result[1]),
+            wp.max(mesh_x0[2], x_result[2]),
+        )
+        broadphase_padding = wp.vec3(
+            static_mesh_query_distance,
+            static_mesh_query_distance,
+            static_mesh_query_distance,
+        )
+        for component_index in range(static_mesh_component_count):
+            component_min = (
+                static_mesh_component_mins[component_index]
+                - broadphase_padding
+            )
+            component_max = (
+                static_mesh_component_maxs[component_index]
+                + broadphase_padding
+            )
+            if (
+                motion_max[0] >= component_min[0]
+                and motion_min[0] <= component_max[0]
+                and motion_max[1] >= component_min[1]
+                and motion_min[1] <= component_max[1]
+                and motion_max[2] >= component_min[2]
+                and motion_min[2] <= component_max[2]
+            ):
+                mesh_broadphase_hit = int(1)
+
+    if static_mesh_enabled != 0 and mesh_broadphase_hit != 0:
         mesh_restitution = wp.clamp(static_mesh_restitution, 0.0, 1.0)
         mesh_friction = wp.clamp(static_mesh_friction, 0.0, 2.0)
         resolved_mesh = int(0)
-        motion = x_result - x0
+        mesh_x0 = static_mesh_sweep_start[tid]
+        motion = x_result - mesh_x0
         motion_length = wp.length(motion)
         if motion_length > 1.0e-8:
             direction = motion / motion_length
             ray = wp.mesh_query_ray(
                 static_mesh,
-                x0,
+                mesh_x0,
                 direction,
                 motion_length,
             )
-            if ray.result and wp.dot(direction, ray.normal) < 0.0:
+            if ray.result:
                 surface_point = wp.mesh_eval_position(
                     static_mesh,
                     ray.face,
@@ -888,39 +1398,14 @@ def integrate_ground_collision(
                     ray.v,
                 )
                 mesh_normal = wp.normalize(ray.normal)
-                if wp.dot(v_result, mesh_normal) < -1.0e-4:
-                    v_result = apply_surface_collision_response(
-                        v_result,
-                        mesh_normal,
-                        mesh_restitution,
-                        mesh_friction,
-                    )
-                x_result = surface_point + mesh_normal * static_mesh_margin
-                resolved_mesh = int(1)
-
-        if resolved_mesh == 0:
-            query = wp.mesh_query_point_sign_winding_number(
-                static_mesh,
-                x_result,
-                max_dist=static_mesh_query_distance,
-                accuracy=static_mesh_winding_accuracy,
-                threshold=static_mesh_winding_threshold,
-            )
-            if query.result:
-                surface_point = wp.mesh_eval_position(
-                    static_mesh,
-                    query.face,
-                    query.u,
-                    query.v,
-                )
-                delta = x_result - surface_point
-                delta_length = wp.length(delta)
-                signed_distance = delta_length * query.sign
-                contact_error = signed_distance - static_mesh_margin
-                if contact_error < 0.0 and delta_length > 1.0e-8:
-                    # Negative sign means the candidate is inside the closed
-                    # mesh, so this reverses delta into the outward normal.
-                    mesh_normal = delta / delta_length * query.sign
+                ray_accepted = int(0)
+                if static_mesh_two_sided != 0:
+                    ray_accepted = int(1)
+                    if wp.dot(direction, mesh_normal) > 0.0:
+                        mesh_normal = -mesh_normal
+                elif wp.dot(direction, mesh_normal) < 0.0:
+                    ray_accepted = int(1)
+                if ray_accepted != 0:
                     if wp.dot(v_result, mesh_normal) < -1.0e-4:
                         v_result = apply_surface_collision_response(
                             v_result,
@@ -928,7 +1413,76 @@ def integrate_ground_collision(
                             mesh_restitution,
                             mesh_friction,
                         )
-                    x_result = x_result + mesh_normal * (-contact_error)
+                    x_result = surface_point + mesh_normal * static_mesh_margin
+                    resolved_mesh = int(1)
+
+        if resolved_mesh == 0:
+            if static_mesh_two_sided != 0:
+                shell_query = wp.mesh_query_point_no_sign(
+                    static_mesh,
+                    x_result,
+                    max_dist=static_mesh_query_distance,
+                )
+                if shell_query.result:
+                    surface_point = wp.mesh_eval_position(
+                        static_mesh,
+                        shell_query.face,
+                        shell_query.u,
+                        shell_query.v,
+                    )
+                    delta = x_result - surface_point
+                    delta_length = wp.length(delta)
+                    contact_error = delta_length - static_mesh_margin
+                    if contact_error < 0.0:
+                        mesh_normal = wp.normalize(
+                            wp.mesh_eval_face_normal(
+                                static_mesh,
+                                shell_query.face,
+                            )
+                        )
+                        if delta_length > 1.0e-8:
+                            mesh_normal = delta / delta_length
+                        elif wp.dot(v_result, mesh_normal) > 0.0:
+                            mesh_normal = -mesh_normal
+                        if wp.dot(v_result, mesh_normal) < -1.0e-4:
+                            v_result = apply_surface_collision_response(
+                                v_result,
+                                mesh_normal,
+                                mesh_restitution,
+                                mesh_friction,
+                            )
+                        x_result = x_result + mesh_normal * (-contact_error)
+            else:
+                query = wp.mesh_query_point_sign_winding_number(
+                    static_mesh,
+                    x_result,
+                    max_dist=static_mesh_query_distance,
+                    accuracy=static_mesh_winding_accuracy,
+                    threshold=static_mesh_winding_threshold,
+                )
+                if query.result:
+                    surface_point = wp.mesh_eval_position(
+                        static_mesh,
+                        query.face,
+                        query.u,
+                        query.v,
+                    )
+                    delta = x_result - surface_point
+                    delta_length = wp.length(delta)
+                    signed_distance = delta_length * query.sign
+                    contact_error = signed_distance - static_mesh_margin
+                    if contact_error < 0.0 and delta_length > 1.0e-8:
+                        # Negative sign means the candidate is inside the closed
+                        # mesh, so this reverses delta into the outward normal.
+                        mesh_normal = delta / delta_length * query.sign
+                        if wp.dot(v_result, mesh_normal) < -1.0e-4:
+                            v_result = apply_surface_collision_response(
+                                v_result,
+                                mesh_normal,
+                                mesh_restitution,
+                                mesh_friction,
+                            )
+                        x_result = x_result + mesh_normal * (-contact_error)
 
     x_new[tid] = x_result
     v_new[tid] = v_result
@@ -969,6 +1523,7 @@ class SpringMassSystemWarp:
         controller_rest_location, #replaces controller_points 
         number_of_instance,
         use_ground_plane=True,
+        self_collision_rest_exclusion_multiplier=5.0,
     ):
         logger.info(f"[SIMULATION]: Initialize the Spring-Mass System")
         self.device = cfg.device
@@ -1028,6 +1583,19 @@ class SpringMassSystemWarp:
         self.dashpot_damping = dashpot_damping
         self.drag_damping = drag_damping
         self.collision_dist = collision_dist
+        self.self_collision_rest_exclusion_multiplier = float(
+            self_collision_rest_exclusion_multiplier
+        )
+        if (
+            not np.isfinite(self.self_collision_rest_exclusion_multiplier)
+            or self.self_collision_rest_exclusion_multiplier < 1.0
+        ):
+            raise ValueError(
+                "self_collision_rest_exclusion_multiplier must be finite and >= 1.0"
+            )
+        self.self_collision_rest_exclusion_distance = float(
+            self.collision_dist
+        ) * self.self_collision_rest_exclusion_multiplier
         self.reverse_factor = 1.0 if not reverse_z else -1.0
         self.spring_Y_min = spring_Y_min
         self.spring_Y_max = spring_Y_max
@@ -1058,6 +1626,11 @@ class SpringMassSystemWarp:
         self.torch_static_surface_extents_u = zero_surface_float.clone()
         self.torch_static_surface_extents_v = zero_surface_float.clone()
         self.torch_static_surface_kinds = zero_surface_kind.clone()
+        self.torch_static_surface_edge_radii = zero_surface_float.clone()
+        self.torch_static_surface_heightfield_offsets = zero_surface_float.clone()
+        self.torch_static_surface_heightfield_starts = zero_surface_kind.clone()
+        self.torch_static_surface_heightfield_cells_u = zero_surface_kind.clone()
+        self.torch_static_surface_heightfield_cells_v = zero_surface_kind.clone()
         self.wp_static_surface_centers = wp.from_torch(
             self.torch_static_surface_centers, dtype=wp.vec3, requires_grad=False
         )
@@ -1079,18 +1652,58 @@ class SpringMassSystemWarp:
         self.wp_static_surface_kinds = wp.from_torch(
             self.torch_static_surface_kinds, dtype=wp.int32, requires_grad=False
         )
+        self.wp_static_surface_edge_radii = wp.from_torch(
+            self.torch_static_surface_edge_radii,
+            dtype=wp.float32,
+            requires_grad=False,
+        )
+        self.wp_static_surface_heightfield_offsets = wp.from_torch(
+            self.torch_static_surface_heightfield_offsets,
+            dtype=wp.float32,
+            requires_grad=False,
+        )
+        self.wp_static_surface_heightfield_starts = wp.from_torch(
+            self.torch_static_surface_heightfield_starts,
+            dtype=wp.int32,
+            requires_grad=False,
+        )
+        self.wp_static_surface_heightfield_cells_u = wp.from_torch(
+            self.torch_static_surface_heightfield_cells_u,
+            dtype=wp.int32,
+            requires_grad=False,
+        )
+        self.wp_static_surface_heightfield_cells_v = wp.from_torch(
+            self.torch_static_surface_heightfield_cells_v,
+            dtype=wp.int32,
+            requires_grad=False,
+        )
         self.static_surface_query_distance = 0.1
         self.static_surface_margin = 0.0
         self.static_surface_restitution = 0.0
         self.static_surface_friction = 0.5
         self.static_mesh_enabled = 0
+        self.static_mesh_substep_interval = 1
         self.static_mesh_id = 0
+        self.static_mesh_two_sided = 0
+        self.static_mesh_component_count = 0
         self.static_mesh_query_distance = 0.1
         self.static_mesh_winding_accuracy = 2.0
         self.static_mesh_winding_threshold = 0.5
         self.static_mesh_margin = 0.0
         self.static_mesh_restitution = 0.0
         self.static_mesh_friction = 0.5
+        self.torch_static_mesh_component_mins = zero_boxes.clone()
+        self.torch_static_mesh_component_maxs = zero_boxes.clone()
+        self.wp_static_mesh_component_mins = wp.from_torch(
+            self.torch_static_mesh_component_mins,
+            dtype=wp.vec3,
+            requires_grad=False,
+        )
+        self.wp_static_mesh_component_maxs = wp.from_torch(
+            self.torch_static_mesh_component_maxs,
+            dtype=wp.vec3,
+            requires_grad=False,
+        )
         self.wp_static_mesh_points = None
         self.wp_static_mesh_indices = None
         self.torch_static_mesh_points = None
@@ -1221,7 +1834,7 @@ class SpringMassSystemWarp:
         restitution=0.0,
         friction=0.5,
     ):
-        """Install immutable finite primitive colliders before CUDA graph capture."""
+        """Install immutable finite surface colliders before CUDA graph capture."""
 
         if not surfaces:
             self.static_surface_count = 0
@@ -1234,9 +1847,22 @@ class SpringMassSystemWarp:
         extents_u = []
         extents_v = []
         kinds = []
+        edge_radii = []
+        heightfield_offsets = []
+        heightfield_starts = []
+        heightfield_cells_u = []
+        heightfield_cells_v = []
         for index, surface in enumerate(surfaces):
             kind_name = str(surface.get("kind", "")).strip().lower()
-            if kind_name not in {"rectangle", "disk", "cylinder"}:
+            if kind_name not in {
+                "rectangle",
+                "disk",
+                "cylinder",
+                "heightfield",
+                "heightfield_superellipse",
+                "heightfield_capsule",
+                "heightfield_rounded_capsule",
+            }:
                 raise ValueError(
                     f"static collision surface {index} has unsupported kind {kind_name!r}"
                 )
@@ -1246,9 +1872,10 @@ class SpringMassSystemWarp:
             axis_v = np.asarray(surface["axis_v"], dtype=np.float32).reshape(3)
             extent_u = float(surface["extent_u"])
             extent_v = float(surface["extent_v"])
+            edge_radius = float(surface.get("edge_radius", 0.0))
             values = np.concatenate([center, normal, axis_u, axis_v])
             if not np.isfinite(values).all() or not np.isfinite(
-                [extent_u, extent_v]
+                [extent_u, extent_v, edge_radius]
             ).all():
                 raise ValueError(
                     f"static collision surface {index} contains non-finite values"
@@ -1256,6 +1883,17 @@ class SpringMassSystemWarp:
             if extent_u <= 0.0 or extent_v <= 0.0:
                 raise ValueError(
                     f"static collision surface {index} extents must be positive"
+                )
+            if kind_name == "heightfield_rounded_capsule":
+                if edge_radius <= 0.0 or edge_radius >= 0.5 * extent_v:
+                    raise ValueError(
+                        f"static rounded capsule {index} edge radius must be "
+                        "positive and less than half its capsule radius"
+                    )
+            elif edge_radius != 0.0:
+                raise ValueError(
+                    f"static collision surface {index} only supports an edge "
+                    "radius for heightfield_rounded_capsule"
                 )
             normal_length = float(np.linalg.norm(normal))
             axis_u_length = float(np.linalg.norm(axis_u))
@@ -1281,7 +1919,45 @@ class SpringMassSystemWarp:
             axes_v.append(axis_v)
             extents_u.append(extent_u)
             extents_v.append(extent_v)
-            kinds.append({"rectangle": 0, "disk": 1, "cylinder": 2}[kind_name])
+            edge_radii.append(edge_radius)
+            kinds.append(
+                {
+                    "rectangle": 0,
+                    "disk": 1,
+                    "cylinder": 2,
+                    "heightfield": 3,
+                    "heightfield_superellipse": 4,
+                    "heightfield_capsule": 5,
+                    "heightfield_rounded_capsule": 6,
+                }[kind_name]
+            )
+            if kind_name in {
+                "heightfield",
+                "heightfield_superellipse",
+                "heightfield_capsule",
+                "heightfield_rounded_capsule",
+            }:
+                offsets = np.asarray(
+                    surface.get("normal_offsets_m"),
+                    dtype=np.float32,
+                )
+                if (
+                    offsets.ndim != 2
+                    or min(offsets.shape) < 3
+                    or not np.isfinite(offsets).all()
+                ):
+                    raise ValueError(
+                        f"static collision heightfield {index} must contain a "
+                        "finite grid with at least 3x3 vertices"
+                    )
+                heightfield_starts.append(len(heightfield_offsets))
+                heightfield_cells_u.append(int(offsets.shape[1] - 1))
+                heightfield_cells_v.append(int(offsets.shape[0] - 1))
+                heightfield_offsets.extend(offsets.reshape(-1).tolist())
+            else:
+                heightfield_starts.append(0)
+                heightfield_cells_u.append(0)
+                heightfield_cells_v.append(0)
 
         scalar_values = {
             "query_distance": float(query_distance),
@@ -1318,6 +1994,27 @@ class SpringMassSystemWarp:
             dtype=torch.int32,
             device=self.device,
         ).contiguous()
+        self.torch_static_surface_edge_radii = _float_tensor(edge_radii)
+        if not heightfield_offsets:
+            heightfield_offsets = [0.0]
+        self.torch_static_surface_heightfield_offsets = _float_tensor(
+            heightfield_offsets
+        )
+        self.torch_static_surface_heightfield_starts = torch.as_tensor(
+            np.ascontiguousarray(heightfield_starts, dtype=np.int32),
+            dtype=torch.int32,
+            device=self.device,
+        ).contiguous()
+        self.torch_static_surface_heightfield_cells_u = torch.as_tensor(
+            np.ascontiguousarray(heightfield_cells_u, dtype=np.int32),
+            dtype=torch.int32,
+            device=self.device,
+        ).contiguous()
+        self.torch_static_surface_heightfield_cells_v = torch.as_tensor(
+            np.ascontiguousarray(heightfield_cells_v, dtype=np.int32),
+            dtype=torch.int32,
+            device=self.device,
+        ).contiguous()
         self.wp_static_surface_centers = wp.from_torch(
             self.torch_static_surface_centers, dtype=wp.vec3, requires_grad=False
         )
@@ -1339,6 +2036,31 @@ class SpringMassSystemWarp:
         self.wp_static_surface_kinds = wp.from_torch(
             self.torch_static_surface_kinds, dtype=wp.int32, requires_grad=False
         )
+        self.wp_static_surface_edge_radii = wp.from_torch(
+            self.torch_static_surface_edge_radii,
+            dtype=wp.float32,
+            requires_grad=False,
+        )
+        self.wp_static_surface_heightfield_offsets = wp.from_torch(
+            self.torch_static_surface_heightfield_offsets,
+            dtype=wp.float32,
+            requires_grad=False,
+        )
+        self.wp_static_surface_heightfield_starts = wp.from_torch(
+            self.torch_static_surface_heightfield_starts,
+            dtype=wp.int32,
+            requires_grad=False,
+        )
+        self.wp_static_surface_heightfield_cells_u = wp.from_torch(
+            self.torch_static_surface_heightfield_cells_u,
+            dtype=wp.int32,
+            requires_grad=False,
+        )
+        self.wp_static_surface_heightfield_cells_v = wp.from_torch(
+            self.torch_static_surface_heightfield_cells_v,
+            dtype=wp.int32,
+            requires_grad=False,
+        )
         self.static_surface_count = len(surfaces)
         self.static_surface_query_distance = scalar_values["query_distance"]
         self.static_surface_margin = scalar_values["margin"]
@@ -1350,6 +2072,9 @@ class SpringMassSystemWarp:
         vertices,
         faces,
         *,
+        two_sided=False,
+        component_bounds=None,
+        substep_interval=1,
         query_distance=0.1,
         winding_accuracy=2.0,
         winding_threshold=0.5,
@@ -1357,7 +2082,13 @@ class SpringMassSystemWarp:
         restitution=0.0,
         friction=0.5,
     ):
-        """Install one immutable closed collision mesh before graph capture."""
+        """Install one immutable collision mesh before graph capture.
+
+        Closed meshes use signed-winding recovery. ``two_sided`` permits an
+        open reconstruction surface and treats its triangles as a thin shell.
+        ``substep_interval`` reduces expensive BVH queries while the integrator
+        retains a continuous sweep from the preceding mesh query.
+        """
 
         vertices_np = np.asarray(vertices, dtype=np.float32)
         faces_np = np.asarray(faces, dtype=np.int32)
@@ -1372,23 +2103,49 @@ class SpringMassSystemWarp:
         if int(faces_np.min()) < 0 or int(faces_np.max()) >= len(vertices_np):
             raise ValueError("static mesh contains an invalid face index")
 
-        # Signed winding requires a closed surface.  Every undirected edge of
-        # each disconnected proxy component must therefore occur twice.
-        edge_counts = {}
-        for face in faces_np:
-            for first, second in (
-                (int(face[0]), int(face[1])),
-                (int(face[1]), int(face[2])),
-                (int(face[2]), int(face[0])),
-            ):
-                edge = (min(first, second), max(first, second))
-                edge_counts[edge] = edge_counts.get(edge, 0) + 1
-        open_edges = [edge for edge, count in edge_counts.items() if count != 2]
-        if open_edges:
-            raise ValueError(
-                "static collision mesh is not closed; "
-                f"{len(open_edges)} edges do not have exactly two incident faces"
+        if component_bounds is None:
+            component_bounds_np = np.asarray(
+                [[vertices_np.min(axis=0), vertices_np.max(axis=0)]],
+                dtype=np.float32,
             )
+        else:
+            component_bounds_np = np.asarray(component_bounds, dtype=np.float32)
+        if (
+            component_bounds_np.ndim != 3
+            or component_bounds_np.shape[1:] != (2, 3)
+            or component_bounds_np.shape[0] == 0
+            or not np.isfinite(component_bounds_np).all()
+            or np.any(
+                component_bounds_np[:, 1, :]
+                <= component_bounds_np[:, 0, :]
+            )
+        ):
+            raise ValueError(
+                "static mesh component_bounds must have finite shape (N, 2, 3) "
+                "with positive extents"
+            )
+
+        two_sided = bool(two_sided)
+        if not two_sided:
+            # Signed winding requires a closed surface. Every undirected edge
+            # of each disconnected proxy component must occur twice.
+            edge_counts = {}
+            for face in faces_np:
+                for first, second in (
+                    (int(face[0]), int(face[1])),
+                    (int(face[1]), int(face[2])),
+                    (int(face[2]), int(face[0])),
+                ):
+                    edge = (min(first, second), max(first, second))
+                    edge_counts[edge] = edge_counts.get(edge, 0) + 1
+            open_edges = [
+                edge for edge, count in edge_counts.items() if count != 2
+            ]
+            if open_edges:
+                raise ValueError(
+                    "static collision mesh is not closed; "
+                    f"{len(open_edges)} edges do not have exactly two incident faces"
+                )
 
         scalar_values = {
             "query_distance": float(query_distance),
@@ -1412,6 +2169,16 @@ class SpringMassSystemWarp:
             raise ValueError("static mesh restitution must be in [0, 1]")
         if not 0.0 <= scalar_values["friction"] <= 2.0:
             raise ValueError("static mesh friction must be in [0, 2]")
+        if isinstance(substep_interval, bool):
+            raise ValueError("static mesh substep_interval must be a positive integer")
+        try:
+            substep_interval_value = int(substep_interval)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(
+                "static mesh substep_interval must be a positive integer"
+            ) from exc
+        if substep_interval_value < 1 or substep_interval_value != substep_interval:
+            raise ValueError("static mesh substep_interval must be a positive integer")
 
         vertices_t = torch.as_tensor(
             np.ascontiguousarray(vertices_np),
@@ -1435,13 +2202,36 @@ class SpringMassSystemWarp:
             dtype=wp.int32,
             requires_grad=False,
         )
+        self.torch_static_mesh_component_mins = torch.as_tensor(
+            np.ascontiguousarray(component_bounds_np[:, 0, :]),
+            dtype=torch.float32,
+            device=self.device,
+        ).contiguous()
+        self.torch_static_mesh_component_maxs = torch.as_tensor(
+            np.ascontiguousarray(component_bounds_np[:, 1, :]),
+            dtype=torch.float32,
+            device=self.device,
+        ).contiguous()
+        self.wp_static_mesh_component_mins = wp.from_torch(
+            self.torch_static_mesh_component_mins,
+            dtype=wp.vec3,
+            requires_grad=False,
+        )
+        self.wp_static_mesh_component_maxs = wp.from_torch(
+            self.torch_static_mesh_component_maxs,
+            dtype=wp.vec3,
+            requires_grad=False,
+        )
         self.static_collision_mesh = wp.Mesh(
             points=self.wp_static_mesh_points,
             indices=self.wp_static_mesh_indices,
-            support_winding_number=True,
+            support_winding_number=not two_sided,
         )
         self.static_mesh_enabled = 1
+        self.static_mesh_substep_interval = substep_interval_value
         self.static_mesh_id = self.static_collision_mesh.id
+        self.static_mesh_two_sided = int(two_sided)
+        self.static_mesh_component_count = int(component_bounds_np.shape[0])
         self.static_mesh_query_distance = scalar_values["query_distance"]
         self.static_mesh_winding_accuracy = scalar_values["winding_accuracy"]
         self.static_mesh_winding_threshold = scalar_values["winding_threshold"]
@@ -1498,14 +2288,25 @@ class SpringMassSystemWarp:
             outputs=[self.wp_single_x],
         )
 
-        self.collision_grid.build(self.wp_single_x, self.collision_dist * 5.0)
-        print("create resting case implementation (doesn't mean its in use check update_collision_graph)")
+        self.resting_collision_pairs.zero_()
+        self.collision_grid.build(
+            self.wp_single_x,
+            self.self_collision_rest_exclusion_distance,
+        )
+        print(
+            "create resting case implementation "
+            "(doesn't mean its in use check update_collision_graph) "
+            "rest_exclusion_multiplier="
+            f"{self.self_collision_rest_exclusion_multiplier:.3f} "
+            "rest_exclusion_distance_m="
+            f"{self.self_collision_rest_exclusion_distance:.6f}"
+        )
         wp.launch(
             build_resting_collision_pairs,
             dim=self.object_massnode_single,
             inputs=[
                 self.wp_single_x,
-                self.collision_dist,
+                self.self_collision_rest_exclusion_distance,
                 self.collision_grid.id,
                 ],
             outputs=[self.resting_collision_pairs],            
@@ -1567,6 +2368,11 @@ class SpringMassSystemWarp:
         )
 
     def step(self):
+        # The full-resolution Ambulance shell is much more expensive than the
+        # analytic floor/surface primitives.  Query it at its configured
+        # cadence, always include the final substep, and sweep over every
+        # skipped state so the optimization does not introduce tunnelling.
+        last_static_mesh_query_state = 0
         for i in range(self.num_substeps):
             self.wp_states[i].clear_forces()
 
@@ -1649,6 +2455,22 @@ class SpringMassSystemWarp:
                     outputs=[self.wp_states[i].wp_v_before_ground],
                 )
 
+            static_mesh_enabled_this_substep = self.static_mesh_enabled
+            static_mesh_sweep_start = self.wp_states[i].wp_x
+            if self.static_mesh_enabled:
+                query_interval = max(int(self.static_mesh_substep_interval), 1)
+                query_this_substep = (
+                    (i + 1) % query_interval == 0
+                    or i == self.num_substeps - 1
+                )
+                if query_this_substep:
+                    static_mesh_sweep_start = self.wp_states[
+                        last_static_mesh_query_state
+                    ].wp_x
+                    last_static_mesh_query_state = i + 1
+                else:
+                    static_mesh_enabled_this_substep = 0
+
             # Update the x and v
             wp.launch(
                 kernel=integrate_ground_collision,
@@ -1671,13 +2493,23 @@ class SpringMassSystemWarp:
                     self.wp_static_surface_extents_u,
                     self.wp_static_surface_extents_v,
                     self.wp_static_surface_kinds,
+                    self.wp_static_surface_edge_radii,
+                    self.wp_static_surface_heightfield_offsets,
+                    self.wp_static_surface_heightfield_starts,
+                    self.wp_static_surface_heightfield_cells_u,
+                    self.wp_static_surface_heightfield_cells_v,
                     self.static_surface_count,
                     self.static_surface_query_distance,
                     self.static_surface_margin,
                     self.static_surface_restitution,
                     self.static_surface_friction,
-                    self.static_mesh_enabled,
+                    static_mesh_enabled_this_substep,
+                    static_mesh_sweep_start,
                     self.static_mesh_id,
+                    self.static_mesh_two_sided,
+                    self.wp_static_mesh_component_mins,
+                    self.wp_static_mesh_component_maxs,
+                    self.static_mesh_component_count,
                     self.static_mesh_query_distance,
                     self.static_mesh_winding_accuracy,
                     self.static_mesh_winding_threshold,

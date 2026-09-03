@@ -3,3 +3,11 @@ Copyright 2025 Hanxiao Jiang
 
 This product includes third-party software distributed under its own license
 terms. Those terms are provided with the corresponding third-party software.
+
+The headset mesh, material, and baked texture in assets/scenes/ILLIXR_lab are
+from the ILLIXR project, Copyright (c) 2019 The Board of Trustees of the
+University of Illinois. See assets/scenes/ILLIXR_lab/ILLIXR_HEADSET_LICENSE.md.
+
+The SOG v2 decoder in qqtt/sog_loader.py implements the format documented by
+PlayCanvas SplatTransform, Copyright (c) 2011-2026 PlayCanvas Ltd. See
+qqtt/PLAYCANVAS_SPLAT_TRANSFORM_LICENSE.md.

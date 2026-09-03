@@ -421,6 +421,8 @@ class GardenSceneRenderer:
     # Garden adapter. Mesh-backed scene renderers must continue through the
     # regular depth/alpha compositor.
     supports_direct_gaussian_output = True
+    scene_runtime_name = GARDEN_SCENE_NAME
+    scene_display_name = "Garden"
 
     def __init__(
         self,
@@ -540,13 +542,16 @@ class GardenSceneRenderer:
         }
 
     def set_layout(self, layout: SimpleLabLayout) -> None:
-        if str(getattr(layout, "scene_name", "")) != GARDEN_SCENE_NAME:
-            raise GardenAssetError("Garden renderer received a non-Garden layout.")
+        if str(getattr(layout, "scene_name", "")) != self.scene_runtime_name:
+            raise GardenAssetError(
+                f"{self.scene_display_name} renderer received a layout for "
+                f"{getattr(layout, 'scene_name', None)!r}."
+            )
         self.layout = layout
         chunks = self.runtime_metadata.get("spatial_chunks")
         if not isinstance(chunks, list) or not chunks:
             raise GardenAssetError(
-                "Garden runtime metadata contains no spatial chunks. Rerun Garden setup."
+                f"{self.scene_display_name} runtime metadata contains no spatial chunks."
             )
         self._chunk_starts = np.asarray(
             [int(chunk["start"]) for chunk in chunks], dtype=np.int64
@@ -604,28 +609,33 @@ class GardenSceneRenderer:
         *,
         output_dtype=None,
     ):
-        """Convert one combined Garden Gaussian render into a headset eye frame.
+        """Convert one combined static/object Gaussian render into an eye frame.
 
         gsplat RGB is already composited against the black render background.
         Multiplying it by its alpha again, as the Lab scene/object compositor
-        does, both darkens partially covered Garden surfaces and performs an
-        unnecessary full-frame blend. Garden's Gaussian image is the complete
-        scene, so preserve its RGB and publish it as opaque.
+        does, both darkens partially covered scene surfaces and performs an
+        unnecessary full-frame blend. The Gaussian image is the complete scene,
+        so preserve its RGB and publish it as opaque.
         """
 
         import torch
 
         if not torch.is_tensor(gaussian_rgba):
-            raise TypeError("Garden direct output requires a torch Gaussian RGBA tensor.")
+            raise TypeError(
+                f"{self.scene_display_name} direct output requires a torch "
+                "Gaussian RGBA tensor."
+            )
         if gaussian_rgba.ndim != 3 or int(gaussian_rgba.shape[0]) < 3:
             raise ValueError(
-                "Garden direct output expects Gaussian color with shape [3|4, H, W]."
+                f"{self.scene_display_name} direct output expects Gaussian color "
+                "with shape [3|4, H, W]."
             )
         if output_dtype is None:
             output_dtype = torch.float32
         if output_dtype not in {torch.float32, torch.uint8}:
             raise ValueError(
-                "Garden direct output supports only torch.float32 or torch.uint8 frames."
+                f"{self.scene_display_name} direct output supports only "
+                "torch.float32 or torch.uint8 frames."
             )
 
         height = int(gaussian_rgba.shape[1])
@@ -665,7 +675,8 @@ class GardenSceneRenderer:
             depth = depth.squeeze()
             if tuple(depth.shape) != (height, width):
                 raise ValueError(
-                    "Garden direct output depth must match the Gaussian image size."
+                    f"{self.scene_display_name} direct output depth must match "
+                    "the Gaussian image size."
                 )
             depth = torch.nan_to_num(
                 depth,
@@ -676,6 +687,8 @@ class GardenSceneRenderer:
 
         metrics = {
             "compose_mode": "garden_direct_output",
+            "direct_gaussian_output": True,
+            "direct_gaussian_scene_name": self.scene_runtime_name,
             "compose_roi_ratio": 1.0,
             "visible_retention_ratio": 1.0,
             "scene_depth_invalid": False,
@@ -717,7 +730,7 @@ class GardenSceneRenderer:
 
     def warmup_balanced_runtime_paths(self, **_kwargs) -> list[str]:
         self._blank_frame(self.width, self.height)
-        return ["garden_combined_gaussian"]
+        return [f"{self.scene_runtime_name}_combined_gaussian"]
 
     def table_world_bounds(self):
         if self.layout is None or self.layout.active_table_bounds is None:
@@ -731,26 +744,124 @@ class GardenSceneRenderer:
     def table_alignment_debug(self) -> dict[str, Any] | None:
         if self.layout is None:
             return None
-        center = np.asarray(self.layout.table_top_center, dtype=np.float32)
+        active_surface_center = getattr(
+            self.layout,
+            "active_table_surface_center",
+            None,
+        )
+        center = np.asarray(
+            self.layout.table_top_center
+            if active_surface_center is None
+            else active_surface_center,
+            dtype=np.float32,
+        )
+        scene_up = np.asarray(self.layout.scene_up, dtype=np.float32)
+        surface_normal = np.asarray(
+            getattr(self.layout, "ambulance_mattress_normal_world", scene_up),
+            dtype=np.float32,
+        )
+        surface_normal_alignment = float(
+            np.clip(np.dot(surface_normal, scene_up), -1.0, 1.0)
+        )
+        runtime_surface_kinds = {
+            str(surface.get("kind", "unknown"))
+            for surface in self.layout.static_collision_surfaces
+        }
+        has_runtime_heightfield = any(
+            kind.startswith("heightfield") for kind in runtime_surface_kinds
+        )
+        collision_metadata = list(
+            getattr(self.layout, "static_collision_mesh_metadata", [])
+        )
+        runtime_mattress_mesh_face_count = sum(
+            int(entry.get("face_count", 0))
+            for entry in collision_metadata
+            if entry.get("kind") == "source_mesh_full_resolution_surface"
+        )
+        runtime_heightfield_face_count = int(
+            len(getattr(self.layout, "ambulance_mattress_heightfield_faces", []))
+        )
+        runtime_detail_mesh_face_count = int(
+            len(getattr(self.layout, "static_collision_detail_mesh_faces", []))
+        )
+        if (
+            runtime_mattress_mesh_face_count > 0
+            and runtime_detail_mesh_face_count > runtime_mattress_mesh_face_count
+        ):
+            runtime_collision_kind = (
+                "full_mattress_mesh+compact_detail_mesh+finite_support_surfaces"
+            )
+        elif runtime_mattress_mesh_face_count > 0:
+            runtime_collision_kind = "full_mattress_mesh+finite_support_surfaces"
+        elif has_runtime_heightfield and runtime_detail_mesh_face_count > 0:
+            runtime_collision_kind = (
+                "heightfield+detail_mesh+finite_support_surfaces"
+            )
+        elif has_runtime_heightfield:
+            runtime_collision_kind = "heightfield+finite_support_surfaces"
+        elif runtime_detail_mesh_face_count > 0:
+            runtime_collision_kind = "detail_mesh+finite_support_surfaces"
+        else:
+            runtime_collision_kind = "finite_support_surfaces"
         return {
-            "asset_transform": "garden_canonical_to_head_aligned_world",
-            "world_surface_normal": np.asarray(self.layout.scene_up, dtype=np.float32).tolist(),
-            "surface_normal_alignment": 1.0,
+            "asset_transform": (
+                f"{self.scene_runtime_name}_canonical_to_head_aligned_world"
+            ),
+            "world_surface_normal": surface_normal.tolist(),
+            "surface_normal_alignment": surface_normal_alignment,
             "world_surface_center": center.tolist(),
             "world_surface_plane_height": float(center[2]),
             "collider_top_plane_height": float(center[2]),
-            "active_table_support_patch_count": 1,
-            "support_slab_count": 2,
+            "active_table_support_patch_count": int(
+                getattr(self.layout, "smooth_tabletop_patch_count", 1)
+            ),
+            "support_slab_count": int(
+                len(getattr(self.layout, "support_surface_boxes", []))
+            ),
             "blocker_box_count": 0,
             "collider_box_count": 0,
             "collision_mesh_face_count": int(self.layout.static_collision_mesh_faces.shape[0]),
-            "runtime_collision_kind": "finite_support_surfaces",
+            "runtime_collision_kind": runtime_collision_kind,
             "runtime_collision_surface_count": len(
                 self.layout.static_collision_surfaces
             ),
+            "runtime_collision_heightfield_face_count": (
+                runtime_heightfield_face_count
+            ),
+            "runtime_collision_mattress_mesh_face_count": (
+                runtime_mattress_mesh_face_count
+            ),
+            "runtime_collision_detail_mesh_face_count": (
+                runtime_detail_mesh_face_count
+            ),
+            "runtime_collision_detail_mesh_component_count": int(
+                len(
+                    getattr(
+                        self.layout,
+                        "static_collision_detail_mesh_component_bounds",
+                        [],
+                    )
+                )
+            ),
+            "runtime_collision_detail_mesh_two_sided": bool(
+                getattr(
+                    self.layout,
+                    "static_collision_detail_mesh_two_sided",
+                    False,
+                )
+            ),
+            "runtime_collision_detail_mesh_source_asset": str(
+                getattr(
+                    self.layout,
+                    "static_collision_detail_mesh_source_asset",
+                    "",
+                )
+            ),
             "table_render_component_ids": [],
             "background_excludes_active_table": False,
-            "table_render_bounds_source": "garden_collision_proxy",
+            "table_render_bounds_source": (
+                f"{self.scene_runtime_name}_collision_proxy"
+            ),
             "table_render_world_bounds": np.asarray(self.layout.active_table_bounds).tolist(),
         }
 
@@ -765,12 +876,18 @@ class GardenSceneRenderer:
             bounds_min = np.asarray(entry["world_bounds_min"], dtype=np.float32)
             bounds_max = np.asarray(entry["world_bounds_max"], dtype=np.float32)
             center = 0.5 * (bounds_min + bounds_max)
+            entry_name = str(entry["name"])
+            entry_name_lower = entry_name.lower()
             output.append(
                 {
                     "support_id": support_id,
                     "component_id": None,
-                    "kind": "table" if entry["name"] == "round_tabletop" else "floor",
-                    "name": entry["name"],
+                    "kind": (
+                        "floor"
+                        if "floor" in entry_name_lower or "patio" in entry_name_lower
+                        else "table"
+                    ),
+                    "name": entry_name,
                     "bounds_min": bounds_min,
                     "bounds_max": bounds_max,
                     "render_bounds_min": bounds_min,
@@ -800,9 +917,18 @@ class GardenSceneRenderer:
     def focus_render_active_table_entry_ids(self):
         return []
 
+    def _load_static_gaussian_model(self, device):
+        from gaussian_splatting.scene.gaussian_model import GaussianModel
+
+        static = GaussianModel(sh_degree=3)
+        static.load_ply(str(self.runtime_ply_path))
+        return static
+
     def bind_dynamic_gaussians(self, dynamic_gaussians):
         if self.layout is None:
-            raise RuntimeError("Garden layout must be set before binding Gaussians.")
+            raise RuntimeError(
+                f"{self.scene_display_name} layout must be set before binding Gaussians."
+            )
         import torch
         from gaussian_splatting.rotation_utils import quaternion_multiply
         from gaussian_splatting.scene.gaussian_model import GaussianModel
@@ -811,12 +937,12 @@ class GardenSceneRenderer:
         capacity = int(self.manifest.get("dynamic_gaussian_capacity", 262144))
         if dynamic_count > capacity:
             raise RuntimeError(
-                f"Garden dynamic Gaussian capacity {capacity} is smaller than object count {dynamic_count}."
+                f"{self.scene_display_name} dynamic Gaussian capacity {capacity} "
+                f"is smaller than object count {dynamic_count}."
             )
 
         if self._combined_gaussians is None:
-            static = GaussianModel(sh_degree=3)
-            static.load_ply(str(self.runtime_ply_path))
+            static = self._load_static_gaussian_model(dynamic_gaussians._xyz.device)
             static.isotropic = False
             rotation_np = np.asarray(
                 self.layout.canonical_to_world_rotation,
@@ -859,7 +985,8 @@ class GardenSceneRenderer:
             self._static_count = int(static._xyz.shape[0])
             if int(np.sum(self._chunk_counts, dtype=np.int64)) != self._static_count:
                 raise GardenAssetError(
-                    "Garden spatial chunks do not match the loaded static Gaussian count."
+                    f"{self.scene_display_name} spatial chunks do not match the "
+                    "loaded static Gaussian count."
                 )
             self._dynamic_capacity = capacity
             total = self._static_count + capacity
@@ -953,7 +1080,9 @@ class GardenSceneRenderer:
         normalized = tuple(sorted(set(int(value) for value in chunk_ids)))
         chunk_count = int(self._chunk_starts.size)
         if any(value < 0 or value >= chunk_count for value in normalized):
-            raise ValueError("Garden spatial chunk selection is out of range.")
+            raise ValueError(
+                f"{self.scene_display_name} spatial chunk selection is out of range."
+            )
         return normalized
 
     def _gather_selected_static_chunks_into(
@@ -964,7 +1093,9 @@ class GardenSceneRenderer:
         import torch
 
         if self._static_gaussians is None or target is None:
-            raise RuntimeError("Garden static Gaussian storage is not initialized.")
+            raise RuntimeError(
+                f"{self.scene_display_name} static Gaussian storage is not initialized."
+            )
         chunk_ids = self._normalize_chunk_ids(chunk_ids)
         chunk_count = int(self._chunk_starts.size)
         selected_count = int(
@@ -1146,10 +1277,14 @@ class GardenSceneRenderer:
         import torch
 
         if self._combined_gaussians is None:
-            raise RuntimeError("Garden combined Gaussian model is not initialized.")
+            raise RuntimeError(
+                f"{self.scene_display_name} combined Gaussian model is not initialized."
+            )
         count = int(dynamic_gaussians._xyz.shape[0])
         if count > self._dynamic_capacity:
-            raise RuntimeError("Dynamic Garden Gaussian capacity exceeded.")
+            raise RuntimeError(
+                f"Dynamic {self.scene_display_name} Gaussian capacity exceeded."
+            )
         start = int(getattr(self, "_active_static_count", self._static_count))
         stop = start + count
         target = getattr(self, "_render_storage", None)
@@ -1229,10 +1364,13 @@ class GardenSceneRenderer:
         left_eye_state: dict,
         right_eye_state: dict,
     ):
-        """Return Garden/object Gaussians for the conservative stereo chunk union."""
+        """Return scene/object Gaussians for the conservative stereo chunk union."""
 
         if self._combined_gaussians is None:
-            raise RuntimeError("Garden Gaussians must be bound before chunk selection.")
+            raise RuntimeError(
+                f"{self.scene_display_name} Gaussians must be bound before chunk "
+                "selection."
+            )
         required_mask = self._stereo_chunk_mask(
             left_eye_state,
             right_eye_state,
@@ -1319,7 +1457,7 @@ class GardenSceneRenderer:
         self._last_chunk_selection_debug = debug
         if first_selection:
             print(
-                "[quest_display] garden stereo frustum chunks: "
+                f"[quest_display] {self.scene_runtime_name} stereo frustum chunks: "
                 f"required={debug['required_chunk_count']} "
                 f"active={debug['selected_chunk_count']}/"
                 f"{debug['total_chunk_count']} "
@@ -1435,11 +1573,24 @@ class GardenSceneRenderer:
             pass
 
 
+def direct_gaussian_scene_enabled(scene_name: str, scene_renderer: Any) -> bool:
+    """Return whether the selected renderer owns the whole Gaussian scene."""
+
+    normalized_scene_name = str(scene_name).strip().lower()
+    renderer_scene_name = str(
+        getattr(scene_renderer, "scene_runtime_name", "")
+    ).strip().lower()
+    return bool(
+        normalized_scene_name
+        and normalized_scene_name == renderer_scene_name
+        and bool(getattr(scene_renderer, "supports_direct_gaussian_output", False))
+    )
+
+
 def garden_direct_output_enabled(scene_name: str, scene_renderer: Any) -> bool:
-    """Return whether this exact runtime owns a combined Garden Gaussian scene."""
+    """Backward-compatible Garden-specific direct-output capability check."""
 
     return bool(
         str(scene_name).strip().lower() == GARDEN_SCENE_NAME
-        and isinstance(scene_renderer, GardenSceneRenderer)
-        and scene_renderer.supports_direct_gaussian_output
+        and direct_gaussian_scene_enabled(scene_name, scene_renderer)
     )

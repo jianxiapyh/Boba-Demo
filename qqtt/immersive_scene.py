@@ -30,6 +30,11 @@ DEFAULT_SCENE_ANALYSIS_CACHE_FILENAME = "scene_analysis_cache_v4.pkl.gz"
 
 TARGET_TABLE_SIZE_X = 0.95
 TARGET_TABLE_SIZE_Y = 0.68
+IMMERSIVE_START_POSTURES = ("standing", "seated")
+LAB_SEATED_HEAD_TO_TABLE_M = 0.62
+LAB_SEATED_HEAD_HEIGHT_ABOVE_FLOOR_M = 1.35
+LAB_STANDING_HEAD_TO_TABLE_M = 0.82
+LAB_STANDING_HEAD_HEIGHT_ABOVE_FLOOR_M = 1.55
 TABLE_SUPPORT_HEIGHT_MIN = 0.12
 TABLE_SUPPORT_AREA_MIN = 0.08
 TABLE_SUPPORT_GAP_Y = 0.03
@@ -101,6 +106,8 @@ class SimpleLabLayout:
     active_table_surface_center: np.ndarray | None = None
     smooth_tabletop_bounds: np.ndarray | None = None
     smooth_tabletop_patch_count: int | None = None
+    start_posture: str = "seated"
+    startup_head_height_above_floor_m: float | None = None
 
     @property
     def scene_down(self) -> np.ndarray:
@@ -152,7 +159,9 @@ class SimpleLabLayout:
             [
                 room_center_xy[0] - self.room_half_extent[0],
                 room_center_xy[1] - self.room_half_extent[1],
-                self.floor_z if float(self.scene_up[2]) < 0.0 else self.floor_z - 0.06,
+                self.floor_z
+                if float(self.scene_up[2]) < 0.0
+                else self.floor_z - 0.06,
             ],
             dtype=np.float32,
         )
@@ -160,11 +169,175 @@ class SimpleLabLayout:
             [
                 room_center_xy[0] + self.room_half_extent[0],
                 room_center_xy[1] + self.room_half_extent[1],
-                self.floor_z + 0.06 if float(self.scene_up[2]) < 0.0 else self.floor_z,
+                self.floor_z + 0.06
+                if float(self.scene_up[2]) < 0.0
+                else self.floor_z,
             ],
             dtype=np.float32,
         )
         return SceneColliderBox(mins=mins, maxs=maxs)
+
+
+def merge_lab_table_divider_collision_boxes(
+    divider_boxes: np.ndarray,
+    *,
+    scene_up: np.ndarray,
+    smooth_table_top: np.ndarray,
+    lower_support_boxes: np.ndarray | None = None,
+    lateral_inflate_m: float = 0.0,
+    surface_overlap_m: float = 0.0,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Build one watertight physics box for the Lab table's center divider.
+
+    The source Lab mesh represents the divider with two nearly coplanar mesh
+    components.  Keeping their AABBs separate leaves an overlapping internal
+    seam, while the small gap between those AABBs and the replacement tabletop
+    is large enough for point-like mass nodes to enter.  This helper unions the
+    components, pads the thin lateral axis for the rendered-object overhang,
+    and extends the divider into the tabletop and nearest lower support.
+    """
+
+    divider_boxes_np = np.asarray(divider_boxes, dtype=np.float32)
+    if (
+        divider_boxes_np.ndim != 3
+        or divider_boxes_np.shape[0] <= 0
+        or divider_boxes_np.shape[1:] != (2, 3)
+        or not np.isfinite(divider_boxes_np).all()
+    ):
+        raise ValueError(
+            "divider_boxes must be a non-empty finite array with shape (N, 2, 3)."
+        )
+
+    scene_up_np = np.asarray(scene_up, dtype=np.float32).reshape(-1)
+    if (
+        scene_up_np.shape != (3,)
+        or not np.isfinite(scene_up_np).all()
+        or float(np.linalg.norm(scene_up_np)) <= 1.0e-6
+    ):
+        raise ValueError("scene_up must be a finite non-zero 3-vector.")
+
+    smooth_table_top_np = np.asarray(smooth_table_top, dtype=np.float32)
+    if (
+        smooth_table_top_np.shape != (2, 3)
+        or not np.isfinite(smooth_table_top_np).all()
+    ):
+        raise ValueError("smooth_table_top must be a finite array with shape (2, 3).")
+
+    lateral_inflate_m = float(lateral_inflate_m)
+    surface_overlap_m = float(surface_overlap_m)
+    if not np.isfinite(lateral_inflate_m) or lateral_inflate_m < 0.0:
+        raise ValueError("lateral_inflate_m must be finite and non-negative.")
+    if not np.isfinite(surface_overlap_m) or surface_overlap_m < 0.0:
+        raise ValueError("surface_overlap_m must be finite and non-negative.")
+
+    divider_mins = np.minimum(divider_boxes_np[:, 0], divider_boxes_np[:, 1])
+    divider_maxs = np.maximum(divider_boxes_np[:, 0], divider_boxes_np[:, 1])
+    original_min = np.min(divider_mins, axis=0)
+    original_max = np.max(divider_maxs, axis=0)
+    merged_min = original_min.copy()
+    merged_max = original_max.copy()
+
+    vertical_axis = int(np.argmax(np.abs(scene_up_np)))
+    top_uses_min = bool(float(scene_up_np[vertical_axis]) < 0.0)
+    lateral_axes = [axis for axis in range(3) if axis != vertical_axis]
+    thin_lateral_axis = lateral_axes[
+        int(np.argmin((original_max - original_min)[lateral_axes]))
+    ]
+    merged_min[thin_lateral_axis] -= lateral_inflate_m
+    merged_max[thin_lateral_axis] += lateral_inflate_m
+
+    tabletop_min = np.minimum(smooth_table_top_np[0], smooth_table_top_np[1])
+    tabletop_max = np.maximum(smooth_table_top_np[0], smooth_table_top_np[1])
+    if top_uses_min:
+        divider_top_before = float(original_min[vertical_axis])
+        tabletop_bottom = float(tabletop_max[vertical_axis])
+        top_gap_before_m = divider_top_before - tabletop_bottom
+        merged_min[vertical_axis] = min(
+            float(merged_min[vertical_axis]),
+            tabletop_bottom - surface_overlap_m,
+        )
+        divider_bottom_before = float(original_max[vertical_axis])
+    else:
+        divider_top_before = float(original_max[vertical_axis])
+        tabletop_bottom = float(tabletop_min[vertical_axis])
+        top_gap_before_m = tabletop_bottom - divider_top_before
+        merged_max[vertical_axis] = max(
+            float(merged_max[vertical_axis]),
+            tabletop_bottom + surface_overlap_m,
+        )
+        divider_bottom_before = float(original_min[vertical_axis])
+
+    selected_lower_support_index = None
+    lower_gap_before_m = None
+    if lower_support_boxes is not None:
+        lower_boxes_np = np.asarray(lower_support_boxes, dtype=np.float32)
+        if lower_boxes_np.size > 0:
+            if (
+                lower_boxes_np.ndim != 3
+                or lower_boxes_np.shape[1:] != (2, 3)
+                or not np.isfinite(lower_boxes_np).all()
+            ):
+                raise ValueError(
+                    "lower_support_boxes must be finite with shape (N, 2, 3)."
+                )
+            lower_mins = np.minimum(lower_boxes_np[:, 0], lower_boxes_np[:, 1])
+            lower_maxs = np.maximum(lower_boxes_np[:, 0], lower_boxes_np[:, 1])
+            overlaps_divider = np.ones(lower_boxes_np.shape[0], dtype=bool)
+            for axis in lateral_axes:
+                overlaps_divider &= (
+                    np.minimum(lower_maxs[:, axis], original_max[axis])
+                    >= np.maximum(lower_mins[:, axis], original_min[axis])
+                )
+            candidate_indices = np.nonzero(overlaps_divider)[0]
+            if candidate_indices.size > 0:
+                lower_top_faces = (
+                    lower_mins[:, vertical_axis]
+                    if top_uses_min
+                    else lower_maxs[:, vertical_axis]
+                )
+                selected_lower_support_index = int(
+                    candidate_indices[
+                        np.argmin(
+                            np.abs(
+                                lower_top_faces[candidate_indices]
+                                - divider_bottom_before
+                            )
+                        )
+                    ]
+                )
+                lower_support_top = float(
+                    lower_top_faces[selected_lower_support_index]
+                )
+                if top_uses_min:
+                    lower_gap_before_m = lower_support_top - divider_bottom_before
+                    merged_max[vertical_axis] = max(
+                        float(merged_max[vertical_axis]),
+                        lower_support_top + surface_overlap_m,
+                    )
+                else:
+                    lower_gap_before_m = divider_bottom_before - lower_support_top
+                    merged_min[vertical_axis] = min(
+                        float(merged_min[vertical_axis]),
+                        lower_support_top - surface_overlap_m,
+                    )
+
+    merged_box = np.stack([merged_min, merged_max], axis=0).astype(np.float32)
+    return merged_box, {
+        "input_box_count": int(divider_boxes_np.shape[0]),
+        "vertical_axis": int(vertical_axis),
+        "thin_lateral_axis": int(thin_lateral_axis),
+        "lateral_inflate_m": float(lateral_inflate_m),
+        "surface_overlap_m": float(surface_overlap_m),
+        "top_gap_before_m": float(top_gap_before_m),
+        "lower_gap_before_m": (
+            None if lower_gap_before_m is None else float(lower_gap_before_m)
+        ),
+        "selected_lower_support_index": selected_lower_support_index,
+        "original_box": np.stack([original_min, original_max], axis=0).astype(
+            np.float32
+        ),
+        "merged_box": merged_box.copy(),
+    }
 
 
 def _normalize(vec: np.ndarray, eps: float = 1e-6) -> np.ndarray:
@@ -723,13 +896,25 @@ def ensure_simple_lab_assets(scene_assets_root: str | Path) -> Path:
     return ensure_illixr_lab_assets(scene_assets_root)
 
 
+def normalize_immersive_start_posture(start_posture: str) -> str:
+    posture = str(start_posture or "seated").strip().lower()
+    if posture not in IMMERSIVE_START_POSTURES:
+        raise ValueError(
+            "Immersive start posture must be one of "
+            f"{IMMERSIVE_START_POSTURES}, got {start_posture!r}."
+        )
+    return posture
+
+
 def make_illixr_lab_layout(
     head_position: np.ndarray,
     forward_direction: np.ndarray,
     scene_up: np.ndarray | None = None,
+    start_posture: str = "seated",
 ) -> SimpleLabLayout:
     head_position = np.asarray(head_position, dtype=np.float32)
     forward_direction = np.asarray(forward_direction, dtype=np.float32)
+    start_posture = normalize_immersive_start_posture(start_posture)
     if scene_up is None:
         scene_up = np.array([0.0, 0.0, -1.0], dtype=np.float32)
     else:
@@ -752,8 +937,18 @@ def make_illixr_lab_layout(
         horizontal_forward /= norm
 
     scene_down = -scene_up
-    table_top_center = head_position + horizontal_forward * 0.78 + scene_down * 0.62
-    floor_point = head_position + scene_down * 1.35
+    if start_posture == "standing":
+        head_to_table_m = LAB_STANDING_HEAD_TO_TABLE_M
+        head_height_above_floor_m = LAB_STANDING_HEAD_HEIGHT_ABOVE_FLOOR_M
+    else:
+        head_to_table_m = LAB_SEATED_HEAD_TO_TABLE_M
+        head_height_above_floor_m = LAB_SEATED_HEAD_HEIGHT_ABOVE_FLOOR_M
+    table_top_center = (
+        head_position
+        + horizontal_forward * 0.78
+        + scene_down * head_to_table_m
+    )
+    floor_point = head_position + scene_down * head_height_above_floor_m
     return SimpleLabLayout(
         table_top_center=table_top_center.astype(np.float32),
         table_size=np.array([TARGET_TABLE_SIZE_X, TARGET_TABLE_SIZE_Y, 0.40], dtype=np.float32),
@@ -763,6 +958,8 @@ def make_illixr_lab_layout(
         scene_up=scene_up.astype(np.float32),
         room_center_xy=np.asarray(table_top_center[:2], dtype=np.float32).copy(),
         static_collider_boxes=None,
+        start_posture=start_posture,
+        startup_head_height_above_floor_m=head_height_above_floor_m,
     )
 
 
@@ -770,11 +967,13 @@ def make_simple_lab_layout(
     head_position: np.ndarray,
     forward_direction: np.ndarray,
     scene_up: np.ndarray | None = None,
+    start_posture: str = "seated",
 ) -> SimpleLabLayout:
     return make_illixr_lab_layout(
         head_position,
         forward_direction,
         scene_up=scene_up,
+        start_posture=start_posture,
     )
 
 

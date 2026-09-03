@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "coordinate_space": "recorded_scene_meters",
+  "metric": "max_t,p ||controller_points[t,p] - controller_points[t-1,p]||_2",
+  "source": {
+    "repository": "Boba_Latest",
+    "case_root": "data/different_types",
+    "case_count": 22,
+    "recording_fps": 30
+  },
+  "demo_solver_period_seconds": 0.0334,
+  "global_maximum": {
+    "distance_m": 0.047083356017,
+    "case": "weird_package",
+    "from_frame_zero_based": 24,
+    "to_frame_zero_based": 25,
+    "controller_point_zero_based": 23
+  },
+  "runtime_limit_m": 0.05,
+  "runtime_limit_margin_above_measured_max_m": 0.002916643983,
+  "runtime_limit_margin_above_measured_max_ratio": 0.061946391,
+  "runtime_limit_rounding": "global maximum rounded upward to a practical 5 cm virtual-space bound",
+  "case_maxima_m": {
+    "double_lift_cloth_1": 0.008645390,
+    "double_lift_cloth_3": 0.010553333,
+    "double_lift_sloth": 0.010539153,
+    "double_lift_zebra": 0.014239194,
+    "double_stretch_sloth": 0.018406995,
+    "double_stretch_zebra": 0.018474885,
+    "rope_double_hand": 0.011802419,
+    "single_clift_cloth_1": 0.016323535,
+    "single_clift_cloth_3": 0.010387234,
+    "single_lift_cloth": 0.008441099,
+    "single_lift_cloth_1": 0.009454656,
+    "single_lift_cloth_3": 0.012113880,
+    "single_lift_cloth_4": 0.011261834,
+    "single_lift_dinosor": 0.014571193,
+    "single_lift_rope": 0.013717240,
+    "single_lift_sloth": 0.013399414,
+    "single_lift_zebra": 0.014619271,
+    "single_push_rope": 0.009536814,
+    "single_push_rope_1": 0.010032628,
+    "single_push_rope_4": 0.009263776,
+    "single_push_sloth": 0.013999252,
+    "weird_package": 0.047083356
+  },
+  "runtime_mapping_note": "The target limiter receives controller targets after the case-specific physical-to-virtual translation scale, so runtime_limit_m is already a virtual-space limit and must not be multiplied by that scale again. Each rendered simulation period advances an active target by at most this distance toward the newest tracked pose; no extra physics periods are run before presentation."
+}

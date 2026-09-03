@@ -31,7 +31,10 @@ from gaussian_splatting.dynamic_utils import (
     knn_weights_sparse,
     get_topk_indices,
 )
-from gs_render import remove_gaussians_with_low_opacity
+from gs_render import (
+    remove_gaussians_outside_largest_component,
+    remove_gaussians_with_low_opacity,
+)
 import time
 from types import SimpleNamespace
 
@@ -63,24 +66,51 @@ from qqtt.immersive_scene import (
     SimpleLabSceneRenderer,
     ensure_simple_lab_assets,
     make_simple_lab_layout,
+    merge_lab_table_divider_collision_boxes,
+    normalize_immersive_start_posture,
 )
 from qqtt.garden_assets import validate_garden_runtime_selection
+from qqtt.ambulance_scene import (
+    AMBULANCE_MAX_PROJECTED_RADIUS_PX,
+    AmbulanceSceneRenderer,
+    ambulance_mattress_alignment_metrics,
+    ambulance_startup_gaze_pitch_down_degrees,
+    make_ambulance_layout,
+    validate_ambulance_scene,
+)
 from qqtt.garden_scene import (
     GardenSceneRenderer,
-    garden_direct_output_enabled,
+    direct_gaussian_scene_enabled,
     make_garden_layout,
 )
 from qqtt.immersive_gaussian_fusion_triton import (
     fuse_gaussian_scene_depth_aware,
     fuse_gaussian_scene_depth_aware_roi,
 )
-from qqtt.pyrender_cuda_bridge import PreviewTextureCudaUploader
+from qqtt.immersive_head_alignment import (
+    build_startup_eye_orientation_registration,
+)
+from qqtt.immersive_controller_motion import (
+    DEFAULT_MAX_CONTROLLER_MOTION_INTERVAL_M,
+    advance_controller_motion_target,
+)
+from qqtt.interactive_preview import (
+    resolve_interactive_preview_render_size,
+    reuse_or_create_interactive_preview_renderer,
+)
+from qqtt.interactive_spectator import (
+    resolve_center_eye_pose,
+    reuse_or_create_interactive_spectator_renderer,
+)
 from qqtt.object_selector import (
     RuntimeObjectSelector,
     object_choices_for_scene,
     selector_lines,
     selector_row_from_ray,
 )
+
+
+DIRECT_GAUSSIAN_SCENE_NAMES = frozenset({"garden", "ambulance"})
 
 TINY_BITMAP_FONT = {
     "0": ("111", "101", "101", "101", "111"),
@@ -6452,6 +6482,7 @@ class InvPhyTrainerWarp:
     LIVE_HAND_LEFT_COLOR = [255.0, 64.0, 64.0]
     LIVE_HAND_RIGHT_COLOR = [64.0, 160.0, 255.0]
     LIVE_CONTROLLER_RAY_LENGTH = 0.65
+    LIVE_CONTROLLER_RAY_RADIUS = 2
     LIVE_CONTROLLER_ORIGIN_RADIUS = 3
     LIVE_CONTROLLER_HIT_RADIUS = 4
     LIVE_CONTROLLER_ACTIVE_OVERLAY_HOLD_FRAMES = 8
@@ -6465,15 +6496,38 @@ class InvPhyTrainerWarp:
     LIVE_CONTROLLER_ATTACH_ACTIVE_COLOR = [255.0, 64.0, 255.0]
     LIVE_CONTROLLER_TRANSLATION_SCALE_DEFAULT = 1.0
     LIVE_CONTROLLER_CASE_TRANSLATION_SCALE = {
-        "sloth": 2.0,
+        "sloth": 4.0,
         "rope_game": 4.0,
     }
     IMMERSIVE_LIVE_HEAD_TRANSLATION_SCALE = 1.0
     LIVE_CONTROLLER_HIT_WORLD_RADIUS = 0.03
     LIVE_CONTROLLER_ATTACH_MAX_REST_LENGTH = 0.01
+    # Sloth anchors span a real 3D volume. Shortening every controller spring
+    # to the Rope-oriented 1 cm cap preloads that volume toward one point and
+    # visibly collapses the skinned Gaussians as soon as a grab begins.
+    LIVE_CONTROLLER_PRESERVE_ATTACH_REST_LENGTH_CASES = ("sloth",)
     LIVE_CONTROLLER_PREDEFINED_ANCHOR_NODE_COUNT = 96
     LIVE_CONTROLLER_PREDEFINED_ANCHOR_RADIUS_SCALE = 1.75
     LIVE_CONTROLLER_PREDEFINED_ANCHOR_MIN_RADIUS = 0.05
+    # Keep the visible marker compact, but give each predefined interaction
+    # point a larger invisible ray target.  Capping the radius keeps nearby
+    # Sloth limbs independently selectable when their attachment patches are
+    # broad or overlap in world space.
+    LIVE_CONTROLLER_PREDEFINED_ANCHOR_AIM_MIN_RADIUS = 0.05
+    LIVE_CONTROLLER_PREDEFINED_ANCHOR_AIM_MAX_RADIUS = 0.075
+    # Normalized against the recorded Sloth rest projection. This targets the
+    # middle of the visible forehead, between the eyes and the top of the face.
+    LIVE_CONTROLLER_SLOTH_HEAD_TOP_OFFSET_X_RATIO = 0.16
+    LIVE_CONTROLLER_SLOTH_HEAD_TOP_OFFSET_Y_RATIO = -0.105
+    LIVE_CONTROLLER_SLOTH_HEAD_TOP_HALF_WIDTH_RATIO = 0.16
+    LIVE_CONTROLLER_SLOTH_HEAD_TOP_HALF_HEIGHT_RATIO = 0.15
+    LIVE_CONTROLLER_SLOTH_HEAD_TOP_SURFACE_SEARCH_RADIUS_PX = 2.0
+    LIVE_CONTROLLER_SLOTH_HEAD_TOP_SURFACE_FRONT_TOLERANCE_M = 0.01
+    # These nodes provide a deformation-following fallback. The displayed
+    # marker normally follows the selected foreground Gaussian exactly.
+    LIVE_CONTROLLER_SLOTH_HEAD_TOP_CENTER_NODE_COUNT = 12
+    SLOTH_VISUAL_COMPONENT_CONNECTIVITY_RADIUS_M = 0.005
+    SLOTH_VISUAL_COMPONENT_MINIMUM_KEEP_FRACTION = 0.95
     LIVE_CONTROLLER_PREVIEW_RADIUS = 3
     LIVE_CONTROLLER_PREVIEW_SELECTED_RADIUS = 5
     LIVE_CONTROLLER_PREVIEW_OCCUPIED_COLOR = [176.0, 176.0, 176.0]
@@ -6567,8 +6621,10 @@ class InvPhyTrainerWarp:
     IMMERSIVE_POST_RELEASE_LANDING_LOCK_MIN_DELAY_FRAMES = 6
     IMMERSIVE_POST_RELEASE_CONTACT_HEIGHT_MARGIN_M = 0.010
     IMMERSIVE_POST_RELEASE_CONTACT_MIN_FRACTION = 0.75
+    IMMERSIVE_POST_RELEASE_PLANAR_DRIFT_CANCEL_CASES = ("sloth",)
     IMMERSIVE_STARTUP_PLANE_EPS = 0.03
     IMMERSIVE_STARTUP_CENTER_EPS = 0.08
+    IMMERSIVE_STARTUP_SURFACE_EDGE_EPS = 0.01
     IMMERSIVE_STARTUP_ALPHA_EPS = 0.02
     IMMERSIVE_STARTUP_DEPTH_EPS = 1e-4
     IMMERSIVE_STARTUP_PIXEL_MARGIN = 8.0
@@ -6661,6 +6717,7 @@ class InvPhyTrainerWarp:
     IMMERSIVE_CONTROLLER_SOURCE_ABSENT_CONFIRM_SAMPLES = 6
     IMMERSIVE_CONTROLLER_SINGLE_LATERAL_MIN_M = 0.04
     IMMERSIVE_CONTROLLER_SINGLE_PROJECTED_OFFSET_MIN_PX = 40.0
+    IMMERSIVE_CONTROLLER_MOTION_INTERVAL_LOG_FRAMES = 60
     IMMERSIVE_IDLE_FULLFRAME_FLASH_ARM_SAFE_COVER_FRAMES = 3
     IMMERSIVE_IDLE_FULLFRAME_FLASH_NEAR_BLACK_MAX_RGB = 12.0
     IMMERSIVE_IDLE_FULLFRAME_FLASH_MIN_NEAR_BLACK_RATIO = 0.85
@@ -6862,6 +6919,9 @@ class InvPhyTrainerWarp:
             f"points_per_frame={int(self.controller_points_group.shape[2])}",
         )
         self._immersive_controller_translation_scale_multiplier = 1.0
+        self._immersive_controller_max_motion_interval_m = (
+            DEFAULT_MAX_CONTROLLER_MOTION_INTERVAL_M
+        )
         self.check_controller_group_same_start(
             self.controller_points_group,
             atol=1e-5,
@@ -7293,6 +7353,226 @@ class InvPhyTrainerWarp:
                 self.IMMERSIVE_IDLE_LOCK_SPLIT_SUPPORT_MIN_LEVEL_FRACTION
             ),
         }
+
+    def _stabilize_grounded_release_planar_velocity(self, sim_state, scene_up):
+        stabilized_state = {
+            "x": sim_state["x"].detach().clone(),
+            "v": sim_state["v"].detach().clone(),
+        }
+        object_count = min(
+            int(self.num_all_points),
+            int(stabilized_state["v"].shape[0]),
+        )
+        if object_count <= 0:
+            return stabilized_state, {
+                "applied": False,
+                "planar_speed_before_mps": 0.0,
+                "planar_speed_after_mps": 0.0,
+            }
+
+        scene_up_t = torch.as_tensor(
+            scene_up,
+            dtype=stabilized_state["v"].dtype,
+            device=stabilized_state["v"].device,
+        )
+        scene_up_t = scene_up_t / torch.linalg.norm(scene_up_t).clamp_min(1.0e-6)
+        object_velocities = stabilized_state["v"][:object_count]
+        center_of_mass_velocity = object_velocities.mean(dim=0)
+        planar_velocity = center_of_mass_velocity - torch.dot(
+            center_of_mass_velocity,
+            scene_up_t,
+        ) * scene_up_t
+        object_velocities -= planar_velocity.unsqueeze(0)
+        center_of_mass_velocity_after = object_velocities.mean(dim=0)
+        planar_velocity_after = center_of_mass_velocity_after - torch.dot(
+            center_of_mass_velocity_after,
+            scene_up_t,
+        ) * scene_up_t
+        return stabilized_state, {
+            "applied": True,
+            "planar_speed_before_mps": float(
+                torch.linalg.norm(planar_velocity).item()
+            ),
+            "planar_speed_after_mps": float(
+                torch.linalg.norm(planar_velocity_after).item()
+            ),
+        }
+
+    def _stabilize_grounded_release_planar_state(
+        self,
+        sim_state,
+        scene_up,
+        planar_center_target,
+    ):
+        """Remove rigid planar drift without changing vertical/local motion."""
+        stabilized_state, debug = self._stabilize_grounded_release_planar_velocity(
+            sim_state,
+            scene_up,
+        )
+        object_count = min(
+            int(self.num_all_points),
+            int(stabilized_state["x"].shape[0]),
+        )
+        if object_count <= 0:
+            return stabilized_state, {
+                **debug,
+                "planar_position_error_before_m": 0.0,
+                "planar_position_error_after_m": 0.0,
+            }
+
+        scene_up_t = torch.as_tensor(
+            scene_up,
+            dtype=stabilized_state["x"].dtype,
+            device=stabilized_state["x"].device,
+        )
+        scene_up_t = scene_up_t / torch.linalg.norm(scene_up_t).clamp_min(1.0e-6)
+        planar_center_target_t = torch.as_tensor(
+            planar_center_target,
+            dtype=stabilized_state["x"].dtype,
+            device=stabilized_state["x"].device,
+        )
+        object_positions = stabilized_state["x"][:object_count]
+        center_error = object_positions.mean(dim=0) - planar_center_target_t
+        planar_position_error = center_error - torch.dot(
+            center_error,
+            scene_up_t,
+        ) * scene_up_t
+        object_positions -= planar_position_error.unsqueeze(0)
+        corrected_center_error = object_positions.mean(dim=0) - planar_center_target_t
+        corrected_planar_position_error = corrected_center_error - torch.dot(
+            corrected_center_error,
+            scene_up_t,
+        ) * scene_up_t
+        return stabilized_state, {
+            **debug,
+            "planar_position_error_before_m": float(
+                torch.linalg.norm(planar_position_error).item()
+            ),
+            "planar_position_error_after_m": float(
+                torch.linalg.norm(corrected_planar_position_error).item()
+            ),
+        }
+
+    def _estimate_object_rigid_angular_velocity(self, positions, velocities):
+        point_count = min(int(positions.shape[0]), int(velocities.shape[0]))
+        if point_count <= 1:
+            return torch.zeros(
+                (3,),
+                dtype=velocities.dtype,
+                device=velocities.device,
+            )
+        positions = positions[:point_count]
+        velocities = velocities[:point_count]
+        offsets = positions - positions.mean(dim=0, keepdim=True)
+        relative_velocities = velocities - velocities.mean(dim=0, keepdim=True)
+        identity = torch.eye(
+            3,
+            dtype=positions.dtype,
+            device=positions.device,
+        )
+        squared_radius_sum = torch.sum(offsets * offsets)
+        inertia = squared_radius_sum * identity - offsets.transpose(0, 1) @ offsets
+        regularization = torch.clamp(
+            torch.trace(inertia).abs() * 1.0e-7,
+            min=1.0e-9,
+        )
+        angular_momentum = torch.cross(
+            offsets,
+            relative_velocities,
+            dim=1,
+        ).sum(dim=0)
+        angular_velocity = torch.linalg.solve(
+            inertia + regularization * identity,
+            angular_momentum,
+        )
+        return torch.nan_to_num(
+            angular_velocity,
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+
+    def _stabilize_grounded_release_rigid_motion(
+        self,
+        sim_state,
+        scene_up,
+        planar_center_target,
+    ):
+        """Remove rigid velocity drift without rotating the simulated shape."""
+        stabilized_state, debug = self._stabilize_grounded_release_planar_state(
+            sim_state,
+            scene_up,
+            planar_center_target,
+        )
+        object_count = min(
+            int(self.num_all_points),
+            int(stabilized_state["x"].shape[0]),
+            int(stabilized_state["v"].shape[0]),
+        )
+        if object_count <= 1:
+            return stabilized_state, {
+                **debug,
+                "rigid_angular_speed_before_radps": 0.0,
+                "rigid_angular_speed_after_radps": 0.0,
+            }
+
+        object_positions = stabilized_state["x"][:object_count]
+        object_velocities = stabilized_state["v"][:object_count]
+        current_offsets = object_positions - object_positions.mean(
+            dim=0,
+            keepdim=True,
+        )
+        angular_velocity_before = self._estimate_object_rigid_angular_velocity(
+            object_positions,
+            object_velocities,
+        )
+        object_velocities -= torch.cross(
+            angular_velocity_before.unsqueeze(0).expand_as(current_offsets),
+            current_offsets,
+            dim=1,
+        )
+        angular_velocity_after = self._estimate_object_rigid_angular_velocity(
+            object_positions,
+            object_velocities,
+        )
+        return stabilized_state, {
+            **debug,
+            "rigid_angular_speed_before_radps": float(
+                torch.linalg.norm(angular_velocity_before).item()
+            ),
+            "rigid_angular_speed_after_radps": float(
+                torch.linalg.norm(angular_velocity_after).item()
+            ),
+        }
+
+    def _should_stabilize_post_release_planar_drift(
+        self,
+        post_release_state,
+        *,
+        case_name,
+        ground_contact_now,
+    ):
+        """Keep the grounded drift guard active for the whole landing window.
+
+        A deformable object can already have enough points on the table to be
+        classified as supported while a lifted part is still falling. Its
+        later impact can create new planar center-of-mass velocity, so this
+        intentionally does not become false after the first correction.
+        """
+        return bool(
+            post_release_state.get("active", False)
+            and str(case_name).strip().lower()
+            in self.IMMERSIVE_POST_RELEASE_PLANAR_DRIFT_CANCEL_CASES
+            and (
+                bool(ground_contact_now)
+                or bool(
+                    post_release_state.get(
+                        "planar_drift_ground_contact_seen",
+                        False,
+                    )
+                )
+            )
+        )
 
     def _make_idle_lock_state(self):
         return {
@@ -8063,6 +8343,7 @@ class InvPhyTrainerWarp:
         seed_idx,
         object_points,
         region_node_count,
+        center_region_node_count=None,
     ):
         if seed_idx is None:
             return None
@@ -8073,8 +8354,16 @@ class InvPhyTrainerWarp:
         )
         if int(region_indices.numel()) == 0:
             return None
+        if center_region_node_count is None:
+            center_region_indices = region_indices
+        else:
+            center_region_node_count = min(
+                int(region_indices.numel()),
+                max(1, int(center_region_node_count)),
+            )
+            center_region_indices = region_indices[:center_region_node_count]
         region_points = object_points[region_indices]
-        center_world = region_points.mean(dim=0)
+        center_world = object_points[center_region_indices].mean(dim=0)
         radius = torch.linalg.norm(
             region_points - center_world.unsqueeze(0), dim=1
         ).max()
@@ -8082,11 +8371,269 @@ class InvPhyTrainerWarp:
             "name": name,
             "seed_index": int(seed_idx),
             "region_indices": region_indices,
+            "center_region_indices": center_region_indices,
             "rest_center_world": center_world,
             "rest_radius": float(radius.item()),
         }
 
-    def _build_sloth_interaction_anchors(self, object_points, intrinsic, w2c):
+    @torch.no_grad()
+    def _resolve_projected_visual_surface_point(
+        self,
+        visual_surface_points,
+        target_pixel,
+        intrinsic,
+        w2c,
+    ):
+        if visual_surface_points is None:
+            return None, None, None
+        visual_surface_points = torch.as_tensor(
+            visual_surface_points,
+            dtype=target_pixel.dtype,
+            device=target_pixel.device,
+        )
+        if visual_surface_points.ndim != 2 or int(visual_surface_points.shape[0]) == 0:
+            return None, None, None
+
+        pixels, depth_valid = self._project_points_to_pixels(
+            visual_surface_points,
+            intrinsic,
+            w2c,
+        )
+        finite = (
+            torch.isfinite(visual_surface_points).all(dim=1)
+            & torch.isfinite(pixels).all(dim=1)
+        )
+        screen_distance = torch.linalg.norm(
+            pixels - target_pixel.unsqueeze(0),
+            dim=1,
+        )
+        nearby = (
+            depth_valid
+            & finite
+            & (
+                screen_distance
+                <= self.LIVE_CONTROLLER_SLOTH_HEAD_TOP_SURFACE_SEARCH_RADIUS_PX
+            )
+        )
+        nearby_indices = torch.nonzero(nearby, as_tuple=False).squeeze(1)
+        if int(nearby_indices.numel()) == 0:
+            return None, None, None
+
+        ones = torch.ones(
+            (visual_surface_points.shape[0], 1),
+            dtype=visual_surface_points.dtype,
+            device=visual_surface_points.device,
+        )
+        world_points_h = torch.cat([visual_surface_points, ones], dim=1)
+        w2c_t = torch.as_tensor(
+            w2c,
+            dtype=visual_surface_points.dtype,
+            device=visual_surface_points.device,
+        )
+        camera_depth = (world_points_h @ w2c_t.T)[:, 2]
+        front_depth = camera_depth[nearby_indices].min()
+        front_indices = nearby_indices[
+            camera_depth[nearby_indices]
+            <= (
+                front_depth
+                + self.LIVE_CONTROLLER_SLOTH_HEAD_TOP_SURFACE_FRONT_TOLERANCE_M
+            )
+        ]
+        best_index = front_indices[
+            torch.argmin(screen_distance[front_indices])
+        ]
+        best_index_int = int(best_index.item())
+        debug = {
+            "target_pixel": target_pixel.detach().cpu().numpy().tolist(),
+            "surface_pixel": pixels[best_index].detach().cpu().numpy().tolist(),
+            "screen_error_px": float(screen_distance[best_index].item()),
+            "camera_depth_m": float(camera_depth[best_index].item()),
+            "nearby_count": int(nearby_indices.numel()),
+            "front_count": int(front_indices.numel()),
+        }
+        return (
+            visual_surface_points[best_index].detach().clone(),
+            best_index_int,
+            debug,
+        )
+
+    @torch.no_grad()
+    def _attach_visual_surface_center_to_anchor_def(
+        self,
+        anchor_def,
+        surface_point_world,
+        visual_point_index,
+        object_points,
+    ):
+        if anchor_def is None or surface_point_world is None:
+            return anchor_def
+        resolved = dict(anchor_def)
+        surface_point_world = torch.as_tensor(
+            surface_point_world,
+            dtype=object_points.dtype,
+            device=object_points.device,
+        )
+        resolved["visual_point_index"] = int(visual_point_index)
+        resolved["rest_center_world"] = surface_point_world.detach().clone()
+
+        region_indices = resolved["region_indices"]
+        region_points = object_points[region_indices]
+        tracking_count = min(
+            int(region_indices.numel()),
+            int(self.LIVE_CONTROLLER_SLOTH_HEAD_TOP_CENTER_NODE_COUNT),
+        )
+        nearest_local = torch.topk(
+            torch.linalg.norm(
+                region_points - surface_point_world.unsqueeze(0),
+                dim=1,
+            ),
+            k=tracking_count,
+            largest=False,
+        ).indices
+        tracking_indices = region_indices[nearest_local]
+        tracking_points = object_points[tracking_indices]
+        tracking_origin = tracking_points.mean(dim=0)
+        affine_matrix = torch.cat(
+            [
+                (tracking_points - tracking_origin.unsqueeze(0)).T,
+                torch.ones(
+                    (1, tracking_count),
+                    dtype=object_points.dtype,
+                    device=object_points.device,
+                ),
+            ],
+            dim=0,
+        )
+        affine_target = torch.cat(
+            [
+                surface_point_world - tracking_origin,
+                torch.ones(
+                    (1,),
+                    dtype=object_points.dtype,
+                    device=object_points.device,
+                ),
+            ]
+        )
+        try:
+            tracking_weights = torch.linalg.pinv(affine_matrix) @ affine_target
+            reconstructed = torch.sum(
+                tracking_points * tracking_weights.unsqueeze(1),
+                dim=0,
+            )
+            reconstruction_error = float(
+                torch.linalg.norm(reconstructed - surface_point_world).item()
+            )
+            weights_valid = bool(
+                torch.isfinite(tracking_weights).all().item()
+                and reconstruction_error <= 1.0e-4
+                and float(tracking_weights.abs().max().item()) <= 4.0
+            )
+        except RuntimeError:
+            tracking_weights = None
+            reconstruction_error = float("inf")
+            weights_valid = False
+
+        if weights_valid:
+            resolved["center_tracking_indices"] = tracking_indices
+            resolved["center_tracking_weights"] = tracking_weights
+            resolved["center_region_indices"] = tracking_indices
+        resolved["surface_tracking_reconstruction_error_m"] = reconstruction_error
+        resolved["rest_radius"] = float(
+            torch.linalg.norm(
+                region_points - surface_point_world.unsqueeze(0),
+                dim=1,
+            ).max().item()
+        )
+        return resolved
+
+    def _interaction_anchor_center_world(
+        self,
+        anchor,
+        object_points,
+        visual_surface_points=None,
+    ):
+        visual_point_index = anchor.get("visual_point_index")
+        if visual_surface_points is not None and visual_point_index is not None:
+            visual_surface_points = torch.as_tensor(
+                visual_surface_points,
+                dtype=object_points.dtype,
+                device=object_points.device,
+            )
+            visual_point_index = int(visual_point_index)
+            if 0 <= visual_point_index < int(visual_surface_points.shape[0]):
+                return visual_surface_points[visual_point_index]
+
+        tracking_indices = anchor.get("center_tracking_indices")
+        tracking_weights = anchor.get("center_tracking_weights")
+        if tracking_indices is not None and tracking_weights is not None:
+            tracking_indices = torch.as_tensor(
+                tracking_indices,
+                dtype=torch.long,
+                device=object_points.device,
+            )
+            tracking_weights = torch.as_tensor(
+                tracking_weights,
+                dtype=object_points.dtype,
+                device=object_points.device,
+            )
+            if int(tracking_indices.numel()) == int(tracking_weights.numel()):
+                return torch.sum(
+                    object_points[tracking_indices]
+                    * tracking_weights.unsqueeze(1),
+                    dim=0,
+                )
+
+        center_region_indices = anchor.get(
+            "center_region_indices",
+            anchor["region_indices"],
+        )
+        return object_points[center_region_indices].mean(dim=0)
+
+    @torch.no_grad()
+    def _nearest_object_surface_seed_index(
+        self,
+        surface_point_world,
+        object_points,
+        excluded_indices=None,
+    ):
+        if surface_point_world is None or int(object_points.shape[0]) == 0:
+            return None
+        surface_point_world = torch.as_tensor(
+            surface_point_world,
+            dtype=object_points.dtype,
+            device=object_points.device,
+        )
+        distances = torch.linalg.norm(
+            object_points - surface_point_world.unsqueeze(0),
+            dim=1,
+        )
+        distances = torch.where(
+            torch.isfinite(object_points).all(dim=1) & torch.isfinite(distances),
+            distances,
+            torch.full_like(distances, float("inf")),
+        )
+        if excluded_indices:
+            excluded = torch.as_tensor(
+                sorted(int(index) for index in excluded_indices),
+                dtype=torch.long,
+                device=object_points.device,
+            )
+            excluded = excluded[
+                (excluded >= 0) & (excluded < int(object_points.shape[0]))
+            ]
+            distances[excluded] = float("inf")
+        seed_index = int(torch.argmin(distances).item())
+        if not bool(torch.isfinite(distances[seed_index]).item()):
+            return None
+        return seed_index
+
+    def _build_sloth_interaction_anchors(
+        self,
+        object_points,
+        intrinsic,
+        w2c,
+        visual_surface_points=None,
+    ):
         pixels, depth_valid = self._project_points_to_pixels(
             object_points,
             intrinsic,
@@ -8105,11 +8652,46 @@ class InvPhyTrainerWarp:
         left_mask = pixels[:, 0] <= center_pixel[0]
         right_mask = pixels[:, 0] > center_pixel[0]
         center_score = torch.linalg.norm(pixels - center_pixel.unsqueeze(0), dim=1)
-        torso_half_width = max(spread_x * 0.18, 8.0)
-        torso_half_height = max(spread_y * 0.16, 10.0)
-        torso_center_mask = (
-            (torch.abs(pixels[:, 0] - center_pixel[0]) <= torso_half_width)
-            & (torch.abs(pixels[:, 1] - center_pixel[1]) <= torso_half_height)
+        head_top_target_pixel = center_pixel + torch.stack(
+            (
+                spread[0]
+                * self.LIVE_CONTROLLER_SLOTH_HEAD_TOP_OFFSET_X_RATIO,
+                spread[1]
+                * self.LIVE_CONTROLLER_SLOTH_HEAD_TOP_OFFSET_Y_RATIO,
+            )
+        )
+        head_top_half_width = max(
+            spread_x * self.LIVE_CONTROLLER_SLOTH_HEAD_TOP_HALF_WIDTH_RATIO,
+            8.0,
+        )
+        head_top_half_height = max(
+            spread_y * self.LIVE_CONTROLLER_SLOTH_HEAD_TOP_HALF_HEIGHT_RATIO,
+            10.0,
+        )
+        head_top_mask = (
+            (
+                torch.abs(pixels[:, 0] - head_top_target_pixel[0])
+                <= head_top_half_width
+            )
+            & (
+                torch.abs(pixels[:, 1] - head_top_target_pixel[1])
+                <= head_top_half_height
+            )
+        )
+        head_top_score = torch.linalg.norm(
+            (pixels - head_top_target_pixel.unsqueeze(0))
+            / spread.clamp_min(1.0).unsqueeze(0),
+            dim=1,
+        )
+        (
+            head_surface_point_world,
+            head_surface_visual_index,
+            head_surface_debug,
+        ) = self._resolve_projected_visual_surface_point(
+            visual_surface_points,
+            head_top_target_pixel,
+            intrinsic,
+            w2c,
         )
 
         anchor_specs = [
@@ -8117,7 +8699,7 @@ class InvPhyTrainerWarp:
             ("right_leg", right_mask & lower_mask, center_score, True),
             ("left_arm", left_mask & upper_mask, center_score, True),
             ("right_arm", right_mask & upper_mask, center_score, True),
-            ("torso_center", torso_center_mask, center_score, False),
+            ("head_top", head_top_mask, head_top_score, False),
         ]
 
         used_indices = set()
@@ -8127,13 +8709,23 @@ class InvPhyTrainerWarp:
             self.LIVE_CONTROLLER_PREDEFINED_ANCHOR_NODE_COUNT,
         )
         for name, required_mask, score_values, prefer_largest in anchor_specs:
-            seed_idx = self._pick_predefined_anchor_seed_index(
-                depth_valid,
-                required_mask,
-                score_values,
-                prefer_largest,
-                used_indices,
-            )
+            if name == "head_top" and head_surface_point_world is not None:
+                # Screen projection alone is ambiguous: a front and rear mass
+                # node can occupy the same pixel. Seed the physics region from
+                # the node nearest the selected facial Gaussian in 3D.
+                seed_idx = self._nearest_object_surface_seed_index(
+                    head_surface_point_world,
+                    object_points,
+                    excluded_indices=used_indices,
+                )
+            else:
+                seed_idx = self._pick_predefined_anchor_seed_index(
+                    depth_valid,
+                    required_mask,
+                    score_values,
+                    prefer_largest,
+                    used_indices,
+                )
             if seed_idx is None:
                 continue
             used_indices.add(seed_idx)
@@ -8142,9 +8734,38 @@ class InvPhyTrainerWarp:
                 seed_idx,
                 object_points,
                 region_node_count,
+                center_region_node_count=(
+                    self.LIVE_CONTROLLER_SLOTH_HEAD_TOP_CENTER_NODE_COUNT
+                    if name == "head_top"
+                    else None
+                ),
             )
+            if name == "head_top" and head_surface_point_world is not None:
+                anchor_def = self._attach_visual_surface_center_to_anchor_def(
+                    anchor_def,
+                    head_surface_point_world,
+                    head_surface_visual_index,
+                    object_points,
+                )
             if anchor_def is not None:
                 anchors.append(anchor_def)
+        if head_surface_debug is not None:
+            head_anchor = next(
+                (anchor for anchor in anchors if anchor["name"] == "head_top"),
+                None,
+            )
+            print(
+                "[quest_display] sloth forehead surface anchor: "
+                f"target_pixel={head_surface_debug['target_pixel']} "
+                f"surface_pixel={head_surface_debug['surface_pixel']} "
+                f"screen_error_px={head_surface_debug['screen_error_px']:.3f} "
+                f"camera_depth_m={head_surface_debug['camera_depth_m']:.4f} "
+                f"nearby_gaussians={head_surface_debug['nearby_count']} "
+                f"foreground_gaussians={head_surface_debug['front_count']} "
+                "tracking_error_m="
+                f"{float('nan') if head_anchor is None else head_anchor.get('surface_tracking_reconstruction_error_m', float('nan')):.6f}",
+                flush=True,
+            )
         return anchors
 
     def _graph_shortest_path_indices(self, start_idx, end_idx, object_points):
@@ -8323,16 +8944,40 @@ class InvPhyTrainerWarp:
         resolved_right["name"] = "right_end"
         return [resolved_left, *other_defs, resolved_right], debug
 
-    def _build_case_interaction_anchors(self, object_points, intrinsic, w2c):
+    def _build_case_interaction_anchors(
+        self,
+        object_points,
+        intrinsic,
+        w2c,
+        visual_surface_points=None,
+    ):
         if self._is_rope_family_case():
             return self._build_rope_interaction_anchors(object_points, intrinsic, w2c)
-        return self._build_sloth_interaction_anchors(object_points, intrinsic, w2c)
+        return self._build_sloth_interaction_anchors(
+            object_points,
+            intrinsic,
+            w2c,
+            visual_surface_points=visual_surface_points,
+        )
 
-    def _compute_predefined_interaction_anchor_states(self, anchor_defs, object_points):
+    def _compute_predefined_interaction_anchor_states(
+        self,
+        anchor_defs,
+        object_points,
+        visual_surface_points=None,
+    ):
         states = []
         for anchor in anchor_defs:
             region_points = object_points[anchor["region_indices"]]
-            center_world = region_points.mean(dim=0)
+            center_region_indices = anchor.get(
+                "center_region_indices",
+                anchor["region_indices"],
+            )
+            center_world = self._interaction_anchor_center_world(
+                anchor,
+                object_points,
+                visual_surface_points=visual_surface_points,
+            )
             radius = torch.linalg.norm(
                 region_points - center_world.unsqueeze(0), dim=1
             ).max()
@@ -8344,6 +8989,7 @@ class InvPhyTrainerWarp:
                 {
                     "name": anchor["name"],
                     "region_indices": anchor["region_indices"],
+                    "center_region_indices": center_region_indices,
                     "center_world": center_world,
                     "radius": float(radius.item()),
                     "selection_radius": selection_radius,
@@ -8431,6 +9077,7 @@ class InvPhyTrainerWarp:
         return {
             "visible": False,
             "cycle_locked": False,
+            "ray_target_selected": False,
             "selected_rank_index": 0,
             "selected_anchor_name": None,
             "current_candidate_names": [],
@@ -8443,6 +9090,7 @@ class InvPhyTrainerWarp:
 
     def _clear_controller_anchor_preview_candidates(self, state):
         state["visible"] = False
+        state["ray_target_selected"] = False
         state["selected_anchor_name"] = None
         state["current_candidate_names"] = []
         state["current_selected_rank"] = None
@@ -8472,6 +9120,7 @@ class InvPhyTrainerWarp:
         origin_world,
         direction_world,
         anchor_states,
+        require_aim_radius=False,
     ):
         if origin_world is None or direction_world is None or not anchor_states:
             return []
@@ -8481,12 +9130,30 @@ class InvPhyTrainerWarp:
         for anchor_index, anchor_state in enumerate(anchor_states):
             delta = anchor_state["center_world"] - origin_world
             along = float(torch.dot(delta, direction).item())
-            along = max(along, 0.0)
+            if along < 0.0:
+                continue
             closest = origin_world + direction * along
             perpendicular = float(
                 torch.linalg.norm(anchor_state["center_world"] - closest).item()
             )
-            ranked.append((perpendicular, along, anchor_index, anchor_state))
+            aim_radius = min(
+                self.LIVE_CONTROLLER_PREDEFINED_ANCHOR_AIM_MAX_RADIUS,
+                max(
+                    self.LIVE_CONTROLLER_PREDEFINED_ANCHOR_AIM_MIN_RADIUS,
+                    float(anchor_state.get("selection_radius", 0.0)),
+                ),
+            )
+            if require_aim_radius and perpendicular > aim_radius:
+                continue
+            normalized_miss = perpendicular / max(aim_radius, 1.0e-6)
+            ranked.append(
+                (
+                    normalized_miss if require_aim_radius else perpendicular,
+                    along,
+                    anchor_index,
+                    anchor_state,
+                )
+            )
 
         ranked.sort(key=lambda item: (item[0], item[1], item[2]))
         return [anchor for _, _, _, anchor in ranked]
@@ -8499,18 +9166,55 @@ class InvPhyTrainerWarp:
         anchor_states,
         require_selection_radius=False,
     ):
+        # A ray that passes through an interaction point's enlarged invisible
+        # target is intentional and should win over a coarse object-surface hit
+        # in front of it.  This is especially important for Sloth limbs whose
+        # points can otherwise lose to the torso.  Retain all remaining anchors
+        # after the aimed candidates so A/X cycling continues to work.
+        aimed_anchors = self._rank_predefined_interaction_anchors_for_ray(
+            origin_world,
+            direction_world,
+            anchor_states,
+            require_aim_radius=True,
+        )
         ranked = self._rank_predefined_interaction_anchors_for_hit(
             hit_world,
             anchor_states,
             require_selection_radius=require_selection_radius,
         )
-        if ranked:
-            return ranked
-        return self._rank_predefined_interaction_anchors_for_ray(
+        ray_ranked = self._rank_predefined_interaction_anchors_for_ray(
             origin_world,
             direction_world,
             anchor_states,
         )
+        if not aimed_anchors:
+            return ranked if ranked else ray_ranked
+
+        ordered = []
+        seen_names = set()
+        for anchor in (*aimed_anchors, *ranked, *ray_ranked):
+            anchor_name = anchor.get("name")
+            if anchor_name in seen_names:
+                continue
+            seen_names.add(anchor_name)
+            ordered.append(anchor)
+        return ordered
+
+    def _ray_targets_predefined_interaction_anchor(
+        self,
+        origin_world,
+        direction_world,
+        anchor_state,
+    ):
+        if anchor_state is None:
+            return False
+        aimed_anchors = self._rank_predefined_interaction_anchors_for_ray(
+            origin_world,
+            direction_world,
+            [anchor_state],
+            require_aim_radius=True,
+        )
+        return bool(aimed_anchors)
 
     def _select_predefined_interaction_anchor(
         self,
@@ -8681,6 +9385,9 @@ class InvPhyTrainerWarp:
         if interaction_state is not None:
             selected_anchor_name = interaction_state.get("anchor_name")
             state["cycle_locked"] = cycle_locked
+            state["ray_target_selected"] = bool(
+                interaction_state.get("ray_target_selected", False)
+            )
             state["visible"] = selected_anchor_name is not None
             state["selected_anchor_name"] = selected_anchor_name
             state["current_candidate_names"] = (
@@ -8719,6 +9426,7 @@ class InvPhyTrainerWarp:
         if not ranked_anchors:
             state["visible"] = True
             state["cycle_locked"] = False
+            state["ray_target_selected"] = False
             state["selected_anchor_name"] = None
             state["selected_rank_index"] = 0
             state["current_candidate_names"] = [
@@ -8793,6 +9501,14 @@ class InvPhyTrainerWarp:
             0 if current_latched_rank_index is None else int(current_latched_rank_index)
         )
         state["cycle_locked"] = cycle_locked
+        state["ray_target_selected"] = bool(
+            not cycle_locked
+            and self._ray_targets_predefined_interaction_anchor(
+                ray_origin_world,
+                ray_direction_world,
+                selected_anchor,
+            )
+        )
         state["selected_rank_index"] = selected_rank_index
         state["selected_anchor_name"] = selected_anchor["name"]
         state["current_selected_rank"] = selected_rank_index + 1
@@ -8866,6 +9582,17 @@ class InvPhyTrainerWarp:
         alpha = sample_positions - lower.to(dtype=torch.float32)
         return values[lower] * (1.0 - alpha) + values[upper] * alpha
 
+    def _controller_attachment_rest_lengths(self, point_deltas, case_name=None):
+        rest_lengths = torch.linalg.norm(point_deltas, dim=-1).clamp_min(1e-4)
+        if case_name is None:
+            case_name = self._interaction_anchor_case_name()
+        case_name = str(case_name).strip().lower()
+        if case_name not in self.LIVE_CONTROLLER_PRESERVE_ATTACH_REST_LENGTH_CASES:
+            rest_lengths = rest_lengths.clamp_max(
+                self.LIVE_CONTROLLER_ATTACH_MAX_REST_LENGTH
+            )
+        return rest_lengths
+
     def _build_predefined_controller_block_runtime(
         self,
         rest_object_points,
@@ -8919,7 +9646,10 @@ class InvPhyTrainerWarp:
                 if region_indices.numel() == 0:
                     continue
                 region_points = rest_object_points[region_indices]
-                anchor_center = anchor_def["rest_center_world"]
+                anchor_center = self._interaction_anchor_center_world(
+                    anchor_def,
+                    rest_object_points,
+                )
                 outward = anchor_center - object_center
                 outward_norm = float(torch.linalg.norm(outward).item())
                 if outward_norm < 1e-6:
@@ -9301,6 +10031,7 @@ class InvPhyTrainerWarp:
         original_controller_source_anchor_centers,
         controller_predefined_anchor_defs,
         default_anchor_names=None,
+        visual_surface_points=None,
     ):
         original_source_meta = self._build_controller_attachment_metadata(
             self.init_springs,
@@ -9320,6 +10051,7 @@ class InvPhyTrainerWarp:
         anchor_states = self._compute_predefined_interaction_anchor_states(
             controller_predefined_anchor_defs,
             rest_object_points,
+            visual_surface_points=visual_surface_points,
         )
         source_runtime = {}
         controller_springs = []
@@ -9418,11 +10150,10 @@ class InvPhyTrainerWarp:
                 [endpoint0, object_indices.to(dtype=object_springs.dtype)],
                 dim=1,
             )
-            rest_lengths = torch.linalg.norm(
+            rest_lengths = self._controller_attachment_rest_lengths(
                 rest_object_points[object_indices]
                 - controller_source_anchor_centers[source_index].unsqueeze(0),
-                dim=1,
-            ).clamp_min(1e-4).clamp_max(self.LIVE_CONTROLLER_ATTACH_MAX_REST_LENGTH)
+            )
             source_spring_y = self._resample_controller_stiffness_template(
                 original_spring_y[original_source_meta[source]["spring_indices"]],
                 int(object_indices.numel()),
@@ -9498,10 +10229,9 @@ class InvPhyTrainerWarp:
                 torch.linalg.norm(region_points - hit_world.unsqueeze(0), dim=1)
             )
             attach_anchor_world = region_points[nearest_idx].clone()
-        rest_lengths = torch.linalg.norm(
+        rest_lengths = self._controller_attachment_rest_lengths(
             object_points[object_indices] - attach_anchor_world.unsqueeze(0),
-            dim=1,
-        ).clamp_min(1e-4).clamp_max(self.LIVE_CONTROLLER_ATTACH_MAX_REST_LENGTH)
+        )
         hit_to_anchor_distance = None
         if hit_world is not None:
             hit_to_anchor_distance = float(
@@ -9534,6 +10264,7 @@ class InvPhyTrainerWarp:
         controller_source_anchor_centers,
         controller_attachment_metadata,
         controller_predefined_anchor_defs,
+        visual_surface_points=None,
     ):
         templates = {"left": {}, "right": {}}
         for source in ("left", "right"):
@@ -9553,7 +10284,11 @@ class InvPhyTrainerWarp:
                 if candidate_pool.numel() == 0:
                     continue
 
-                anchor_center = anchor_def["rest_center_world"]
+                anchor_center = self._interaction_anchor_center_world(
+                    anchor_def,
+                    rest_object_points,
+                    visual_surface_points=visual_surface_points,
+                )
                 source_offsets = source_template_offsets.clone()
                 template_springs = source_meta["template_springs"].clone()
                 selected_object_indices = []
@@ -9638,7 +10373,7 @@ class InvPhyTrainerWarp:
             unique_object_indices = template["selected_object_indices"]
             if unique_object_indices.numel() == 0:
                 return None
-            attach_center_world = object_points[unique_object_indices].mean(dim=0)
+            attach_center_world = anchor_state["center_world"].clone()
             attach_radius = torch.linalg.norm(
                 object_points[unique_object_indices] - attach_center_world.unsqueeze(0),
                 dim=1,
@@ -9652,9 +10387,9 @@ class InvPhyTrainerWarp:
             object_indices = torch.where(
                 endpoint0 < self.num_all_points, endpoint0, endpoint1
             ).long()
-            rest_lengths = torch.linalg.norm(
-                spring_control_points - object_points[object_indices], dim=1
-            ).clamp_min(1e-4).clamp_max(self.LIVE_CONTROLLER_ATTACH_MAX_REST_LENGTH)
+            rest_lengths = self._controller_attachment_rest_lengths(
+                spring_control_points - object_points[object_indices]
+            )
             return {
                 "anchor_name": template["anchor_name"],
                 "springs": template["springs"].clone(),
@@ -9676,7 +10411,7 @@ class InvPhyTrainerWarp:
         if unique_object_indices.numel() == 0:
             return None
 
-        attach_center_world = object_points[unique_object_indices].mean(dim=0)
+        attach_center_world = anchor_state["center_world"].clone()
         attach_radius = torch.linalg.norm(
             object_points[unique_object_indices] - attach_center_world.unsqueeze(0), dim=1
         ).max()
@@ -9689,9 +10424,9 @@ class InvPhyTrainerWarp:
         object_indices = torch.where(
             endpoint0 < self.num_all_points, endpoint0, endpoint1
         ).long()
-        rest_lengths = torch.linalg.norm(
-            spring_control_points - object_points[object_indices], dim=1
-        ).clamp_min(1e-4).clamp_max(self.LIVE_CONTROLLER_ATTACH_MAX_REST_LENGTH)
+        rest_lengths = self._controller_attachment_rest_lengths(
+            spring_control_points - object_points[object_indices]
+        )
 
         return {
             "anchor_name": anchor_state["name"],
@@ -9986,10 +10721,9 @@ class InvPhyTrainerWarp:
                 torch.linalg.norm(selected_points - hit_world.unsqueeze(0), dim=1)
             )
             attach_anchor_world = selected_points[nearest_patch_offset].clone()
-        rest_lengths = torch.linalg.norm(
+        rest_lengths = self._controller_attachment_rest_lengths(
             object_points[expanded_indices] - attach_anchor_world.unsqueeze(0),
-            dim=1,
-        ).clamp_min(1e-4).clamp_max(self.LIVE_CONTROLLER_ATTACH_MAX_REST_LENGTH)
+        )
         attach_radius = torch.linalg.norm(
             selected_points - attach_center_world.unsqueeze(0), dim=1
         ).max()
@@ -11451,6 +12185,166 @@ class InvPhyTrainerWarp:
             scale=scale,
             blend=0.92,
         )
+
+    @torch.no_grad()
+    def _composite_interactive_spectator_headset(
+        self,
+        frame,
+        gaussian_rgba,
+        gaussian_depth,
+        headset_color,
+        headset_depth,
+    ):
+        preview_frame = frame.clone()
+        headset_depth_t = torch.as_tensor(
+            headset_depth,
+            dtype=torch.float32,
+            device=preview_frame.device,
+        ).squeeze()
+        headset_color_t = torch.as_tensor(
+            headset_color,
+            device=preview_frame.device,
+        )
+        if tuple(headset_depth_t.shape) != tuple(preview_frame.shape[:2]):
+            raise ValueError("Spectator headset depth resolution mismatch.")
+        if tuple(headset_color_t.shape[:2]) != tuple(preview_frame.shape[:2]):
+            raise ValueError("Spectator headset color resolution mismatch.")
+
+        headset_visible = (
+            torch.isfinite(headset_depth_t)
+            & (headset_depth_t > float(self.IMMERSIVE_STARTUP_DEPTH_EPS))
+        )
+        gaussian_visible = torch.zeros_like(headset_visible)
+        gaussian_depth_t = self._normalize_gaussian_depth(gaussian_depth)
+        if gaussian_depth_t is not None:
+            gaussian_alpha = torch.as_tensor(
+                gaussian_rgba[3],
+                dtype=torch.float32,
+                device=preview_frame.device,
+            )
+            gaussian_visible = (
+                torch.isfinite(gaussian_depth_t)
+                & (gaussian_depth_t > float(self.IMMERSIVE_STARTUP_DEPTH_EPS))
+                & (gaussian_alpha > float(self.IMMERSIVE_COMPOSE_ALPHA_EPS))
+            )
+            headset_visible &= (
+                (~gaussian_visible)
+                | (headset_depth_t <= (gaussian_depth_t + 5.0e-3))
+            )
+        if bool(headset_visible.any().item()):
+            preview_frame[headset_visible] = headset_color_t[
+                headset_visible
+            ].to(dtype=preview_frame.dtype)
+        return preview_frame.contiguous()
+
+    @torch.no_grad()
+    def _render_interactive_window_spectator_frame(
+        self,
+        spectator_renderer,
+        *,
+        scene_name,
+        left_eye_pose_world,
+        right_eye_pose_world,
+        controller_overlays_world,
+        rope_game_overlay_state,
+        gaussians,
+        render_pipe,
+        background_black,
+        background_white,
+        scene_renderer,
+        compose_mode,
+        compose_roi_padding,
+        compose_cache,
+    ):
+        if spectator_renderer is None:
+            return None
+        headset_pose_world = resolve_center_eye_pose(
+            left_eye_pose_world,
+            right_eye_pose_world,
+        )
+        if headset_pose_world is None:
+            return None
+
+        draw_room = not direct_gaussian_scene_enabled(
+            scene_name,
+            scene_renderer,
+        )
+        headset_scene_color, headset_scene_depth = (
+            spectator_renderer.render_scene_with_headset(
+                headset_pose_world,
+                draw_scene=draw_room,
+            )
+        )
+        spectator_height = int(spectator_renderer.height)
+        spectator_width = int(spectator_renderer.width)
+        spectator_eye_render_state = self._prepare_immersive_eye_render_state(
+            spectator_renderer.camera_pose_world,
+            spectator_renderer.intrinsic,
+            spectator_height,
+            spectator_width,
+            eye_label="interactive_spectator",
+        )
+        (
+            spectator_frame,
+            spectator_gaussian_rgba,
+            spectator_gaussian_depth,
+            _,
+            _,
+        ) = self._render_immersive_eye_frame(
+            spectator_renderer.camera_pose_world,
+            spectator_renderer.intrinsic,
+            spectator_height,
+            spectator_width,
+            headset_scene_color,
+            headset_scene_depth,
+            gaussians,
+            render_pipe,
+            background_black,
+            background_white,
+            compose_cache=compose_cache,
+            compose_mode=compose_mode,
+            compose_roi_padding=compose_roi_padding,
+            eye_render_state=spectator_eye_render_state,
+            output_dtype=torch.uint8,
+            eye_label="interactive_spectator",
+            scene_name=scene_name,
+            direct_output_renderer=scene_renderer,
+        )
+        if draw_room:
+            preview_frame = spectator_frame.clone()
+        else:
+            # The static scene and deformable object are one Gaussian render,
+            # so merge the separately rasterized headset by metric depth after
+            # the direct scene output has been prepared.
+            preview_frame = self._composite_interactive_spectator_headset(
+                spectator_frame,
+                spectator_gaussian_rgba,
+                spectator_gaussian_depth,
+                headset_scene_color,
+                headset_scene_depth,
+            )
+
+        overlay_world_entries = list(controller_overlays_world or [])
+        if overlay_world_entries:
+            projected = self._project_live_controller_world_overlays_batched(
+                overlay_world_entries,
+                {"interactive_spectator": spectator_eye_render_state},
+                spectator_height,
+                spectator_width,
+            )
+            controller_entries = projected.get("interactive_spectator", [])
+            if controller_entries:
+                self._draw_live_controller_overlay(
+                    preview_frame,
+                    controller_entries,
+                )
+        if rope_game_overlay_state is not None:
+            self._draw_rope_game_overlay(
+                preview_frame,
+                rope_game_overlay_state,
+                spectator_eye_render_state,
+            )
+        return preview_frame.contiguous()
 
     def _copy_immersive_support_entry(self, support_entry):
         if support_entry is None:
@@ -16729,7 +17623,12 @@ class InvPhyTrainerWarp:
             return None
         return torch.stack(eye_positions, dim=0).mean(dim=0)
 
-    def _compute_immersive_head_alignment(self, sample):
+    def _compute_immersive_head_alignment(
+        self,
+        sample,
+        *,
+        startup_gaze_pitch_down_degrees=None,
+    ):
         live_head_origin = self._immersive_live_head_center_from_sample(sample)
         if live_head_origin is None:
             return None
@@ -16769,8 +17668,61 @@ class InvPhyTrainerWarp:
         basis_np = (scene_basis @ live_basis.T).astype(np.float32)
         basis_np_t_basis = basis_np.T @ basis_np
 
+        startup_eye_rotations = []
+        for eye_sample in (sample.left_eye, sample.right_eye):
+            if eye_sample is None or not eye_sample.pose_valid:
+                continue
+            startup_eye_rotations.append(
+                self._quaternion_xyzw_to_rotation_matrix(eye_sample.orientation)
+            )
+        eye_local_orientation_offset = np.eye(3, dtype=np.float32)
+        desired_startup_eye_rotation_world = None
+        startup_eye_orientation_registered = (
+            startup_gaze_pitch_down_degrees is not None
+        )
+        resolved_startup_gaze_pitch_down_degrees = (
+            0.0
+            if startup_gaze_pitch_down_degrees is None
+            else float(startup_gaze_pitch_down_degrees)
+        )
+        if startup_eye_orientation_registered:
+            orientation_registration = (
+                build_startup_eye_orientation_registration(
+                    basis_np,
+                    startup_eye_rotations,
+                    scene_up=scene_up,
+                    scene_forward=scene_forward,
+                    pitch_down_degrees=(
+                        resolved_startup_gaze_pitch_down_degrees
+                    ),
+                )
+            )
+            eye_local_orientation_offset = np.asarray(
+                orientation_registration["eye_local_orientation_offset"],
+                dtype=np.float32,
+            )
+            desired_startup_eye_rotation_world = np.asarray(
+                orientation_registration[
+                    "desired_startup_eye_rotation_world"
+                ],
+                dtype=np.float32,
+            )
+        eye_offset_t_eye_offset = (
+            eye_local_orientation_offset.T @ eye_local_orientation_offset
+        )
+
         return {
             "basis": torch.as_tensor(basis_np, dtype=torch.float32, device=cfg.device),
+            "eye_local_orientation_offset": eye_local_orientation_offset,
+            "desired_startup_eye_rotation_world": (
+                desired_startup_eye_rotation_world
+            ),
+            "startup_gaze_pitch_down_degrees": (
+                resolved_startup_gaze_pitch_down_degrees
+            ),
+            "startup_eye_orientation_registered": (
+                startup_eye_orientation_registered
+            ),
             "translation_scale": torch.tensor(
                 self.IMMERSIVE_LIVE_HEAD_TRANSLATION_SCALE,
                 dtype=torch.float32,
@@ -16786,6 +17738,16 @@ class InvPhyTrainerWarp:
             "basis_det": float(np.linalg.det(basis_np)),
             "basis_orthogonality_error": float(
                 np.max(np.abs(basis_np_t_basis - np.eye(3, dtype=np.float32)))
+            ),
+            "eye_orientation_offset_det": float(
+                np.linalg.det(eye_local_orientation_offset)
+            ),
+            "eye_orientation_offset_orthogonality_error": float(
+                np.max(
+                    np.abs(
+                        eye_offset_t_eye_offset - np.eye(3, dtype=np.float32)
+                    )
+                )
             ),
             "startup_live_forward": live_forward_horizontal,
         }
@@ -16866,6 +17828,13 @@ class InvPhyTrainerWarp:
         current_scene_eye_offsets = {}
         current_eye_rotations_world = {}
         basis_np = head_alignment["basis"].detach().cpu().numpy()
+        eye_local_orientation_offset = np.asarray(
+            head_alignment.get(
+                "eye_local_orientation_offset",
+                np.eye(3, dtype=np.float32),
+            ),
+            dtype=np.float32,
+        )
 
         for source, eye_sample in (
             ("left", sample.left_eye),
@@ -16880,9 +17849,9 @@ class InvPhyTrainerWarp:
             rotation_local = self._quaternion_xyzw_to_rotation_matrix(
                 eye_sample.orientation
             )
-            current_eye_rotations_world[source] = (basis_np @ rotation_local).astype(
-                np.float32
-            )
+            current_eye_rotations_world[source] = (
+                basis_np @ rotation_local @ eye_local_orientation_offset
+            ).astype(np.float32)
 
         if not valid_eye_positions_live:
             head_pose_state["had_valid_pose"] = False
@@ -17766,6 +18735,15 @@ class InvPhyTrainerWarp:
                 garden_quality=garden_quality,
                 eye_resolution=eye_resolution,
             )
+        elif normalized_scene_name == "ambulance":
+            future = executor.submit(
+                AmbulanceSceneRenderer,
+                scene_assets_root=scene_assets_root,
+                width=scene_width,
+                height=scene_height,
+                repo_root=repo_root,
+                eye_resolution=eye_resolution,
+            )
         else:
             future = executor.submit(
                 SimpleLabSceneRenderer,
@@ -18073,6 +19051,9 @@ class InvPhyTrainerWarp:
         shared_scene_reproject_caches = startup_context["shared_scene_reproject_caches"]
         scene_name = str(startup_context.get("scene_name", "lab")).strip().lower()
         repo_root = Path(startup_context.get("repo_root", Path(__file__).resolve().parents[2]))
+        immersive_start_posture = normalize_immersive_start_posture(
+            startup_context.get("immersive_start_posture", "standing")
+        )
 
         bootstrap_output.setdefault(
             "head_pose_state",
@@ -18318,8 +19299,19 @@ class InvPhyTrainerWarp:
                     "session_live_head_alignment"
                 )
                 if live_head_alignment is None:
+                    startup_gaze_pitch_down_degrees = (
+                        ambulance_startup_gaze_pitch_down_degrees(
+                            repo_root,
+                            start_posture=immersive_start_posture,
+                        )
+                        if scene_name == "ambulance"
+                        else None
+                    )
                     live_head_alignment = self._compute_immersive_head_alignment(
-                        current_sample
+                        current_sample,
+                        startup_gaze_pitch_down_degrees=(
+                            startup_gaze_pitch_down_degrees
+                        ),
                     )
                 if live_head_alignment is None:
                     raise RuntimeError(
@@ -18332,7 +19324,13 @@ class InvPhyTrainerWarp:
                     f"forward={live_head_alignment['scene_forward'].tolist()} "
                     f"right={live_head_alignment['scene_right'].tolist()} "
                     f"det={live_head_alignment['basis_det']:.5f} "
-                    f"ortho_err={live_head_alignment['basis_orthogonality_error']:.6f}",
+                    f"ortho_err={live_head_alignment['basis_orthogonality_error']:.6f} "
+                    "startup_gaze_pitch_down_deg="
+                    f"{live_head_alignment.get('startup_gaze_pitch_down_degrees', 0.0):.2f} "
+                    "startup_eye_orientation_registered="
+                    f"{int(live_head_alignment.get('startup_eye_orientation_registered', False))} "
+                    "eye_offset_det="
+                    f"{live_head_alignment.get('eye_orientation_offset_det', 1.0):.5f}",
                     flush=True,
                 )
                 immersive_controller_basis_state = (
@@ -18425,11 +19423,20 @@ class InvPhyTrainerWarp:
                             scene_up=bootstrap_output["live_head_alignment"]["scene_up"],
                             repo_root=repo_root,
                         )
+                    elif scene_name == "ambulance":
+                        layout = make_ambulance_layout(
+                            head_position,
+                            head_forward,
+                            scene_up=bootstrap_output["live_head_alignment"]["scene_up"],
+                            repo_root=repo_root,
+                            start_posture=immersive_start_posture,
+                        )
                     else:
                         layout = make_simple_lab_layout(
                             head_position,
                             head_forward,
                             scene_up=bootstrap_output["live_head_alignment"]["scene_up"],
+                            start_posture=immersive_start_posture,
                         )
                 else:
                     layout_scene_name = str(
@@ -18588,6 +19595,9 @@ class InvPhyTrainerWarp:
                     )
                 print(
                     "[quest_display] immersive layout: "
+                    f"start_posture={immersive_start_posture} "
+                    "head_height_above_floor_m="
+                    f"{getattr(layout, 'startup_head_height_above_floor_m', None)} "
                     f"head_position={np.mean([pose[:3, 3] for pose in [bootstrap_output['initial_left_eye_pose_world'], bootstrap_output['initial_right_eye_pose_world']] if pose is not None], axis=0).astype(np.float32).tolist()} "
                     f"table_top_center={layout.table_top_center.tolist()}",
                     flush=True,
@@ -18710,6 +19720,7 @@ class InvPhyTrainerWarp:
                     self._compute_predefined_interaction_anchor_states(
                         bootstrap_output["controller_predefined_anchor_defs"],
                         bootstrap_output["obj_init_vertices"],
+                        visual_surface_points=gaussians._xyz,
                     )
                 )
                 resolved_default_anchor_names, anchor_mapping_debug = (
@@ -18756,6 +19767,7 @@ class InvPhyTrainerWarp:
                     bootstrap_output["original_controller_source_anchor_centers"],
                     bootstrap_output["controller_predefined_anchor_defs"],
                     default_anchor_names=bootstrap_output["resolved_default_anchor_names"],
+                    visual_surface_points=gaussians._xyz,
                 )
                 controller_runtime_base_target = two_point_runtime[
                     "controller_rest_points"
@@ -18857,6 +19869,9 @@ class InvPhyTrainerWarp:
                     controller_rest_location=self.batch_controller_points[0],
                     number_of_instance=1,
                     use_ground_plane=False,
+                    self_collision_rest_exclusion_multiplier=(
+                        cfg.self_collision_rest_exclusion_multiplier
+                    ),
                 )
                 self.simulator.set_init_state(
                     self.simulator.wp_init_vertices, self.simulator.wp_init_velocities
@@ -18867,6 +19882,8 @@ class InvPhyTrainerWarp:
                     f"self_collision={bool(getattr(cfg, 'self_collision', False))} "
                     "object_collision_flag="
                     f"{int(getattr(self.simulator, 'object_collision_flag', 0))} "
+                    "rest_exclusion_multiplier="
+                    f"{float(getattr(self.simulator, 'self_collision_rest_exclusion_multiplier', 5.0)):.3f} "
                     f"dt={float(getattr(self.simulator, 'dt', cfg.dt)):.8g} "
                     "num_substeps="
                     f"{int(getattr(self.simulator, 'num_substeps', cfg.num_substeps))}",
@@ -19510,24 +20527,24 @@ class InvPhyTrainerWarp:
                         f"source={pipeline_source} backend={presentation_backend_kind}",
                         flush=True,
                     )
-                if garden_direct_output_enabled(
+                if direct_gaussian_scene_enabled(
                     scene_name,
                     bootstrap_output["scene_renderer"],
                 ):
                     print(
-                        "[quest_display] garden output: "
+                        f"[quest_display] {scene_name} output: "
                         "mode=direct_combined_gaussian "
                         "lab_compositor=off overlays=on stable_cover=on",
                         flush=True,
                     )
                 layout = bootstrap_output["layout"]
-                if scene_name == "garden":
-                    garden_boxes = torch.as_tensor(
+                if scene_name in DIRECT_GAUSSIAN_SCENE_NAMES:
+                    scene_boxes = torch.as_tensor(
                         layout.static_collision_boxes,
                         dtype=torch.float32,
                         device=cfg.device,
                     )
-                    self.simulator.set_static_collision_boxes(garden_boxes)
+                    self.simulator.set_static_collision_boxes(scene_boxes)
                     contact = dict(
                         getattr(layout, "static_collision_mesh_contact", {}) or {}
                     )
@@ -19538,11 +20555,108 @@ class InvPhyTrainerWarp:
                         restitution=contact.get("restitution", 0.04),
                         friction=contact.get("friction", 0.62),
                     )
+                    detail_mesh_vertices = getattr(
+                        layout,
+                        "static_collision_detail_mesh_vertices",
+                        None,
+                    )
+                    detail_mesh_faces = getattr(
+                        layout,
+                        "static_collision_detail_mesh_faces",
+                        None,
+                    )
+                    detail_mesh_face_count = 0
+                    mattress_mesh_face_count = int(
+                        len(
+                            getattr(
+                                layout,
+                                "ambulance_mattress_collision_mesh_faces",
+                                [],
+                            )
+                        )
+                    )
+                    detail_mesh_component_count = 0
+                    detail_mesh_two_sided = False
+                    detail_mesh_margin = 0.0
+                    if (
+                        detail_mesh_vertices is not None
+                        and detail_mesh_faces is not None
+                        and len(detail_mesh_vertices) > 0
+                        and len(detail_mesh_faces) > 0
+                    ):
+                        detail_contact = dict(
+                            getattr(
+                                layout,
+                                "static_collision_detail_mesh_contact",
+                                {},
+                            )
+                            or {}
+                        )
+                        self.simulator.set_static_collision_mesh(
+                            detail_mesh_vertices,
+                            detail_mesh_faces,
+                            two_sided=detail_contact.get(
+                                "two_sided",
+                                False,
+                            ),
+                            component_bounds=getattr(
+                                layout,
+                                "static_collision_detail_mesh_component_bounds",
+                                None,
+                            ),
+                            substep_interval=detail_contact.get(
+                                "substep_interval",
+                                1,
+                            ),
+                            query_distance=detail_contact.get(
+                                "query_distance_m",
+                                0.08,
+                            ),
+                            winding_accuracy=detail_contact.get(
+                                "winding_accuracy",
+                                2.0,
+                            ),
+                            winding_threshold=detail_contact.get(
+                                "winding_threshold",
+                                0.5,
+                            ),
+                            margin=detail_contact.get("margin_m", 0.0025),
+                            restitution=detail_contact.get("restitution", 0.04),
+                            friction=detail_contact.get("friction", 0.62),
+                        )
+                        detail_mesh_face_count = len(detail_mesh_faces)
+                        detail_mesh_component_count = len(
+                            getattr(
+                                layout,
+                                "static_collision_detail_mesh_component_bounds",
+                                [],
+                            )
+                        )
+                        detail_mesh_two_sided = bool(
+                            detail_contact.get("two_sided", False)
+                        )
+                        detail_mesh_margin = float(
+                            detail_contact.get("margin_m", 0.0025)
+                        )
+                    surface_kinds = ",".join(
+                        sorted(
+                            {
+                                str(surface.get("kind", "unknown"))
+                                for surface in layout.static_collision_surfaces
+                            }
+                        )
+                    )
                     print(
-                        "[quest_display] Garden primitive collision ready: "
+                        f"[quest_display] {scene_name.title()} collision ready: "
                         f"surfaces={len(layout.static_collision_surfaces)} "
                         f"boxes={len(layout.static_collision_boxes)} "
-                        "kinds=closed_cylinder,rectangle "
+                        f"kinds={surface_kinds} "
+                        f"mattress_mesh_faces={mattress_mesh_face_count} "
+                        f"detail_mesh_faces={detail_mesh_face_count} "
+                        f"detail_mesh_substep_interval={int(getattr(self.simulator, 'static_mesh_substep_interval', 1))} "
+                        f"detail_mesh_components={detail_mesh_component_count} "
+                        f"detail_mesh_two_sided={detail_mesh_two_sided} "
+                        f"detail_mesh_margin_m={detail_mesh_margin:.4f} "
                         f"debug_proxy_faces={len(layout.static_collision_mesh_faces)} "
                         f"margin_m={float(contact.get('margin_m', 0.0025)):.4f}",
                         flush=True,
@@ -19644,11 +20758,17 @@ class InvPhyTrainerWarp:
                 gaussians._xyz = current_pos
                 gaussians._rotation = current_rot
                 render_gaussians = gaussians
-                if scene_name == "garden":
+                if direct_gaussian_scene_enabled(
+                    scene_name,
+                    bootstrap_output["scene_renderer"],
+                ):
                     render_gaussians = bootstrap_output[
                         "scene_renderer"
                     ].bind_dynamic_gaussians(gaussians)
-                    if bool(startup_context.get("garden_debug_collision", False)):
+                    if (
+                        scene_name == "garden"
+                        and bool(startup_context.get("garden_debug_collision", False))
+                    ):
                         debug_path = (
                             repo_root
                             / "data"
@@ -19726,6 +20846,7 @@ class InvPhyTrainerWarp:
                         bootstrap_output["controller_source_anchor_centers"],
                         bootstrap_output["controller_attachment_metadata"],
                         bootstrap_output["controller_predefined_anchor_defs"],
+                        visual_surface_points=gaussians._xyz,
                     )
                 )
                 bootstrap_output.update(
@@ -23369,7 +24490,14 @@ class InvPhyTrainerWarp:
 
         rotation_local = self._quaternion_xyzw_to_rotation_matrix(eye_sample.orientation)
         basis = head_alignment["basis"].detach().cpu().numpy()
-        rotation_world = basis @ rotation_local
+        eye_local_orientation_offset = np.asarray(
+            head_alignment.get(
+                "eye_local_orientation_offset",
+                np.eye(3, dtype=np.float32),
+            ),
+            dtype=np.float32,
+        )
+        rotation_world = basis @ rotation_local @ eye_local_orientation_offset
 
         pose = np.eye(4, dtype=np.float32)
         pose[:3, :3] = rotation_world
@@ -23622,7 +24750,48 @@ class InvPhyTrainerWarp:
             layout,
             table_surface_center_world=table_surface_center_world,
         )
-        if xy_error > self.IMMERSIVE_STARTUP_CENTER_EPS or z_error > self.IMMERSIVE_STARTUP_PLANE_EPS:
+        is_settled_state = str(context).strip().lower().startswith("settled")
+        is_ambulance = (
+            str(getattr(layout, "scene_name", "")).strip().lower() == "ambulance"
+        )
+        if is_settled_state and is_ambulance:
+            surface_metrics = ambulance_mattress_alignment_metrics(
+                layout,
+                support_center.detach().cpu().numpy(),
+                table_surface_center_world=table_center.detach().cpu().numpy(),
+            )
+            surface_failed = (
+                float(surface_metrics["plane_error_m"])
+                > self.IMMERSIVE_STARTUP_PLANE_EPS
+                or float(surface_metrics["edge_overrun_m"])
+                > self.IMMERSIVE_STARTUP_SURFACE_EDGE_EPS
+            )
+            if surface_failed:
+                raise RuntimeError(
+                    f"Immersive scene spawn validation failed during {context}: "
+                    f"support_center={support_center.detach().cpu().numpy().tolist()} "
+                    f"table_top_center={table_center.detach().cpu().numpy().tolist()} "
+                    f"surface_u={float(surface_metrics['offset_u_m']):.4f} "
+                    f"surface_v={float(surface_metrics['offset_v_m']):.4f} "
+                    f"plane_error={float(surface_metrics['plane_error_m']):.4f} "
+                    f"edge_overrun={float(surface_metrics['edge_overrun_m']):.4f}"
+                )
+            if xy_error > self.IMMERSIVE_STARTUP_CENTER_EPS:
+                print(
+                    "[quest_display] settled object relaxed along the captured "
+                    "ambulance mattress mesh: "
+                    f"center_offset={xy_error:.4f} "
+                    f"surface_u={float(surface_metrics['offset_u_m']):.4f} "
+                    f"surface_v={float(surface_metrics['offset_v_m']):.4f} "
+                    f"plane_error={float(surface_metrics['plane_error_m']):.4f}",
+                    flush=True,
+                )
+            return support_center
+
+        if (
+            xy_error > self.IMMERSIVE_STARTUP_CENTER_EPS
+            or z_error > self.IMMERSIVE_STARTUP_PLANE_EPS
+        ):
             raise RuntimeError(
                 f"Immersive scene spawn validation failed during {context}: "
                 f"support_center={support_center.detach().cpu().numpy().tolist()} "
@@ -26256,6 +27425,15 @@ class InvPhyTrainerWarp:
             "object_bounds_max": object_bounds_max.tolist(),
             "head_alignment_basis_det": head_alignment["basis_det"],
             "head_alignment_orthogonality_error": head_alignment["basis_orthogonality_error"],
+            "head_alignment_startup_gaze_pitch_down_degrees": float(
+                head_alignment.get("startup_gaze_pitch_down_degrees", 0.0)
+            ),
+            "head_alignment_startup_eye_orientation_registered": bool(
+                head_alignment.get("startup_eye_orientation_registered", False)
+            ),
+            "head_alignment_eye_orientation_offset_det": float(
+                head_alignment.get("eye_orientation_offset_det", 1.0)
+            ),
             "scene_up": np.asarray(head_alignment["scene_up"], dtype=np.float32).tolist(),
             "scene_forward": np.asarray(head_alignment["scene_forward"], dtype=np.float32).tolist(),
             "scene_right": np.asarray(head_alignment["scene_right"], dtype=np.float32).tolist(),
@@ -26879,6 +28057,15 @@ class InvPhyTrainerWarp:
             "head_alignment_orthogonality_error": head_alignment[
                 "basis_orthogonality_error"
             ],
+            "head_alignment_startup_gaze_pitch_down_degrees": float(
+                head_alignment.get("startup_gaze_pitch_down_degrees", 0.0)
+            ),
+            "head_alignment_startup_eye_orientation_registered": bool(
+                head_alignment.get("startup_eye_orientation_registered", False)
+            ),
+            "head_alignment_eye_orientation_offset_det": float(
+                head_alignment.get("eye_orientation_offset_det", 1.0)
+            ),
             "scene_up": np.asarray(
                 head_alignment["scene_up"], dtype=np.float32
             ).tolist(),
@@ -27542,6 +28729,7 @@ class InvPhyTrainerWarp:
         ray_direction,
         controller_interaction_state=None,
         explicit_preview_selected=False,
+        ray_target_selected=False,
     ):
         if interaction_state is None or remap_candidate is None:
             return "missing_interaction_candidate", {}
@@ -27598,6 +28786,7 @@ class InvPhyTrainerWarp:
         )
         if (
             not explicit_preview_selected
+            and not ray_target_selected
             and not (bool(hit_distance_passed) or projected_anchor_distance_passed)
         ):
             hit_summary = (
@@ -27618,12 +28807,17 @@ class InvPhyTrainerWarp:
                     "hit_distance": hit_distance,
                     "hit_distance_limit": hit_distance_limit,
                     "hit_distance_passed": hit_distance_passed,
+                    "ray_target_selected": bool(ray_target_selected),
                     "validation_path": "none",
                 },
             )
 
-        validation_path = "manual_preview"
-        if not explicit_preview_selected:
+        validation_path = (
+            "manual_preview"
+            if explicit_preview_selected
+            else ("ray_target" if ray_target_selected else "none")
+        )
+        if not explicit_preview_selected and not ray_target_selected:
             if bool(hit_distance_passed) and projected_anchor_distance_passed:
                 validation_path = "hit+ray"
             elif bool(hit_distance_passed):
@@ -27633,7 +28827,12 @@ class InvPhyTrainerWarp:
             else:
                 validation_path = "none"
 
-        if hit_world is not None and ray_direction is not None and not explicit_preview_selected:
+        if (
+            hit_world is not None
+            and ray_direction is not None
+            and not explicit_preview_selected
+            and not ray_target_selected
+        ):
             direction = ray_direction / ray_direction.norm().clamp_min(1e-6)
             anchor_depth = float(torch.dot(attach_anchor_world - hit_world, direction).item())
             if anchor_depth > self.LIVE_CONTROLLER_MULTI_POINTS_BACK_DEPTH_THRESHOLD:
@@ -27648,6 +28847,7 @@ class InvPhyTrainerWarp:
                         "projected_anchor_distance_bypassed": projected_anchor_distance_bypassed,
                         "strict_projected_anchor_distance_limit": strict_projected_anchor_distance_limit,
                         "explicit_preview_selected": bool(explicit_preview_selected),
+                        "ray_target_selected": bool(ray_target_selected),
                         "hit_distance": hit_distance,
                         "hit_distance_limit": hit_distance_limit,
                         "hit_distance_passed": hit_distance_passed,
@@ -27662,6 +28862,7 @@ class InvPhyTrainerWarp:
             "projected_anchor_distance_bypassed": projected_anchor_distance_bypassed,
             "strict_projected_anchor_distance_limit": strict_projected_anchor_distance_limit,
             "explicit_preview_selected": bool(explicit_preview_selected),
+            "ray_target_selected": bool(ray_target_selected),
             "hit_distance": hit_distance,
             "hit_distance_limit": hit_distance_limit,
             "hit_distance_passed": hit_distance_passed,
@@ -27730,11 +28931,17 @@ class InvPhyTrainerWarp:
             if interaction_state is None
             else int(bool(interaction_state.get("explicit_preview_selected", False)))
         )
+        ray_target_selected = (
+            None
+            if interaction_state is None
+            else int(bool(interaction_state.get("ray_target_selected", False)))
+        )
         self._log_live_openxr_controller_info(
             "[live_openxr_controller] "
             f"{source} interaction_start=1 "
             f"mode={grab_start_mode} "
             f"explicit_preview_selected={explicit_preview_selected} "
+            f"ray_target_selected={ray_target_selected} "
             f"preview_visible={preview_anchor_visible} "
             f"preview_anchor={preview_anchor_name} "
             f"preview_resolved={preview_anchor_resolved} "
@@ -27785,6 +28992,11 @@ class InvPhyTrainerWarp:
             if interaction_state is None
             else int(bool(interaction_state.get("explicit_preview_selected", False)))
         )
+        ray_target_selected = (
+            None
+            if interaction_state is None
+            else int(bool(interaction_state.get("ray_target_selected", False)))
+        )
         hit_distance_passed = (
             None
             if interaction_state is None
@@ -27815,6 +29027,7 @@ class InvPhyTrainerWarp:
             f"{source} interaction_{action}=1 "
             f"mode={grab_start_mode} "
             f"explicit_preview_selected={explicit_preview_selected} "
+            f"ray_target_selected={ray_target_selected} "
             f"start_reference={start_reference} "
             f"validation_path={validation_path} "
             f"hit_gate={None if hit_distance_passed is None else int(bool(hit_distance_passed))} "
@@ -28407,6 +29620,7 @@ class InvPhyTrainerWarp:
                     0.12,
                     2.0 * float(table_vertical_max_thickness_m),
                 )
+                table_divider_mask = np.zeros(original_box_count, dtype=bool)
                 preserved_table_divider_colliders = 0
                 preserved_table_side_colliders = 0
                 for box_idx in np.nonzero(preserved_table_vertical_mask)[0]:
@@ -28421,6 +29635,7 @@ class InvPhyTrainerWarp:
                         <= divider_center_tolerance_m
                     )
                     if is_divider:
+                        table_divider_mask[int(box_idx)] = True
                         preserved_table_divider_colliders += 1
                     else:
                         preserved_table_side_colliders += 1
@@ -28491,6 +29706,101 @@ class InvPhyTrainerWarp:
                         kept_boxes_physics_np[
                             sofa_handle_bar_physics_indices, 0, vertical_axis
                         ] -= sofa_handle_physics_bottom_extra_m
+
+                lab_table_divider_merge_requested = bool(
+                    getattr(cfg, "runtime_lab_table_divider_merge_enabled", False)
+                )
+                immersive_scene_name = str(
+                    getattr(cfg, "immersive_scene_name", "lab") or "lab"
+                ).strip().lower()
+                lab_table_divider_merge_enabled = bool(
+                    lab_table_divider_merge_requested
+                    and immersive_scene_name in {"lab", "illixr_lab"}
+                )
+                lab_table_divider_lateral_inflate_m = float(
+                    getattr(
+                        cfg,
+                        "runtime_lab_table_divider_lateral_inflate_m",
+                        0.0,
+                    )
+                )
+                if (
+                    not np.isfinite(lab_table_divider_lateral_inflate_m)
+                    or lab_table_divider_lateral_inflate_m < 0.0
+                ):
+                    lab_table_divider_lateral_inflate_m = 0.0
+                lab_table_divider_surface_overlap_m = float(
+                    getattr(
+                        cfg,
+                        "runtime_lab_table_divider_surface_overlap_m",
+                        0.0,
+                    )
+                )
+                if (
+                    not np.isfinite(lab_table_divider_surface_overlap_m)
+                    or lab_table_divider_surface_overlap_m < 0.0
+                ):
+                    lab_table_divider_surface_overlap_m = 0.0
+
+                kept_table_divider_mask = table_divider_mask[kept_box_mask]
+                lab_table_divider_input_boxes = int(
+                    np.count_nonzero(kept_table_divider_mask)
+                )
+                lab_table_divider_output_boxes = lab_table_divider_input_boxes
+                lab_table_divider_top_gap_before_m = float("nan")
+                lab_table_divider_lower_gap_before_m = float("nan")
+                lab_table_divider_physics_aabb = "disabled"
+                if lab_table_divider_merge_enabled:
+                    if lab_table_divider_input_boxes <= 0:
+                        raise RuntimeError(
+                            "runtime_lab_table_divider_merge_enabled could not find "
+                            "the Lab active-table center divider colliders."
+                        )
+                    merged_divider_box, divider_merge_debug = (
+                        merge_lab_table_divider_collision_boxes(
+                            kept_boxes_physics_np[kept_table_divider_mask],
+                            scene_up=scene_up,
+                            smooth_table_top=smooth_table_top,
+                            lower_support_boxes=boxes_np[lower_active_support_mask],
+                            lateral_inflate_m=(
+                                lab_table_divider_lateral_inflate_m
+                            ),
+                            surface_overlap_m=(
+                                lab_table_divider_surface_overlap_m
+                            ),
+                        )
+                    )
+                    first_divider_index = int(
+                        np.nonzero(kept_table_divider_mask)[0][0]
+                    )
+                    merged_kept_boxes = []
+                    for kept_box_index, kept_box in enumerate(
+                        kept_boxes_physics_np
+                    ):
+                        if kept_box_index == first_divider_index:
+                            merged_kept_boxes.append(merged_divider_box)
+                        elif not bool(
+                            kept_table_divider_mask[kept_box_index]
+                        ):
+                            merged_kept_boxes.append(kept_box)
+                    kept_boxes_physics_np = np.stack(
+                        merged_kept_boxes,
+                        axis=0,
+                    ).astype(np.float32)
+                    lab_table_divider_output_boxes = 1
+                    lab_table_divider_top_gap_before_m = float(
+                        divider_merge_debug["top_gap_before_m"]
+                    )
+                    divider_lower_gap = divider_merge_debug[
+                        "lower_gap_before_m"
+                    ]
+                    if divider_lower_gap is not None:
+                        lab_table_divider_lower_gap_before_m = float(
+                            divider_lower_gap
+                        )
+                    lab_table_divider_physics_aabb = str(
+                        merged_divider_box.tolist()
+                    )
                 support_keep_mask = np.array(
                     [
                         category
@@ -28610,6 +29920,24 @@ class InvPhyTrainerWarp:
                     f"{int(preserved_table_side_colliders)} "
                     "preserved_table_divider_colliders="
                     f"{int(preserved_table_divider_colliders)} "
+                    "lab_table_divider_merge_requested="
+                    f"{int(lab_table_divider_merge_requested)} "
+                    "lab_table_divider_merge_enabled="
+                    f"{int(lab_table_divider_merge_enabled)} "
+                    "lab_table_divider_input_boxes="
+                    f"{lab_table_divider_input_boxes} "
+                    "lab_table_divider_output_boxes="
+                    f"{lab_table_divider_output_boxes} "
+                    "lab_table_divider_lateral_inflate_m="
+                    f"{lab_table_divider_lateral_inflate_m:.4f} "
+                    "lab_table_divider_surface_overlap_m="
+                    f"{lab_table_divider_surface_overlap_m:.4f} "
+                    "lab_table_divider_top_gap_before_m="
+                    f"{lab_table_divider_top_gap_before_m:.4f} "
+                    "lab_table_divider_lower_gap_before_m="
+                    f"{lab_table_divider_lower_gap_before_m:.4f} "
+                    "lab_table_divider_physics_aabb="
+                    f"{lab_table_divider_physics_aabb} "
                     "sofa_handle_colliders="
                     f"{int(np.count_nonzero(kept_sofa_handle_mask))} "
                     "sofa_handle_top_support_boxes="
@@ -28655,6 +29983,8 @@ class InvPhyTrainerWarp:
                     f"kept_non_table_boxes={kept_non_table_boxes} "
                     f"kept_active_table_other_boxes={kept_active_other_boxes} "
                     f"kept_boxes={int(kept_boxes_np.shape[0])} "
+                    "physics_kept_boxes="
+                    f"{int(kept_boxes_physics_np.shape[0])} "
                     f"output_boxes={int(boxes_np.shape[0])} "
                     f"runtime_support_boxes={int(runtime_support_boxes_np.shape[0])} "
                     f"top_level_reference={float(active_table_top_reference):.4f} "
@@ -29045,9 +30375,9 @@ class InvPhyTrainerWarp:
                     new_springs[spring_position, 0] = object_idx.to(new_springs.dtype)
                 else:
                     new_springs[spring_position, 1] = object_idx.to(new_springs.dtype)
-                rest_length = torch.linalg.norm(
+                rest_length = self._controller_attachment_rest_lengths(
                     control_point - object_points[int(object_idx.item())]
-                ).clamp_min(1e-4).clamp_max(self.LIVE_CONTROLLER_ATTACH_MAX_REST_LENGTH)
+                )
                 new_rest_lengths[spring_position] = rest_length
 
         if not selected_object_indices:
@@ -29439,12 +30769,21 @@ class InvPhyTrainerWarp:
             interaction_state = controller_interaction_state[source]
             if controller_world is None:
                 if interaction_state is not None:
-                    self._clear_live_controller_interaction(
-                        source,
-                        controller_interaction_state,
-                        controller_attachment_metadata,
-                        reason="controller_invalid",
+                    released_interaction_state = (
+                        self._clear_live_controller_interaction(
+                            source,
+                            controller_interaction_state,
+                            controller_attachment_metadata,
+                            reason="controller_invalid",
+                        )
                     )
+                    if interaction_release_callback is not None:
+                        interaction_release_callback(
+                            source=source,
+                            frame_index=frame_index,
+                            interaction_state=released_interaction_state,
+                            select_release_frames=0,
+                        )
                 self._reset_controller_anchor_preview_state(
                     controller_anchor_preview_state,
                     source,
@@ -29550,6 +30889,16 @@ class InvPhyTrainerWarp:
                             preview_state["current_candidate_count"] = len(ranked_anchors)
                 if snapped_anchor is None:
                     continue
+                ray_target_selected = bool(
+                    not cycle_locked
+                    and self._ray_targets_predefined_interaction_anchor(
+                        ray_origin_world,
+                        ray_direction_world,
+                        snapped_anchor,
+                    )
+                )
+                if ray_target_selected:
+                    grab_start_mode = "ray_target"
                 explicit_preview_selected = bool(
                     cycle_locked
                     and selected_preview_anchor is not None
@@ -29570,12 +30919,17 @@ class InvPhyTrainerWarp:
                     preview_interaction_state = {
                         "grab_start_mode": grab_start_mode,
                         "explicit_preview_selected": explicit_preview_selected,
+                        "ray_target_selected": ray_target_selected,
                         "preview_anchor_visible": preview_anchor_visible,
                         "preview_anchor_name": preview_anchor_name,
                         "preview_anchor_resolved": True,
                         "hit_present": bool(hit_world is not None),
                         "start_reference": (
-                            "ray_hit" if hit_world is not None else "anchor_center"
+                            "anchor_target"
+                            if ray_target_selected
+                            else (
+                                "ray_hit" if hit_world is not None else "anchor_center"
+                            )
                         ),
                     }
                     reason = (
@@ -29614,9 +30968,14 @@ class InvPhyTrainerWarp:
                         "hit_present": bool(hit_world is not None),
                         "cycle_locked": cycle_locked,
                         "explicit_preview_selected": explicit_preview_selected,
+                        "ray_target_selected": ray_target_selected,
                         "selected_rank_index": selected_rank_index,
                         "start_reference": (
-                            "ray_hit" if hit_world is not None else "anchor_center"
+                            "anchor_target"
+                            if ray_target_selected
+                            else (
+                                "ray_hit" if hit_world is not None else "anchor_center"
+                            )
                         ),
                     }
                 )
@@ -29635,6 +30994,7 @@ class InvPhyTrainerWarp:
                     ray_direction_world,
                     controller_interaction_state=controller_interaction_state,
                     explicit_preview_selected=explicit_preview_selected,
+                    ray_target_selected=ray_target_selected,
                 )
                 interaction_state.update(validation_debug)
                 if rejection_reason is not None:
@@ -29685,6 +31045,7 @@ class InvPhyTrainerWarp:
                         "grab_spring_mean": remap_candidate.get("grab_spring_mean"),
                         "grab_spring_max": remap_candidate.get("grab_spring_max"),
                         "explicit_preview_selected": explicit_preview_selected,
+                        "ray_target_selected": ray_target_selected,
                         "grab_start_mode": grab_start_mode,
                         "preview_anchor_visible": preview_anchor_visible,
                         "preview_anchor_name": preview_anchor_name,
@@ -29858,7 +31219,7 @@ class InvPhyTrainerWarp:
                     origin_pixel,
                     end_pixel,
                     color,
-                    radius=1,
+                    radius=self.LIVE_CONTROLLER_RAY_RADIUS,
                     blend=0.68
                     if attachment_active
                     else (0.52 if hit_pixel is not None else 0.34),
@@ -30253,7 +31614,7 @@ class InvPhyTrainerWarp:
                 origin_pixel,
                 end_pixel,
                 color,
-                radius=1,
+                radius=self.LIVE_CONTROLLER_RAY_RADIUS,
                 blend=0.68
                 if attachment_active
                 else (0.52 if hit_pixel is not None else 0.34),
@@ -30700,7 +32061,7 @@ class InvPhyTrainerWarp:
                     origin_pixel,
                     end_pixel,
                     color,
-                    radius=1,
+                    radius=self.LIVE_CONTROLLER_RAY_RADIUS,
                     blend=0.68
                     if attachment_active
                     else (0.52 if hit_pixel is not None else 0.34),
@@ -31095,6 +32456,95 @@ class InvPhyTrainerWarp:
             controller_source_masks[source_index],
             as_tuple=False,
         ).squeeze(1)
+
+    def _advance_immersive_controller_motion_target(
+        self,
+        limiter_state,
+        desired_target,
+        controller_source_masks,
+        controller_interaction_state,
+    ):
+        simulated_target = limiter_state.get("simulated_target")
+        if (
+            simulated_target is None
+            or simulated_target.shape != desired_target.shape
+            or simulated_target.device != desired_target.device
+        ):
+            simulated_target = desired_target.detach().clone()
+        interaction_tokens = limiter_state.setdefault(
+            "interaction_tokens",
+            {"left": None, "right": None},
+        )
+        active_point_index_groups = []
+        active_sources = []
+        for source in ("left", "right"):
+            interaction_state = controller_interaction_state.get(source)
+            if interaction_state is None or interaction_state.get(
+                "kinematic_only", False
+            ):
+                interaction_tokens[source] = None
+                continue
+            target_point_indices = self._controller_target_point_indices_for_state(
+                source,
+                controller_source_masks,
+                interaction_state,
+            )
+            interaction_token = self._immersive_controller_interaction_token(
+                interaction_state
+            )
+            if interaction_tokens.get(source) != interaction_token:
+                # A spring remap starts at the current controller attachment.
+                # Do not make a newly grabbed object chase a stale inactive
+                # controller-template position.
+                simulated_target = simulated_target.clone()
+                simulated_target[target_point_indices] = desired_target[
+                    target_point_indices
+                ]
+            interaction_tokens[source] = interaction_token
+            active_sources.append(source)
+            active_point_index_groups.append(target_point_indices)
+        advance = advance_controller_motion_target(
+            simulated_target,
+            desired_target,
+            active_point_index_groups,
+            max_interval_distance_m=(
+                self._immersive_controller_max_motion_interval_m
+            ),
+        )
+        limiter_state["simulated_target"] = advance.target.detach().clone()
+        return simulated_target, advance, tuple(active_sources)
+
+    @staticmethod
+    def _immersive_controller_interaction_token(interaction_state):
+        interaction_start_frame_index = interaction_state.get(
+            "interaction_start_frame_index"
+        )
+        if interaction_start_frame_index is not None:
+            return ("frame", int(interaction_start_frame_index))
+        return ("object", id(interaction_state))
+
+    @classmethod
+    def _reset_immersive_controller_motion_limiter(
+        cls,
+        limiter_state,
+        target,
+        controller_interaction_state=None,
+    ):
+        limiter_state["simulated_target"] = target.detach().clone()
+        interaction_tokens = {"left": None, "right": None}
+        if controller_interaction_state is not None:
+            for source in ("left", "right"):
+                interaction_state = controller_interaction_state.get(source)
+                if interaction_state is None or interaction_state.get(
+                    "kinematic_only", False
+                ):
+                    continue
+                interaction_tokens[source] = (
+                    cls._immersive_controller_interaction_token(
+                        interaction_state
+                    )
+                )
+        limiter_state["interaction_tokens"] = interaction_tokens
 
     def _controller_spring_subset_stats(self, source, controller_attachment_metadata):
         source_meta = controller_attachment_metadata.get(source)
@@ -32257,7 +33707,7 @@ class InvPhyTrainerWarp:
             )
             timing_out["gaussian_ready_monotonic"] = time.perf_counter()
         self._render_profile_end_cuda_span(render_profile_frame, gaussian_span)
-        direct_output_active = garden_direct_output_enabled(
+        direct_output_active = direct_gaussian_scene_enabled(
             scene_name,
             direct_output_renderer,
         )
@@ -32274,7 +33724,7 @@ class InvPhyTrainerWarp:
         compose_metrics = None
         compose_debug_maps = None
         if direct_output_active:
-            # The direct Garden image is already the final scene. Produce the
+            # The direct Gaussian image is already the final scene. Produce the
             # bridge's native byte format here so the later shared overlay path
             # can draw in place without another full-frame dtype conversion.
             composed, gaussian_depth, compose_metrics = (
@@ -33895,6 +35345,7 @@ class InvPhyTrainerWarp:
         cuda_ctx,
         interactive_window_mode,
         scene_assets_root,
+        immersive_start_posture="standing",
         profile=False,
         profile_freq=30,
         immersive_timewarp="off",
@@ -33914,6 +35365,9 @@ class InvPhyTrainerWarp:
         immersive_gaussian_render=None,
         immersive_present_pipeline=True,
         immersive_controller_translation_scale=1.2,
+        immersive_controller_max_motion_interval_m=(
+            DEFAULT_MAX_CONTROLLER_MOTION_INTERVAL_M
+        ),
         existing_immersive_bridge=None,
         immersive_session_state=None,
         show_startup_tutorial=True,
@@ -33923,8 +35377,11 @@ class InvPhyTrainerWarp:
         garden_debug_collision=False,
     ):
         scene_name = str(scene_name or "lab").strip().lower()
-        if scene_name not in {"lab", "garden"}:
+        if scene_name not in {"lab", "garden", "ambulance"}:
             raise ValueError(f"Unsupported immersive scene: {scene_name}")
+        immersive_start_posture = normalize_immersive_start_posture(
+            immersive_start_posture
+        )
         garden_quality = str(garden_quality or "balanced").strip().lower()
         immersive_controller_translation_scale = float(
             immersive_controller_translation_scale
@@ -33938,6 +35395,20 @@ class InvPhyTrainerWarp:
             )
         self._immersive_controller_translation_scale_multiplier = float(
             immersive_controller_translation_scale
+        )
+        immersive_controller_max_motion_interval_m = float(
+            immersive_controller_max_motion_interval_m
+        )
+        if (
+            not np.isfinite(immersive_controller_max_motion_interval_m)
+            or immersive_controller_max_motion_interval_m <= 0.0
+        ):
+            raise ValueError(
+                "--immersive_controller_max_motion_interval_m must be a finite "
+                "positive distance."
+            )
+        self._immersive_controller_max_motion_interval_m = float(
+            immersive_controller_max_motion_interval_m
         )
         immersive_eye_resolution = int(immersive_eye_resolution)
         if immersive_eye_resolution <= 0:
@@ -33991,9 +35462,19 @@ class InvPhyTrainerWarp:
         raw_gaussian_count = int(gaussians._xyz.shape[0])
         gaussian_finite_debug = self._sanitize_rope_game_gaussians(gaussians)
         kept_gaussian_count = raw_gaussian_count
+        opacity_kept_gaussian_count = raw_gaussian_count
         opacity_pruning_enabled = case_name == "sloth"
         if opacity_pruning_enabled:
             gaussians = remove_gaussians_with_low_opacity(gaussians, 0.1)
+            opacity_kept_gaussian_count = int(gaussians._xyz.shape[0])
+            gaussians = remove_gaussians_outside_largest_component(
+                gaussians,
+                self.SLOTH_VISUAL_COMPONENT_CONNECTIVITY_RADIUS_M,
+                minimum_keep_fraction=(
+                    self.SLOTH_VISUAL_COMPONENT_MINIMUM_KEEP_FRACTION
+                ),
+                cache_key=gs_path,
+            )
             kept_gaussian_count = int(gaussians._xyz.shape[0])
         gaussians.isotropic = True
         visual_retarget_debug = self._apply_visual_gaussian_retarget_to_sim_rest(
@@ -34020,7 +35501,10 @@ class InvPhyTrainerWarp:
             f"case={case_name} "
             f"gaussian_source={gs_path} "
             f"total_gaussians={raw_gaussian_count} "
+            f"opacity_kept_gaussians={opacity_kept_gaussian_count} "
             f"kept_gaussians={kept_gaussian_count} "
+            "disconnected_gaussians_removed="
+            f"{opacity_kept_gaussian_count - kept_gaussian_count} "
             f"object_nodes={int(getattr(self, 'num_original_points', 0))} "
             f"mass_nodes={int(self.num_all_points)} "
             f"opacity_pruning={'0.1' if opacity_pruning_enabled else 'disabled'} "
@@ -34069,6 +35553,7 @@ class InvPhyTrainerWarp:
             obj_init_vertices,
             intrinsic_torch,
             w2c_torch,
+            visual_surface_points=gaussians._xyz,
         )
         live_controller_case_profile = self._live_controller_case_profile()
         controller_runtime_base_target = None
@@ -34089,13 +35574,32 @@ class InvPhyTrainerWarp:
             antialiasing=True,
             compute_cov3D_python=False,
             convert_SHs_python=False,
-            absgrad=scene_name != "garden",
-            radius_clip=0.25 if scene_name == "garden" else 0.0,
+            absgrad=scene_name not in DIRECT_GAUSSIAN_SCENE_NAMES,
+            radius_clip=(
+                0.25 if scene_name in DIRECT_GAUSSIAN_SCENE_NAMES else 0.0
+            ),
+            # Keep this opt-in until the other demo scenes have been visually
+            # qualified against PlayCanvas's bounded projected footprint.
+            max_projected_radius=(
+                AMBULANCE_MAX_PROJECTED_RADIUS_PX
+                if scene_name == "ambulance"
+                else 0.0
+            ),
         )
+        if render_pipe.max_projected_radius > 0.0:
+            print(
+                "[quest_display] projected-splat guard enabled: "
+                f"scene={scene_name} "
+                f"max_radius_px={render_pipe.max_projected_radius:.0f} "
+                "viewport_bounded=1 offscreen_recull=1",
+                flush=True,
+            )
 
         repo_root = Path(__file__).resolve().parents[2]
         if scene_name == "garden":
             validate_garden_runtime_selection(repo_root, garden_quality)
+        elif scene_name == "ambulance":
+            validate_ambulance_scene(repo_root)
         else:
             ensure_simple_lab_assets(scene_assets_root)
         eye_width = int(immersive_eye_resolution)
@@ -34121,12 +35625,50 @@ class InvPhyTrainerWarp:
                 "Runtime object switching cannot change the launch-time scene: "
                 f"requested={scene_name} cached={cached_scene_name}."
             )
+        cached_start_posture = normalize_immersive_start_posture(
+            immersive_session_state.get(
+                "start_posture",
+                immersive_start_posture,
+            )
+        )
+        if cached_start_posture != immersive_start_posture:
+            raise RuntimeError(
+                "Runtime object switching cannot change the launch-time start posture: "
+                f"requested={immersive_start_posture} cached={cached_start_posture}."
+            )
         session_live_head_alignment = immersive_session_state.get(
             "live_head_alignment"
         )
         session_layout = immersive_session_state.get("layout")
         session_scene_renderer = immersive_session_state.get("scene_renderer")
         scene_renderer_owned_by_run = session_scene_renderer is None
+        preview_display_active = interactive_window_mode == "visible"
+        preview_renderer = None
+        interactive_spectator_renderer = None
+        preview_width = eye_width
+        preview_height = eye_height
+        if preview_display_active and window is not None:
+            framebuffer_width, framebuffer_height = glfw.get_framebuffer_size(window)
+            if int(framebuffer_width) > 0 and int(framebuffer_height) > 0:
+                preview_width, preview_height = (
+                    resolve_interactive_preview_render_size(
+                        framebuffer_width,
+                        framebuffer_height,
+                    )
+                )
+                print(
+                    "[interactive_window] preview sizing: "
+                    f"framebuffer={int(framebuffer_width)}x{int(framebuffer_height)} "
+                    f"render={preview_width}x{preview_height} aspect=16:9",
+                    flush=True,
+                )
+            preview_renderer = reuse_or_create_interactive_preview_renderer(
+                immersive_session_state.get("interactive_preview_renderer"),
+                window,
+                preview_width,
+                preview_height,
+                device=torch.device(cfg.device),
+            )
         immersive_bridge = existing_immersive_bridge
         bridge_owned_by_run = immersive_bridge is None
         episode_result = {
@@ -34142,16 +35684,12 @@ class InvPhyTrainerWarp:
         presentation_worker = None
         balanced_eye_workers = {}
         balanced_eye_parallel_enabled = False
-        preview_tex = None
-        preview_uploader = None
-        preview_prog = None
-        preview_vao = None
-        preview_framebuffer_size = None
-        preview_display_active = interactive_window_mode == "visible"
         rope_game_state = None
+        rope_game_overlay_state = None
         left_eye_frame = None
         right_eye_frame = None
         shared_scene_compose_cache = {}
+        interactive_spectator_compose_cache = {}
         shared_scene_reproject_caches = {
             "source": {},
             "left": {},
@@ -34552,7 +36090,7 @@ class InvPhyTrainerWarp:
             else self.IMMERSIVE_BALANCED_INTERNAL_STEREO_MODE,
             immersive_overlay_mode="minimal",
         )
-        if scene_name == "garden":
+        if scene_name in DIRECT_GAUSSIAN_SCENE_NAMES:
             immersive_render_options = dict(immersive_render_options)
             immersive_render_options["scene_render_scale"] = 1.0
             immersive_render_options["scene_stereo_mode"] = "per_eye"
@@ -34635,6 +36173,9 @@ class InvPhyTrainerWarp:
         presentation_pending_profile_frames = {}
         presentation_pending_safe_snapshots = {}
         latest_preview_completion = None
+        interactive_spectator_failure_logged = False
+        interactive_spectator_disabled = False
+        controller_overlay_by_source = {}
         stable_compose_reject_count = 0
         stable_compose_reject_blue_scene_exposure_count = 0
         stable_compose_reject_gaussian_blue_source_count = 0
@@ -34669,6 +36210,15 @@ class InvPhyTrainerWarp:
         }
         interaction_contact_gap_mm_samples = []
         interaction_contact_tracked_frames = 0
+        controller_motion_limited_frame_count = 0
+        controller_motion_max_requested_distance_m = 0.0
+        controller_motion_max_applied_distance_m = 0.0
+        controller_motion_max_remaining_distance_m = 0.0
+        controller_motion_max_catchup_period_count = 1
+        controller_motion_limit_last_log_frame = -int(
+            self.IMMERSIVE_CONTROLLER_MOTION_INTERVAL_LOG_FRAMES
+        )
+        controller_motion_limit_last_logged_period_count = 1
         steady_state_metrics_epoch_armed = False
         steady_state_scalar_count_baselines = {}
         steady_state_reason_count_baselines = {}
@@ -35123,94 +36673,9 @@ class InvPhyTrainerWarp:
             return None
 
         def _ensure_startup_preview_display_initialized():
-            nonlocal preview_tex
-            nonlocal preview_uploader
-            nonlocal preview_prog
-            nonlocal preview_vao
-            nonlocal preview_framebuffer_size
-            if not preview_display_active or window is None or preview_uploader is not None:
+            if not preview_display_active or preview_renderer is None:
                 return
-
-            glfw.make_context_current(window)
-
-            def _startup_preview_framebuffer_size_callback(_window, width, height):
-                nonlocal preview_framebuffer_size
-                preview_framebuffer_size = (
-                    max(1, int(width)),
-                    max(1, int(height)),
-                )
-
-            glfw.set_framebuffer_size_callback(
-                window,
-                _startup_preview_framebuffer_size_callback,
-            )
-            preview_framebuffer_size = tuple(
-                int(value) for value in glfw.get_framebuffer_size(window)
-            )
-            preview_tex = gl.glGenTextures(1)
-            gl.glBindTexture(gl.GL_TEXTURE_2D, preview_tex)
-            gl.glTexParameteri(
-                gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MIN_FILTER, gl.GL_LINEAR
-            )
-            gl.glTexParameteri(
-                gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MAG_FILTER, gl.GL_LINEAR
-            )
-            gl.glTexImage2D(
-                gl.GL_TEXTURE_2D,
-                0,
-                gl.GL_RGBA8,
-                eye_width,
-                eye_height,
-                0,
-                gl.GL_RGBA,
-                gl.GL_UNSIGNED_BYTE,
-                None,
-            )
-            gl.glBindTexture(gl.GL_TEXTURE_2D, 0)
-            preview_uploader = PreviewTextureCudaUploader(
-                preview_tex,
-                eye_width,
-                eye_height,
-                device=torch.device(cfg.device),
-            )
-
-            vertex_shader = """
-            #version 330 core
-            out vec2 uv;
-            const vec2 V[4]=vec2[4](vec2(-1,-1),vec2(1,-1),vec2(-1,1),vec2(1,1));
-            const vec2 T[4]=vec2[4](vec2(0,0),vec2(1,0),vec2(0,1),vec2(1,1));
-            void main(){ gl_Position=vec4(V[gl_VertexID],0,1); uv=T[gl_VertexID]; }
-            """
-            fragment_shader = """
-            #version 330 core
-            in vec2 uv; out vec4 frag; uniform sampler2D uTex;
-            void main(){ frag = texture(uTex, vec2(uv.x, 1.0 - uv.y)); }
-            """
-
-            def _compile_startup_preview_shader(kind, source):
-                shader_id = gl.glCreateShader(kind)
-                gl.glShaderSource(shader_id, source)
-                gl.glCompileShader(shader_id)
-                if not gl.glGetShaderiv(shader_id, gl.GL_COMPILE_STATUS):
-                    raise RuntimeError(gl.glGetShaderInfoLog(shader_id).decode())
-                return shader_id
-
-            preview_prog = gl.glCreateProgram()
-            gl.glAttachShader(
-                preview_prog,
-                _compile_startup_preview_shader(gl.GL_VERTEX_SHADER, vertex_shader),
-            )
-            gl.glAttachShader(
-                preview_prog,
-                _compile_startup_preview_shader(gl.GL_FRAGMENT_SHADER, fragment_shader),
-            )
-            gl.glLinkProgram(preview_prog)
-            if not gl.glGetProgramiv(preview_prog, gl.GL_LINK_STATUS):
-                raise RuntimeError(gl.glGetProgramInfoLog(preview_prog).decode())
-            gl.glUseProgram(preview_prog)
-            gl.glUniform1i(gl.glGetUniformLocation(preview_prog, "uTex"), 0)
-            gl.glUseProgram(0)
-            preview_vao = gl.glGenVertexArrays(1)
+            preview_renderer.initialize()
 
         def _present_startup_preview_frame(preview_frame):
             if (
@@ -35220,29 +36685,9 @@ class InvPhyTrainerWarp:
             ):
                 return
             _ensure_startup_preview_display_initialized()
-            if preview_tex is None or preview_uploader is None:
+            if preview_renderer is None:
                 return
-            glfw.make_context_current(window)
-            preview_uploader.upload(preview_frame)
-            if preview_framebuffer_size is None:
-                preview_dimensions = tuple(
-                    int(value) for value in glfw.get_framebuffer_size(window)
-                )
-            else:
-                preview_dimensions = preview_framebuffer_size
-            fb_width, fb_height = preview_dimensions
-            gl.glViewport(0, 0, fb_width, fb_height)
-            gl.glDisable(gl.GL_DEPTH_TEST)
-            gl.glClear(gl.GL_COLOR_BUFFER_BIT)
-            gl.glUseProgram(preview_prog)
-            gl.glBindVertexArray(preview_vao)
-            gl.glActiveTexture(gl.GL_TEXTURE0)
-            gl.glBindTexture(gl.GL_TEXTURE_2D, preview_tex)
-            gl.glDrawArrays(gl.GL_TRIANGLE_STRIP, 0, 4)
-            gl.glBindTexture(gl.GL_TEXTURE_2D, 0)
-            gl.glBindVertexArray(0)
-            gl.glUseProgram(0)
-            glfw.swap_buffers(window)
+            preview_renderer.present(preview_frame)
 
         try:
             startup_timeline = self._make_immersive_startup_timeline()
@@ -35900,6 +37345,7 @@ class InvPhyTrainerWarp:
                 self._compute_predefined_interaction_anchor_states(
                     controller_predefined_anchor_defs,
                     obj_init_vertices,
+                    visual_surface_points=gaussians._xyz,
                 )
             )
             resolved_default_anchor_names, anchor_mapping_debug = (
@@ -35933,6 +37379,7 @@ class InvPhyTrainerWarp:
                 original_controller_source_anchor_centers,
                 controller_predefined_anchor_defs,
                 default_anchor_names=resolved_default_anchor_names,
+                visual_surface_points=gaussians._xyz,
             )
             controller_runtime_base_target = two_point_runtime["controller_rest_points"].clone()
             controller_source_masks = two_point_runtime["controller_source_masks"]
@@ -36010,6 +37457,9 @@ class InvPhyTrainerWarp:
                 controller_rest_location=self.batch_controller_points[0],
                 number_of_instance=1,
                 use_ground_plane=False,
+                self_collision_rest_exclusion_multiplier=(
+                    cfg.self_collision_rest_exclusion_multiplier
+                ),
             )
             self.simulator.set_init_state(
                 self.simulator.wp_init_vertices, self.simulator.wp_init_velocities
@@ -36020,6 +37470,8 @@ class InvPhyTrainerWarp:
                 f"self_collision={bool(getattr(cfg, 'self_collision', False))} "
                 "object_collision_flag="
                 f"{int(getattr(self.simulator, 'object_collision_flag', 0))} "
+                "rest_exclusion_multiplier="
+                f"{float(getattr(self.simulator, 'self_collision_rest_exclusion_multiplier', 5.0)):.3f} "
                 f"dt={float(getattr(self.simulator, 'dt', cfg.dt)):.8g} "
                 "num_substeps="
                 f"{int(getattr(self.simulator, 'num_substeps', cfg.num_substeps))}",
@@ -36702,6 +38154,7 @@ class InvPhyTrainerWarp:
                 controller_source_anchor_centers,
                 controller_attachment_metadata,
                 controller_predefined_anchor_defs,
+                visual_surface_points=gaussians._xyz,
             )
             startup_scene_validation_mode = "assembled_scene"
             if active_scene_stereo_mode == "reproject_from_center":
@@ -36979,6 +38432,10 @@ class InvPhyTrainerWarp:
             idle_lock_state = startup_bootstrap_output["idle_lock_state"]
             current_target = startup_bootstrap_output["current_target"]
             prev_target = startup_bootstrap_output["prev_target"]
+            controller_motion_limiter_state = {
+                "simulated_target": current_target.detach().clone(),
+                "interaction_tokens": {"left": None, "right": None},
+            }
             scene_rest_state = startup_bootstrap_output["scene_rest_state"]
             x = startup_bootstrap_output["x"]
             current_v = scene_rest_state["v"].detach().clone()
@@ -37034,10 +38491,40 @@ class InvPhyTrainerWarp:
                 "render_gaussians",
                 gaussians,
             )
+            if preview_display_active and preview_renderer is not None:
+                interactive_spectator_renderer = (
+                    reuse_or_create_interactive_spectator_renderer(
+                        immersive_session_state.get(
+                            "interactive_spectator_renderer"
+                        ),
+                        scene_assets_root,
+                        preview_width,
+                        preview_height,
+                        device=torch.device(cfg.device),
+                        texture_mode=immersive_native_gl_texture_mode,
+                        anisotropy=immersive_native_gl_anisotropy,
+                        mipmap_lod_bias=immersive_native_gl_mipmap_lod_bias,
+                        msaa_samples=immersive_native_gl_msaa_samples,
+                        depth_format=immersive_native_gl_depth_format,
+                    )
+                )
+                interactive_spectator_renderer.configure_layout(
+                    layout,
+                    last_left_eye_pose_world,
+                    last_right_eye_pose_world,
+                )
+                print(
+                    "[interactive_window] spectator scene active: "
+                    f"scene={scene_name} "
+                    "camera_profile="
+                    f"{interactive_spectator_renderer.camera_profile} "
+                    "tracked_headset_mesh=1 object=1 controller_rays=1",
+                    flush=True,
+                )
 
             def _sync_active_scene_gaussians():
                 nonlocal render_gaussians
-                if scene_name == "garden":
+                if direct_gaussian_scene_enabled(scene_name, scene_renderer):
                     render_gaussians = scene_renderer.sync_dynamic_gaussians(
                         gaussians
                     )
@@ -37124,6 +38611,14 @@ class InvPhyTrainerWarp:
                 "latest_released_contact_fraction": 0.0,
                 "latest_released_contact_max_height": float("inf"),
                 "last_block_log_frame": -1000000,
+                "planar_drift_ground_contact_seen": False,
+                "planar_drift_anchor_world": None,
+                "rigid_rotation_broad_support_seen": False,
+                "planar_drift_guard_frames": 0,
+                "planar_drift_correction_count": 0,
+                "planar_drift_peak_speed_mps": 0.0,
+                "planar_drift_peak_position_error_m": 0.0,
+                "rigid_rotation_peak_angular_speed_radps": 0.0,
             }
             visual_contact_sink_m = float(
                 getattr(cfg, "runtime_visual_contact_sink_m", 0.0)
@@ -37162,7 +38657,7 @@ class InvPhyTrainerWarp:
                 and visual_contact_sink_band_m > 0.0
                 and support_surface_boxes_t is not None
                 and int(support_surface_boxes_t.numel()) > 0
-                and scene_name != "garden"
+                and scene_name not in DIRECT_GAUSSIAN_SCENE_NAMES
             )
             visual_contact_sink_diagnostic_state = {"last_log_frame": -1000000}
 
@@ -37411,6 +38906,35 @@ class InvPhyTrainerWarp:
                     if released_contact_indices is None
                     else int(torch.as_tensor(released_contact_indices).numel())
                 )
+                release_object_points = x[: self.num_all_points]
+                release_support_metrics = self._scene_support_level_metrics(
+                    release_object_points,
+                    support_surface_boxes_t,
+                    layout.scene_up,
+                )
+                release_support_fraction = float(
+                    release_support_metrics["support_fraction"]
+                )
+                release_ground_contact_now = release_support_fraction > 0.0
+                release_case_name = str(
+                    idle_lock_case_profile.get("case_name", "")
+                ).strip().lower()
+                release_ground_contact_seen = bool(
+                    release_case_name
+                    in self.IMMERSIVE_POST_RELEASE_PLANAR_DRIFT_CANCEL_CASES
+                    and release_ground_contact_now
+                )
+                release_planar_anchor_world = (
+                    release_object_points.mean(dim=0).detach().clone()
+                    if release_ground_contact_seen
+                    else None
+                )
+                release_broad_support_seen = bool(
+                    release_case_name
+                    in self.IMMERSIVE_POST_RELEASE_PLANAR_DRIFT_CANCEL_CASES
+                    and release_support_fraction
+                    >= float(idle_lock_case_profile["min_support_fraction"])
+                )
                 post_release_landing_lock_state.update(
                     {
                         "active": True,
@@ -37424,6 +38948,18 @@ class InvPhyTrainerWarp:
                         "latest_released_contact_fraction": 0.0,
                         "latest_released_contact_max_height": float("inf"),
                         "last_block_log_frame": -1000000,
+                        "planar_drift_ground_contact_seen": (
+                            release_ground_contact_seen
+                        ),
+                        "planar_drift_anchor_world": release_planar_anchor_world,
+                        "rigid_rotation_broad_support_seen": (
+                            release_broad_support_seen
+                        ),
+                        "planar_drift_guard_frames": 0,
+                        "planar_drift_correction_count": 0,
+                        "planar_drift_peak_speed_mps": 0.0,
+                        "planar_drift_peak_position_error_m": 0.0,
+                        "rigid_rotation_peak_angular_speed_radps": 0.0,
                     }
                 )
                 print(
@@ -37434,6 +38970,11 @@ class InvPhyTrainerWarp:
                     f"expires_frame={release_frame_index + window_frames} "
                     f"anchor={anchor_name} "
                     f"released_contact_count={released_contact_count} "
+                    f"release_support_fraction={release_support_fraction:.3f} "
+                    "planar_drift_ground_contact_seen="
+                    f"{int(release_ground_contact_seen)} "
+                    "rigid_rotation_broad_support_seen="
+                    f"{int(release_broad_support_seen)} "
                     f"select_release_frames={int(select_release_frames)}",
                     flush=True,
                 )
@@ -37461,6 +39002,174 @@ class InvPhyTrainerWarp:
                 post_release_landing_lock_state["sources"] = []
                 post_release_landing_lock_state["contact_object_indices"] = None
 
+            def _apply_post_release_rigid_drift_guard(sim_x, sim_v):
+                if not bool(post_release_landing_lock_state.get("active", False)):
+                    return sim_x, sim_v
+                if bool(idle_lock_state.get("active", False)):
+                    return sim_x, sim_v
+                if object_selector.blocks_object_input:
+                    return sim_x, sim_v
+                if (
+                    controller_interaction_state.get("left") is not None
+                    or controller_interaction_state.get("right") is not None
+                ):
+                    return sim_x, sim_v
+
+                object_points = sim_x[: self.num_all_points]
+                support_level_metrics = self._scene_support_level_metrics(
+                    object_points,
+                    support_surface_boxes_t,
+                    layout.scene_up,
+                )
+                support_fraction = float(support_level_metrics["support_fraction"])
+                ground_contact_now = support_fraction > 0.0
+                if ground_contact_now and not bool(
+                    post_release_landing_lock_state.get(
+                        "planar_drift_ground_contact_seen",
+                        False,
+                    )
+                ):
+                    post_release_landing_lock_state[
+                        "planar_drift_ground_contact_seen"
+                    ] = True
+                    post_release_landing_lock_state[
+                        "planar_drift_anchor_world"
+                    ] = object_points.mean(dim=0).detach().clone()
+                broad_support_now = support_fraction >= float(
+                    idle_lock_case_profile["min_support_fraction"]
+                )
+                if broad_support_now and not bool(
+                    post_release_landing_lock_state.get(
+                        "rigid_rotation_broad_support_seen",
+                        False,
+                    )
+                ):
+                    post_release_landing_lock_state[
+                        "rigid_rotation_broad_support_seen"
+                    ] = True
+
+                release_case_name = str(
+                    idle_lock_case_profile.get("case_name", "")
+                ).strip().lower()
+                should_stabilize = self._should_stabilize_post_release_planar_drift(
+                    post_release_landing_lock_state,
+                    case_name=release_case_name,
+                    ground_contact_now=ground_contact_now,
+                )
+                planar_anchor_world = post_release_landing_lock_state.get(
+                    "planar_drift_anchor_world"
+                )
+                if not should_stabilize or planar_anchor_world is None:
+                    return sim_x, sim_v
+
+                guard_frames = int(
+                    post_release_landing_lock_state.get(
+                        "planar_drift_guard_frames", 0
+                    )
+                ) + 1
+                post_release_landing_lock_state[
+                    "planar_drift_guard_frames"
+                ] = guard_frames
+                broad_support_seen = bool(
+                    post_release_landing_lock_state.get(
+                        "rigid_rotation_broad_support_seen",
+                        False,
+                    )
+                )
+                if not broad_support_seen:
+                    stabilized_state, drift_debug = (
+                        self._stabilize_grounded_release_planar_state(
+                            {"x": sim_x, "v": sim_v},
+                            layout.scene_up,
+                            planar_anchor_world,
+                        )
+                    )
+                    drift_debug.update(
+                        {
+                            "rigid_angular_speed_before_radps": 0.0,
+                            "rigid_angular_speed_after_radps": 0.0,
+                        }
+                    )
+                else:
+                    stabilized_state, drift_debug = (
+                        self._stabilize_grounded_release_rigid_motion(
+                            {"x": sim_x, "v": sim_v},
+                            layout.scene_up,
+                            planar_anchor_world,
+                        )
+                    )
+                planar_speed_before = float(
+                    drift_debug["planar_speed_before_mps"]
+                )
+                planar_position_error_before = float(
+                    drift_debug["planar_position_error_before_m"]
+                )
+                rigid_angular_speed_before = float(
+                    drift_debug["rigid_angular_speed_before_radps"]
+                )
+                post_release_landing_lock_state[
+                    "planar_drift_peak_speed_mps"
+                ] = max(
+                    float(
+                        post_release_landing_lock_state.get(
+                            "planar_drift_peak_speed_mps", 0.0
+                        )
+                    ),
+                    planar_speed_before,
+                )
+                post_release_landing_lock_state[
+                    "planar_drift_peak_position_error_m"
+                ] = max(
+                    float(
+                        post_release_landing_lock_state.get(
+                            "planar_drift_peak_position_error_m", 0.0
+                        )
+                    ),
+                    planar_position_error_before,
+                )
+                post_release_landing_lock_state[
+                    "rigid_rotation_peak_angular_speed_radps"
+                ] = max(
+                    float(
+                        post_release_landing_lock_state.get(
+                            "rigid_rotation_peak_angular_speed_radps", 0.0
+                        )
+                    ),
+                    rigid_angular_speed_before,
+                )
+                correction_needed = bool(
+                    planar_speed_before > 1.0e-6
+                    or planar_position_error_before > 1.0e-6
+                    or rigid_angular_speed_before > 1.0e-6
+                )
+                if correction_needed:
+                    self._restore_sim_state(stabilized_state)
+                    post_release_landing_lock_state[
+                        "planar_drift_correction_count"
+                    ] = int(
+                        post_release_landing_lock_state.get(
+                            "planar_drift_correction_count", 0
+                        )
+                    ) + 1
+                    sim_x = stabilized_state["x"]
+                    sim_v = stabilized_state["v"]
+                if guard_frames == 1:
+                    print(
+                        "[quest_display] post_release_rigid_drift_guard=active "
+                        f"case={release_case_name} "
+                        f"support_fraction={support_fraction:.3f} "
+                        f"ground_contact_now={int(ground_contact_now)} "
+                        f"broad_support_now={int(broad_support_now)} "
+                        "planar_speed_before_mps="
+                        f"{planar_speed_before:.6f} "
+                        "planar_position_error_before_m="
+                        f"{planar_position_error_before:.6f} "
+                        "rigid_angular_speed_before_radps="
+                        f"{rigid_angular_speed_before:.6f}",
+                        flush=True,
+                    )
+                return sim_x, sim_v
+
             def _maybe_apply_post_release_landing_lock(object_points, sim_state):
                 if not bool(post_release_landing_lock_state.get("active", False)):
                     return False
@@ -37482,11 +39191,6 @@ class InvPhyTrainerWarp:
                     _clear_post_release_landing_lock("invalid_release_frame")
                     return False
                 frame_distance = int(frame_count) - release_frame_index
-                min_delay_frames = int(
-                    self.IMMERSIVE_POST_RELEASE_LANDING_LOCK_MIN_DELAY_FRAMES
-                )
-                if frame_distance < min_delay_frames:
-                    return False
                 support_level_metrics = self._scene_support_level_metrics(
                     object_points,
                     support_surface_boxes_t,
@@ -37504,6 +39208,11 @@ class InvPhyTrainerWarp:
                 post_release_landing_lock_state["latest_support_fraction"] = float(
                     support_fraction
                 )
+                min_delay_frames = int(
+                    self.IMMERSIVE_POST_RELEASE_LANDING_LOCK_MIN_DELAY_FRAMES
+                )
+                if frame_distance < min_delay_frames:
+                    return False
                 if support_fraction_ok or split_support_ok:
                     contact_indices = post_release_landing_lock_state.get(
                         "contact_object_indices"
@@ -37739,84 +39448,9 @@ class InvPhyTrainerWarp:
                     if restore_xyz is not None:
                         gaussians_arg._xyz = restore_xyz
 
-            glfw.make_context_current(window)
-            if preview_display_active and preview_uploader is None:
-                def _preview_framebuffer_size_callback(_window, width, height):
-                    nonlocal preview_framebuffer_size
-                    preview_framebuffer_size = (
-                        max(1, int(width)),
-                        max(1, int(height)),
-                    )
-
-                glfw.set_framebuffer_size_callback(
-                    window,
-                    _preview_framebuffer_size_callback,
-                )
-                preview_framebuffer_size = tuple(
-                    int(value) for value in glfw.get_framebuffer_size(window)
-                )
-                preview_tex = gl.glGenTextures(1)
-                gl.glBindTexture(gl.GL_TEXTURE_2D, preview_tex)
-                gl.glTexParameteri(
-                    gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MIN_FILTER, gl.GL_LINEAR
-                )
-                gl.glTexParameteri(
-                    gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MAG_FILTER, gl.GL_LINEAR
-                )
-                gl.glTexImage2D(
-                    gl.GL_TEXTURE_2D,
-                    0,
-                    gl.GL_RGBA8,
-                    eye_width,
-                    eye_height,
-                    0,
-                    gl.GL_RGBA,
-                    gl.GL_UNSIGNED_BYTE,
-                    None,
-                )
-                gl.glBindTexture(gl.GL_TEXTURE_2D, 0)
-                preview_uploader = PreviewTextureCudaUploader(
-                    preview_tex,
-                    eye_width,
-                    eye_height,
-                    device=torch.device(cfg.device),
-                )
-
-                vertex_shader = """
-                #version 330 core
-                out vec2 uv;
-                const vec2 V[4]=vec2[4](vec2(-1,-1),vec2(1,-1),vec2(-1,1),vec2(1,1));
-                const vec2 T[4]=vec2[4](vec2(0,0),vec2(1,0),vec2(0,1),vec2(1,1));
-                void main(){ gl_Position=vec4(V[gl_VertexID],0,1); uv=T[gl_VertexID]; }
-                """
-                fragment_shader = """
-                #version 330 core
-                in vec2 uv; out vec4 frag; uniform sampler2D uTex;
-                void main(){ frag = texture(uTex, vec2(uv.x, 1.0 - uv.y)); }
-                """
-
-                def _compile_shader(kind, source):
-                    shader_id = gl.glCreateShader(kind)
-                    gl.glShaderSource(shader_id, source)
-                    gl.glCompileShader(shader_id)
-                    if not gl.glGetShaderiv(shader_id, gl.GL_COMPILE_STATUS):
-                        raise RuntimeError(gl.glGetShaderInfoLog(shader_id).decode())
-                    return shader_id
-
-                preview_prog = gl.glCreateProgram()
-                gl.glAttachShader(
-                    preview_prog, _compile_shader(gl.GL_VERTEX_SHADER, vertex_shader)
-                )
-                gl.glAttachShader(
-                    preview_prog, _compile_shader(gl.GL_FRAGMENT_SHADER, fragment_shader)
-                )
-                gl.glLinkProgram(preview_prog)
-                if not gl.glGetProgramiv(preview_prog, gl.GL_LINK_STATUS):
-                    raise RuntimeError(gl.glGetProgramInfoLog(preview_prog).decode())
-                gl.glUseProgram(preview_prog)
-                gl.glUniform1i(gl.glGetUniformLocation(preview_prog, "uTex"), 0)
-                gl.glUseProgram(0)
-                preview_vao = gl.glGenVertexArrays(1)
+            if window is not None:
+                glfw.make_context_current(window)
+            _ensure_startup_preview_display_initialized()
 
             if presentation_backend_enabled:
                 presentation_worker_cls = (
@@ -37851,21 +39485,6 @@ class InvPhyTrainerWarp:
                     "height": int(eye_render_state["height"]),
                     "width": int(eye_render_state["width"]),
                 }
-
-            def _ensure_preview_context_current():
-                if window is None:
-                    return
-                current_context = glfw.get_current_context()
-                if current_context != window:
-                    glfw.make_context_current(window)
-
-            def _get_preview_framebuffer_size():
-                nonlocal preview_framebuffer_size
-                if preview_framebuffer_size is None:
-                    preview_framebuffer_size = tuple(
-                        int(value) for value in glfw.get_framebuffer_size(window)
-                    )
-                return preview_framebuffer_size
 
             def _append_immersive_render_profile_row(frame_index, frame_profile):
                 if frame_profile is None:
@@ -37967,7 +39586,9 @@ class InvPhyTrainerWarp:
             def _capture_stable_present_safe_snapshot():
                 return {
                     "sim_state": self._capture_sim_state(),
-                    "target": current_target.clone(),
+                    "target": controller_motion_limiter_state[
+                        "simulated_target"
+                    ].clone(),
                     "gaussian_state": self._capture_gaussian_runtime_state(
                         gaussians
                     ),
@@ -38104,6 +39725,11 @@ class InvPhyTrainerWarp:
                 restored_target = rollback_result["restored_target"]
                 prev_target = restored_target.clone()
                 current_target = restored_target.clone()
+                self._reset_immersive_controller_motion_limiter(
+                    controller_motion_limiter_state,
+                    restored_target,
+                    controller_interaction_state,
+                )
                 x = committed_safe_sim_state["x"].clone()
                 prev_x = x.clone()
                 current_pos = gaussians.get_xyz
@@ -38693,12 +40319,52 @@ class InvPhyTrainerWarp:
                     + immersive_bridge.debug_summary()
                 )
 
+            def _build_interactive_spectator_frame(fallback_frame):
+                nonlocal interactive_spectator_disabled
+                nonlocal interactive_spectator_failure_logged
+                if (
+                    interactive_spectator_disabled
+                    or interactive_spectator_renderer is None
+                ):
+                    return fallback_frame
+                try:
+                    spectator_frame = (
+                        self._render_interactive_window_spectator_frame(
+                            interactive_spectator_renderer,
+                            scene_name=scene_name,
+                            left_eye_pose_world=last_left_eye_pose_world,
+                            right_eye_pose_world=last_right_eye_pose_world,
+                            controller_overlays_world=list(
+                                controller_overlay_by_source.values()
+                            ),
+                            rope_game_overlay_state=rope_game_overlay_state,
+                            gaussians=render_gaussians,
+                            render_pipe=render_pipe,
+                            background_black=background_black,
+                            background_white=background_white,
+                            scene_renderer=scene_renderer,
+                            compose_mode=immersive_compose_mode,
+                            compose_roi_padding=gaussian_compose_roi_padding,
+                            compose_cache=interactive_spectator_compose_cache,
+                        )
+                    )
+                    return fallback_frame if spectator_frame is None else spectator_frame
+                except Exception as exc:
+                    interactive_spectator_disabled = True
+                    if not interactive_spectator_failure_logged:
+                        print(
+                            "[interactive_window] spectator scene disabled after "
+                            f"render failure: {type(exc).__name__}: {exc}",
+                            flush=True,
+                        )
+                        interactive_spectator_failure_logged = True
+                    return fallback_frame
+
             def _update_preview_from_latest_completion(current_frame_profile):
                 nonlocal latest_preview_completion
                 if (
                     not preview_display_active
-                    or preview_tex is None
-                    or preview_uploader is None
+                    or preview_renderer is None
                     or latest_preview_completion is None
                 ):
                     return
@@ -38710,21 +40376,10 @@ class InvPhyTrainerWarp:
                 preview_update_start = time.perf_counter()
                 if preview_ready_event is not None and torch.cuda.is_available():
                     torch.cuda.current_stream().wait_event(preview_ready_event)
-                _ensure_preview_context_current()
-                preview_uploader.upload(preview_frame)
-                fb_width, fb_height = _get_preview_framebuffer_size()
-                gl.glViewport(0, 0, fb_width, fb_height)
-                gl.glDisable(gl.GL_DEPTH_TEST)
-                gl.glClear(gl.GL_COLOR_BUFFER_BIT)
-                gl.glUseProgram(preview_prog)
-                gl.glBindVertexArray(preview_vao)
-                gl.glActiveTexture(gl.GL_TEXTURE0)
-                gl.glBindTexture(gl.GL_TEXTURE_2D, preview_tex)
-                gl.glDrawArrays(gl.GL_TRIANGLE_STRIP, 0, 4)
-                gl.glBindTexture(gl.GL_TEXTURE_2D, 0)
-                gl.glBindVertexArray(0)
-                gl.glUseProgram(0)
-                glfw.swap_buffers(window)
+                interactive_preview_frame = _build_interactive_spectator_frame(
+                    preview_frame
+                )
+                preview_renderer.present(interactive_preview_frame)
                 preview_update_ms = 1000.0 * (
                     time.perf_counter() - preview_update_start
                 )
@@ -38743,29 +40398,17 @@ class InvPhyTrainerWarp:
             def _present_preview_frame_direct(preview_frame, current_frame_profile):
                 if (
                     not preview_display_active
-                    or preview_tex is None
-                    or preview_uploader is None
+                    or preview_renderer is None
                     or preview_frame is None
                 ):
                     return
                 preview_window_start = (
                     time.perf_counter() if current_frame_profile is not None else None
                 )
-                _ensure_preview_context_current()
-                preview_uploader.upload(preview_frame)
-                fb_width, fb_height = _get_preview_framebuffer_size()
-                gl.glViewport(0, 0, fb_width, fb_height)
-                gl.glDisable(gl.GL_DEPTH_TEST)
-                gl.glClear(gl.GL_COLOR_BUFFER_BIT)
-                gl.glUseProgram(preview_prog)
-                gl.glBindVertexArray(preview_vao)
-                gl.glActiveTexture(gl.GL_TEXTURE0)
-                gl.glBindTexture(gl.GL_TEXTURE_2D, preview_tex)
-                gl.glDrawArrays(gl.GL_TRIANGLE_STRIP, 0, 4)
-                gl.glBindTexture(gl.GL_TEXTURE_2D, 0)
-                gl.glBindVertexArray(0)
-                gl.glUseProgram(0)
-                glfw.swap_buffers(window)
+                interactive_preview_frame = _build_interactive_spectator_frame(
+                    preview_frame
+                )
+                preview_renderer.present(interactive_preview_frame)
                 if preview_window_start is not None:
                     self._render_profile_add_wall_time(
                         current_frame_profile,
@@ -39088,6 +40731,10 @@ class InvPhyTrainerWarp:
                                 controller_anchor_preview_state,
                                 selector_source,
                             )
+                        self._reset_immersive_controller_motion_limiter(
+                            controller_motion_limiter_state,
+                            controller_runtime_base_target,
+                        )
                         object_selector_frozen_sim_state = self._capture_sim_state()
                         print(
                             "[quest_display] object selector opened via Y/B hold",
@@ -39135,6 +40782,10 @@ class InvPhyTrainerWarp:
                         )
                         prev_target = reset_target.clone()
                         current_target = reset_target
+                        self._reset_immersive_controller_motion_limiter(
+                            controller_motion_limiter_state,
+                            reset_target,
+                        )
                         reset_object_points = scene_rest_state["x"][
                             : self.num_all_points
                         ]
@@ -39638,13 +41289,84 @@ class InvPhyTrainerWarp:
                             current_live_right_controller,
                             controller_interaction_state["right"],
                         )
+                    (
+                        simulated_previous_target,
+                        controller_motion_advance,
+                        active_motion_sources,
+                    ) = self._advance_immersive_controller_motion_target(
+                        controller_motion_limiter_state,
+                        current_target,
+                        controller_source_masks,
+                        controller_interaction_state,
+                    )
+                    controller_motion_max_requested_distance_m = max(
+                        controller_motion_max_requested_distance_m,
+                        controller_motion_advance.max_requested_distance_m,
+                    )
+                    controller_motion_max_applied_distance_m = max(
+                        controller_motion_max_applied_distance_m,
+                        controller_motion_advance.max_applied_distance_m,
+                    )
+                    controller_motion_max_remaining_distance_m = max(
+                        controller_motion_max_remaining_distance_m,
+                        controller_motion_advance.max_remaining_distance_m,
+                    )
+                    controller_motion_max_catchup_period_count = max(
+                        controller_motion_max_catchup_period_count,
+                        controller_motion_advance.max_catchup_period_count,
+                    )
+                    if controller_motion_advance.limited_group_count > 0:
+                        controller_motion_limited_frame_count += 1
+                        catchup_period_count = (
+                            controller_motion_advance.max_catchup_period_count
+                        )
+                        should_log_controller_motion_limit = bool(
+                            catchup_period_count
+                            != controller_motion_limit_last_logged_period_count
+                            or frame_count - controller_motion_limit_last_log_frame
+                            >= int(
+                                self.IMMERSIVE_CONTROLLER_MOTION_INTERVAL_LOG_FRAMES
+                            )
+                        )
+                        if should_log_controller_motion_limit:
+                            limited_sources = ",".join(
+                                source
+                                for source, group_advance in zip(
+                                    active_motion_sources,
+                                    controller_motion_advance.group_advances,
+                                )
+                                if group_advance.limited
+                            )
+                            self._log_live_openxr_controller_info(
+                                "[live_openxr_controller] immersive "
+                                "motion_target_limited=1 "
+                                f"frame={int(frame_count)} "
+                                f"sources={limited_sources or 'none'} "
+                                "requested_distance_m="
+                                f"{controller_motion_advance.max_requested_distance_m:.4f} "
+                                "applied_distance_m="
+                                f"{controller_motion_advance.max_applied_distance_m:.4f} "
+                                "remaining_distance_m="
+                                f"{controller_motion_advance.max_remaining_distance_m:.4f} "
+                                f"catchup_periods={catchup_period_count} "
+                                "one_physics_period_this_frame=1 "
+                                "max_interval_m="
+                                f"{self._immersive_controller_max_motion_interval_m:.4f}",
+                            )
+                            controller_motion_limit_last_log_frame = int(frame_count)
+                            controller_motion_limit_last_logged_period_count = int(
+                                catchup_period_count
+                            )
+
                     self._apply_live_controller_anchor_kinematic_overrides(
                         pre_step_left_anchor,
                         pre_step_right_anchor,
                         controller_interaction_state,
                     )
-
-                    self.simulator.set_controller_interactive(prev_target, current_target)
+                    self.simulator.set_controller_interactive(
+                        simulated_previous_target,
+                        controller_motion_advance.target,
+                    )
                     if self.simulator.object_collision_flag:
                         self.simulator.update_collision_graph()
                     wp.capture_launch(self.simulator.forward_graph)
@@ -39655,7 +41377,6 @@ class InvPhyTrainerWarp:
                         controller_interaction_state,
                         state_index=-1,
                     )
-
                     self.simulator.set_init_state(
                         self.simulator.wp_states[-1].wp_x,
                         self.simulator.wp_states[-1].wp_v,
@@ -39668,6 +41389,10 @@ class InvPhyTrainerWarp:
                         self.simulator.wp_states[0].wp_v,
                         requires_grad=False,
                     ).clone()
+                x, current_v = _apply_post_release_rigid_drift_guard(
+                    x,
+                    current_v,
+                )
                 sim_time = sim_timer.stop()
                 if frame_count > 1:
                     _record_component_time("simulator", sim_time)
@@ -39751,6 +41476,7 @@ class InvPhyTrainerWarp:
                     self._compute_predefined_interaction_anchor_states(
                         controller_predefined_anchor_defs,
                         object_points,
+                        visual_surface_points=gaussians._xyz,
                     )
                 )
                 current_interaction_anchor_by_source = {"left": None, "right": None}
@@ -40085,7 +41811,7 @@ class InvPhyTrainerWarp:
                         "scene_render_eye_state_setup_wall",
                         eye_state_setup_elapsed_s,
                     )
-                if scene_name == "garden":
+                if direct_gaussian_scene_enabled(scene_name, scene_renderer):
                     garden_chunk_selection_start = time.perf_counter()
                     render_gaussians, garden_chunk_debug = (
                         scene_renderer.select_stereo_frustum_gaussians(
@@ -40978,7 +42704,7 @@ class InvPhyTrainerWarp:
                     stable_compose_analysis_start = None
                     native_gl_gaussian_fusion_active = False
                     garden_direct_output_active_for_frame = (
-                        garden_direct_output_enabled(scene_name, scene_renderer)
+                        direct_gaussian_scene_enabled(scene_name, scene_renderer)
                     )
                     native_gl_gaussian_fusion_attempted = bool(
                         not garden_direct_output_active_for_frame
@@ -42010,6 +43736,11 @@ class InvPhyTrainerWarp:
                             gaussians,
                             last_valid_gaussian_state,
                         )
+                        self._reset_immersive_controller_motion_limiter(
+                            controller_motion_limiter_state,
+                            current_target,
+                            controller_interaction_state,
+                        )
                         x = last_valid_sim_state["x"].clone()
                         current_pos = gaussians.get_xyz
                         current_rot = gaussians.get_rotation
@@ -42809,7 +44540,9 @@ class InvPhyTrainerWarp:
                     and self._is_finite_tensor(current_rot)
                 ):
                     last_valid_sim_state = self._capture_sim_state()
-                    last_valid_target = current_target.clone()
+                    last_valid_target = controller_motion_limiter_state[
+                        "simulated_target"
+                    ].clone()
                     last_valid_gaussian_state = self._capture_gaussian_runtime_state(
                         gaussians
                     )
@@ -42963,6 +44696,11 @@ class InvPhyTrainerWarp:
                                 "layout": layout,
                                 "scene_renderer": scene_renderer,
                                 "scene_name": scene_name,
+                                "start_posture": immersive_start_posture,
+                                "interactive_preview_renderer": preview_renderer,
+                                "interactive_spectator_renderer": (
+                                    interactive_spectator_renderer
+                                ),
                                 "input_blocked_until": input_blocked_until,
                                 "loading_left_frame": switch_left_frame,
                                 "loading_right_frame": switch_right_frame,
@@ -44740,6 +46478,30 @@ class InvPhyTrainerWarp:
                         "Interaction Contact Tracked Frames: "
                         f"{int(interaction_contact_tracked_frames)}"
                     )
+                diagnostics_lines.append(
+                    "Controller Motion Limited Frames: "
+                    f"{int(controller_motion_limited_frame_count)}"
+                )
+                diagnostics_lines.append(
+                    "Controller Motion Maximum Requested Distance M: "
+                    f"{float(controller_motion_max_requested_distance_m):.4f}"
+                )
+                diagnostics_lines.append(
+                    "Controller Motion Maximum Applied Distance M: "
+                    f"{float(controller_motion_max_applied_distance_m):.4f}"
+                )
+                diagnostics_lines.append(
+                    "Controller Motion Maximum Remaining Distance M: "
+                    f"{float(controller_motion_max_remaining_distance_m):.4f}"
+                )
+                diagnostics_lines.append(
+                    "Controller Motion Maximum Catchup Periods: "
+                    f"{int(controller_motion_max_catchup_period_count)}"
+                )
+                diagnostics_lines.append(
+                    "Controller Motion Maximum Advance Per Rendered Frame M: "
+                    f"{float(self._immersive_controller_max_motion_interval_m):.4f}"
+                )
                 if (
                     active_overlay_debug_summary.get("active_overlay_total_count", 0)
                     > 0
@@ -45223,14 +46985,16 @@ class InvPhyTrainerWarp:
                     glfw.make_context_current(window)
                 except Exception:
                     pass
-            if preview_uploader is not None:
-                preview_uploader.delete()
-            if preview_prog is not None:
-                gl.glDeleteProgram(preview_prog)
-            if preview_tex is not None:
-                gl.glDeleteTextures([preview_tex])
-            if preview_vao is not None:
-                gl.glDeleteVertexArrays(1, [preview_vao])
+            keep_preview_renderer = (
+                str(episode_result.get("action", "exit")) == "switch"
+            )
+            if preview_renderer is not None and not keep_preview_renderer:
+                preview_renderer.delete()
+            if (
+                interactive_spectator_renderer is not None
+                and not keep_preview_renderer
+            ):
+                interactive_spectator_renderer.delete()
             if presentation_worker is not None:
                 try:
                     presentation_worker.stop()
@@ -45267,6 +47031,7 @@ class InvPhyTrainerWarp:
         cuda_ctx=None,
         interactive_window_mode="visible",
         scene_assets_root="./assets/scenes",
+        immersive_start_posture="standing",
         profile=False,
         profile_freq=30,
         immersive_timewarp="off",
@@ -45286,6 +47051,9 @@ class InvPhyTrainerWarp:
         immersive_gaussian_render=None,
         immersive_present_pipeline=True,
         immersive_controller_translation_scale=1.2,
+        immersive_controller_max_motion_interval_m=(
+            DEFAULT_MAX_CONTROLLER_MOTION_INTERVAL_M
+        ),
         existing_immersive_bridge=None,
         immersive_session_state=None,
         show_startup_tutorial=True,
@@ -45306,6 +47074,7 @@ class InvPhyTrainerWarp:
             cuda_ctx=cuda_ctx,
             interactive_window_mode=interactive_window_mode,
             scene_assets_root=scene_assets_root,
+            immersive_start_posture=immersive_start_posture,
             profile=profile,
             profile_freq=profile_freq,
             immersive_timewarp=immersive_timewarp,
@@ -45328,6 +47097,9 @@ class InvPhyTrainerWarp:
             immersive_present_pipeline=immersive_present_pipeline,
             immersive_controller_translation_scale=(
                 immersive_controller_translation_scale
+            ),
+            immersive_controller_max_motion_interval_m=(
+                immersive_controller_max_motion_interval_m
             ),
             existing_immersive_bridge=existing_immersive_bridge,
             immersive_session_state=immersive_session_state,

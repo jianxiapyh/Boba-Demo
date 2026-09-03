@@ -55,6 +55,7 @@ tools/compare_immersive_gpu_path_smoke_repair/
 !assets/**/*.obj
 !assets/**/*.mtl
 !assets/**/*.jpg
+!assets/**/*.glb
 
 # Track immersive scene manifest but keep downloaded assets ignored.
 !data/

@@ -10,7 +10,18 @@ vis_interval: 20
 init_spring_Y: 3e4
 collide_elas: 0.5
 collide_fric: 0.3
-runtime_static_collider_mode: "scene"
+runtime_static_collider_mode: "scene_replace_active_table_with_smooth_top"
+# Sloth Gaussians extend up to about 10 mm beyond their driving mass nodes.
+# Keep the continuous physical tabletop slightly above the rendered surface so
+# an arm whose mass nodes are in contact cannot visually pass through it.
+runtime_smooth_table_top_offset_m: 0.011
+runtime_smooth_table_top_thickness_m: 0.035
+# The Lab table's center divider is split across two source components. Merge
+# them into one collider, cover the visible Gaussian overhang, and overlap both
+# shelf junctions so point-like mass nodes cannot thread through their seams.
+runtime_lab_table_divider_merge_enabled: true
+runtime_lab_table_divider_lateral_inflate_m: 0.012
+runtime_lab_table_divider_surface_overlap_m: 0.006
 runtime_visual_contact_sink_m: 0.000
 runtime_visual_contact_sink_band_m: 0.010
 runtime_visual_floor_contact_sink_m: 0.002
@@ -29,6 +40,13 @@ vp_up: [0, 0, -1]
 vp_zoom: 1
 collision_dist: 0.02
 collision_learn: true
-self_collision: false
+# Prevent separated limbs from folding through the torso. The simulator builds
+# a rest-pose exclusion map so adjacent/initially touching Sloth nodes do not
+# repel one another.
+self_collision: true
+# Demo-time experiment: exclude just the pairs that begin within the actual
+# collision distance. The learned parameters remain the 5x-trained values, so
+# this intentionally trades training consistency for stronger limb separation.
+self_collision_rest_exclusion_multiplier: 1.0
 chamfer_weight: 1.0
 track_weight: 1.0

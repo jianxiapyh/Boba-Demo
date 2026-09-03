@@ -12,7 +12,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 PUBLIC_DEMO_CASES = ("rope_game", "sloth")
-PUBLIC_SCENES = ("lab", "garden")
+PUBLIC_SCENES = ("lab", "garden", "ambulance")
 GARDEN_QUALITIES = ("auto", "full", "balanced", "performance")
 LFS_POINTER_HEADER = "version https://git-lfs.github.com/spec/v1"
 REQUIRED_MANIFEST_PAYLOAD_KEYS = (
@@ -231,6 +231,11 @@ def resolve_shared_runtime_assets(
             )
         )
 
+    # The visible desktop spectator renders the tracked ILLIXR headset through
+    # the native-GL Lab renderer even when the headset scene itself is Garden or
+    # Ambulance. Validate those real runtime dependencies for every scene.
+    shared_assets.extend(_resolve_spectator_assets(repo_root))
+
     if scene_name == "garden":
         try:
             from qqtt.garden_assets import validate_garden_runtime_selection
@@ -258,18 +263,42 @@ def resolve_shared_runtime_assets(
             )
         return shared_assets
 
+    if scene_name == "ambulance":
+        try:
+            from qqtt.ambulance_scene import validate_ambulance_scene
+
+            ambulance_paths = validate_ambulance_scene(repo_root)
+        except Exception as exc:
+            raise DemoAssetValidationError(
+                f"Ambulance scene assets are not ready: {exc}"
+            ) from exc
+        for index, path in enumerate(ambulance_paths):
+            shared_assets.append(
+                ManifestAsset(
+                    case_name="shared",
+                    key=f"ambulance[{index}]",
+                    path=Path(path).resolve(),
+                    repo_relative_path=_repo_relative_path(repo_root, Path(path)),
+                )
+            )
+        return shared_assets
+
+    return shared_assets
+
+
+def _resolve_spectator_assets(repo_root: Path) -> list[ManifestAsset]:
     scene_dir = repo_root / "assets" / "scenes" / "ILLIXR_lab"
     scene_manifest_path = scene_dir / "manifest.json"
-    shared_assets.append(
+    assets = [
         ManifestAsset(
             case_name="shared",
             key="scene_manifest",
             path=scene_manifest_path,
             repo_relative_path=_repo_relative_path(repo_root, scene_manifest_path),
         )
-    )
+    ]
     if not scene_manifest_path.is_file():
-        return shared_assets
+        return assets
     with scene_manifest_path.open("r", encoding="utf-8") as handle:
         scene_manifest = json.load(handle)
     scene_paths = {
@@ -281,13 +310,21 @@ def resolve_shared_runtime_assets(
     if not isinstance(textures, list):
         raise DemoAssetValidationError("ILLIXR_lab manifest key 'textures' must be a list.")
     scene_paths.update({f"texture[{index}]": value for index, value in enumerate(textures)})
+    scene_paths.update(
+        {
+            "tracked_headset_model": "headset.obj",
+            "tracked_headset_material": "headset.mtl",
+            "tracked_headset_texture": "HeadsetBake.png",
+            "tracked_headset_license": "ILLIXR_HEADSET_LICENSE.md",
+        }
+    )
     for key, relative_path in scene_paths.items():
         if not relative_path:
             raise DemoAssetValidationError(
                 f"ILLIXR_lab manifest is missing required asset entry: {key}"
             )
         path = (scene_dir / str(relative_path)).resolve()
-        shared_assets.append(
+        assets.append(
             ManifestAsset(
                 case_name="shared",
                 key=key,
@@ -295,7 +332,7 @@ def resolve_shared_runtime_assets(
                 repo_relative_path=_repo_relative_path(repo_root, path),
             )
         )
-    return shared_assets
+    return assets
 
 
 def _read_lfs_pointer(path: Path) -> bool:

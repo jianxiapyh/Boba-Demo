@@ -7,6 +7,7 @@ import sys
 import textwrap
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 import torch
@@ -102,7 +103,7 @@ class CustomGsplatTests(unittest.TestCase):
             packages = renderer.render_gsplat_batch(
                 [_FakeCamera(1.25), _FakeCamera(1.75, view_offset=0.1)],
                 _FakeGaussianModel(),
-                pipe=None,
+                pipe=SimpleNamespace(max_projected_radius=1024.0),
                 bg_color=torch.zeros(3),
                 antialiased=True,
             )
@@ -112,6 +113,7 @@ class CustomGsplatTests(unittest.TestCase):
         self.assertEqual(captured["Ks"][:, 0, 2].tolist(), [1.25, 1.75])
         self.assertEqual(captured["rasterize_mode"], "antialiased")
         self.assertEqual(captured["render_mode"], "RGB+ED")
+        self.assertEqual(captured["max_projected_radius"], 1024.0)
         self.assertEqual(len(packages), 2)
         self.assertEqual(tuple(packages[0]["render"].shape), (4, 2, 3))
         self.assertEqual(packages[0]["radii"].tolist(), [4, 0, 3])
@@ -149,6 +151,47 @@ class CustomGsplatTests(unittest.TestCase):
         self.assertEqual(package["radii"].tolist(), [6, 0, 4])
         self.assertEqual(
             package["visibility_filter"].tolist(), [True, False, True]
+        )
+
+    def test_projected_radius_limit_bounds_and_reculls_offscreen_splats(self):
+        importlib.import_module("gaussian_splatting.gaussian_renderer")
+        rendering = importlib.import_module("gsplat.rendering")
+
+        radii = torch.tensor(
+            [[[809_933, 400_000], [2_000, 3_000], [8, 9], [0, 0]]],
+            dtype=torch.int32,
+        )
+        means2d = torch.tensor(
+            [
+                [
+                    [-5_000.0, 672.0],
+                    [672.0, 672.0],
+                    [1_400.0, 672.0],
+                    [0.0, 0.0],
+                ]
+            ]
+        )
+        bounded = rendering._apply_projected_radius_limit(
+            radii,
+            means2d,
+            width=1344,
+            height=1344,
+            max_projected_radius=1024.0,
+        )
+
+        self.assertEqual(
+            bounded.tolist(),
+            [[[0, 0], [1024, 1024], [0, 0], [0, 0]]],
+        )
+        self.assertIs(
+            rendering._apply_projected_radius_limit(
+                radii,
+                means2d,
+                width=1344,
+                height=1344,
+                max_projected_radius=0.0,
+            ),
+            radii,
         )
 
 

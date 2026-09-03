@@ -106,6 +106,31 @@ class GardenPrimitiveCollisionCudaTests(unittest.TestCase):
             dtype=wp.int32,
             device="cuda:0",
         )
+        cls.surface_edge_radii = wp.zeros(
+            len(cls.surfaces),
+            dtype=float,
+            device="cuda:0",
+        )
+        cls.surface_heightfield_offsets = wp.zeros(
+            1,
+            dtype=float,
+            device="cuda:0",
+        )
+        cls.surface_heightfield_starts = wp.zeros(
+            len(cls.surfaces),
+            dtype=wp.int32,
+            device="cuda:0",
+        )
+        cls.surface_heightfield_cells_u = wp.zeros(
+            len(cls.surfaces),
+            dtype=wp.int32,
+            device="cuda:0",
+        )
+        cls.surface_heightfield_cells_v = wp.zeros(
+            len(cls.surfaces),
+            dtype=wp.int32,
+            device="cuda:0",
+        )
 
     def _launch(
         self,
@@ -147,12 +172,22 @@ class GardenPrimitiveCollisionCudaTests(unittest.TestCase):
                     self.surface_extents_u,
                     self.surface_extents_v,
                     self.surface_kinds,
+                    self.surface_edge_radii,
+                    self.surface_heightfield_offsets,
+                    self.surface_heightfield_starts,
+                    self.surface_heightfield_cells_u,
+                    self.surface_heightfield_cells_v,
                     len(self.surfaces) if surfaces_enabled else 0,
                     float(contact["query_distance_m"]),
                     float(contact["margin_m"]),
                     float(contact["restitution"]),
                     float(contact["friction"]),
                     0,
+                    x,
+                    0,
+                    0,
+                    dummy_boxes,
+                    dummy_boxes,
                     0,
                     0.1,
                     2.0,

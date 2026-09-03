@@ -112,6 +112,9 @@ def render_gsplat(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.T
         rasterize_mode=rasterize_mode,
         absgrad=bool(getattr(pipe, "absgrad", True)),
         radius_clip=float(getattr(pipe, "radius_clip", 0.0)),
+        max_projected_radius=float(
+            getattr(pipe, "max_projected_radius", 0.0)
+        ),
     )
     # [1, H, W, 4] -> [3, H, W]
     rendered_image = render_colors[0].permute(2, 0, 1)[:3]
@@ -163,6 +166,11 @@ def render_gsplat(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.T
                 packed=False,
                 sh_degree=None,
                 render_mode='RGB+ED',
+                absgrad=bool(getattr(pipe, "absgrad", True)),
+                radius_clip=float(getattr(pipe, "radius_clip", 0.0)),
+                max_projected_radius=float(
+                    getattr(pipe, "max_projected_radius", 0.0)
+                ),
             )[0]
             image = render_colors[0].permute(2, 0, 1)[:3]   # [1, H, W, 4] -> [3, H, W]
             out_extras[k] = image
@@ -278,6 +286,9 @@ def render_gsplat_batch(viewpoint_cameras, pc : GaussianModel, pipe, bg_color : 
         rasterize_mode=rasterize_mode,
         absgrad=bool(getattr(pipe, "absgrad", True)),
         radius_clip=float(getattr(pipe, "radius_clip", 0.0)),
+        max_projected_radius=float(
+            getattr(pipe, "max_projected_radius", 0.0)
+        ),
     )
 
     try:

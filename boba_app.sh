@@ -36,7 +36,8 @@ exec env \
   python boba_quest_immersive.py \
   --case_name rope_game \
   --n_dup 0 \
-  --interactive_window_mode hidden \
+  --interactive_window_mode visible \
+  --immersive_start_posture standing \
   --immersive_static_scene_backend native_gl \
   --immersive_static_scene_overlap on \
   --immersive_present_pipeline off \
@@ -49,6 +50,7 @@ exec env \
   --immersive_native_gl_depth_format depth32f \
   --immersive_eye_resolution 1344 \
   --immersive_controller_translation_scale 0.25 \
+  --immersive_controller_max_motion_interval_m 0.05 \
   --immersive_viewer_upload_mode pbo \
   --immersive_viewer_upload_thread auto \
   "$@"

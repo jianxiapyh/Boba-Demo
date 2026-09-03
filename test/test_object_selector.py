@@ -257,3 +257,13 @@ def test_garden_selector_labels_both_objects_as_free_play():
     )
     assert lines[1] == "  Rope — Free Play  [Active]"
     assert lines[2] == "> Sloth — Free Play"
+
+
+def test_ambulance_selector_labels_both_objects_as_free_play():
+    choices = object_choices_for_scene("ambulance")
+    assert [choice.label for choice in choices] == [
+        "Rope — Free Play",
+        "Sloth — Free Play",
+    ]
+    selector = RuntimeObjectSelector("sloth", scene_name="ambulance")
+    assert selector.highlighted_case == "sloth"

@@ -30,16 +30,19 @@ OBJECT_CHOICES: tuple[ObjectChoice, ...] = (
     ObjectChoice("sloth", "Sloth \u2014 Free Play"),
 )
 
-GARDEN_OBJECT_CHOICES: tuple[ObjectChoice, ...] = (
+FREE_PLAY_OBJECT_CHOICES: tuple[ObjectChoice, ...] = (
     ObjectChoice("rope_game", "Rope \u2014 Free Play"),
     ObjectChoice("sloth", "Sloth \u2014 Free Play"),
 )
 
+# Retain the public name used by existing tests and callers.
+GARDEN_OBJECT_CHOICES = FREE_PLAY_OBJECT_CHOICES
+
 
 def object_choices_for_scene(scene_name: str = "lab") -> tuple[ObjectChoice, ...]:
     normalized = str(scene_name or "lab").strip().lower()
-    if normalized == "garden":
-        return GARDEN_OBJECT_CHOICES
+    if normalized in {"garden", "ambulance"}:
+        return FREE_PLAY_OBJECT_CHOICES
     if normalized == "lab":
         return OBJECT_CHOICES
     raise ValueError(f"Unsupported immersive scene: {scene_name}")

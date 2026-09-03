@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import gc
+import math
 import os
 import pickle
 import random
@@ -15,6 +16,7 @@ from pathlib import Path
 
 from tools.fetch_demo_case_assets import (
     DemoAssetValidationError,
+    PUBLIC_SCENES,
     validate_all_demo_assets,
 )
 
@@ -23,6 +25,14 @@ torch = None
 REPO_ROOT = Path(__file__).resolve().parent
 DEFAULT_SCENE_ASSETS_ROOT = REPO_ROOT / "assets" / "scenes"
 PUBLIC_DEMO_CASES = ("rope_game", "sloth")
+DIRECT_GAUSSIAN_SCENES = frozenset({"garden", "ambulance"})
+IMMERSIVE_START_POSTURES = ("standing", "seated")
+DEFAULT_IMMERSIVE_CONTROLLER_MAX_MOTION_INTERVAL_M = 0.05
+INTERACTIVE_WINDOW_ASPECT_WIDTH = 16
+INTERACTIVE_WINDOW_ASPECT_HEIGHT = 9
+INTERACTIVE_WINDOW_TARGET_MONITOR_AREA = 0.55
+INTERACTIVE_WINDOW_MAX_WORKAREA_FRACTION = 0.94
+INTERACTIVE_WINDOW_FALLBACK_WORKAREA = (1920, 1080)
 SHARED_TUTORIAL_SLIDES = (
     "controls_overview.png",
     "interaction_tips.png",
@@ -275,11 +285,113 @@ def set_all_seeds(seed: int):
     torch.backends.cudnn.benchmark = False
 
 
-def create_gl_window(width: int, height: int, visible: bool = True):
+def interactive_window_size_for_workarea(
+    workarea_width: int,
+    workarea_height: int,
+) -> tuple[int, int]:
+    """Return a 16:9 window covering slightly over half the monitor area."""
+
+    workarea_width = int(workarea_width)
+    workarea_height = int(workarea_height)
+    if workarea_width <= 0 or workarea_height <= 0:
+        raise ValueError("Monitor work-area dimensions must be positive.")
+
+    aspect = float(INTERACTIVE_WINDOW_ASPECT_WIDTH) / float(
+        INTERACTIVE_WINDOW_ASPECT_HEIGHT
+    )
+    target_area = (
+        float(workarea_width)
+        * float(workarea_height)
+        * float(INTERACTIVE_WINDOW_TARGET_MONITOR_AREA)
+    )
+    target_height = math.sqrt(target_area / aspect)
+    target_width = target_height * aspect
+    max_width = float(workarea_width) * INTERACTIVE_WINDOW_MAX_WORKAREA_FRACTION
+    max_height = float(workarea_height) * INTERACTIVE_WINDOW_MAX_WORKAREA_FRACTION
+    fit_scale = min(1.0, max_width / target_width, max_height / target_height)
+    target_width *= fit_scale
+    target_height *= fit_scale
+
+    # Derive one integer dimension from the other so rounding cannot produce a
+    # visibly different aspect ratio.
+    width = max(1, int(round(target_width)))
+    height = max(
+        1,
+        int(
+            round(
+                width
+                * float(INTERACTIVE_WINDOW_ASPECT_HEIGHT)
+                / float(INTERACTIVE_WINDOW_ASPECT_WIDTH)
+            )
+        ),
+    )
+    if height > int(max_height):
+        height = max(1, int(max_height))
+        width = max(
+            1,
+            int(
+                round(
+                    height
+                    * float(INTERACTIVE_WINDOW_ASPECT_WIDTH)
+                    / float(INTERACTIVE_WINDOW_ASPECT_HEIGHT)
+                )
+            ),
+        )
+    return width, height
+
+
+def _primary_monitor_workarea(glfw_module):
+    monitor = glfw_module.get_primary_monitor()
+    fallback_width, fallback_height = INTERACTIVE_WINDOW_FALLBACK_WORKAREA
+    if monitor is None:
+        return None, (0, 0, fallback_width, fallback_height)
+
+    get_workarea = getattr(glfw_module, "get_monitor_workarea", None)
+    if callable(get_workarea):
+        try:
+            workarea = tuple(int(value) for value in get_workarea(monitor))
+            if len(workarea) == 4 and workarea[2] > 0 and workarea[3] > 0:
+                return monitor, workarea
+        except Exception:
+            pass
+
+    try:
+        mode = glfw_module.get_video_mode(monitor)
+        monitor_width = int(mode.size.width)
+        monitor_height = int(mode.size.height)
+        monitor_x, monitor_y = glfw_module.get_monitor_pos(monitor)
+        if monitor_width > 0 and monitor_height > 0:
+            return monitor, (
+                int(monitor_x),
+                int(monitor_y),
+                monitor_width,
+                monitor_height,
+            )
+    except Exception:
+        pass
+    return monitor, (0, 0, fallback_width, fallback_height)
+
+
+def create_gl_window(
+    width: int | None = None,
+    height: int | None = None,
+    visible: bool = True,
+):
     import glfw
     from OpenGL import GL as gl
 
     assert glfw.init(), "GLFW init failed"
+    monitor, workarea = _primary_monitor_workarea(glfw)
+    adaptive_size = width is None and height is None
+    if adaptive_size:
+        width, height = interactive_window_size_for_workarea(
+            workarea[2],
+            workarea[3],
+        )
+    elif width is None or height is None:
+        raise ValueError("Interactive window width and height must be supplied together.")
+    width = int(width)
+    height = int(height)
     glfw.window_hint(glfw.CLIENT_API, glfw.OPENGL_API)
     glfw.window_hint(glfw.CONTEXT_VERSION_MAJOR, 4)
     glfw.window_hint(glfw.CONTEXT_VERSION_MINOR, 6)
@@ -288,6 +400,32 @@ def create_gl_window(width: int, height: int, visible: bool = True):
 
     window = glfw.create_window(width, height, "Boba Quest Immersive", None, None)
     assert window, "create_window failed (need X11 desktop GL)"
+
+    if adaptive_size:
+        set_aspect_ratio = getattr(glfw, "set_window_aspect_ratio", None)
+        if callable(set_aspect_ratio):
+            set_aspect_ratio(
+                window,
+                INTERACTIVE_WINDOW_ASPECT_WIDTH,
+                INTERACTIVE_WINDOW_ASPECT_HEIGHT,
+            )
+        if visible:
+            try:
+                glfw.set_window_pos(
+                    window,
+                    int(workarea[0]) + max(0, (int(workarea[2]) - width) // 2),
+                    int(workarea[1]) + max(0, (int(workarea[3]) - height) // 2),
+                )
+            except Exception:
+                pass
+        coverage = float(width * height) / float(workarea[2] * workarea[3])
+        print(
+            "[interactive_window] monitor-aware window: "
+            f"size={width}x{height} aspect=16:9 "
+            f"monitor_workarea={workarea[2]}x{workarea[3]} "
+            f"area_coverage={coverage * 100.0:.1f}%",
+            flush=True,
+        )
 
     glfw.make_context_current(window)
     _ = gl.glGetString(gl.GL_VERSION)
@@ -440,7 +578,7 @@ def configure_demo_case_runtime(
     )
     scene_name = str(scene_name).strip().lower()
     cfg.immersive_scene_name = scene_name
-    if scene_name == "garden":
+    if scene_name in DIRECT_GAUSSIAN_SCENES:
         cfg.demo_game_mode = "free_play"
         cfg.demo_game_course_path = None
         cfg.demo_tutorial_slide_paths = [
@@ -520,7 +658,8 @@ def build_parser() -> ArgumentParser:
             "Run the shipped Boba Quest immersive demo. "
             "Standalone OpenXR is the default; --illixr enables the ILLIXR-managed bridge. "
             "The launcher uses immersive Quest display, "
-            "a launch-time Lab or Garden scene, and the balanced immersive preset. "
+            "a launch-time Lab, Garden, or Ambulance scene, and the balanced "
+            "immersive preset. "
             "Runtime demo assets are resolved from ./assets/."
         )
     )
@@ -534,9 +673,12 @@ def build_parser() -> ArgumentParser:
     )
     parser.add_argument(
         "--scene",
-        choices=("lab", "garden"),
+        choices=PUBLIC_SCENES,
         default="lab",
-        help="launch the existing Lab scene or Gaussian Mip-NeRF 360 Garden",
+        help=(
+            "launch the mesh Lab, Gaussian Mip-NeRF 360 Garden, or bundled "
+            "Gaussian Ambulance scene"
+        ),
     )
     parser.add_argument(
         "--garden-quality",
@@ -572,8 +714,17 @@ def build_parser() -> ArgumentParser:
     parser.add_argument(
         "--interactive_window_mode",
         choices=("visible", "hidden"),
-        default="hidden",
+        default="visible",
         help="show or hide the local OpenGL window while Quest output stays active",
+    )
+    parser.add_argument(
+        "--immersive_start_posture",
+        choices=IMMERSIVE_START_POSTURES,
+        default="standing",
+        help=(
+            "explicit standing or seated startup layout; automatic posture "
+            "detection is intentionally not enabled"
+        ),
     )
     parser.add_argument(
         "--profile",
@@ -789,6 +940,19 @@ def build_parser() -> ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--immersive_controller_max_motion_interval_m",
+        type=float,
+        default=DEFAULT_IMMERSIVE_CONTROLLER_MAX_MOTION_INTERVAL_M,
+        help=(
+            "maximum active controller-target translation in virtual scene meters "
+            "advanced by one full physics period; the default is the measured "
+            "maximum across all 22 recorded test trajectories, rounded upward to "
+            "a practical 5 cm bound. Larger tracking jumps catch up over later "
+            "rendered frames toward the newest tracked pose, with one physics "
+            "period and one LBS/render update per frame"
+        ),
+    )
+    parser.add_argument(
         "--immersive_viewer_upload_mode",
         choices=("pbo", "direct", "legacy"),
         default="pbo",
@@ -836,10 +1000,10 @@ def main(argv: list[str] | None = None):
     parser = build_parser()
     args = parser.parse_args(argv)
     configure_illixr_launch(args.illixr)
-    if args.scene == "garden":
-        # Garden is itself part of the batched Gaussian render.  The static
-        # adapter supplies a depthless retained frame, so static workers and
-        # cross-frame scene reuse are intentionally disabled.
+    if args.scene in DIRECT_GAUSSIAN_SCENES:
+        # These scenes are themselves part of the batched Gaussian render. The
+        # static adapter supplies a depthless retained frame, so static workers
+        # and cross-frame scene reuse are intentionally disabled.
         args.immersive_timewarp = "off"
         args.immersive_static_scene_overlap = "off"
         args.immersive_static_scene_reuse = "off"
@@ -911,16 +1075,19 @@ def main(argv: list[str] | None = None):
     print(f"[quest_display] input_source={input_source}", flush=True)
     print("[quest_display] controller_mode=multi_points", flush=True)
     print("[quest_display] mode=immersive", flush=True)
-    print(
-        "[quest_display] scene_preset="
-        + ("Mip-NeRF_360_garden" if args.scene == "garden" else "ILLIXR_lab"),
-        flush=True,
-    )
+    scene_preset = {
+        "lab": "ILLIXR_lab",
+        "garden": "Mip-NeRF_360_garden",
+        "ambulance": "Insta360_ambulance",
+    }[args.scene]
+    print(f"[quest_display] scene_preset={scene_preset}", flush=True)
     if args.scene == "garden":
         print(
             f"[quest_display] garden_quality={args.garden_quality} mode=free_play",
             flush=True,
         )
+    elif args.scene == "ambulance":
+        print("[quest_display] ambulance_sog=v2 mode=free_play", flush=True)
     print("[quest_display] immersive_render_preset=balanced", flush=True)
     print(
         "[quest_display] immersive_eye_resolution="
@@ -987,6 +1154,11 @@ def main(argv: list[str] | None = None):
         flush=True,
     )
     print(
+        "[quest_display] immersive_controller_max_motion_interval_m="
+        f"{float(args.immersive_controller_max_motion_interval_m):.3f}",
+        flush=True,
+    )
+    print(
         "[quest_display] immersive_viewer_upload="
         f"mode={args.immersive_viewer_upload_mode} "
         f"thread={args.immersive_viewer_upload_thread} "
@@ -996,6 +1168,10 @@ def main(argv: list[str] | None = None):
     )
     print(
         f"[quest_display] interactive_window_mode={args.interactive_window_mode}",
+        flush=True,
+    )
+    print(
+        f"[quest_display] immersive_start_posture={args.immersive_start_posture}",
         flush=True,
     )
 
@@ -1009,8 +1185,6 @@ def main(argv: list[str] | None = None):
     from qqtt.utils import logger, cfg
 
     window = create_gl_window(
-        848,
-        400,
         visible=(args.interactive_window_mode == "visible"),
     )
     if args.interactive_window_mode == "hidden":
@@ -1058,6 +1232,7 @@ def main(argv: list[str] | None = None):
                         cuda_ctx=ctx,
                         interactive_window_mode=args.interactive_window_mode,
                         scene_assets_root=args.scene_assets_root,
+                        immersive_start_posture=args.immersive_start_posture,
                         profile=args.profile,
                         profile_freq=args.profile_freq,
                         immersive_timewarp=args.immersive_timewarp,
@@ -1100,6 +1275,9 @@ def main(argv: list[str] | None = None):
                         ),
                         immersive_controller_translation_scale=(
                             args.immersive_controller_translation_scale
+                        ),
+                        immersive_controller_max_motion_interval_m=(
+                            args.immersive_controller_max_motion_interval_m
                         ),
                         existing_immersive_bridge=immersive_bridge,
                         immersive_session_state=immersive_session_state,
@@ -1175,6 +1353,24 @@ def main(argv: list[str] | None = None):
         if immersive_bridge is not None:
             try:
                 immersive_bridge.stop()
+            except Exception:
+                pass
+
+        interactive_preview_renderer = immersive_session_state.get(
+            "interactive_preview_renderer"
+        )
+        if interactive_preview_renderer is not None:
+            try:
+                interactive_preview_renderer.delete()
+            except Exception:
+                pass
+
+        interactive_spectator_renderer = immersive_session_state.get(
+            "interactive_spectator_renderer"
+        )
+        if interactive_spectator_renderer is not None:
+            try:
+                interactive_spectator_renderer.delete()
             except Exception:
                 pass
 

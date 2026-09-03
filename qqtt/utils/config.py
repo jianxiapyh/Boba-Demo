@@ -33,6 +33,9 @@ class Config:
         self.runtime_table_vertical_min_height_m = 0.10
         self.runtime_table_vertical_min_length_m = 0.15
         self.runtime_lower_table_support_floor_clearance_m = 0.02
+        self.runtime_lab_table_divider_merge_enabled = False
+        self.runtime_lab_table_divider_lateral_inflate_m = 0.0
+        self.runtime_lab_table_divider_surface_overlap_m = 0.0
         self.runtime_sofa_handle_physics_inflate_m = 0.02
         self.runtime_sofa_handle_physics_top_extra_m = 0.0
         self.runtime_sofa_handle_physics_bottom_extra_m = 0.004
@@ -57,6 +60,7 @@ class Config:
         # Parameters on whether update the collision parameters
         self.collision_learn = True
         self.self_collision = False
+        self.self_collision_rest_exclusion_multiplier = 5.0
 
         # DEBUG mode: set use_graph to False
         self.use_graph = True

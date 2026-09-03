@@ -41,6 +41,49 @@ def _profile(profiler, name):
     return profiler.record(name)
 
 
+def _apply_projected_radius_limit(
+    radii: Tensor,
+    means2d: Tensor,
+    width: int,
+    height: int,
+    max_projected_radius: float,
+) -> Tensor:
+    """Bound splat tile coverage and re-cull against the bounded footprint.
+
+    PlayCanvas bounds each projected splat by the smaller of 1024 pixels and
+    the viewport dimensions before its off-screen test.  Keep the projected
+    conic unchanged so pixels inside the bounded footprint retain the original
+    Gaussian falloff; only tile coverage and visibility are constrained here.
+    """
+
+    requested_limit = float(max_projected_radius)
+    if requested_limit == 0.0:
+        return radii
+    if not math.isfinite(requested_limit) or requested_limit < 1.0:
+        raise ValueError(
+            "max_projected_radius must be 0 (disabled) or a finite value >= 1"
+        )
+
+    radius_limit = min(
+        int(math.floor(requested_limit)),
+        int(width),
+        int(height),
+    )
+    bounded_radii = radii.clamp(max=radius_limit)
+    was_visible = (radii > 0).all(dim=-1)
+    overlaps_viewport = (
+        (means2d[..., 0] + bounded_radii[..., 0] > 0)
+        & (means2d[..., 0] - bounded_radii[..., 0] < width)
+        & (means2d[..., 1] + bounded_radii[..., 1] > 0)
+        & (means2d[..., 1] - bounded_radii[..., 1] < height)
+    )
+    return torch.where(
+        (was_visible & overlaps_viewport).unsqueeze(-1),
+        bounded_radii,
+        torch.zeros_like(bounded_radii),
+    )
+
+
 def _normalize_shared_template_backgrounds(
     backgrounds: Optional[Tensor],
     num_cameras: int,
@@ -537,6 +580,7 @@ def rasterization(
     # rolling shutter
     rolling_shutter: RollingShutterType = RollingShutterType.GLOBAL,
     viewmats_rs: Optional[Tensor] = None,  # [..., C, 4, 4]
+    max_projected_radius: float = 0.0,
     profiler=None,
 ) -> Tuple[Tensor, Tensor, Dict]:
     """Rasterize a set of 3D Gaussians (N) to a batch of image planes (C).
@@ -643,6 +687,10 @@ def rasterization(
         far_plane: The far plane for clipping. Default is 1e10.
         radius_clip: Gaussians with 2D radius smaller or equal than this value will be
             skipped. This is extremely helpful for speeding up large scale scenes.
+            Default is 0.0.
+        max_projected_radius: Maximum per-axis projected splat radius used for
+            tile coverage and off-screen culling. The effective limit is also
+            bounded by the viewport dimensions. Set to 0.0 to disable it.
             Default is 0.0.
         eps2d: An epsilon added to the egienvalues of projected 2D covariance matrices.
             This will prevents the projected GS to be too small. For example eps2d=0.3
@@ -921,6 +969,14 @@ def rasterization(
         batch_ids, camera_ids, gaussian_ids = None, None, None
         image_ids = None
 
+    radii = _apply_projected_radius_limit(
+        radii,
+        means2d,
+        width,
+        height,
+        max_projected_radius,
+    )
+
     if compensations is not None:
         opacities = opacities * compensations
 
@@ -936,6 +992,11 @@ def rasterization(
             "depths": depths,
             "conics": conics,
             "opacities": opacities,
+            "max_projected_radius": (
+                min(float(max_projected_radius), float(width), float(height))
+                if float(max_projected_radius) > 0.0
+                else 0.0
+            ),
         }
     )
 

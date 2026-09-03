@@ -1,0 +1,196 @@
+{
+  "schema_version": 1,
+  "coordinate_convention": "canonical x=right, y=forward, z=down; the legacy source interaction reference is the canonical origin and the fitted blue-mattress plane is recorded under interaction_surface",
+  "calibration_method": "The SOG floor and ceiling were fitted on source Y, establishing source -Y as up. Scale was set from the fitted 1.8 m interior height. Source-space cross-aisle renders place the seated headset over the large source -Z squad bench at a 1.20 m headset height, facing source +Z with its optical axis parallel to the fitted ambulance floor. The standing headset is placed in the clear aisle beside the mattress at a 1.45 m eye height with a 30 degree downward gaze. A robust fit to 7,204 blue-mattress Gaussians supplies the stretcher reference frame. Runtime contact uses the matching ambulance_mesh_best.glb padded mattress shell at full triangle resolution so its measured curvature and asymmetric ends remain intact. Only the side hardware and undercarriage are aggressively decimated. The runtime GLB contains positions and triangle indices only; colors, normals, UVs, textures, and materials are excluded.",
+  "source_interaction_surface_center": [
+    -7.2,
+    -1.5,
+    0.4
+  ],
+  "source_to_canonical_rotation": [
+    [
+      -0.999832555,
+      0.018299255,
+      0.0
+    ],
+    [
+      -0.000692405,
+      -0.037831567,
+      0.99928389
+    ],
+    [
+      0.018286151,
+      0.999116565,
+      0.037837903
+    ]
+  ],
+  "meters_per_source_unit": 0.264,
+  "seated_view": {
+    "support_name": "squad_bench",
+    "faces": "stretcher",
+    "source_head_position": [
+      -7.2,
+      -4.285827187,
+      -2.5
+    ],
+    "source_forward_direction": [
+      -0.000692405,
+      -0.037831567,
+      0.99928389
+    ],
+    "source_gaze_target": [
+      -7.2,
+      -1.5,
+      0.4
+    ],
+    "startup_gaze_pitch_down_degrees": 0.0,
+    "headset_height_above_floor_m": 1.2
+  },
+  "standing_view": {
+    "support_name": "center_aisle",
+    "faces": "stretcher",
+    "canonical_head_position_m": [
+      0.039645,
+      -0.535824,
+      -1.013777
+    ],
+    "canonical_forward_direction": [
+      0.0,
+      1.0,
+      0.0
+    ],
+    "startup_gaze_pitch_down_degrees": 30.0,
+    "headset_height_above_floor_m": 1.45,
+    "mattress_side_clearance_m": 0.18
+  },
+  "interaction_surface": {
+    "support_name": "stretcher_mattress",
+    "canonical_center_xy_m": [
+      0.1,
+      -0.1
+    ],
+    "canonical_axis_u_xy": [
+      0.99047226,
+      -0.13771221
+    ],
+    "canonical_plane_z_down_from_xy": [
+      0.062205606,
+      0.000259148,
+      -0.089588001
+    ],
+    "fit_inlier_tolerance_m": 0.012,
+    "fit_inlier_count": 7204,
+    "collision_heightfield": {
+      "schema_version": 2,
+      "cells_u": 32,
+      "cells_v": 16,
+      "source": "Legacy fitted crown retained only to define and validate the collision proxy coordinate frame. Runtime mattress contact uses the full-resolution captured source mesh.",
+      "footprint": {
+        "kind": "capsule"
+      },
+      "profile": {
+        "kind": "convex_crown",
+        "center_above_fitted_plane_m": 0.022,
+        "length_edge_drop_m": 0.008,
+        "width_edge_drop_m": 0.018,
+        "length_exponent": 2.0,
+        "width_exponent": 2.0
+      },
+      "edge_round_radius_m": 0.035,
+      "max_normal_offset_from_fitted_plane_m": 0.03
+    },
+    "size_m": [
+      1.8,
+      0.52,
+      0.055
+    ]
+  },
+  "stretcher_detail_collision_proxy": {
+    "schema_version": 2,
+    "source": "Cropped from ambulance_mesh_best.glb (SHA-256 41b6e4537f8ad6b55ca9a71ca5e75e5c58435da66b208e18f75932be47d072f4). The padded mattress shell retains every selected source triangle; only side hardware and the undercarriage are quadric-decimated. The generated GLB stores only float32 POSITION and uint32 triangle indices, and its mattress component is authoritative for runtime top contact. Runtime queries this exact shell every sixteen 0.2 ms spring substeps and sweeps from the preceding query state.",
+    "source_mesh_sha256": "41b6e4537f8ad6b55ca9a71ca5e75e5c58435da66b208e18f75932be47d072f4",
+    "coordinate_frame": "mattress_collision_center_local_uvw_m",
+    "components": [
+      {
+        "name": "mattress_surface_full_resolution",
+        "vertex_count": 24301,
+        "face_count": 46829
+      },
+      {
+        "name": "side_hardware_positive_v",
+        "vertex_count": 1475,
+        "face_count": 2500
+      },
+      {
+        "name": "side_hardware_negative_v",
+        "vertex_count": 1091,
+        "face_count": 2013
+      },
+      {
+        "name": "lower_structure_00",
+        "vertex_count": 2940,
+        "face_count": 4809
+      },
+      {
+        "name": "lower_structure_01",
+        "vertex_count": 554,
+        "face_count": 868
+      },
+      {
+        "name": "lower_structure_02",
+        "vertex_count": 149,
+        "face_count": 173
+      },
+      {
+        "name": "lower_structure_03",
+        "vertex_count": 109,
+        "face_count": 150
+      }
+    ],
+    "contact": {
+      "two_sided": true,
+      "substep_interval": 16,
+      "query_distance_m": 0.05,
+      "winding_accuracy": 2.0,
+      "winding_threshold": 0.5,
+      "margin_m": 0.01,
+      "friction": 0.62,
+      "restitution": 0.04
+    }
+  },
+  "floor": {
+    "down_from_interaction_surface_m": 0.525811,
+    "size_m": [
+      4.8,
+      2.35,
+      0.08
+    ]
+  },
+  "contact": {
+    "query_distance_m": 0.16,
+    "margin_m": 0.0025,
+    "friction": 0.62,
+    "restitution": 0.04
+  },
+  "fit_diagnostics": {
+    "source_floor_up_normal": [
+      -0.018286151,
+      -0.999116565,
+      -0.037837903
+    ],
+    "source_floor_plane_offset": 0.037158564,
+    "seated_head_source_position": [
+      -7.2,
+      -4.285827187,
+      -2.5
+    ],
+    "seated_head_canonical_position_m": [
+      -0.013458,
+      -0.737228,
+      -0.763777
+    ],
+    "legacy_reference_height_above_floor_m": 0.436223,
+    "fitted_mattress_center_above_legacy_reference_m": 0.083393,
+    "collision_crown_center_above_fitted_plane_m": 0.022
+  }
+}

@@ -31,6 +31,9 @@ from kornia import create_meshgrid
 import copy
 
 
+_GAUSSIAN_COMPONENT_MASK_CACHE = {}
+
+
 def render_set(model_path, name, iteration, views, gaussians, pipeline, background, train_test_exp, separate_sh, disable_sh=False):
     render_path = os.path.join(model_path, name, "ours_{}".format(iteration), "renders")
     gts_path = os.path.join(model_path, name, "ours_{}".format(iteration), "gt")
@@ -206,6 +209,137 @@ def remove_gaussians_with_low_opacity(gaussians, opacity_threshold=0.1):
     new_gaussians._opacity = gaussians._opacity[mask3d]
 
     return new_gaussians
+
+
+def _largest_radius_connected_component_mask(points, connectivity_radius):
+    """Return the largest radius-connected component of a Gaussian point set."""
+
+    points = np.asarray(points, dtype=np.float32)
+    if points.ndim != 2 or points.shape[1] != 3:
+        raise ValueError("Gaussian points must have shape (N, 3).")
+    point_count = int(points.shape[0])
+    if point_count == 0:
+        return np.zeros(0, dtype=bool), {
+            "component_count": 0,
+            "largest_component_count": 0,
+        }
+    connectivity_radius = float(connectivity_radius)
+    if not np.isfinite(connectivity_radius) or connectivity_radius <= 0.0:
+        raise ValueError("Gaussian connectivity radius must be finite and positive.")
+
+    # These imports stay local because this path is only used for the Sloth
+    # asset. Rope loading should not pay the scipy import or graph-build cost.
+    from scipy.sparse import coo_matrix
+    from scipy.sparse.csgraph import connected_components
+    from scipy.spatial import cKDTree
+
+    pairs = cKDTree(points).query_pairs(
+        connectivity_radius,
+        output_type="ndarray",
+    )
+    if int(pairs.shape[0]) == 0:
+        labels = np.arange(point_count, dtype=np.int64)
+        component_count = point_count
+    else:
+        graph = coo_matrix(
+            (
+                np.ones(int(pairs.shape[0]), dtype=np.uint8),
+                (pairs[:, 0], pairs[:, 1]),
+            ),
+            shape=(point_count, point_count),
+        ).tocsr()
+        component_count, labels = connected_components(graph, directed=False)
+
+    component_sizes = np.bincount(labels, minlength=int(component_count))
+    largest_component = int(np.argmax(component_sizes))
+    keep_mask = labels == largest_component
+    return keep_mask, {
+        "component_count": int(component_count),
+        "largest_component_count": int(component_sizes[largest_component]),
+    }
+
+
+def remove_gaussians_outside_largest_component(
+    gaussians,
+    connectivity_radius,
+    *,
+    minimum_keep_fraction=0.95,
+    cache_key=None,
+):
+    """Remove detached Gaussian islands while retaining the main object."""
+
+    point_count = int(gaussians._xyz.shape[0])
+    if point_count == 0:
+        return gaussians
+    cache_identity = None
+    if cache_key is not None:
+        cache_identity = (
+            str(cache_key),
+            point_count,
+            float(connectivity_radius),
+        )
+    cached = _GAUSSIAN_COMPONENT_MASK_CACHE.get(cache_identity)
+    cache_hit = cached is not None
+    if cached is None:
+        keep_mask_np, component_debug = _largest_radius_connected_component_mask(
+            gaussians._xyz.detach().cpu().numpy(),
+            connectivity_radius,
+        )
+        if cache_identity is not None:
+            _GAUSSIAN_COMPONENT_MASK_CACHE[cache_identity] = (
+                keep_mask_np.copy(),
+                dict(component_debug),
+            )
+    else:
+        keep_mask_np, component_debug = cached
+
+    kept_count = int(np.count_nonzero(keep_mask_np))
+    keep_fraction = float(kept_count) / float(point_count)
+    minimum_keep_fraction = float(minimum_keep_fraction)
+    if (
+        not np.isfinite(minimum_keep_fraction)
+        or minimum_keep_fraction < 0.0
+        or minimum_keep_fraction > 1.0
+    ):
+        raise ValueError("Minimum Gaussian component keep fraction must be in [0, 1].")
+    if keep_fraction < minimum_keep_fraction:
+        print(
+            "[quest_display] skipping disconnected Gaussian cleanup because the "
+            "largest component "
+            f"keeps only {kept_count}/{point_count} points "
+            f"({keep_fraction:.3f} < {minimum_keep_fraction:.3f}).",
+            flush=True,
+        )
+        return gaussians
+
+    keep_mask = torch.as_tensor(
+        keep_mask_np,
+        dtype=torch.bool,
+        device=gaussians._xyz.device,
+    )
+    cleaned_gaussians = copy.copy(gaussians)
+    for field_name in (
+        "_xyz",
+        "_features_dc",
+        "_features_rest",
+        "_scaling",
+        "_rotation",
+        "_opacity",
+    ):
+        setattr(
+            cleaned_gaussians,
+            field_name,
+            getattr(gaussians, field_name)[keep_mask],
+        )
+    print(
+        "[quest_display] removing "
+        f"{point_count - kept_count} disconnected gaussians "
+        f"outside the largest {float(connectivity_radius):.4f} m component "
+        f"(components={int(component_debug['component_count'])}, "
+        f"kept={kept_count}/{point_count}, cache_hit={int(cache_hit)})",
+        flush=True,
+    )
+    return cleaned_gaussians
 
 
 def remove_gaussians_with_point_mesh_distance(gaussians, mesh_sampled_points, dist_threshold=0.1):

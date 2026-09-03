@@ -1,13 +1,14 @@
 # Boba Quest Immersive Demo
 
-This repository contains one Quest/OpenXR experience with two runtime-selectable Gaussian objects and two launch-time scenes:
+This repository contains one Quest/OpenXR experience with two runtime-selectable Gaussian objects and three launch-time scenes:
 
 | Scene | Rope | Sloth |
 | --- | --- | --- |
 | Lab (default) | Game: course, targets, timer, HUD, and finish screen | Free play |
 | Mip-NeRF 360 Garden | Free play | Free play |
+| Insta360 Ambulance | Free play | Free play |
 
-Switching Rope/Sloth keeps the OpenXR session, selected scene, and head alignment alive. The Garden and active object are rendered together in one stereo-batched Gaussian pass and published through a Garden-only direct-output path; the Lab scene retains its mesh/Gaussian depth compositor. Garden's static Gaussians are stored in deterministic spatial chunks. Each source frame submits the conservative union of chunks intersecting either eye frustum, then leaves per-Gaussian frustum/radius culling to gsplat; the active object is always included. Fast invisible primitives supply contact: an analytic closed tabletop cylinder (top, rim, and underside), a finite patio plane, and inexpensive boxes for the table understructure. The detailed closed proxy mesh is retained only for developer visualization; vegetation, lawn, planters, and distant scenery remain non-colliding.
+Switching Rope/Sloth keeps the OpenXR session, selected scene, and head alignment alive. Garden and Ambulance each combine their static scene with the active object in one stereo-batched Gaussian pass; Lab retains its mesh/Gaussian depth compositor. Garden's static Gaussians are stored in deterministic spatial chunks and use an analytic patio-table collision proxy. The launcher now uses an explicit standing layout by default, with no automatic posture detection. Lab starts at a 1.55 m eye height. Ambulance decodes the bundled SOG v2 asset directly, places the active object on top of the stretcher, anchors the launch-time headset in the clear aisle at a 1.45 m eye height with a 30-degree downward view toward the mattress, and uses the captured full-resolution padded-mattress shell plus aggressively simplified source-mesh geometry for the side hardware and undercarriage. Pass `--immersive_start_posture seated` to use the preserved seated layouts.
 
 ## Prerequisite: a working Boba-Batched machine
 
@@ -15,7 +16,7 @@ Before setting up this demo, install and successfully run the current `Boba_Batc
 
 This demo reuses the installed packages in `phystwin-cu132`; it does **not** import source or assets from the Boba-Batched checkout. The custom `gsplat` source, Rope and Sloth data, and room assets required at runtime are committed here, so the Boba-Batched checkout does not need to be beside this repository. The Sloth Gaussian is tracked with Git LFS; clone with Git LFS enabled so the PLY payload is checked out rather than left as a pointer.
 
-Launch from the same working X11 session used for Boba-Batched. A valid `DISPLAY` is required even though the interactive window is hidden.
+Launch from the same working X11 session used for Boba-Batched. A valid `DISPLAY` is required. The interactive window is visible by default and uses an independent spectator camera: the selected scene, deformable object, controller rays, and tracked 3D headset mesh are rendered together in scene space. The headset mesh is the asset used by ILLIXR's `plugins/debugview`; the Quest continues to receive its normal stereo eye views. Pass `--interactive_window_mode hidden` to disable the desktop spectator view.
 
 ## Install the demo additions
 
@@ -83,6 +84,17 @@ The desktop streamer and Quest client must use matching ALVR versions. Installin
 
 ## Run
 
+For a concise on-site handoff covering the Lab and Ambulance scenes, open the
+offline guide with copy buttons:
+
+```bash
+./open_operator_guide.sh
+```
+
+The same instructions are also available as a
+[local webpage](IMMERSIVE_DEMO_OPERATOR_GUIDE.html) and a
+[plain Markdown guide](IMMERSIVE_DEMO_OPERATOR_GUIDE.md).
+
 From the cloned repository, run the canonical launcher:
 
 ```bash
@@ -97,18 +109,26 @@ Launch the Gaussian Garden alternative with:
 
 Garden never downloads during launch. If its local cache is missing or stale, startup exits before XR with the exact one-time setup command. The default is `balanced`; choose another tier explicitly with `--garden-quality full` or `performance`. The optional `--garden-quality auto` mode uses the highest cached tier measured at or above 72 source FPS for the current GPU, NVIDIA driver, renderer revision, model hash, and 1344-per-eye configuration. It never silently lowers eye resolution. An unprofiled `auto` run starts at `balanced`, records 120 source frames, and stores the result in the ignored local profile cache.
 
-The launcher can be called from `base`, `phystwin`, `phystwin-cu130`, `phystwin-cu132`, or a shell with no active Conda environment. It discards inherited Conda/CUDA display variables and always starts a clean child in `phystwin-cu132`, so nested `conda run` metadata cannot make the correct Python report the wrong environment. It also works by absolute path from another directory, validates both objects plus only the selected scene before starting XR, and launches with Rope. Lab keeps the existing native-GL static room and compositor. Garden selects the union of conservatively visible static chunks, appends the complete active object, and publishes the combined Gaussian result directly before adding the shared controller/UI overlays. Both retain the fixed 1344-pixel-per-eye launcher default and controller translation scale `0.25`.
+Launch the bundled Insta360 Ambulance scene with:
+
+```bash
+./boba_app.sh --scene ambulance
+```
+
+The Ambulance SOG is validated by version, Gaussian count, and SHA-256 checksum before XR starts. It is decoded directly in memory, so no PLY conversion or one-time preparation command is required. Stretcher contact uses the captured mattress shell at its full selected resolution (46,829 triangles), preserving its real curvature and longer asymmetric end. The handles, side frame, legs, and undercarriage remain aggressively simplified (10,513 triangles), keeping the complete position/index-only collision proxy near 1.06 MB. It is used as a two-sided collision surface; rendering colors, normals, UVs, textures, and materials are deliberately omitted. The authored object anchor remains at the calibrated mattress reference, and the hidden startup settle resolves individual nodes onto the irregular captured surface. To avoid paying for an exact BVH query on all 167 spring substeps, Ambulance checks the source mesh every 16 substeps, always checks the final substep, and sweeps continuously from the previous check so fast motion cannot tunnel through the skipped interval.
+
+The launcher can be called from `base`, `phystwin`, `phystwin-cu130`, `phystwin-cu132`, or a shell with no active Conda environment. It discards inherited Conda/CUDA display variables and always starts a clean child in `phystwin-cu132`, so nested `conda run` metadata cannot make the correct Python report the wrong environment. It also works by absolute path from another directory, validates both objects, the selected scene, and the shared spectator-headset assets before starting XR, and launches with Rope. Lab keeps the existing native-GL static room and compositor. Garden and Ambulance append the complete active object to their static Gaussians and publish the combined result directly before adding the shared controller/UI overlays. All scenes retain the fixed 1344-pixel-per-eye launcher default and controller translation-scale multiplier `0.25`. Rope and Sloth both have a case-default gain of `4.0`, producing an effective gain of `1.0`: 5 cm of real controller motion maps to 5 cm in scene space for either object. While an object is grabbed, its simulated controller target advances by at most 0.05 m in each rendered simulation period. Any excess is carried into later displayed frames and always chases the newest tracked pose, so every frame runs one physics graph followed by one LBS/render update instead of blocking presentation on a burst of catch-up graphs. Releasing the grab discards unfinished catch-up motion. The largest consecutive driven-point displacement measured across all 22 recorded 30 FPS test trajectories is `0.047083356 m`; the 5 cm production limit leaves 2.92 mm (6.2%) headroom. [The calibration record](assets/controller_motion_calibration.json) contains the per-case measurements. Override the bound with `--immersive_controller_max_motion_interval_m` when stress testing.
 
 ## Headset controls
 
-- Trigger/Select: grab and move the active object. In the selector, point at a row and press Trigger to choose it.
-- X/A: cycle interaction anchors during normal play. In the selector, move the highlighted row; press Trigger to confirm.
+- Trigger/Select: point near an interaction marker and grab; its enlarged invisible ray target takes priority even when another part of the object is in front. In the selector, point at a row and press Trigger to choose it.
+- X/A: optionally cycle interaction anchors when direct pointing is ambiguous. In the selector, move the highlighted row; press Trigger to confirm.
 - Either joystick up/down: move the highlighted selector row once per deflection; recenter before moving again.
-- Y/B short tap: in Lab, restart the Rope course or reset Sloth; in Garden, reset either selected object to its settled center-table pose.
+- Y/B short tap: in Lab, restart the Rope course or reset Sloth; in Garden or Ambulance, reset either selected object to its settled interaction-surface pose.
 - Y/B hold for 0.75 seconds: open the object selector. Y/B cancels it.
 - Grip hold: exit the demo as before.
 
-In Lab, selecting **Rope — Game** always creates a fresh course at target one with a reset timer; selecting **Sloth — Free Play** removes all Rope targets and HUD elements. In Garden, the selector labels both objects **Free Play**, and no goals, timer, targets, course HUD, or completion screen are created. Either object starts from its original settled position on the center table. A dark, headset-locked progress overlay retains the last valid view while the new object loads and settles, avoiding white frames. If loading fails, the demo shows an error and restores the previous object.
+In Lab, selecting **Rope — Game** always creates a fresh course at target one with a reset timer; selecting **Sloth — Free Play** removes all Rope targets and HUD elements. In Garden and Ambulance, the selector labels both objects **Free Play**, and no goals, timer, targets, course HUD, or completion screen are created. Either object starts from its original settled position on the calibrated interaction surface. A dark, headset-locked progress overlay retains the last valid view while the new object loads and settles, avoiding white frames. If loading fails, the demo shows an error and restores the previous object.
 
 For collision/placement calibration, add `--garden-debug-collision`. Once head alignment is known, the demo exports the ignored `data/garden/debug/collision_proxy_world.obj`, including the detailed world-space reference proxy and placement-frame axes. Runtime contact uses the calibrated closed tabletop cylinder, patio surface, and understructure boxes described above.
 

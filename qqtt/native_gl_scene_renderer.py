@@ -241,6 +241,7 @@ class NativeGlSceneRenderer:
         device: torch.device | str | None = None,
         output_ring_size: int = 4,
         progress_callback: Callable[[dict[str, Any]], None] | None = None,
+        tracked_mesh_obj: str | Path | None = None,
     ) -> None:
         self.scene_root = _resolve_scene_root(scene_assets_root)
         self.width = int(width)
@@ -284,7 +285,31 @@ class NativeGlSceneRenderer:
             self.scene_root / str(self.manifest["scene_material"])
         )
         self._publish_progress("parse_scene_mesh", "Loading scene mesh")
-        self._asset_groups = self._parse_obj_groups()
+        self._asset_groups = self._parse_obj_groups(
+            self.scene_root / str(self.manifest["scene_model"]),
+            excluded_faces_by_material=self._background_excluded_faces,
+        )
+        self._tracked_mesh_obj_path: Path | None = None
+        self._tracked_asset_groups: list[_ObjGroupAsset] = []
+        if tracked_mesh_obj is not None:
+            tracked_mesh_obj_path = Path(tracked_mesh_obj)
+            if not tracked_mesh_obj_path.is_absolute():
+                tracked_mesh_obj_path = self.scene_root / tracked_mesh_obj_path
+            tracked_mesh_obj_path = tracked_mesh_obj_path.resolve()
+            if not tracked_mesh_obj_path.is_file():
+                raise FileNotFoundError(
+                    f"Tracked mesh OBJ was not found: {tracked_mesh_obj_path}"
+                )
+            tracked_mtl_path = tracked_mesh_obj_path.with_suffix(".mtl")
+            if not tracked_mtl_path.is_file():
+                raise FileNotFoundError(
+                    f"Tracked mesh material was not found: {tracked_mtl_path}"
+                )
+            self._materials.update(_parse_mtl(tracked_mtl_path))
+            self._tracked_mesh_obj_path = tracked_mesh_obj_path
+            self._tracked_asset_groups = self._parse_obj_groups(
+                tracked_mesh_obj_path,
+            )
 
         self._platform = None
         self._gl = None
@@ -296,6 +321,7 @@ class NativeGlSceneRenderer:
         self._texture_cache: dict[str, int] = {}
         self._white_texture = 0
         self._meshes: list[_GlMesh] = []
+        self._tracked_meshes: list[_GlMesh] = []
         self._world_transform = np.eye(4, dtype=np.float32)
         self._interop_dims: tuple[int, int] | None = None
         self._color_pbo: _InteropBuffer | None = None
@@ -340,8 +366,14 @@ class NativeGlSceneRenderer:
             excluded.update(int(index) for index in record.get("face_indices", []))
         return {_BACKGROUND_MATERIAL: excluded} if excluded else {}
 
-    def _parse_obj_groups(self) -> list[_ObjGroupAsset]:
-        obj_path = self.scene_root / str(self.manifest["scene_model"])
+    def _parse_obj_groups(
+        self,
+        obj_path: str | Path,
+        *,
+        excluded_faces_by_material: dict[str, set[int]] | None = None,
+    ) -> list[_ObjGroupAsset]:
+        obj_path = Path(obj_path)
+        excluded_faces_by_material = excluded_faces_by_material or {}
         positions: list[tuple[float, float, float]] = []
         uvs: list[tuple[float, float]] = []
         normals: list[tuple[float, float, float]] = []
@@ -401,7 +433,7 @@ class NativeGlSceneRenderer:
                 elif key == "f" and len(parts) >= 4:
                     face_index = material_face_index.get(current_material, 0)
                     material_face_index[current_material] = face_index + 1
-                    excluded = self._background_excluded_faces.get(current_material)
+                    excluded = excluded_faces_by_material.get(current_material)
                     if excluded is not None and face_index in excluded:
                         continue
                     parsed = [
@@ -939,14 +971,32 @@ class NativeGlSceneRenderer:
         self._upload_meshes()
 
     def _upload_meshes(self) -> None:
+        self._meshes = self._upload_mesh_groups(
+            self._asset_groups,
+            transform=self._world_transform,
+        )
+        self._tracked_meshes = self._upload_mesh_groups(
+            self._tracked_asset_groups,
+            transform=np.eye(4, dtype=np.float32),
+            force_texture_color=True,
+        )
+
+    def _upload_mesh_groups(
+        self,
+        groups: list[_ObjGroupAsset],
+        *,
+        transform: np.ndarray,
+        force_texture_color: bool = False,
+    ) -> list[_GlMesh]:
         gl = self._gl
         assert gl is not None
-        matrix3 = self._world_transform[:3, :3]
+        transform = np.asarray(transform, dtype=np.float32)
+        matrix3 = transform[:3, :3]
         normal_matrix = np.linalg.inv(matrix3).T.astype(np.float32)
         meshes: list[_GlMesh] = []
-        for group in self._asset_groups:
+        for group in groups:
             vertices = np.asarray(group.vertices, dtype=np.float32)
-            positions = _transform_points(vertices[:, :3], self._world_transform)
+            positions = _transform_points(vertices[:, :3], transform)
             normals = _normalize_rows(vertices[:, 5:8] @ normal_matrix.T)
             upload = np.ascontiguousarray(
                 np.column_stack([positions, vertices[:, 3:5], normals]).astype(
@@ -956,7 +1006,12 @@ class NativeGlSceneRenderer:
             indices = np.ascontiguousarray(group.indices.astype(np.uint32))
             material = self._materials.get(group.material_name)
             texture_id = self._texture_for_material(material)
-            if material is None:
+            if force_texture_color and material is not None and material.texture_name:
+                # ILLIXR's debugview displays the headset's baked texture
+                # directly.  Its MTL Kd values describe Blender materials and
+                # would otherwise darken the already-baked pixels a second time.
+                color_factor = np.ones((3,), dtype=np.float32)
+            elif material is None:
                 color_factor = np.ones((3,), dtype=np.float32)
             elif material.texture_name is None:
                 color_factor = np.clip(
@@ -1020,7 +1075,7 @@ class NativeGlSceneRenderer:
                     color_factor=color_factor,
                 )
             )
-        self._meshes = meshes
+        return meshes
 
     def _ensure_cuda_readback_targets(self) -> None:
         width = int(self.width)
@@ -1103,9 +1158,14 @@ class NativeGlSceneRenderer:
         camera_pose_world: np.ndarray,
         intrinsic: np.ndarray,
         target_name: str,
+        *,
+        tracked_mesh_pose_world: np.ndarray | None = None,
+        draw_scene: bool = True,
     ) -> tuple[float, int, int]:
-        if not self._meshes:
+        if draw_scene and not self._meshes:
             raise RuntimeError("Native GL scene layout has not been configured.")
+        if tracked_mesh_pose_world is not None and not self._tracked_meshes:
+            raise RuntimeError("Native GL tracked mesh has not been configured.")
         gl = self._gl
         assert gl is not None
         self._platform.make_current()
@@ -1120,13 +1180,12 @@ class NativeGlSceneRenderer:
         view = np.linalg.inv(np.asarray(camera_pose_world, dtype=np.float32)).astype(
             np.float32
         )
-        mvp = (projection @ view).astype(np.float32)
+        scene_mvp = (projection @ view).astype(np.float32)
 
         start = time.perf_counter()
         gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, int(target["draw_fbo"]))
         gl.glViewport(0, 0, self.width, self.height)
         gl.glUseProgram(self._program)
-        gl.glUniformMatrix4fv(self._uniform_mvp, 1, gl.GL_TRUE, mvp)
         gl.glUniform1i(self._uniform_texture, 0)
         gl.glActiveTexture(gl.GL_TEXTURE0)
         clear = [float(v) / 255.0 for v in _DEFAULT_CLEAR_RGBA]
@@ -1135,18 +1194,37 @@ class NativeGlSceneRenderer:
         gl.glClear(gl.GL_COLOR_BUFFER_BIT | gl.GL_DEPTH_BUFFER_BIT)
         draw_calls = 0
         triangle_count = 0
-        for mesh in self._meshes:
-            gl.glBindTexture(gl.GL_TEXTURE_2D, mesh.texture_id)
-            gl.glUniform3fv(self._uniform_color_factor, 1, mesh.color_factor)
-            gl.glBindVertexArray(mesh.vao)
-            gl.glDrawElements(
-                gl.GL_TRIANGLES,
-                mesh.index_count,
-                gl.GL_UNSIGNED_INT,
-                None,
+
+        def _draw_mesh_group(meshes: list[_GlMesh], mvp: np.ndarray) -> None:
+            nonlocal draw_calls
+            nonlocal triangle_count
+            if not meshes:
+                return
+            gl.glUniformMatrix4fv(self._uniform_mvp, 1, gl.GL_TRUE, mvp)
+            for mesh in meshes:
+                gl.glBindTexture(gl.GL_TEXTURE_2D, mesh.texture_id)
+                gl.glUniform3fv(self._uniform_color_factor, 1, mesh.color_factor)
+                gl.glBindVertexArray(mesh.vao)
+                gl.glDrawElements(
+                    gl.GL_TRIANGLES,
+                    mesh.index_count,
+                    gl.GL_UNSIGNED_INT,
+                    None,
+                )
+                draw_calls += 1
+                triangle_count += mesh.triangle_count
+
+        if draw_scene:
+            _draw_mesh_group(self._meshes, scene_mvp)
+        if tracked_mesh_pose_world is not None:
+            tracked_pose = np.asarray(
+                tracked_mesh_pose_world,
+                dtype=np.float32,
             )
-            draw_calls += 1
-            triangle_count += mesh.triangle_count
+            if tracked_pose.shape != (4, 4) or not np.all(np.isfinite(tracked_pose)):
+                raise ValueError("Tracked mesh pose must be a finite 4x4 matrix.")
+            tracked_mvp = (projection @ view @ tracked_pose).astype(np.float32)
+            _draw_mesh_group(self._tracked_meshes, tracked_mvp)
         gl.glBindVertexArray(0)
         gl.glBindTexture(gl.GL_TEXTURE_2D, 0)
         gl.glUseProgram(0)
@@ -1219,6 +1297,8 @@ class NativeGlSceneRenderer:
         height: int | None = None,
         *,
         target_name: str = "center",
+        tracked_mesh_pose_world: np.ndarray | None = None,
+        draw_scene: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if width is not None and int(width) != int(self.width):
             raise ValueError(
@@ -1232,6 +1312,8 @@ class NativeGlSceneRenderer:
             camera_pose_world,
             intrinsic,
             str(target_name),
+            tracked_mesh_pose_world=tracked_mesh_pose_world,
+            draw_scene=bool(draw_scene),
         )
         color, depth, readback_ms = self._read_target_to_cuda(str(target_name))
         self._last_render_debug = {
@@ -1241,6 +1323,8 @@ class NativeGlSceneRenderer:
             "native_gl_readback_wall_ms": float(readback_ms),
             "draw_calls": int(draw_calls),
             "triangle_count": int(triangle_count),
+            "tracked_mesh_drawn": bool(tracked_mesh_pose_world is not None),
+            "scene_drawn": bool(draw_scene),
             "width": int(self.width),
             "height": int(self.height),
             "native_gl_texture_mode": self.texture_mode,
@@ -1308,7 +1392,14 @@ class NativeGlSceneRenderer:
                 sum(mesh.triangle_count for mesh in self._meshes)
             ),
             "vertex_count_per_eye": int(sum(mesh.vertex_count for mesh in self._meshes)),
-            "material_count": int(len(self._meshes)),
+            "tracked_mesh_draw_calls": int(len(self._tracked_meshes)),
+            "tracked_mesh_triangle_count": int(
+                sum(mesh.triangle_count for mesh in self._tracked_meshes)
+            ),
+            "tracked_mesh_vertex_count": int(
+                sum(mesh.vertex_count for mesh in self._tracked_meshes)
+            ),
+            "material_count": int(len(self._meshes) + len(self._tracked_meshes)),
             "texture_count": int(len(self._texture_cache)),
             "readback_mode": self.pyrender_readback_mode(),
             "texture_mode": self.texture_mode,
@@ -1346,8 +1437,9 @@ class NativeGlSceneRenderer:
         gl = self._gl
         if gl is None:
             self._meshes = []
+            self._tracked_meshes = []
             return
-        for mesh in self._meshes:
+        for mesh in self._meshes + self._tracked_meshes:
             try:
                 gl.glDeleteBuffers(1, [int(mesh.ebo)])
                 gl.glDeleteBuffers(1, [int(mesh.vbo)])
@@ -1355,6 +1447,7 @@ class NativeGlSceneRenderer:
             except Exception:
                 pass
         self._meshes = []
+        self._tracked_meshes = []
 
     def delete(self) -> None:
         gl = self._gl

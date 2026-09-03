@@ -1,0 +1,514 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Boba Immersive Demo — Operator Guide</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --page: #f4f7fb;
+      --panel: #ffffff;
+      --ink: #172033;
+      --muted: #5f6b7d;
+      --line: #dbe2ec;
+      --blue: #2457d6;
+      --blue-dark: #173e9f;
+      --blue-soft: #eaf0ff;
+      --amber: #9a5b00;
+      --amber-soft: #fff4d8;
+      --green: #19663e;
+      --green-soft: #e8f6ee;
+      --code: #111827;
+      --code-ink: #edf4ff;
+      --shadow: 0 12px 32px rgba(24, 39, 75, 0.09);
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      background:
+        radial-gradient(circle at 8% -5%, #dce7ff 0, transparent 30rem),
+        var(--page);
+      color: var(--ink);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+        "Segoe UI", sans-serif;
+      line-height: 1.5;
+    }
+
+    main {
+      width: min(1080px, calc(100% - 32px));
+      margin: 36px auto 64px;
+    }
+
+    header {
+      margin-bottom: 22px;
+      padding: 32px;
+      border: 1px solid #cbd8f6;
+      border-radius: 22px;
+      background: linear-gradient(135deg, #ffffff 35%, #edf3ff);
+      box-shadow: var(--shadow);
+    }
+
+    .eyebrow {
+      margin: 0 0 8px;
+      color: var(--blue);
+      font-size: 0.78rem;
+      font-weight: 800;
+      letter-spacing: 0.11em;
+      text-transform: uppercase;
+    }
+
+    h1, h2, h3 { line-height: 1.16; }
+    h1 { margin: 0; font-size: clamp(2rem, 5vw, 3.35rem); letter-spacing: -0.04em; }
+    h2 { margin: 0 0 18px; font-size: 1.45rem; }
+    h3 { margin: 0 0 8px; font-size: 1.08rem; }
+
+    header > p:not(.eyebrow) {
+      max-width: 720px;
+      margin: 13px 0 0;
+      color: var(--muted);
+      font-size: 1.04rem;
+    }
+
+    .badges { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 19px; }
+    .badge {
+      padding: 6px 10px;
+      border-radius: 999px;
+      background: var(--green-soft);
+      color: var(--green);
+      font-size: 0.82rem;
+      font-weight: 750;
+    }
+
+    section {
+      margin-top: 18px;
+      padding: 25px;
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      background: var(--panel);
+      box-shadow: 0 7px 20px rgba(24, 39, 75, 0.055);
+    }
+
+    .step-label {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 30px;
+      height: 30px;
+      margin-right: 8px;
+      border-radius: 9px;
+      background: var(--blue);
+      color: white;
+      font-size: 0.9rem;
+      vertical-align: 2px;
+    }
+
+    .command-card {
+      overflow: hidden;
+      margin: 13px 0 17px;
+      border-radius: 13px;
+      background: var(--code);
+    }
+
+    .command-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 10px 11px 9px 16px;
+      border-bottom: 1px solid #2d3748;
+      color: #aebbd0;
+      font-size: 0.79rem;
+      font-weight: 750;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+    }
+
+    pre {
+      overflow-x: auto;
+      margin: 0;
+      padding: 17px;
+      color: var(--code-ink);
+      font: 0.92rem/1.62 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      white-space: pre;
+    }
+
+    button.copy {
+      min-width: 92px;
+      padding: 8px 12px;
+      border: 1px solid #64748b;
+      border-radius: 9px;
+      background: #263247;
+      color: white;
+      cursor: pointer;
+      font: inherit;
+      font-size: 0.78rem;
+      font-weight: 800;
+      letter-spacing: 0;
+      text-transform: none;
+    }
+
+    button.copy:hover { background: #35445e; }
+    button.copy:focus-visible { outline: 3px solid #8bb2ff; outline-offset: 2px; }
+    button.copy.copied { border-color: #61c48b; background: #17663e; }
+
+    ol, ul { margin: 11px 0 0; padding-left: 1.35rem; }
+    li + li { margin-top: 7px; }
+    code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+
+    .note {
+      margin-top: 17px;
+      padding: 16px 17px;
+      border-left: 5px solid #e8a323;
+      border-radius: 10px;
+      background: var(--amber-soft);
+      color: #654311;
+    }
+
+    .note strong { color: var(--amber); }
+
+    .saved-values {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px;
+      margin: 13px 0;
+    }
+
+    .saved-value {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      padding: 12px 13px;
+      border: 1px solid #e6ca86;
+      border-radius: 10px;
+      background: #fffaf0;
+    }
+
+    .saved-value small { display: block; color: #7d6842; font-weight: 700; }
+    .saved-value code { display: block; margin-top: 2px; color: #503a13; font-weight: 800; }
+    .saved-value button.copy { min-width: 68px; background: #72501a; }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 16px;
+    }
+
+    .scene-card {
+      padding: 19px;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: #fbfcff;
+    }
+
+    .scene-card p { margin: 6px 0 0; color: var(--muted); }
+    .scene-card .command-card { margin-bottom: 0; }
+
+    .check-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px 18px;
+      padding: 0;
+      list-style: none;
+    }
+
+    .check-grid li {
+      position: relative;
+      margin: 0;
+      padding: 11px 12px 11px 38px;
+      border-radius: 10px;
+      background: #f6f8fc;
+    }
+
+    .check-grid li::before {
+      content: "✓";
+      position: absolute;
+      left: 13px;
+      color: var(--green);
+      font-weight: 900;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.93rem;
+    }
+
+    th, td { padding: 10px 11px; border-bottom: 1px solid var(--line); text-align: left; }
+    th { color: var(--muted); font-size: 0.78rem; letter-spacing: 0.04em; text-transform: uppercase; }
+    td:first-child { width: 33%; font-weight: 750; }
+
+    details {
+      border-top: 1px solid var(--line);
+      padding: 13px 2px;
+    }
+
+    details:first-of-type { border-top: 0; }
+    summary { cursor: pointer; font-weight: 800; }
+    details p { margin: 9px 0 0; color: var(--muted); }
+
+    .stop {
+      border-color: #c9d8fb;
+      background: var(--blue-soft);
+    }
+
+    footer { padding: 24px 4px; color: var(--muted); text-align: center; font-size: 0.9rem; }
+    footer a { color: var(--blue); font-weight: 750; }
+
+    #copy-status {
+      position: fixed;
+      right: 18px;
+      bottom: 18px;
+      transform: translateY(90px);
+      padding: 11px 15px;
+      border-radius: 10px;
+      background: #13213b;
+      color: white;
+      box-shadow: var(--shadow);
+      font-weight: 750;
+      opacity: 0;
+      transition: 180ms ease;
+    }
+
+    #copy-status.visible { transform: translateY(0); opacity: 1; }
+
+    @media (max-width: 760px) {
+      main { width: min(100% - 20px, 1080px); margin-top: 10px; }
+      header, section { padding: 20px; border-radius: 14px; }
+      .grid, .saved-values, .check-grid { grid-template-columns: 1fr; }
+      .command-head { align-items: flex-start; }
+    }
+
+    @media print {
+      body { background: white; }
+      main { width: 100%; margin: 0; }
+      header, section { break-inside: avoid; box-shadow: none; }
+      button.copy, #copy-status { display: none; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <p class="eyebrow">On-site quick guide</p>
+      <h1>Boba Immersive Demo</h1>
+      <p>Launch ALVR, connect the Quest, then choose the mesh-based Lab or Gaussian Ambulance scene.</p>
+      <div class="badges">
+        <span class="badge">Offline page</span>
+        <span class="badge">Lab + Ambulance</span>
+        <span class="badge">One-click command copy</span>
+      </div>
+    </header>
+
+    <section>
+      <h2><span class="step-label">1</span>Start ALVR first</h2>
+      <p>Open Terminal 1, copy this block, paste it, and press Enter:</p>
+      <div class="command-card">
+        <div class="command-head">
+          <span>Terminal 1 · ALVR</span>
+          <button class="copy" type="button" data-copy="cmd-alvr">Copy command</button>
+        </div>
+        <pre id="cmd-alvr">cd /home/yihan/Downloads/alvr_streamer_linux/bin
+./alvr_dashboard</pre>
+      </div>
+      <ol>
+        <li>Put the computer and Quest on <strong>Emacs</strong>, the default demo network.</li>
+        <li>Start SteamVR, then open ALVR on the Quest.</li>
+        <li>Choose <strong>Trust</strong> in the desktop dashboard.</li>
+        <li>Confirm SteamVR sees the headset and both controllers.</li>
+      </ol>
+
+      <div class="note">
+        <h3>Using a network other than Emacs?</h3>
+        <p>First compare the connection values below with the <strong>Hostname</strong> and <strong>IP address</strong> shown inside ALVR on the Quest.</p>
+        <div class="saved-values">
+          <div class="saved-value">
+            <span><small>Current hostname</small><code id="saved-hostname">7921.client</code></span>
+            <button class="copy" type="button" data-copy="saved-hostname">Copy</button>
+          </div>
+          <div class="saved-value">
+            <span><small>Current IP address</small><code id="saved-ip">10.200.15.239</code></span>
+            <button class="copy" type="button" data-copy="saved-ip">Copy</button>
+          </div>
+        </div>
+        <ol>
+          <li>Connect the computer and Quest to the same low-latency network.</li>
+          <li>In the desktop dashboard, open <strong>Devices → Edit connection</strong>.</li>
+          <li>Replace both fields with the exact values displayed inside the Quest.</li>
+          <li>Use <strong>Add new</strong> only to keep another known IP, then choose <strong>Save</strong> and <strong>Trust</strong>.</li>
+        </ol>
+        <p><strong>Important:</strong> enter the Quest values, not the computer hostname or IP.</p>
+      </div>
+    </section>
+
+    <section>
+      <h2><span class="step-label">2</span>Prepare for alignment</h2>
+      <ul class="check-grid">
+        <li>Computer is on power</li>
+        <li>Quest and controller batteries are ready</li>
+        <li>Wearer is standing with the Quest on and upright</li>
+        <li>Wearer is looking naturally forward</li>
+      </ul>
+      <div class="note"><strong>Do not launch with the headset on a desk.</strong> Startup captures its position and direction.</div>
+      <p>The launcher uses an explicit <strong>standing</strong> layout; automatic posture detection is not enabled. Add <code>--immersive_start_posture seated</code> only for a seated test.</p>
+    </section>
+
+    <section>
+      <h2><span class="step-label">3</span>Choose and launch one scene</h2>
+      <div class="grid">
+        <article class="scene-card">
+          <h3>Lab <small>· default mesh scene</small></h3>
+          <p>Rope game with course, targets, timer, and HUD. Sloth is free play. Standing eye height is 1.55 m above the floor; the table is 0.82 m below and 0.78 m ahead.</p>
+          <div class="command-card">
+            <div class="command-head">
+              <span>Terminal 2 · Lab</span>
+              <button class="copy" type="button" data-copy="cmd-lab">Copy command</button>
+            </div>
+            <pre id="cmd-lab">source /home/yihan/miniconda3/etc/profile.d/conda.sh
+cd /home/yihan/Research/Boba-Demo
+./boba_app.sh</pre>
+          </div>
+        </article>
+
+        <article class="scene-card">
+          <h3>Ambulance <small>· Gaussian scene</small></h3>
+          <p>Clear-aisle view facing Rope on the stretcher. Standing eye height is 1.45 m above the floor with a 30° downward view. Rope and Sloth are both free play.</p>
+          <div class="command-card">
+            <div class="command-head">
+              <span>Terminal 2 · Ambulance</span>
+              <button class="copy" type="button" data-copy="cmd-ambulance">Copy command</button>
+            </div>
+            <pre id="cmd-ambulance">source /home/yihan/miniconda3/etc/profile.d/conda.sh
+cd /home/yihan/Research/Boba-Demo
+./boba_app.sh --scene ambulance</pre>
+          </div>
+        </article>
+      </div>
+      <p>The launcher selects <code>phystwin-cu132</code> automatically. To change scenes, stop and relaunch. Rope and Sloth can be switched without restarting.</p>
+    </section>
+
+    <section>
+      <h2><span class="step-label">4</span>Finish startup</h2>
+      <ol>
+        <li>Press either trigger once for each tutorial page.</li>
+        <li>On the last page, wait for <strong>Ready</strong>, release the trigger, then press it once.</li>
+        <li>Check that Rope and the chosen scene appear in the headset.</li>
+        <li>Check both controller rays and test one grab and release.</li>
+        <li>Check that the desktop window shows the scene, object, rays, and headset.</li>
+      </ol>
+      <p>The first launch can pause while CUDA or the OpenXR bridge compiles. Keep the terminal open while it continues printing output.</p>
+    </section>
+
+    <section>
+      <h2>Headset controls</h2>
+      <table>
+        <thead><tr><th>Control</th><th>Action</th></tr></thead>
+        <tbody>
+          <tr><td>Trigger</td><td>Advance tutorial; hold to grab, release to drop</td></tr>
+          <tr><td>Point at marker</td><td>Select that interaction point automatically</td></tr>
+          <tr><td>X or A</td><td>Optionally cycle interaction points</td></tr>
+          <tr><td>Y or B · short</td><td>Restart Lab Rope or reset the current free-play object</td></tr>
+          <tr><td>Y or B · hold 0.75 s</td><td>Open the Rope/Sloth selector</td></tr>
+          <tr><td>Joystick up/down</td><td>Move one selector row; recenter before moving again</td></tr>
+          <tr><td>Trigger in selector</td><td>Confirm highlighted object</td></tr>
+          <tr><td>Y or B in selector</td><td>Cancel selector</td></tr>
+          <tr><td>Grip · hold</td><td>Exit demo</td></tr>
+        </tbody>
+      </table>
+      <p>Wait for the loading overlay when switching Rope or Sloth. Do not press the selection buttons repeatedly.</p>
+    </section>
+
+    <section class="stop">
+      <h2>Reset or stop</h2>
+      <ul>
+        <li>Between attendees, short-press <strong>Y or B</strong>. In Ambulance, this returns the object to the stretcher.</li>
+        <li>If a new wearer has a badly tilted view, relaunch while they wear the upright headset and look forward.</li>
+        <li>To stop normally, press <strong>Ctrl+C</strong> in Terminal 2. Holding either Grip also exits.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Quick troubleshooting</h2>
+      <details>
+        <summary>Headset or controllers are not detected</summary>
+        <p>Stop the demo. Confirm ALVR is open on the Quest, the dashboard trusts it, and SteamVR shows the headset and both controllers. Then relaunch.</p>
+      </details>
+      <details>
+        <summary>Initial view is tilted or displaced</summary>
+        <p>Stop, recenter SteamVR/ALVR if needed, and relaunch with the headset worn upright while the wearer looks forward.</p>
+      </details>
+      <details>
+        <summary>Final tutorial page does not continue</summary>
+        <p>Wait for <strong>Ready</strong>, fully release the trigger, and press it once.</p>
+      </details>
+      <details>
+        <summary>Object switching appears frozen</summary>
+        <p>Wait for the progress overlay. If the terminal reports an error or stops progressing, press Ctrl+C, verify SteamVR remains connected, and relaunch the same scene.</p>
+      </details>
+    </section>
+
+    <footer>
+      This page works without Internet access. See the
+      <a href="IMMERSIVE_DEMO_OPERATOR_GUIDE.md">plain Markdown guide</a>
+      for the same operating procedure.
+    </footer>
+  </main>
+
+  <div id="copy-status" role="status" aria-live="polite">Copied</div>
+
+  <script>
+    const statusBubble = document.getElementById("copy-status");
+    let statusTimer;
+
+    function fallbackCopy(text) {
+      const textArea = document.createElement("textarea");
+      textArea.value = text;
+      textArea.setAttribute("readonly", "");
+      textArea.style.position = "fixed";
+      textArea.style.opacity = "0";
+      document.body.appendChild(textArea);
+      textArea.select();
+      const copied = document.execCommand("copy");
+      textArea.remove();
+      if (!copied) throw new Error("Copy command was rejected");
+    }
+
+    async function copyText(text) {
+      if (navigator.clipboard && window.isSecureContext) {
+        await navigator.clipboard.writeText(text);
+      } else {
+        fallbackCopy(text);
+      }
+    }
+
+    function showStatus(message) {
+      statusBubble.textContent = message;
+      statusBubble.classList.add("visible");
+      clearTimeout(statusTimer);
+      statusTimer = setTimeout(() => statusBubble.classList.remove("visible"), 1700);
+    }
+
+    document.querySelectorAll("button[data-copy]").forEach((button) => {
+      button.addEventListener("click", async () => {
+        const source = document.getElementById(button.dataset.copy);
+        const original = button.textContent;
+        try {
+          await copyText(source.textContent.trim());
+          button.textContent = "Copied";
+          button.classList.add("copied");
+          showStatus("Copied to clipboard");
+        } catch (error) {
+          showStatus("Copy failed — select the text manually");
+        }
+        setTimeout(() => {
+          button.textContent = original;
+          button.classList.remove("copied");
+        }, 1700);
+      });
+    });
+  </script>
+</body>
+</html>

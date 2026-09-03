@@ -8,11 +8,11 @@
 
 This branch packages Boba Demo 2: a 100-session batched replay on the workstation display with QR-based phone claiming, phone controls, and a low-latency per-session phone stream.
 
-## Prerequisites
+## Self-contained runtime and prerequisites
 
-This branch already contains the Boba-Batched runtime source, the custom
-`gsplat` source, and the packaged Rope and Sloth demo assets. A separate
-Boba-Batched checkout is **not** required.
+This branch contains all Boba-Batched runtime files needed by the phone demo,
+the custom `gsplat` source, and the packaged Rope and Sloth demo assets. A
+separate Boba or Boba-Batched checkout is **not** required.
 
 The repository does not bundle a Conda environment. Before setup, the demo
 computer must have the `phystwin` environment with its CUDA/rendering

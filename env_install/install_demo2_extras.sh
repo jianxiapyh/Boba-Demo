@@ -94,7 +94,7 @@ from importlib import metadata
 from pathlib import Path
 
 # Pin every distribution already present. pip may add missing web dependencies,
-# but cannot upgrade, downgrade, or replace anything in the working Boba env.
+# but cannot upgrade, downgrade, or replace anything in the existing environment.
 installed = {}
 for distribution in metadata.distributions():
     name = distribution.metadata.get("Name")

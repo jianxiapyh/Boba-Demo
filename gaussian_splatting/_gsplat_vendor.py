@@ -39,7 +39,7 @@ def _is_vendored_gsplat_module(gsplat_module) -> bool:
 def _prepare_vendored_gsplat_import() -> None:
     if not VENDORED_GSPLAT_PACKAGE.is_dir():
         raise RuntimeError(
-            "Boba Phone Demo could not find the Boba-Batched gsplat source tree.\n"
+            "Boba Phone Demo could not find its bundled gsplat source tree.\n"
             f"{_install_hint()}"
         )
     vendored_root = str(VENDORED_GSPLAT_ROOT)

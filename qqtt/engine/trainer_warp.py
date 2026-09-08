@@ -2692,7 +2692,7 @@ class InvPhyTrainerWarp:
         replay_start = int(replay_start)
         replay_len = int(replay_end - replay_start)
         print(
-            "[Demo2] Runtime ready: "
+            "[Demo2] Simulation initialized: "
             f"batch_size={runtime.batch_size}, replay={replay_start}:{replay_end}, "
             f"gaussian_render_mode={gaussian_render_mode}, sim_force_mode={sim_force_mode}, "
             f"control_parts={demo2_control_parts}, runtime_fps={float(demo2_runtime_fps):g}"
@@ -2771,6 +2771,7 @@ class InvPhyTrainerWarp:
                 for part_idx, indices in enumerate(interaction_masks)
             )
         )
+        print("[Demo2] Preparing first frame; CUDA kernels may compile on first use.")
         replay_action_table = build_replay_action_table(
             controller_points_group[:batch_size].detach().cpu().numpy(),
             [indices.detach().cpu().numpy() for indices in interaction_masks],
@@ -3343,6 +3344,8 @@ class InvPhyTrainerWarp:
                         list(replay_cursors),
                         controls_by_session,
                     )
+                if frame_counter == 0:
+                    print("[Demo2] First frame displayed; playground is ready.")
 
                 end_of_replay_sessions = []
                 for session_id in range(int(runtime.batch_size)):

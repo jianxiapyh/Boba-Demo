@@ -155,12 +155,20 @@ They contain only the checkpoint, calibration, metadata, optimized parameters,
 final data, Gaussian PLY, background, and filtered controller bank required at
 runtime.
 
+The original `data/`, `experiments/`, and `experiments_optimization/` folders
+are not required by the phone demo. Their required outputs are packaged in
+these case directories. The renderer code and custom gsplat source are bundled
+under `gaussian_splatting/`. Validate the payloads with
+`python tools/validate_demo2_assets.py --case double_stretch_sloth`.
+
 The raw trajectory bank and original training dataset are intentionally excluded. `demos/filter_demo_trajectories.py` remains a developer tool for users who separately possess those inputs.
 
 ## Troubleshooting
 
 - **Wrong environment:** activate `phystwin` or `phystwin-cu132`; the scripts reject other environments.
 - **OpenGL/display failure:** confirm `DISPLAY` is set and launch from the computer's local X11 desktop session.
+- **Black window during startup:** `Simulation initialized` precedes rendering. Wait for `First frame displayed; playground is ready.` The first launch may compile CUDA kernels; check terminal output for errors if it does not finish.
 - **`libstdc++` import errors:** launch through `scripts/run_demo2.sh`, which places `$CONDA_PREFIX/lib` before system libraries.
 - **Phone cannot connect:** confirm both devices are on the same non-isolated LAN, allow TCP `7860`, and use an explicit `--public_url`.
 - **CUDA out of memory:** retry with a smaller explicit `--batch_size` and matching `--batch_grid_cols`.
+- **cu132 out of memory at `torch.linalg.eigh`:** update the phone-demo branch. The rotation solver now processes at most 4,096 bone matrices per call, avoiding the 15–30 GiB temporary allocations seen with 25–49 Sloth instances on an RTX 4090. Other rendering allocations still depend on batch size and image resolution.

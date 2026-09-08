@@ -1,4 +1,5 @@
 import os
+import re
 import torch
 import torch.nn.functional as F
 # from e3nn import o3
@@ -7,6 +8,38 @@ import torch.nn.functional as F
 """
 Some functions are borrowed from PhysDreamer: https://github.com/a1600012888/PhysDreamer/blob/main/physdreamer/gaussian_3d/utils/rigid_body_utils.py
 """
+
+
+def eigh_3x3(matrices: torch.Tensor, chunk_size: int = 4096):
+    """Solve a batch of symmetric 3x3 matrices with bounded solver workspace.
+
+    cuSOLVER in the cu132 environment can request over 30 GiB of workspace
+    for the 118,923 bone matrices in a 49-instance Sloth replay. Independent
+    chunks retain the same eigendecomposition while reusing a smaller workspace.
+    """
+    if chunk_size < 1:
+        raise ValueError("chunk_size must be positive")
+    if matrices.ndim != 3 or matrices.shape[-2:] != (3, 3):
+        raise ValueError(f"Expected (N, 3, 3) matrices, got {matrices.shape}")
+    if matrices.shape[0] <= chunk_size:
+        return torch.linalg.eigh(matrices)
+
+    eigenvalues, eigenvectors = [], []
+    for start in range(0, matrices.shape[0], chunk_size):
+        try:
+            values, vectors = torch.linalg.eigh(matrices[start:start + chunk_size])
+        except torch.linalg.LinAlgError as exc:
+            # Keep the replay diagnostic's matrix index relative to the full
+            # input, rather than reporting an index local to this chunk.
+            message = re.sub(
+                r"Batch element (\d+)",
+                lambda match: f"Batch element {start + int(match.group(1))}",
+                str(exc),
+            )
+            raise torch.linalg.LinAlgError(message) from exc
+        eigenvalues.append(values)
+        eigenvectors.append(vectors)
+    return torch.cat(eigenvalues, dim=0), torch.cat(eigenvectors, dim=0)
 
 
 def _sqrt_positive_part(x: torch.Tensor) -> torch.Tensor:

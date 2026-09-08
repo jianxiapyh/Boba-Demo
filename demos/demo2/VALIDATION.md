@@ -176,3 +176,45 @@ A particular phone and LAN cannot be validated automatically. Before presenting 
   compiled the bundled gsplat extension and exited successfully. The web server
   was bound to localhost. This check covered one session; physical-phone access
   and batch-100 capacity were not tested on this machine.
+
+## 2026-09-08 RTX 4090 rotation workspace fix
+
+Environment: arches, RTX 4090 (23.52 GiB reported CUDA capacity), driver
+595.91.07, `phystwin-cu132`, PyTorch 2.12.1+cu132. Desktop and renderer settings
+were unchanged during the checks below.
+
+- Reproduced a first-frame failure at `torch.linalg.eigh(G)` with 49 Sloth
+  instances: cuSOLVER requested a 30.07 GiB temporary allocation. The operator
+  also reported a 15.34 GiB allocation failure during a 25-instance replay.
+- Limited each bone eigendecomposition call to 4,096 independent 3x3 matrices.
+  A standalone 4,096-matrix solve peaked at 1,069 MiB of allocated GPU memory.
+  The numerical regression reconstructs the input matrices, including singular
+  matrices and repeated eigenvalues, and checks full-input error indices.
+- All 63 phone-demo tests passed in `phystwin-cu132`, including GPU memory
+  regressions for 100-, 49-, and 25-instance Sloth-sized eigendecompositions.
+  Each solve stayed below the 2 GiB additional-allocation limit. The three CPU
+  regressions also passed in legacy `phystwin`; its GPU test was skipped.
+- Both packaged cases passed asset validation, including all nine manifest
+  entries and all eight recorded payload hashes. Original training and
+  optimization directories were not needed.
+
+Full-runtime checks used `double_stretch_sloth`, shared-template rendering,
+gather simulation forces, 640x480 images, localhost port 7861, and
+`--max_frames 410`. Every run exited successfully, published sequence 409,
+crossed two full 192-frame replay boundaries, and produced a visually inspected
+playground screenshot with the Sloth models and QR overlay.
+
+| Instances | Grid columns | Frames completed | Sampled peak whole-GPU usage |
+| --- | --- | --- | --- |
+| 25 | 5 | 410 | 5,694 MiB (5.56 GiB) |
+| 49 | 7 | 410 | 7,254 MiB (7.08 GiB) |
+| 100 | 10 | 410 | 13,522 MiB (13.21 GiB) |
+
+Whole-GPU usage was sampled every two seconds with `nvidia-smi` and includes
+desktop usage; these are observed samples rather than guaranteed memory caps.
+The first 25-instance run also rebuilt gsplat before displaying a frame. Later
+runs reused the build. Startup now distinguishes simulation initialization,
+first-frame preparation, and the first successfully displayed frame.
+
+These bounded replay checks did not attach physical phones or exercise the
+Cloudflare tunnel, simultaneous phone streams, or a sustained event workload.

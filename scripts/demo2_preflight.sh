@@ -88,7 +88,7 @@ from importlib import metadata
 missing = []
 for name in (
     "torch", "torchvision", "numpy", "scipy", "warp-lang",
-    "pycuda", "pytorch3d", "open3d", "PyOpenGL", "glfw", "kornia", "Pillow",
+    "pycuda", "open3d", "PyOpenGL", "glfw", "kornia", "Pillow",
 ):
     try:
         version = metadata.version(name)

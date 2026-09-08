@@ -6,7 +6,7 @@ import sys
 from pathlib import Path
 
 
-EXPECTED_CONDA_ENV = "phystwin"
+SUPPORTED_CONDA_ENVS = ("phystwin", "phystwin-cu132")
 VENDORED_GSPLAT_ROOT = Path(__file__).resolve().parent / "submodules" / "gsplat"
 VENDORED_GSPLAT_PACKAGE = VENDORED_GSPLAT_ROOT / "gsplat"
 
@@ -14,7 +14,7 @@ VENDORED_GSPLAT_PACKAGE = VENDORED_GSPLAT_ROOT / "gsplat"
 def _install_hint() -> str:
     return (
         "The phone-demo branch includes its required gsplat source.\n"
-        "  conda activate phystwin\n"
+        "  conda activate phystwin  # or phystwin-cu132\n"
         "  bash env_install/install_demo2_extras.sh\n"
         f"Bundled gsplat source: {VENDORED_GSPLAT_ROOT}"
     )
@@ -23,7 +23,7 @@ def _install_hint() -> str:
 def _active_env_name() -> str:
     env_name = os.environ.get("CONDA_DEFAULT_ENV")
     if env_name:
-        return env_name
+        return Path(env_name).name
     return Path(sys.prefix).resolve().name
 
 
@@ -57,10 +57,11 @@ def _prepare_vendored_gsplat_import() -> None:
 
 def validate_gsplat_runtime(gsplat_module) -> None:
     active_env = _active_env_name()
-    if active_env != EXPECTED_CONDA_ENV:
+    if active_env not in SUPPORTED_CONDA_ENVS:
         raise RuntimeError(
-            "Boba rendering only supports the vendored gsplat installed inside the "
-            f"{EXPECTED_CONDA_ENV!r} conda environment. Active env: {active_env!r}, "
+            "Boba rendering requires the bundled gsplat source inside the "
+            "'phystwin' or 'phystwin-cu132' conda environment. "
+            f"Active env: {active_env!r}, "
             f"sys.prefix: {Path(sys.prefix).resolve()}.\n{_install_hint()}"
         )
 
@@ -83,10 +84,11 @@ def validate_gsplat_runtime(gsplat_module) -> None:
 
 def import_gsplat():
     active_env = _active_env_name()
-    if active_env != EXPECTED_CONDA_ENV:
+    if active_env not in SUPPORTED_CONDA_ENVS:
         raise RuntimeError(
-            "Boba rendering only supports the vendored gsplat installed inside the "
-            f"{EXPECTED_CONDA_ENV!r} conda environment. Active env: {active_env!r}, "
+            "Boba rendering requires the bundled gsplat source inside the "
+            "'phystwin' or 'phystwin-cu132' conda environment. "
+            f"Active env: {active_env!r}, "
             f"sys.prefix: {Path(sys.prefix).resolve()}.\n{_install_hint()}"
         )
 
@@ -96,7 +98,7 @@ def import_gsplat():
         gsplat_module = importlib.import_module("gsplat")
     except ModuleNotFoundError as exc:
         raise RuntimeError(
-            "Boba could not import gsplat from the active phystwin environment.\n"
+            "Boba could not import gsplat from the active Conda environment.\n"
             f"{_install_hint()}"
         ) from exc
 
@@ -110,7 +112,7 @@ rasterization_shared_template = gsplat.rasterization_shared_template
 
 
 __all__ = [
-    "EXPECTED_CONDA_ENV",
+    "SUPPORTED_CONDA_ENVS",
     "VENDORED_GSPLAT_PACKAGE",
     "VENDORED_GSPLAT_ROOT",
     "gsplat",

@@ -2,10 +2,8 @@
 set -euo pipefail
 
 # Install only the small web/QR additions needed by Demo 2. The existing
-# phystwin environment remains the source of third-party core packages; the
+# phystwin or phystwin-cu132 environment supplies third-party core packages; the
 # Boba runtime source itself is bundled in this branch.
-
-EXPECTED_ENV="phystwin"
 
 die() {
   printf '[Demo2 extras] ERROR: %s\n' "$*" >&2
@@ -14,8 +12,8 @@ die() {
 
 active_env_name="${CONDA_DEFAULT_ENV:-}"
 active_env_name="${active_env_name##*/}"
-if [[ "${active_env_name}" != "${EXPECTED_ENV}" ]]; then
-  die "activate the ${EXPECTED_ENV} Conda environment before running this script (active: ${CONDA_DEFAULT_ENV:-none})."
+if [[ "${active_env_name}" != "phystwin" && "${active_env_name}" != "phystwin-cu132" ]]; then
+  die "activate phystwin or phystwin-cu132 before running this script (active: ${CONDA_DEFAULT_ENV:-none})."
 fi
 
 if [[ -z "${CONDA_PREFIX:-}" || ! -x "${CONDA_PREFIX}/bin/python" ]]; then
@@ -26,8 +24,8 @@ PYTHON="${CONDA_PREFIX}/bin/python"
 export PYTHONNOUSERSITE=1
 
 python_prefix_name="$("${PYTHON}" -c 'import pathlib, sys; print(pathlib.Path(sys.prefix).resolve().name)')"
-if [[ "${python_prefix_name}" != "${EXPECTED_ENV}" ]]; then
-  die "${PYTHON} belongs to ${python_prefix_name}, not ${EXPECTED_ENV}."
+if [[ "${python_prefix_name}" != "${active_env_name}" ]]; then
+  die "${PYTHON} belongs to ${python_prefix_name}, not ${active_env_name}."
 fi
 
 tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/boba-demo2-extras.XXXXXX")"

@@ -157,3 +157,22 @@ A particular phone and LAN cannot be validated automatically. Before presenting 
   the complete detector at 0.052 ms for one settling session, 0.053 ms for ten,
   and 0.066 ms for all 100 sessions (median; 0.069 ms p95 for 100). This is
   negligible beside simulation, rendering, and JPEG encoding.
+
+## 2026-09-07 CUDA 13.2 environment support
+
+- Setup, preflight, launch, and the bundled gsplat loader accept both `phystwin`
+  and `phystwin-cu132`. The original `phystwin` launcher (`--help`) and gsplat
+  import passed.
+- On an RTX 4090 with driver 595.91.07, `phystwin-cu132` uses Python 3.10.20,
+  PyTorch 2.12.1+cu132, and CUDA toolkit 13.2. The launcher selects the Conda
+  toolkit and supplies its target-specific CUDA header directory for gsplat JIT
+  compilation.
+- The guarded extras installer added Flask-Sock 0.7.0, simple-websocket 1.1.0,
+  and qrcode 8.2 with their missing dependencies; core package versions were
+  identical before and after installation.
+- Full GPU/OpenGL preflight and all 59 phone-demo tests passed. Neither
+  Torchaudio nor PyTorch3D is required by phone preflight.
+- A `double_stretch_sloth` smoke run with `--batch_size 1 --max_frames 3`
+  compiled the bundled gsplat extension and exited successfully. The web server
+  was bound to localhost. This check covered one session; physical-phone access
+  and batch-100 capacity were not tested on this machine.

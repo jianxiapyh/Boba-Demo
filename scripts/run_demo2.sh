@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-EXPECTED_ENV="phystwin"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 
 die() {
@@ -11,15 +10,17 @@ die() {
 
 active_env_name="${CONDA_DEFAULT_ENV:-}"
 active_env_name="${active_env_name##*/}"
-if [[ "${active_env_name}" != "${EXPECTED_ENV}" ]]; then
-  die "activate ${EXPECTED_ENV} before starting Demo 2 (active: ${CONDA_DEFAULT_ENV:-none})."
+if [[ "${active_env_name}" != "phystwin" && "${active_env_name}" != "phystwin-cu132" ]]; then
+  die "activate phystwin or phystwin-cu132 before starting Demo 2 (active: ${CONDA_DEFAULT_ENV:-none})."
 fi
 if [[ -z "${CONDA_PREFIX:-}" || ! -x "${CONDA_PREFIX}/bin/python" ]]; then
-  die "CONDA_PREFIX does not identify the active ${EXPECTED_ENV} environment."
+  die "CONDA_PREFIX does not identify the active ${active_env_name} environment."
 fi
 resolved_cuda_home="${CUDA_HOME:-}"
 if [[ -z "${resolved_cuda_home}" || ! -x "${resolved_cuda_home}/bin/nvcc" ]]; then
-  if command -v nvcc >/dev/null 2>&1; then
+  if [[ -x "${CONDA_PREFIX}/bin/nvcc" ]]; then
+    resolved_cuda_home="${CONDA_PREFIX}"
+  elif command -v nvcc >/dev/null 2>&1; then
     resolved_nvcc="$(readlink -f "$(command -v nvcc)")"
     resolved_cuda_home="$(cd "$(dirname "${resolved_nvcc}")/.." && pwd -P)"
   elif [[ -x /usr/local/cuda/bin/nvcc ]]; then
@@ -30,6 +31,12 @@ if [[ -z "${resolved_cuda_home}" || ! -x "${resolved_cuda_home}/bin/nvcc" ]]; th
 fi
 
 export CUDA_HOME="${resolved_cuda_home}"
+# Conda CUDA toolkits keep headers under a target directory. PyTorch's
+# extension builder needs this path when compiling gsplat's C++ sources.
+cuda_target_include="${CUDA_HOME}/targets/$(uname -m)-linux/include"
+if [[ -z "${CUDA_INC_PATH:-}" && -f "${cuda_target_include}/cuda_runtime.h" ]]; then
+  export CUDA_INC_PATH="${cuda_target_include}"
+fi
 export PYTHONNOUSERSITE=1
 export PATH="${CONDA_PREFIX}/bin:${CUDA_HOME}/bin:${PATH}"
 export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib:${CUDA_HOME}/lib64${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"

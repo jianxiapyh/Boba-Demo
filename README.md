@@ -15,12 +15,19 @@ the custom `gsplat` source, and the packaged Rope and Sloth demo assets. A
 separate Boba or Boba-Batched checkout is **not** required.
 
 The repository does not bundle a Conda environment. Before setup, the demo
-computer must have the `phystwin` environment with its CUDA/rendering
+computer must have a `phystwin` or `phystwin-cu132` environment with its CUDA/rendering
 dependencies, an NVIDIA CUDA toolkit, and a working X11/OpenGL desktop session.
 The phone-demo setup adds only the small web/QR packages; it does not replace or
 upgrade PyTorch, CUDA, Warp, PyCUDA, NumPy, or Open3D.
 
 ## One-time phone-demo setup
+
+The commands below use `phystwin`. If your installed environment is
+`phystwin-cu132`, activate that name instead; the same setup and launch scripts
+support both environments.
+
+When `CUDA_HOME` is unset, the scripts prefer the CUDA toolkit inside the active
+environment before searching the system `PATH`.
 
 ```bash
 conda activate phystwin
@@ -152,7 +159,7 @@ The raw trajectory bank and original training dataset are intentionally excluded
 
 ## Troubleshooting
 
-- **Wrong environment:** activate `phystwin`; the scripts reject other environments.
+- **Wrong environment:** activate `phystwin` or `phystwin-cu132`; the scripts reject other environments.
 - **OpenGL/display failure:** confirm `DISPLAY` is set and launch from the computer's local X11 desktop session.
 - **`libstdc++` import errors:** launch through `scripts/run_demo2.sh`, which places `$CONDA_PREFIX/lib` before system libraries.
 - **Phone cannot connect:** confirm both devices are on the same non-isolated LAN, allow TCP `7860`, and use an explicit `--public_url`.

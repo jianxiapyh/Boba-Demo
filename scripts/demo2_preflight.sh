@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-EXPECTED_ENV="phystwin"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 failures=0
 
@@ -20,23 +19,23 @@ fail() {
 
 active_env_name="${CONDA_DEFAULT_ENV:-}"
 active_env_name="${active_env_name##*/}"
-if [[ "${active_env_name}" == "${EXPECTED_ENV}" ]]; then
-  ok "active Conda environment is ${EXPECTED_ENV}"
+if [[ "${active_env_name}" == "phystwin" || "${active_env_name}" == "phystwin-cu132" ]]; then
+  ok "active Conda environment is ${active_env_name}"
 else
-  fail "activate ${EXPECTED_ENV} first (active: ${CONDA_DEFAULT_ENV:-none})"
+  fail "activate phystwin or phystwin-cu132 first (active: ${CONDA_DEFAULT_ENV:-none})"
 fi
 
 if [[ -n "${CONDA_PREFIX:-}" && -x "${CONDA_PREFIX}/bin/python" ]]; then
   PYTHON="${CONDA_PREFIX}/bin/python"
   python_prefix_name="$("${PYTHON}" -c 'import pathlib, sys; print(pathlib.Path(sys.prefix).resolve().name)' 2>/dev/null || true)"
-  if [[ "${python_prefix_name}" == "${EXPECTED_ENV}" ]]; then
-    ok "Python resolves inside ${EXPECTED_ENV}: ${PYTHON}"
+  if [[ "${python_prefix_name}" == "${active_env_name}" ]]; then
+    ok "Python resolves inside ${active_env_name}: ${PYTHON}"
   else
-    fail "${PYTHON} resolves to environment ${python_prefix_name:-unknown}, not ${EXPECTED_ENV}"
+    fail "${PYTHON} resolves to environment ${python_prefix_name:-unknown}, not ${active_env_name:-unknown}"
   fi
 else
   fail "CONDA_PREFIX does not contain an executable Python"
-  printf '[Demo2 preflight] Stop: activate phystwin and rerun this preflight.\n' >&2
+  printf '[Demo2 preflight] Stop: activate phystwin or phystwin-cu132 and rerun this preflight.\n' >&2
   exit 1
 fi
 
@@ -66,7 +65,9 @@ fi
 
 resolved_cuda_home="${CUDA_HOME:-}"
 if [[ -z "${resolved_cuda_home}" || ! -x "${resolved_cuda_home}/bin/nvcc" ]]; then
-  if command -v nvcc >/dev/null 2>&1; then
+  if [[ -x "${CONDA_PREFIX}/bin/nvcc" ]]; then
+    resolved_cuda_home="${CONDA_PREFIX}"
+  elif command -v nvcc >/dev/null 2>&1; then
     resolved_nvcc="$(readlink -f "$(command -v nvcc)")"
     resolved_cuda_home="$(cd "$(dirname "${resolved_nvcc}")/.." && pwd -P)"
   elif [[ -x /usr/local/cuda/bin/nvcc ]]; then
@@ -75,6 +76,10 @@ if [[ -z "${resolved_cuda_home}" || ! -x "${resolved_cuda_home}/bin/nvcc" ]]; th
 fi
 if [[ -n "${resolved_cuda_home}" && -x "${resolved_cuda_home}/bin/nvcc" ]]; then
   export CUDA_HOME="${resolved_cuda_home}"
+  cuda_target_include="${CUDA_HOME}/targets/$(uname -m)-linux/include"
+  if [[ -z "${CUDA_INC_PATH:-}" && -f "${cuda_target_include}/cuda_runtime.h" ]]; then
+    export CUDA_INC_PATH="${cuda_target_include}"
+  fi
   ok "CUDA toolkit: ${CUDA_HOME}"
   "${CUDA_HOME}/bin/nvcc" --version | tail -n 1 | sed 's/^/[Demo2 preflight]   /'
 else
@@ -222,7 +227,7 @@ if ninja is None:
 try:
     Path(ninja).resolve().relative_to(Path(sys.prefix).resolve())
 except ValueError as exc:
-    raise RuntimeError(f"ninja resolves outside phystwin: {ninja}") from exc
+    raise RuntimeError(f"ninja resolves outside the active environment: {ninja}") from exc
 print(f"Flask={metadata.version('Flask')}")
 print(
     f"Flask-Sock={metadata.version('Flask-Sock')}; "

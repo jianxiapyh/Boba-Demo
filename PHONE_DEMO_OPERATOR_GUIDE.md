@@ -22,6 +22,8 @@ xdg-open /home/yihan/Research/Boba-Phone-Demo/PHONE_DEMO_OPERATOR_GUIDE.html
 
 ## Before opening the venue
 
+- Use the installed `phystwin` or `phystwin-cu132` Conda environment. The commands
+  below use `phystwin`; replace that name with `phystwin-cu132` when using CUDA 13.2.
 - Connect the computer to its monitor, keyboard, and mouse.
 - Keep the computer connected to power.
 - Have one phone available for a complete test.
@@ -146,9 +148,9 @@ post it publicly, and stop the tunnel after the demo.
 
 ## Quick troubleshooting
 
-### The command says the phystwin environment is not active
+### The command says a supported environment is not active
 
-Run these commands again, then retry the launch command:
+Activate `phystwin` or `phystwin-cu132`, then retry the launch command. For example:
 
 ~~~bash
 source /home/yihan/miniconda3/etc/profile.d/conda.sh

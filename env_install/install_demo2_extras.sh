@@ -48,7 +48,6 @@ from pathlib import Path
 distribution_names = (
     "torch",
     "torchvision",
-    "torchaudio",
     "numpy",
     "scipy",
     "warp-lang",

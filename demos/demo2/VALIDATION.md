@@ -10,6 +10,10 @@ Environment: `phystwin`, Python 3.10.20, CUDA 12.8 PyTorch build
 
 ## Shared-environment audit
 
+The table below records the original validation environment. `torchaudio` was
+installed there, but is unused by the demo and is no longer included in preflight
+or core-package audits.
+
 `env_install/install_demo2_extras.sh` found Flask, qrcode/Pillow, and Ninja already installed, so it performed no package installation. Its before/after snapshots were identical:
 
 | Distribution | Before | After |

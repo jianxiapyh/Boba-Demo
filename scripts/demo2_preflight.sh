@@ -87,7 +87,7 @@ from importlib import metadata
 
 missing = []
 for name in (
-    "torch", "torchvision", "torchaudio", "numpy", "scipy", "warp-lang",
+    "torch", "torchvision", "numpy", "scipy", "warp-lang",
     "pycuda", "pytorch3d", "open3d", "PyOpenGL", "glfw", "kornia", "Pillow",
 ):
     try:

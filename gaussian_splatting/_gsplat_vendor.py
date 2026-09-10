@@ -5,8 +5,10 @@ import os
 import sys
 from pathlib import Path
 
+from .cuda_linalg import require_runtime
 
-SUPPORTED_CONDA_ENVS = ("phystwin", "phystwin-cu132")
+
+SUPPORTED_CONDA_ENVS = ("phystwin-cu132",)
 VENDORED_GSPLAT_ROOT = Path(__file__).resolve().parent / "submodules" / "gsplat"
 VENDORED_GSPLAT_PACKAGE = VENDORED_GSPLAT_ROOT / "gsplat"
 
@@ -14,16 +16,13 @@ VENDORED_GSPLAT_PACKAGE = VENDORED_GSPLAT_ROOT / "gsplat"
 def _install_hint() -> str:
     return (
         "The phone-demo branch includes its required gsplat source.\n"
-        "  conda activate phystwin  # or phystwin-cu132\n"
+        "  conda activate phystwin-cu132\n"
         "  bash env_install/install_demo2_extras.sh\n"
         f"Bundled gsplat source: {VENDORED_GSPLAT_ROOT}"
     )
 
 
 def _active_env_name() -> str:
-    env_name = os.environ.get("CONDA_DEFAULT_ENV")
-    if env_name:
-        return Path(env_name).name
     return Path(sys.prefix).resolve().name
 
 
@@ -60,7 +59,7 @@ def validate_gsplat_runtime(gsplat_module) -> None:
     if active_env not in SUPPORTED_CONDA_ENVS:
         raise RuntimeError(
             "Boba rendering requires the bundled gsplat source inside the "
-            "'phystwin' or 'phystwin-cu132' conda environment. "
+            "'phystwin-cu132' conda environment. "
             f"Active env: {active_env!r}, "
             f"sys.prefix: {Path(sys.prefix).resolve()}.\n{_install_hint()}"
         )
@@ -83,11 +82,12 @@ def validate_gsplat_runtime(gsplat_module) -> None:
 
 
 def import_gsplat():
+    require_runtime()
     active_env = _active_env_name()
     if active_env not in SUPPORTED_CONDA_ENVS:
         raise RuntimeError(
             "Boba rendering requires the bundled gsplat source inside the "
-            "'phystwin' or 'phystwin-cu132' conda environment. "
+            "'phystwin-cu132' conda environment. "
             f"Active env: {active_env!r}, "
             f"sys.prefix: {Path(sys.prefix).resolve()}.\n{_install_hint()}"
         )

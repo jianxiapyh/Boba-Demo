@@ -177,7 +177,7 @@ def _validate_controller_bank(path: Path, case_name: str, expected_count: int) -
     except ModuleNotFoundError as exc:
         raise AssetValidationError(
             f"Unable to inspect controller bank because Python module {exc.name!r} is missing. "
-            "Activate the Boba-Batched phystwin environment and retry."
+            "Activate the phystwin-cu132 environment and retry."
         ) from exc
     except (OSError, pickle.UnpicklingError, EOFError, AttributeError, ValueError) as exc:
         raise AssetValidationError(f"Unable to load filtered controller bank {path}: {exc}") from exc

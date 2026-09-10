@@ -15,22 +15,26 @@ the custom `gsplat` source, and the packaged Rope and Sloth demo assets. A
 separate Boba or Boba-Batched checkout is **not** required.
 
 The repository does not bundle a Conda environment. Before setup, the demo
-computer must have a `phystwin` or `phystwin-cu132` environment with its CUDA/rendering
-dependencies, an NVIDIA CUDA toolkit, and a working X11/OpenGL desktop session.
+computer must have the `phystwin-cu132` environment with its CUDA/rendering
+dependencies, a PyTorch CUDA 13.2+ build, an NVIDIA CUDA toolkit, and a working
+X11/OpenGL desktop session.
 The phone-demo setup adds only the small web/QR packages; it does not replace or
 upgrade PyTorch, CUDA, Warp, PyCUDA, NumPy, or Open3D.
 
 ## One-time phone-demo setup
 
-The commands below use `phystwin`. If your installed environment is
-`phystwin-cu132`, activate that name instead; the same setup and launch scripts
-support both environments.
+Setup and launch require `phystwin-cu132` with a PyTorch CUDA 13.2+ build.
+cuSOLVER is the fixed production backend on every GPU; startup reports
+`[Boba] Linear algebra backend: cusolver`. Old `BOBA_LINALG_BACKEND` exports
+are ignored. The dedicated 3x3 solver runs one batch on RTX 3090, RTX 4090,
+RTX 5090 and RTX PRO 6000 Blackwell. See the
+[solver and build notes](gaussian_splatting/CUSOLVER.md).
 
 When `CUDA_HOME` is unset, the scripts prefer the CUDA toolkit inside the active
 environment before searching the system `PATH`.
 
 ```bash
-conda activate phystwin
+conda activate phystwin-cu132
 mkdir -p /home/yihan/Research
 git clone --single-branch --branch Boba-Phone-Demo \
   https://github.com/jianxiapyh/Boba-Demo.git \
@@ -165,10 +169,10 @@ The raw trajectory bank and original training dataset are intentionally excluded
 
 ## Troubleshooting
 
-- **Wrong environment:** activate `phystwin` or `phystwin-cu132`; the scripts reject other environments.
+- **Wrong environment:** activate `phystwin-cu132`; the scripts reject legacy `phystwin` and other environments.
 - **OpenGL/display failure:** confirm `DISPLAY` is set and launch from the computer's local X11 desktop session.
 - **Black window during startup:** `Simulation initialized` precedes rendering. Wait for `First frame displayed; playground is ready.` The first launch may compile CUDA kernels; check terminal output for errors if it does not finish.
 - **`libstdc++` import errors:** launch through `scripts/run_demo2.sh`, which places `$CONDA_PREFIX/lib` before system libraries.
 - **Phone cannot connect:** confirm both devices are on the same non-isolated LAN, allow TCP `7860`, and use an explicit `--public_url`.
 - **CUDA out of memory:** retry with a smaller explicit `--batch_size` and matching `--batch_grid_cols`.
-- **cu132 out of memory at `torch.linalg.eigh`:** update the phone-demo branch. The rotation solver now processes at most 4,096 bone matrices per call, avoiding the 15–30 GiB temporary allocations seen with 25–49 Sloth instances on an RTX 4090. Other rendering allocations still depend on batch size and image resolution.
+- **Old eigensolver workspace errors:** update this branch and run preflight. The dedicated cuSOLVER `syevjBatched` path replaces the generic solver and automatic 4,096-matrix splitting on every GPU. Other allocations still depend on batch size and resolution.

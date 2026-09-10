@@ -10,8 +10,8 @@ die() {
 
 active_env_name="${CONDA_DEFAULT_ENV:-}"
 active_env_name="${active_env_name##*/}"
-if [[ "${active_env_name}" != "phystwin" && "${active_env_name}" != "phystwin-cu132" ]]; then
-  die "activate phystwin or phystwin-cu132 before starting Demo 2 (active: ${CONDA_DEFAULT_ENV:-none})."
+if [[ "${active_env_name}" != "phystwin-cu132" ]]; then
+  die "activate phystwin-cu132 before starting Demo 2 (active: ${CONDA_DEFAULT_ENV:-none})."
 fi
 if [[ -z "${CONDA_PREFIX:-}" || ! -x "${CONDA_PREFIX}/bin/python" ]]; then
   die "CONDA_PREFIX does not identify the active ${active_env_name} environment."

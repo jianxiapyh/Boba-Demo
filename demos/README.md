@@ -5,15 +5,15 @@ individual sessions through a QR-code mobile web client.
 
 The phone-demo branch includes all Boba-Batched runtime files it needs and its
 packaged assets, so it does not require another Boba checkout. It uses the
-existing `phystwin` or `phystwin-cu132` Conda environment for third-party CUDA/rendering
+required `phystwin-cu132` Conda environment for third-party CUDA/rendering
 dependencies. From the phone-demo repository, install the small web dependency
 layer and validate the bundled runtime first:
 
-Activate the environment installed on your machine. The examples below use
-`phystwin`; use `conda activate phystwin-cu132` for the CUDA 13.2 environment.
+Activate `phystwin-cu132`, which must provide a PyTorch CUDA 13.2+ build.
+The runtime defaults to cuSOLVER on all GPUs.
 
 ```bash
-conda activate phystwin
+conda activate phystwin-cu132
 bash env_install/install_demo2_extras.sh
 bash scripts/demo2_preflight.sh
 python tools/validate_demo2_assets.py --case single_push_rope_4

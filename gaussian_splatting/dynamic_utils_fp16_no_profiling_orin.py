@@ -456,7 +456,7 @@ def interpolate_motions_speedup_rotation_reuse(
             X = F_rec
             G = X.transpose(-2, -1) @ X
             G = 0.5 * (G + G.transpose(-2, -1))
-            w, V = torch.linalg.eigh(G)
+            w, V = eigh_3x3(G)
             idx = torch.argsort(w, dim=-1, descending=True)
             w   = w.gather(-1, idx)
             V   = V.gather(-1, idx.unsqueeze(-2).expand_as(V))

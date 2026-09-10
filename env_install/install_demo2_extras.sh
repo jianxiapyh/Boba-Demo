@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Install only the small web/QR additions needed by Demo 2. The existing
-# phystwin or phystwin-cu132 environment supplies third-party core packages; the
+# phystwin-cu132 environment supplies third-party core packages; the
 # Boba runtime source itself is bundled in this branch.
 
 die() {
@@ -12,8 +12,8 @@ die() {
 
 active_env_name="${CONDA_DEFAULT_ENV:-}"
 active_env_name="${active_env_name##*/}"
-if [[ "${active_env_name}" != "phystwin" && "${active_env_name}" != "phystwin-cu132" ]]; then
-  die "activate phystwin or phystwin-cu132 before running this script (active: ${CONDA_DEFAULT_ENV:-none})."
+if [[ "${active_env_name}" != "phystwin-cu132" ]]; then
+  die "activate phystwin-cu132 before running this script (active: ${CONDA_DEFAULT_ENV:-none})."
 fi
 
 if [[ -z "${CONDA_PREFIX:-}" || ! -x "${CONDA_PREFIX}/bin/python" ]]; then
@@ -22,6 +22,8 @@ fi
 
 PYTHON="${CONDA_PREFIX}/bin/python"
 export PYTHONNOUSERSITE=1
+# A user-level bin directory can precede Conda even after activation.
+export PATH="${CONDA_PREFIX}/bin:${PATH}"
 
 python_prefix_name="$("${PYTHON}" -c 'import pathlib, sys; print(pathlib.Path(sys.prefix).resolve().name)')"
 if [[ "${python_prefix_name}" != "${active_env_name}" ]]; then

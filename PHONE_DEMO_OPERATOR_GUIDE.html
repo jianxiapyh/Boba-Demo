@@ -512,7 +512,7 @@
     <section id="before-starting">
       <h2>Before opening the venue</h2>
       <ul>
-        <li>Use the installed <code>phystwin</code> or <code>phystwin-cu132</code> environment. The commands below use <code>phystwin</code>; replace that name with <code>phystwin-cu132</code> when using CUDA 13.2.</li>
+        <li>Use the installed <code>phystwin-cu132</code> environment. This is required by the setup and launch scripts.</li>
         <li>Connect the demo computer to its monitor, keyboard, mouse, and power.</li>
         <li>Have one phone ready for a complete test.</li>
         <li>For Mode 1, bring the travel router, its power supply, and an Ethernet cable.</li>
@@ -536,7 +536,7 @@
           <button class="copy-button" type="button" data-copy-target="travel-command">Copy command</button>
         </div>
         <pre><code id="travel-command">source /home/yihan/miniconda3/etc/profile.d/conda.sh
-conda activate phystwin
+conda activate phystwin-cu132
 cd /home/yihan/Research/Boba-Phone-Demo
 
 bash scripts/run_demo2.sh \
@@ -568,7 +568,7 @@ bash scripts/run_demo2.sh \
           >Copy smaller command</button>
         </div>
         <pre><code id="travel-command-small">source /home/yihan/miniconda3/etc/profile.d/conda.sh
-conda activate phystwin
+conda activate phystwin-cu132
 cd /home/yihan/Research/Boba-Phone-Demo
 
 bash scripts/run_demo2.sh \
@@ -684,7 +684,7 @@ bash scripts/run_demo2.sh \
           >Copy final command</button>
         </div>
         <pre><code id="public-command">source /home/yihan/miniconda3/etc/profile.d/conda.sh
-conda activate phystwin
+conda activate phystwin-cu132
 cd /home/yihan/Research/Boba-Phone-Demo
 
 DEMO_PUBLIC_URL='<span class="replace" id="public-url-value" data-public-url-value>https://PASTE-THE-GENERATED-URL.trycloudflare.com</span>'
@@ -722,7 +722,7 @@ bash scripts/run_demo2.sh \
           >Copy smaller command</button>
         </div>
         <pre><code id="public-command-small">source /home/yihan/miniconda3/etc/profile.d/conda.sh
-conda activate phystwin
+conda activate phystwin-cu132
 cd /home/yihan/Research/Boba-Phone-Demo
 
 DEMO_PUBLIC_URL='<span class="replace" id="public-url-value-small" data-public-url-value>https://PASTE-THE-GENERATED-URL.trycloudflare.com</span>'
@@ -768,15 +768,15 @@ bash scripts/run_demo2.sh \
       <h2>Quick troubleshooting</h2>
 
       <details>
-        <summary>A supported environment is not active</summary>
-        <p>Activate <code>phystwin</code> or <code>phystwin-cu132</code>, then retry the launch command. These example commands use <code>phystwin</code>.</p>
+        <summary>phystwin-cu132 is not active</summary>
+        <p>Activate <code>phystwin-cu132</code>, then retry the launch command.</p>
         <div class="code-card">
           <div class="code-head">
             <span>Activate environment</span>
             <button class="copy-button" type="button" data-copy-target="conda-command">Copy command</button>
           </div>
           <pre><code id="conda-command">source /home/yihan/miniconda3/etc/profile.d/conda.sh
-conda activate phystwin</code></pre>
+conda activate phystwin-cu132</code></pre>
         </div>
       </details>
 

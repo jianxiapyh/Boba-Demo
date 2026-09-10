@@ -2,6 +2,7 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+cd "${REPO_ROOT}"
 failures=0
 
 ok() {
@@ -19,10 +20,11 @@ fail() {
 
 active_env_name="${CONDA_DEFAULT_ENV:-}"
 active_env_name="${active_env_name##*/}"
-if [[ "${active_env_name}" == "phystwin" || "${active_env_name}" == "phystwin-cu132" ]]; then
+if [[ "${active_env_name}" == "phystwin-cu132" ]]; then
   ok "active Conda environment is ${active_env_name}"
 else
-  fail "activate phystwin or phystwin-cu132 first (active: ${CONDA_DEFAULT_ENV:-none})"
+  fail "activate phystwin-cu132 first (active: ${CONDA_DEFAULT_ENV:-none})"
+  exit 1
 fi
 
 if [[ -n "${CONDA_PREFIX:-}" && -x "${CONDA_PREFIX}/bin/python" ]]; then
@@ -35,11 +37,13 @@ if [[ -n "${CONDA_PREFIX:-}" && -x "${CONDA_PREFIX}/bin/python" ]]; then
   fi
 else
   fail "CONDA_PREFIX does not contain an executable Python"
-  printf '[Demo2 preflight] Stop: activate phystwin or phystwin-cu132 and rerun this preflight.\n' >&2
+  printf '[Demo2 preflight] Stop: activate phystwin-cu132 and rerun this preflight.\n' >&2
   exit 1
 fi
 
 export PYTHONNOUSERSITE=1
+# Use the same environment-local executables as run_demo2.sh.
+export PATH="${CONDA_PREFIX}/bin:${PATH}"
 
 for runtime_marker in \
   "interactive_playground.py" \
@@ -111,17 +115,23 @@ fi
 if cuda_python_report="$(${PYTHON} <<'PY' 2>&1
 import torch
 
+cuda_version = tuple(int(part) for part in (torch.version.cuda or "0.0").split(".")[:2])
+if cuda_version < (13, 2):
+    raise RuntimeError(f"phystwin-cu132 requires a PyTorch CUDA 13.2+ build, got {torch.version.cuda}")
 if not torch.cuda.is_available():
     raise RuntimeError("torch.cuda.is_available() is false")
 print(f"PyTorch {torch.__version__}; CUDA build {torch.version.cuda}")
 for index in range(torch.cuda.device_count()):
     props = torch.cuda.get_device_properties(index)
     print(f"cuda:{index}: {props.name}; {props.total_memory / (1024 ** 3):.1f} GiB")
-_ = torch.empty(1, device="cuda")
+torch.backends.cuda.preferred_linalg_library("cusolver")
+from gaussian_splatting.rotation_utils import eigh_3x3
+eigh_3x3(torch.eye(3, device="cuda").unsqueeze(0))
 torch.cuda.synchronize()
+print("cuSOLVER syevjBatched eigendecomposition succeeds")
 PY
 )"; then
-  ok "PyTorch CUDA allocation succeeds"
+  ok "PyTorch CUDA 13.2+ and cuSOLVER eigendecomposition succeed"
   printf '%s\n' "${cuda_python_report}" | sed 's/^/[Demo2 preflight]   /'
 else
   fail "PyTorch CUDA check failed: ${cuda_python_report}"

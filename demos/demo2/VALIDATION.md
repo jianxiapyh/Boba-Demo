@@ -218,3 +218,16 @@ first-frame preparation, and the first successfully displayed frame.
 
 These bounded replay checks did not attach physical phones or exercise the
 Cloudflare tunnel, simultaneous phone streams, or a sustained event workload.
+
+
+## 2026-09-10 Dedicated cuSOLVER and required CUDA 13.2 runtime
+
+The runtime now requires `phystwin-cu132` and a PyTorch CUDA 13.2+ build.
+CUDA rotation inference uses one dedicated cuSOLVER `syevjBatched` call on
+all GPU architectures. It replaces the automatic 4,096-matrix split without
+changing the LBS formulas or physical simulation. Older environment and
+workspace entries above are historical.
+
+See the [production validation record](../../gaussian_splatting/CUSOLVER_VALIDATION.md)
+for regression tests, RTX 4090 replays, the public full-runtime benchmark,
+and the exact downstream/render comparison on RTX 5090.

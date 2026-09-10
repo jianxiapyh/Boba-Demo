@@ -36,6 +36,14 @@ ILLIXR's `plugins/debugview`; the Quest continues to receive its normal stereo
 eye views. Pass `--interactive_window_mode hidden` to disable the desktop
 spectator view.
 
+The runtime verifies that the executing interpreter is `phystwin-cu132` and
+PyTorch was built with CUDA 13.2 or newer. cuSOLVER is fixed on every GPU;
+old `BOBA_LINALG_BACKEND` exports are ignored. Rotation eigendecomposition
+uses one dedicated `syevjBatched` call, including on RTX 3090 and RTX 4090.
+The existing LBS formulas and fallback behavior remain in place. See the
+[solver and first-build instructions](gaussian_splatting/CUSOLVER.md), and
+warm the extension before starting an event.
+
 ## Install the demo additions
 
 Clone the demo and install only its pinned add-on package:

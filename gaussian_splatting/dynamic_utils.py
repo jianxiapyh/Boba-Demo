@@ -1,4 +1,8 @@
 import torch
+from .rotation_utils import eigh_3x3
+from .cuda_linalg import configure_linalg_backend
+
+SELECTED_LINALG_BACKEND = configure_linalg_backend(torch)
 import kornia
 from torch.profiler import profile, ProfilerActivity, record_function
 import torch.nn.functional as Func
@@ -455,7 +459,7 @@ def interpolate_motions_speedup_rotation_reuse(
             X = F_rec
             G = X.transpose(-2, -1) @ X
             G = 0.5 * (G + G.transpose(-2, -1))
-            w, V = torch.linalg.eigh(G)
+            w, V = eigh_3x3(G)
             idx = torch.argsort(w, dim=-1, descending=True)
             w   = w.gather(-1, idx)
             V   = V.gather(-1, idx.unsqueeze(-2).expand_as(V))
@@ -894,7 +898,7 @@ def _polar_rotation_from_eigh(X: torch.Tensor, eps: float = 1e-10) -> torch.Tens
     G = 0.5 * (G + G.transpose(-2, -1))
     eye = torch.eye(3, device=X.device, dtype=X.dtype).unsqueeze(0)
     G = G + eye * eps
-    eigenvalues, eigenvectors = torch.linalg.eigh(G)
+    eigenvalues, eigenvectors = eigh_3x3(G)
 
     sort_idx = torch.argsort(eigenvalues, dim=-1, descending=True)
     eigenvalues = eigenvalues.gather(-1, sort_idx)

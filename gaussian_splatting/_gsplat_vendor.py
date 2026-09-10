@@ -8,6 +8,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from .cuda_linalg import require_runtime
+
 import torch
 
 
@@ -123,6 +125,7 @@ def validate_gsplat_runtime(gsplat_module: Any) -> None:
 
 
 def import_gsplat():
+    require_runtime()
     if _active_env_name() != EXPECTED_CONDA_ENV:
         raise RuntimeError(
             "Boba Demo requires its supported conda environment. "
